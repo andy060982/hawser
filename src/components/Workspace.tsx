@@ -81,11 +81,13 @@ export function Workspace({
         <div className="ml-auto flex items-center gap-1">
           {session.view === 'terminal' && (
             <>
+              {/* Split stays labeled (discoverable) and shrink-0 so it can never
+                  be squeezed out of the toolbar when the pane actions appear. */}
               <button
                 type="button"
                 onClick={() => onSplit('row')}
                 title="Split the focused pane — new session to the right"
-                className="flex h-[22px] items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
+                className="flex h-[22px] shrink-0 items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
               >
                 <SplitSquareHorizontal size={12} aria-hidden />
                 Split right
@@ -94,36 +96,39 @@ export function Workspace({
                 type="button"
                 onClick={() => onSplit('col')}
                 title="Split the focused pane — new session below"
-                className="flex h-[22px] items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
+                className="flex h-[22px] shrink-0 items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
               >
                 <SplitSquareVertical size={12} aria-hidden />
                 Split down
               </button>
+              {/* Broadcast + Separate are icon-only: they only appear at 2+ panes,
+                  which is exactly when the toolbar would otherwise overflow and
+                  push the Split buttons off-screen. */}
               {groupSessions.length > 1 && (
                 <button
                   type="button"
                   onClick={onToggleBroadcast}
                   aria-pressed={broadcast}
-                  title="Type once, send to every pane in this tab"
-                  className={`flex h-[22px] items-center gap-1 rounded border px-1.5 text-[11.5px] transition-colors ${
+                  aria-label="Broadcast input to all panes"
+                  title={broadcast ? 'Broadcasting — input goes to every pane' : 'Broadcast input to every pane in this tab'}
+                  className={`grid h-[22px] w-[22px] shrink-0 place-items-center rounded border transition-colors ${
                     broadcast
                       ? 'border-warn/60 bg-warn/15 text-warn'
                       : 'border-line text-ink-dim hover:bg-surface-3 hover:text-ink'
                   }`}
                 >
-                  <Radio size={12} aria-hidden />
-                  {broadcast ? 'Broadcasting' : 'Broadcast'}
+                  <Radio size={13} aria-hidden />
                 </button>
               )}
               {groupSessions.length > 1 && (
                 <button
                   type="button"
                   onClick={() => onSeparate(session.id)}
+                  aria-label="Separate this pane into its own tab"
                   title="Move this pane out into its own tab"
-                  className="flex h-[22px] items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
+                  className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded border border-line text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
                 >
-                  <Unlink size={12} aria-hidden />
-                  Separate
+                  <Unlink size={13} aria-hidden />
                 </button>
               )}
             </>
