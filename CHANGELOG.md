@@ -4,6 +4,39 @@ All notable changes to Skiff are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Copy-on-select and middle-click paste** in the terminal: finishing a mouse
+  selection copies it to the clipboard (iTerm2/PuTTY style), and the mouse-wheel
+  button pastes. Both toggle in Settings → Terminal (default on).
+- **Mixed split-pane layouts.** A tab is now a binary split tree, so panes can be
+  nested in any mix of rows and columns ("Split right" / "Split down" on the
+  focused pane). Dividers drag to resize and double-click to reset; each pane has
+  its own close button; proportions hold on window resize.
+- **Interactive password prompt** when connecting to a host with no saved
+  secret, instead of failing with "no saved credential". An opt-in "Save this
+  password to your OS keychain" records the credential→destination binding on a
+  successful login (and rolls the secret back if the binding fails to persist).
+- **In-app confirm / alert dialogs** (Enter confirms, Esc cancels).
+
+### Changed
+
+- Replaced native `window.confirm` / `window.alert` — which do not reliably show
+  in the WebView — with the in-app dialogs across the destructive-command guard,
+  tab close, SFTP delete/overwrite, connect confirmation, snippet guard, and host
+  delete.
+
+### Fixed
+
+- The per-pane close button did nothing: a `pointerdown` `preventDefault`
+  cancelled the click in WebKit.
+- Separating the first ("anchor") pane of a split was a no-op; it now moves to its
+  own tab like any other pane.
+- Native paste (Cmd/Ctrl+V, platform/WebView paste) bypassed the
+  destructive-command guard; it is now intercepted and routed through the guard.
+
 ## [0.4.0] - 2026-09-26
 
 ### Security

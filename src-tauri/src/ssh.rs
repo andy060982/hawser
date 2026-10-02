@@ -232,25 +232,38 @@ pub struct AuthPromptRequest {
     pub name: String,
     pub instruction: String,
     pub prompts: Vec<AuthPromptField>,
+    /// When true, the dialog offers a "save to the OS vault" checkbox. Only set
+    /// for the up-front "no saved password" prompt — never for a live server
+    /// challenge (an OTP or token code is single-use and must not be stored).
+    pub offer_save: bool,
 }
 
-/// Same oneshot bridge as `HostKeyPrompts`, but the answer is the list of typed
-/// responses — one per echo prompt shown. Resolved by `auth_prompt_respond`.
+/// The user's answer to an auth prompt: one typed response per shown prompt,
+/// plus whether they asked to save the password to the OS vault.
+#[derive(Debug, Default)]
+pub struct AuthAnswer {
+    pub answers: Vec<String>,
+    pub save: bool,
+}
+
+/// Same oneshot bridge as `HostKeyPrompts`, but the answer is the typed
+/// responses (one per echo prompt shown) plus the save choice. Resolved by
+/// `auth_prompt_respond`.
 #[derive(Default)]
 pub struct AuthPrompts {
-    pending: DashMap<String, oneshot::Sender<Vec<String>>>,
+    pending: DashMap<String, oneshot::Sender<AuthAnswer>>,
 }
 
 impl AuthPrompts {
-    /// Resolve a pending auth prompt with the user's typed answers.
-    pub fn respond(&self, request_id: &str, answers: Vec<String>) -> bool {
+    /// Resolve a pending auth prompt with the user's typed answers and save choice.
+    pub fn respond(&self, request_id: &str, answers: Vec<String>, save: bool) -> bool {
         match self.pending.remove(request_id) {
-            Some((_, tx)) => tx.send(answers).is_ok(),
+            Some((_, tx)) => tx.send(AuthAnswer { answers, save }).is_ok(),
             None => false,
         }
     }
 
-    fn register(&self, request_id: String) -> oneshot::Receiver<Vec<String>> {
+    fn register(&self, request_id: String) -> oneshot::Receiver<AuthAnswer> {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(request_id, tx);
         rx
@@ -615,8 +628,8 @@ impl Registry {
                 let mut jh =
                     client::connect(jump_config, (j.host.as_str(), j.port), jump_handler).await?;
                 authenticate(
-                    &mut jh, &j.host_id, &j.username, &j.auth, j.key_path.as_deref(), None,
-                    &app, &auth_prompts, session_id,
+                    &mut jh, &j.host_id, &j.host, j.port, &j.username, &j.auth,
+                    j.key_path.as_deref(), None, &app, &auth_prompts, session_id,
                 )
                 .await?;
 
@@ -634,7 +647,7 @@ impl Registry {
         };
 
         authenticate(
-            &mut handle, host_id, username, auth, key_path, one_shot_password,
+            &mut handle, host_id, host, port, username, auth, key_path, one_shot_password,
             &app, &auth_prompts, session_id,
         )
         .await?;
@@ -1375,6 +1388,8 @@ fn authorize_stored_password(
 async fn authenticate(
     handle: &mut Handle<ClientHandler>,
     host_id: &str,
+    host: &str,
+    port: u16,
     username: &str,
     auth: &str,
     key_path: Option<&str>,
@@ -1432,13 +1447,44 @@ async fn authenticate(
             // already returns Zeroizing; a one-shot password is wrapped to match.
             // The previous `unsafe { as_mut_vec().fill(0) }` is gone — fill(0) is
             // not a guaranteed zeroization primitive, and Zeroizing::drop is.
+            // A password the user typed AND asked to save, held until we know it
+            // actually authenticated — never persist a wrong guess.
+            let mut save_typed: Option<zeroize::Zeroizing<String>> = None;
             let pw: zeroize::Zeroizing<String> = match one_shot_password {
                 Some(p) => zeroize::Zeroizing::new(p.to_string()),
-                None => credentials::read_secret(host_id)?,
+                None => match credentials::read_secret(host_id) {
+                    Ok(secret) => secret,
+                    // No saved password and none supplied for this connect: ask
+                    // the user for it interactively rather than failing outright
+                    // with "no saved credential". The prompt is hidden (masked),
+                    // and the typed password comes INWARD via auth_prompt_respond
+                    // — no stored secret is ever emitted outward, so the
+                    // "secrets never cross IPC outward" invariant holds.
+                    Err(credentials::CredError::NotFound(_)) => {
+                        let answer = request_auth_answers(
+                            app,
+                            auth_prompts,
+                            session_id,
+                            "Password required",
+                            &format!("Enter the password for {username}"),
+                            vec![AuthPromptField { prompt: "Password:".into(), echo: false }],
+                            true,
+                        )
+                        .await?;
+                        let typed = zeroize::Zeroizing::new(
+                            answer.answers.into_iter().next().unwrap_or_default(),
+                        );
+                        if answer.save {
+                            save_typed = Some(typed.clone());
+                        }
+                        typed
+                    }
+                    Err(e) => return Err(e.into()),
+                },
             };
-            let result = handle.authenticate_password(username, pw.as_str()).await?;
-            if matches!(result, russh::client::AuthResult::Success) {
-                result
+            let first = handle.authenticate_password(username, pw.as_str()).await?;
+            let result = if matches!(first, russh::client::AuthResult::Success) {
+                first
             } else {
                 keyboard_interactive_with_password(
                     handle,
@@ -1449,7 +1495,34 @@ async fn authenticate(
                     session_id,
                 )
                 .await?
+            };
+            // Persist a freshly-typed password only now that it has authenticated,
+            // and only if the user opted in. A vault-write failure must not fail an
+            // otherwise-good session, so it is logged, not propagated.
+            if matches!(result, russh::client::AuthResult::Success) {
+                if let Some(secret) = &save_typed {
+                    if let Err(e) = credentials::write_secret(host_id, username, secret.as_str()) {
+                        eprintln!("skiff: could not save password for {host_id}: {e}");
+                    } else if let Err(e) =
+                        crate::utils::hosts::snapshot_binding(host_id, host, port, username)
+                    {
+                        // The binding authorizes this exact destination for the
+                        // credential (same pairing the host-editor save records).
+                        // If it fails to persist, a saved secret with no binding is
+                        // refused by the anti-exfiltration guard on the very next
+                        // connect — fail-closed but confusing. Roll the secret back
+                        // so the user is simply prompted again next time instead of
+                        // hitting an inexplicable "not an authorized destination".
+                        eprintln!(
+                            "skiff: could not bind saved credential {host_id}: {e}; \
+                             rolling back the saved password"
+                        );
+                        let _ = credentials::delete_secret(host_id);
+                        crate::utils::hosts::remove_binding(host_id);
+                    }
+                }
             }
+            result
             // `pw` (Zeroizing) drops here — or at any `?` above — wiping its
             // buffer on every exit path; no manual fill, no plain-String copy.
         }
@@ -1513,12 +1586,12 @@ async fn keyboard_interactive_with_password(
                         .map(|p| AuthPromptField { prompt: p.prompt.clone(), echo: true })
                         .collect();
                     let typed = request_auth_answers(
-                        app, auth_prompts, session_id, &name, &instructions, echo_fields,
+                        app, auth_prompts, session_id, &name, &instructions, echo_fields, false,
                     )
                     .await?;
                     // Interleave the user's typed answers (echo prompts, in order)
                     // with the password (hidden prompts).
-                    let mut typed = typed.into_iter();
+                    let mut typed = typed.answers.into_iter();
                     prompts
                         .iter()
                         .map(|p| {
@@ -1556,7 +1629,8 @@ async fn request_auth_answers(
     name: &str,
     instruction: &str,
     fields: Vec<AuthPromptField>,
-) -> Result<Vec<String>, SshError> {
+    offer_save: bool,
+) -> Result<AuthAnswer, SshError> {
     let request_id = format!(
         "auth-{}-{}",
         session_id,
@@ -1573,6 +1647,7 @@ async fn request_auth_answers(
                 name: name.to_string(),
                 instruction: instruction.to_string(),
                 prompts: fields,
+                offer_save,
             },
         )
         .is_err()
@@ -1586,7 +1661,7 @@ async fn request_auth_answers(
     }
 
     match tokio::time::timeout(AUTH_PROMPT_TIMEOUT, rx).await {
-        Ok(Ok(answers)) => Ok(answers),
+        Ok(Ok(answer)) => Ok(answer),
         // Sender dropped (dialog cancelled) — abort auth cleanly.
         Ok(Err(_)) => Err(SshError::AuthFailed("interactive auth cancelled".into())),
         Err(_) => {
@@ -1652,7 +1727,7 @@ pub async fn copy_id(
     // Password (with keyboard-interactive fallback), one-shot. host_id "" is
     // never consulted because the one-shot password is supplied.
     authenticate(
-        &mut handle, "", username, "password", None, Some(password),
+        &mut handle, "", host, port, username, "password", None, Some(password),
         &app, &auth_prompts, "install-key",
     )
     .await?;

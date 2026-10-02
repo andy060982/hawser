@@ -4,6 +4,7 @@ import type { FileEntry, PaneSide, Session } from '../types'
 import { FilePane } from './FilePane'
 import { ResizeHandle } from './ResizeHandle'
 import { joinPath } from '../lib/sftp'
+import { useDialogs } from '../lib/dialogs'
 import { onFileDrop, safeInvoke } from '../lib/tauri'
 import { ContextMenu, type MenuState } from './ContextMenu'
 import { X } from 'lucide-react'
@@ -53,6 +54,7 @@ export function SftpView({
   /** Bumps when any transfer completes, so the destination pane re-reads. */
   transferTick: number
 }) {
+  const { confirm, alert } = useDialogs()
   const [ratio, setRatio] = useState(0.5)
   const [focus, setFocus] = useState<PaneSide>('local')
   const [localPath, setLocalPath] = useState(savedPaths?.local || defaultLocal())
@@ -106,7 +108,7 @@ export function SftpView({
   const runOp = (side: PaneSide, op: Promise<unknown>) => {
     void op
       .then(() => bump(side))
-      .catch((e) => window.alert(e instanceof Error ? e.message : String(e)))
+      .catch((e) => void alert(e instanceof Error ? e.message : String(e)))
   }
 
   const openRowMenu = (side: PaneSide) => (entry: FileEntry, x: number, y: number) => {
@@ -128,7 +130,7 @@ export function SftpView({
             const next = window.prompt('New name', entry.name)?.trim()
             if (!next || next === entry.name) return
             if (/[\\/]/.test(next)) {
-              window.alert('Names cannot contain slashes.')
+              void alert('Names cannot contain slashes.')
               return
             }
             const to = joinPath(side, base, next)
@@ -142,7 +144,7 @@ export function SftpView({
             const name = window.prompt('Folder name')?.trim()
             if (!name) return
             if (/[\\/]/.test(name)) {
-              window.alert('Names cannot contain slashes.')
+              void alert('Names cannot contain slashes.')
               return
             }
             const target = joinPath(side, base, name)
@@ -162,11 +164,17 @@ export function SftpView({
             // Non-recursive by design: rm -rf from a GUI click is how
             // production directories die. Non-empty folders fail server-side
             // and the error is shown.
-            if (!window.confirm(`Delete ${entry.name}? This cannot be undone.`)) return
-            runOp(side, safeInvoke(side === 'local' ? 'local_delete' : 'sftp_delete',
-              side === 'local'
-                ? { path: full, isDir }
-                : { sessionId: session.id, path: full, isDir }))
+            void confirm(`Delete ${entry.name}? This cannot be undone.`, {
+              title: 'Delete',
+              confirmLabel: 'Delete',
+              danger: true,
+            }).then((ok) => {
+              if (!ok) return
+              runOp(side, safeInvoke(side === 'local' ? 'local_delete' : 'sftp_delete',
+                side === 'local'
+                  ? { path: full, isDir }
+                  : { sessionId: session.id, path: full, isDir }))
+            })
           },
         },
       ],
@@ -277,7 +285,7 @@ export function SftpView({
       (j) => /[\\/]/.test(j.name) || j.name === '.' || j.name === '..' || j.name.includes(':'),
     )
     if (unsafe.length > 0) {
-      window.alert(`Refusing unsafe name(s): ${unsafe.map((j) => j.name).join(', ')}`)
+      void alert(`Refusing unsafe name(s): ${unsafe.map((j) => j.name).join(', ')}`)
       jobs = jobs.filter((j) => !unsafe.includes(j))
       if (jobs.length === 0) return
     }
@@ -302,7 +310,14 @@ export function SftpView({
       } catch {
         exists = false
       }
-      if (exists && !window.confirm(`${job.name} already exists at the destination. Overwrite it?`)) {
+      if (
+        exists &&
+        !(await confirm(`${job.name} already exists at the destination. Overwrite it?`, {
+          title: 'Overwrite?',
+          confirmLabel: 'Overwrite',
+          danger: true,
+        }))
+      ) {
         continue
       }
       kept.push(job)

@@ -83,8 +83,9 @@ async fn auth_prompt_respond(
     auth_prompts: State<'_, Arc<AuthPrompts>>,
     request_id: String,
     answers: Vec<String>,
+    #[allow(non_snake_case)] save: Option<bool>,
 ) -> CmdResult<()> {
-    auth_prompts.respond(&request_id, answers);
+    auth_prompts.respond(&request_id, answers, save.unwrap_or(false));
     Ok(())
 }
 

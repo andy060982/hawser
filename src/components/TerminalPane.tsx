@@ -8,6 +8,7 @@ import { safeInvoke, safeListen, inTauri } from '../lib/tauri'
 import { onLocal } from '../lib/localTerm'
 import { isDangerousCommand } from '../lib/dangerous'
 import { useSettings } from '../lib/settings'
+import { useDialogs } from '../lib/dialogs'
 import { registerTerm, unregisterTerm } from '../lib/termRegistry'
 import {
   TERMINAL_FONT,
@@ -56,6 +57,11 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
   const { settings } = useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
+  // Held in a ref so the terminal effect (keyed on session.id) always calls the
+  // current confirm without being torn down when the dialog api identity changes.
+  const { confirm } = useDialogs()
+  const confirmRef = useRef(confirm)
+  confirmRef.current = confirm
 
   useEffect(() => {
     const host = hostRef.current
@@ -105,12 +111,46 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
     // All paste paths funnel here so the dangerous-command guard can inspect the
     // full clipboard text before it reaches the shell; term.paste keeps
     // bracketed-paste framing.
-    const doPaste = (text: string) => {
+    const doPaste = async (text: string) => {
       if (settingsRef.current.dangerousGuard) {
         const reason = isDangerousCommand(text)
-        if (reason && !window.confirm(`Pasted text looks destructive (${reason}). Paste it?`)) return
+        if (
+          reason &&
+          !(await confirmRef.current(`Pasted text looks destructive (${reason}). Paste it?`, {
+            title: 'Destructive paste',
+            confirmLabel: 'Paste',
+            danger: true,
+          }))
+        ) {
+          return
+        }
       }
       term.paste(text)
+    }
+
+    // Read the clipboard and paste it through the guard. Shared by every paste
+    // gesture — right-click, Ctrl+Shift+V, and middle-click — so the
+    // dangerous-command check and the "clipboard blocked" notice behave
+    // identically no matter how the paste was triggered.
+    const pasteFromClipboard = () => {
+      void navigator.clipboard
+        .readText()
+        .then((text) => {
+          if (text) void doPaste(text)
+        })
+        .catch(() => {
+          term.write('\r\n\x1b[38;2;242;178;92m● clipboard read blocked\x1b[0m\r\n')
+        })
+    }
+
+    // Copy the current selection to the clipboard, if any. Returns whether there
+    // was a selection to copy, so callers can branch (right-click copies-then-
+    // pastes off this).
+    const copySelection = (): boolean => {
+      const sel = term.getSelection()
+      if (!sel) return false
+      void navigator.clipboard.writeText(sel)
+      return true
     }
 
     /* ---------------------------------------------------- keystrokes out */
@@ -156,24 +196,57 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
     // combined into the one gesture people actually use).
     const onCtx = (e: MouseEvent) => {
       e.preventDefault()
-      if (term.hasSelection()) {
-        void navigator.clipboard.writeText(term.getSelection())
+      // With a selection, right-click copies it and clears — but copy-on-select
+      // has usually already put it on the clipboard, so this is mostly a no-op
+      // confirmation. Without a selection, right-click pastes (PuTTY muscle
+      // memory). doPaste applies the dangerous-command guard, then term.paste
+      // (not a raw send) so xterm keeps bracketed-paste framing — a multi-line
+      // payload arrives inert for review instead of auto-running.
+      if (copySelection()) {
         term.clearSelection()
         return
       }
-      void navigator.clipboard
-        .readText()
-        .then((text) => {
-          // doPaste applies the dangerous-command guard, then term.paste (not a
-          // raw send) so xterm keeps bracketed-paste framing — a multi-line
-          // payload arrives inert for review instead of auto-running.
-          if (text) doPaste(text)
-        })
-        .catch(() => {
-          term.write('\r\n\x1b[38;2;242;178;92m● clipboard read blocked\x1b[0m\r\n')
-        })
+      pasteFromClipboard()
     }
     host.addEventListener('contextmenu', onCtx)
+
+    // Copy-on-select: the instant a mouse-drag selection ends, put it on the
+    // clipboard — no Ctrl-chord, no right-click. This is the "copy/paste should
+    // be easy" behaviour of iTerm2 and PuTTY. Guarded on hasSelection so a plain
+    // click (no drag) never clobbers the clipboard, and the selection is left
+    // highlighted rather than cleared, so it stays visible after copying.
+    const onMouseUp = () => {
+      if (settingsRef.current.copyOnSelect) copySelection()
+    }
+    host.addEventListener('mouseup', onMouseUp)
+
+    // Middle-click (mouse wheel button) pastes, X11 / PuTTY style. preventDefault
+    // on the button-1 mousedown suppresses the browser's auto-scroll cursor that
+    // would otherwise hijack the gesture.
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button === 1 && settingsRef.current.middleClickPaste) {
+        e.preventDefault()
+        pasteFromClipboard()
+      }
+    }
+    host.addEventListener('mousedown', onMouseDown)
+
+    // Native paste (Cmd/Ctrl+V, the platform Edit menu, a WebView paste) fires a
+    // `paste` event that xterm's hidden textarea would otherwise ingest directly,
+    // bypassing the dangerous-command guard entirely. Intercept it in the capture
+    // phase — which runs on this host ancestor before xterm's own textarea
+    // handler — take over, and route the text through the guarded doPaste. This
+    // adds no new paste trigger; it only gates the native path xterm already had.
+    const onPaste = (e: ClipboardEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const text = e.clipboardData?.getData('text/plain')
+      // clipboardData is normally populated on a paste event; if it isn't (some
+      // WebView paths), fall back to an async clipboard read — still guarded.
+      if (text) void doPaste(text)
+      else pasteFromClipboard()
+    }
+    host.addEventListener('paste', onPaste, true)
 
     const dataSub = term.onData((data) => {
       send(Array.from(encoder.encode(data)))
@@ -198,26 +271,16 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       if (e.type !== 'keydown') return true
 
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
-        const sel = term.getSelection()
-        if (sel) void navigator.clipboard.writeText(sel)
+        copySelection()
         return false
       }
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
-        void navigator.clipboard
-          .readText()
-          .then((text) => {
-            // Guarded paste — see the context-menu paste above.
-            if (text) doPaste(text)
-          })
-          .catch(() => {
-            // Clipboard read can be denied by the webview; say so rather than
-            // looking like the paste silently did nothing.
-            term.write('\r\n\x1b[38;2;242;178;92m● clipboard read blocked\x1b[0m\r\n')
-          })
+        // Guarded paste — see pasteFromClipboard and the context-menu paste above.
+        pasteFromClipboard()
         return false
       }
       if (e.ctrlKey && !e.shiftKey && e.code === 'KeyC' && term.hasSelection()) {
-        void navigator.clipboard.writeText(term.getSelection())
+        copySelection()
         term.clearSelection()
         return false
       }
@@ -319,6 +382,9 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       unlisten?.()
       unLocal()
       host.removeEventListener('contextmenu', onCtx)
+      host.removeEventListener('mouseup', onMouseUp)
+      host.removeEventListener('mousedown', onMouseDown)
+      host.removeEventListener('paste', onPaste, true)
       unregisterTerm(session.id)
       dataSub.dispose()
       binarySub.dispose()
