@@ -28,10 +28,10 @@ pub enum CredError {
     Backend(String),
 }
 
-/// Vault key for a host. Namespaced so Skiff's entries are obvious in each
+/// Vault key for a host. Namespaced so Hawser's entries are obvious in each
 /// platform's vault UI and cannot collide with another application's entries.
 pub fn target_name(host_id: &str) -> String {
-    format!("skiff:host:{host_id}")
+    format!("hawser:host:{host_id}")
 }
 
 /// True for vault ids that belong to another namespace and must never be used
@@ -201,7 +201,7 @@ mod imp {
 // ---------------------------------------------------------------------------
 // Unix (Linux Secret Service / macOS Keychain) via the `keyring` crate.
 //
-// A host is keyed by (service = "skiff", account = target_name(host_id)) so a
+// A host is keyed by (service = "hawser", account = target_name(host_id)) so a
 // read needs only the host id — the username the Windows path stores is not
 // part of the lookup key here. `get_password` returns a plain `String`; we wrap
 // it in `Zeroizing` immediately so it wipes on drop like the Windows path.
@@ -213,7 +213,7 @@ mod imp {
 
     use super::{target_name, CredError};
 
-    const SERVICE: &str = "skiff";
+    const SERVICE: &str = "hawser";
 
     fn entry(host_id: &str) -> Result<Entry, CredError> {
         Entry::new(SERVICE, &target_name(host_id)).map_err(|e| CredError::Backend(e.to_string()))
@@ -274,7 +274,7 @@ mod tests {
     /// would test nothing at all.
     #[test]
     fn write_read_delete_roundtrip() {
-        let id = "__skiff_selftest__";
+        let id = "__hawser_selftest__";
         // Deliberately not ASCII: the blob is UTF-16LE, and a truncation bug in
         // the encode/decode pair only shows up above the BMP-free happy path.
         let secret = "p@ss w\u{f6}rd \u{4e2d}\u{6587} 123";
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn missing_secret_is_not_found() {
-        match read_secret("__skiff_definitely_absent__") {
+        match read_secret("__hawser_definitely_absent__") {
             Err(CredError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }

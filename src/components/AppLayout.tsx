@@ -380,7 +380,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   /** Lowest unused 1-based pane number for a host.
    *
    *  Reuses gaps rather than always incrementing, so closing pane 1 of two and
-   *  reopening lands back on `skiff-1` instead of drifting to `skiff-3` and
+   *  reopening lands back on `hawser-1` instead of drifting to `hawser-3` and
    *  orphaning tmux sessions on the server forever. */
   const nextPaneIndex = useCallback((hostId: string) => {
     const taken = new Set(
@@ -1435,7 +1435,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
               // Merging is deliberate — import ADDS to the catalogue rather
               // than replacing it, so a bad file cannot wipe existing hosts.
               if (!Array.isArray(tree) || tree.some((n) => typeof n !== 'object' || !('kind' in n))) {
-                throw new Error('not a Skiff host export')
+                throw new Error('not a Hawser host export')
               }
               // Colliding ids (importing the same export twice, or an export
               // from this machine) get fresh ids at every depth, so a re-import

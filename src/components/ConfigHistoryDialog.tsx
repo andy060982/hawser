@@ -29,7 +29,7 @@ const fmtWhen = (epoch: number | null) => {
    Answers the question that starts most network incident calls — "what
    changed on this box". Snapshot runs the host's configured capture command
    over a fresh exec channel (invisible to the interactive terminal), stores
-   plain text under %APPDATA%\skiff\configs\<host>\, and any two snapshots
+   plain text under %APPDATA%\hawser\configs\<host>\, and any two snapshots
    diff as unified text with added/removed colouring.
 
    Select one snapshot to view it; select two to diff them.

@@ -1,6 +1,6 @@
 /** App-wide settings: host-color policies and a couple of safety toggles.
  *
- *  Persisted to %APPDATA%\skiff\settings.json via the settings_load/save IPC
+ *  Persisted to %APPDATA%\hawser\settings.json via the settings_load/save IPC
  *  commands (same corrupt-tolerant contract as the host catalogue). Exposed
  *  through a context so the cross-cutting consumers — connect flow, AI panel,
  *  broadcast, close guard — read one source of truth instead of threading

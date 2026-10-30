@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Skiff are documented here. Format follows
+All notable changes to Hawser are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/).
 

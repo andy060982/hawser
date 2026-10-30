@@ -82,7 +82,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), KnownHostsError> {
     Ok(())
 }
 
-/// `%APPDATA%\skiff\hosts.json`, beside known_hosts.
+/// `%APPDATA%\hawser\hosts.json`, beside known_hosts.
 fn hosts_path() -> Result<PathBuf, KnownHostsError> {
     let store = super::known_hosts::store_path()?;
     Ok(store
@@ -116,7 +116,7 @@ pub fn load() -> Result<Option<Value>, KnownHostsError> {
             let backup = path.with_extension("json.corrupt");
             let _ = std::fs::write(&backup, &text);
             eprintln!(
-                "skiff: hosts.json is not valid JSON; backed up to {} and starting from defaults",
+                "hawser: hosts.json is not valid JSON; backed up to {} and starting from defaults",
                 backup.display()
             );
             Ok(None)
@@ -466,7 +466,7 @@ fn walk_hosts(node: &Value, visit: &mut impl FnMut(&Value)) {
 
 /* -------------------------------------------------------------------------- */
 
-/// `%APPDATA%\skiff\sessions.json` — which hosts were open when the app last
+/// `%APPDATA%\hawser\sessions.json` — which hosts were open when the app last
 /// closed.
 ///
 /// Only host ids and view mode are recorded. A TCP connection cannot be
@@ -507,7 +507,7 @@ pub fn save_sessions(list: &Value) -> Result<(), KnownHostsError> {
 
 /* -------------------------------------------------------------------------- */
 
-/// Generic sibling-file persistence in the skiff data dir, for small settings
+/// Generic sibling-file persistence in the hawser data dir, for small settings
 /// files (ai.json). Same corrupt-file-tolerant contract as the catalogue.
 pub fn load_named(name: &str) -> Result<Option<Value>, KnownHostsError> {
     let store = super::known_hosts::store_path()?;

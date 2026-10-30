@@ -3,11 +3,11 @@
 //! The most-asked question in network operations is "what changed on this box
 //! since it last worked". Snapshots answer it: run the device's config-dump
 //! command, store the output timestamped under
-//! `%APPDATA%\skiff\configs\<host>\`, and diff any two.
+//! `%APPDATA%\hawser\configs\<host>\`, and diff any two.
 //!
 //! Storage is one plain text file per snapshot — no database, no custom
 //! format — so the archive stays greppable and usable by other tools (or by
-//! the user in a panic at 2 AM) without Skiff involved.
+//! the user in a panic at 2 AM) without Hawser involved.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn same_second_snapshots_do_not_overwrite() {
         let dir = std::env::temp_dir().join(format!(
-            "skiff-configs-test-{}-{}",
+            "hawser-configs-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

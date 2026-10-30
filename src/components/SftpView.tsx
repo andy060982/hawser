@@ -214,7 +214,7 @@ export function SftpView({
       // No button held: the press that armed this drag ended somewhere we did
       // not see. Never let plain hovering activate it.
       if ((e.buttons & 1) === 0) {
-        document.body.classList.remove('skiff-dragging')
+        document.body.classList.remove('hawser-dragging')
         setDrag(null)
         setHoverTarget(null)
         return
@@ -228,7 +228,7 @@ export function SftpView({
         // highlights across the pane. The instant OUR drag takes over, wipe
         // whatever it selected and suspend selection until the drop.
         window.getSelection()?.removeAllRanges()
-        document.body.classList.add('skiff-dragging')
+        document.body.classList.add('hawser-dragging')
       }
       const over = paneAt(e.clientX, e.clientY)
       setHoverTarget(over && over !== d.from ? over : null)
@@ -237,7 +237,7 @@ export function SftpView({
 
     const onUp = (e: PointerEvent) => {
       const d = dragRef.current
-      document.body.classList.remove('skiff-dragging')
+      document.body.classList.remove('hawser-dragging')
       setDrag(null)
       setHoverTarget(null)
       if (!d?.active) return
@@ -252,7 +252,7 @@ export function SftpView({
     // the drag then (never transfer), or it stays armed and the next unrelated
     // click over the other pane would start a transfer.
     const abandon = () => {
-      document.body.classList.remove('skiff-dragging')
+      document.body.classList.remove('hawser-dragging')
       setDrag(null)
       setHoverTarget(null)
     }
@@ -268,7 +268,7 @@ export function SftpView({
     window.addEventListener('keydown', onKey)
     return () => {
       // Covers unmount mid-drag too, so the class can never stick.
-      document.body.classList.remove('skiff-dragging')
+      document.body.classList.remove('hawser-dragging')
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', abandon)

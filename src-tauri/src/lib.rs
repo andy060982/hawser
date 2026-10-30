@@ -457,7 +457,7 @@ async fn log_read(name: String) -> CmdResult<String> {
     utils::session_log::read_log(&name).map_err(|e| e.to_string())
 }
 
-/// Export the host catalogue to Documents\skiff-hosts.json and reveal it.
+/// Export the host catalogue to Documents\hawser-hosts.json and reveal it.
 ///
 /// Topology only — names, addresses, folders, snippets. Passwords live in the
 /// Credential Manager and are structurally absent from hosts.json, so an
@@ -471,7 +471,7 @@ async fn hosts_export() -> CmdResult<String> {
 
     let docs = utils::platform::documents_dir().ok_or("cannot resolve Documents folder")?;
     std::fs::create_dir_all(&docs).map_err(|e| e.to_string())?;
-    let path = docs.join("skiff-hosts.json");
+    let path = docs.join("hawser-hosts.json");
     let text = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
 
@@ -634,13 +634,13 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     // twenty servers is irreplaceable. Reserve the name ATOMICALLY with an
     // exclusive create (O_EXCL) and bump the suffix on collision — a plain
     // exists()-then-write races two concurrent keygens onto the same path.
-    let mut path = dir.join("skiff_ed25519");
+    let mut path = dir.join("hawser_ed25519");
     let mut n = 1;
     let mut file = loop {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(f) => break f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                path = dir.join(format!("skiff_ed25519_{n}"));
+                path = dir.join(format!("hawser_ed25519_{n}"));
                 n += 1;
             }
             Err(e) => return Err(e.to_string()),
@@ -723,7 +723,7 @@ async fn ai_key_delete(profile: String) -> CmdResult<()> {
 }
 
 /// Provider settings (kind/baseUrl/model — never the key) as opaque JSON at
-/// %APPDATA%\skiffi.json, same pattern as the host catalogue.
+/// %APPDATA%\hawseri.json, same pattern as the host catalogue.
 #[tauri::command]
 async fn ai_config_load() -> CmdResult<Option<serde_json::Value>> {
     utils::hosts::load_named("ai.json").map_err(|e| e.to_string())
@@ -735,7 +735,7 @@ async fn ai_config_save(config: serde_json::Value) -> CmdResult<()> {
 }
 
 /// App-wide settings (colour policies, device profiles, UI defaults).
-/// %APPDATA%\skiff\settings.json — opaque JSON owned by the frontend, same
+/// %APPDATA%\hawser\settings.json — opaque JSON owned by the frontend, same
 /// corrupt-tolerant contract as the host catalogue.
 #[tauri::command]
 async fn settings_load() -> CmdResult<Option<serde_json::Value>> {
@@ -830,9 +830,9 @@ pub fn run() {
                 // vanishing mid-scan) is reported rather than silently swallowed
                 // by a dead background thread.
                 match std::panic::catch_unwind(|| utils::session_log::prune(30, 500)) {
-                    Ok(n) if n > 0 => eprintln!("skiff: pruned {n} old session log(s)"),
+                    Ok(n) if n > 0 => eprintln!("hawser: pruned {n} old session log(s)"),
                     Ok(_) => {}
-                    Err(_) => eprintln!("skiff: session-log pruning thread panicked"),
+                    Err(_) => eprintln!("hawser: session-log pruning thread panicked"),
                 }
             });
             Ok(())

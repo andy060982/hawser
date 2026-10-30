@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::known_hosts::KnownHostsError;
 
-/// `%APPDATA%\skiff\logs`
+/// `%APPDATA%\hawser\logs`
 pub fn logs_dir() -> Result<PathBuf, KnownHostsError> {
     let store = super::known_hosts::store_path()?;
     Ok(store
@@ -146,7 +146,7 @@ impl SessionLog {
 
         let _ = writeln!(
             file,
-            "=== skiff session: {username}@{host} started {} UTC ===",
+            "=== hawser session: {username}@{host} started {} UTC ===",
             timestamp_name(now)
         );
 

@@ -15,7 +15,7 @@ import { safeInvoke } from '../lib/tauri'
    Add / edit a saved host.
 
    The password field is the reason this component matters. Before it existed
-   the only way to store a credential was `cmdkey /generic:skiff:host:<id>`,
+   the only way to store a credential was `cmdkey /generic:hawser:host:<id>`,
    which is an unreasonable thing to ask of anyone.
 
    The secret goes straight to `credential_save`, which writes it to the Windows
@@ -631,7 +631,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                   title="Generate a new Ed25519 keypair in ~/.ssh and use it here"
                   onClick={() =>
                     void safeInvoke<{ privatePath: string; publicKey: string }>('ssh_keygen', {
-                      comment: `skiff ${draft.username || 'user'}@${draft.hostname || draft.name}`,
+                      comment: `hawser ${draft.username || 'user'}@${draft.hostname || draft.name}`,
                     })
                       .then((r) => {
                         if (!r) return

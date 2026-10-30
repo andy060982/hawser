@@ -33,7 +33,7 @@ export function TitleBar({
           </button>
         )}
         <Waves size={14} className="text-accent" aria-hidden />
-        <span className="text-[12px] font-medium tracking-wide text-ink">Skiff</span>
+        <span className="text-[12px] font-medium tracking-wide text-ink">Hawser</span>
         {subtitle && (
           <>
             <span className="text-ink-faint">/</span>
