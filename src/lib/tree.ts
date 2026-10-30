@@ -266,13 +266,35 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
     return id
   }
 
+  const existingIds = new Set(taken)
+  /** Imported id -> the id it ends up with (itself when it did not collide). */
+  const remap = new Map<string, string>()
+
   const walk = (list: HostNode[]): HostNode[] =>
     list.map((n) => {
       const id = taken.has(n.id) ? freshId(isFolder(n) ? 'f' : 'h') : (taken.add(n.id), n.id)
+      if (!remap.has(n.id)) remap.set(n.id, id)
       return isFolder(n)
         ? { ...n, id, children: walk(n.children) }
         : { ...n, id }
     })
 
-  return walk(imported)
+  // Cross-references (bastion, shared credential) must follow the renames: a
+  // host whose jump host was re-id'd would otherwise keep the OLD id and bind
+  // to whatever LOCAL host owns it — tunnelling through the wrong bastion. A
+  // reference that points outside the import at an id this machine already
+  // uses is dropped rather than bound to an unrelated local host.
+  const fix = (ref: string | undefined): string | undefined => {
+    if (ref === undefined) return undefined
+    if (remap.has(ref)) return remap.get(ref)
+    return existingIds.has(ref) ? undefined : ref
+  }
+  const relink = (list: HostNode[]): HostNode[] =>
+    list.map((n) =>
+      isFolder(n)
+        ? { ...n, children: relink(n.children) }
+        : { ...n, jumpHostId: fix(n.jumpHostId), credentialId: fix(n.credentialId) },
+    )
+
+  return relink(walk(imported))
 }

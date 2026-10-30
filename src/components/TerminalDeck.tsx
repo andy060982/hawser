@@ -108,6 +108,7 @@ export function TerminalDeck({
             <TerminalPane
               session={s}
               visible={visible}
+              focused={s.id === focusedId}
               onSize={onSize}
               broadcastTo={
                 // Only the focused pane fans out, to the other visible panes;

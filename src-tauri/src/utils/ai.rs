@@ -97,21 +97,9 @@ fn load_ai_origins() -> serde_json::Value {
 }
 
 fn write_ai_origins(map: &serde_json::Value) -> Result<(), String> {
-    let path = ai_origins_path().ok_or_else(|| "no app-data dir for ai_origins".to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let text = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&path);
-        std::fs::rename(&tmp, &path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            e.to_string()
-        })?;
-    }
-    Ok(())
+    // Through the shared atomic writer (unique temp, serialised, never deletes
+    // the original before the replacement is in place).
+    crate::utils::hosts::save_named("ai_origins.json", map).map_err(|e| e.to_string())
 }
 
 /// Record, in backend-owned state, the origin this profile's key may be sent to.
@@ -193,6 +181,28 @@ pub fn key_exists(profile: &str) -> bool {
     credentials::has_secret(&vault_profile(profile))
 }
 
+/// Remove a profile's key and its origin binding. A missing key is not an
+/// error — the end state the user asked for already holds.
+pub fn delete_key(profile: &str) -> Result<(), String> {
+    match credentials::delete_secret(&vault_profile(profile)) {
+        Ok(()) | Err(credentials::CredError::NotFound(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let mut map = load_ai_origins();
+    if let Some(obj) = map.as_object_mut() {
+        if obj.remove(profile).is_some() {
+            write_ai_origins(&map)?;
+        }
+    }
+    Ok(())
+}
+
+/// Same origin for binding purposes: equal kind, and base URLs equal once a
+/// trailing slash is ignored.
+fn same_origin(kind_a: &str, url_a: &str, kind_b: &str, url_b: &str) -> bool {
+    kind_a == kind_b && url_a.trim_end_matches('/') == url_b.trim_end_matches('/')
+}
+
 /// Stream one chat completion, emitting deltas on `ai://{run_id}`.
 pub async fn chat(
     app: AppHandle,
@@ -255,7 +265,10 @@ pub async fn chat(
         };
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // A hung CLI is killed when the timeout below drops it, instead of
+            // lingering as an orphan.
+            .kill_on_drop(true);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -276,7 +289,19 @@ pub async fn chat(
             let _ = stdin.write_all(prompt.as_bytes()).await;
             // Dropping stdin closes it; claude -p reads to EOF then answers.
         }
-        match child.wait_with_output().await {
+        // Bounded like the HTTP path: without it a wedged `claude` process never
+        // sends `done`, and the panel stays "streaming" with input refused.
+        const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+        let waited = match tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output()).await {
+            Ok(r) => r,
+            Err(_) => {
+                return emit_err(
+                    &app,
+                    format!("Claude CLI timed out after {}s", CLI_TIMEOUT.as_secs()),
+                )
+            }
+        };
+        match waited {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 let _ = app.emit(
@@ -325,23 +350,46 @@ pub async fn chat(
     // origin for this profile, refuse rather than fall back to the caller's
     // base_url — otherwise a poisoned/absent origin record would let the key be
     // sent to a frontend-chosen destination.
-    let cfg = if key.is_some() {
-        match saved_origin(&profile) {
-            Some((kind, base_url)) if !base_url.is_empty() => ProviderConfig {
-                kind,
-                base_url,
-                model: cfg.model,
-            },
+    //
+    // And never silently REDIRECT: if the user picked a different provider than
+    // the one the key is bound to (e.g. switched to local Ollama and left the
+    // key field blank), sending their terminal context to the old hosted origin
+    // instead would override an explicit privacy choice. A loopback selection
+    // goes ahead WITHOUT the key; anything else asks for the key to be re-saved.
+    let caller_loopback = is_loopback_url(&cfg.base_url);
+    let (cfg, key) = match key {
+        None => (cfg, None),
+        Some(k) => match saved_origin(&profile) {
+            Some((kind, base_url)) if !base_url.is_empty() => {
+                if same_origin(&kind, &base_url, &cfg.kind, &cfg.base_url) {
+                    (ProviderConfig { kind, base_url, model: cfg.model }, Some(k))
+                } else if caller_loopback {
+                    (cfg, None)
+                } else {
+                    return emit_err(
+                        &app,
+                        format!(
+                            "The selected provider ({} at {}) is not the one the saved API key is bound to ({kind} at {base_url}). Re-enter the key for this provider in AI settings, or remove the saved key.",
+                            cfg.kind, cfg.base_url
+                        ),
+                    );
+                }
+            }
+            _ if caller_loopback => (cfg, None),
             _ => {
                 return emit_err(
                     &app,
                     "This provider's API key is not bound to a saved origin. Open AI settings and re-save the key to bind it before chatting.".into(),
                 );
             }
-        }
-    } else {
-        cfg
+        },
     };
+
+    // An empty turn (a reply that never streamed any text) is rejected by the
+    // Anthropic API as a non-final message, which would break every later turn
+    // of the thread. Drop them before building the request.
+    let messages: Vec<ChatMessage> =
+        messages.into_iter().filter(|m| !m.content.trim().is_empty()).collect();
 
     // Enforce HTTPS for non-loopback endpoints: an API key and the session
     // context must never travel in cleartext to a remote host. Local providers
@@ -416,15 +464,17 @@ pub async fn chat(
         // Provider error bodies are useful ("model not found", "invalid key")
         // but can be huge HTML. response.text() would buffer ALL of it before we
         // truncate; instead stream only until we have enough to show, then stop.
-        let mut body = String::new();
+        // Bytes first, decoded once, so a multi-byte character split across
+        // chunks is not shown as two replacement characters.
+        let mut body: Vec<u8> = Vec::new();
         let mut es = response.bytes_stream();
         while body.len() < 8192 {
             match es.next().await {
-                Some(Ok(chunk)) => body.push_str(&String::from_utf8_lossy(&chunk)),
+                Some(Ok(chunk)) => body.extend_from_slice(&chunk),
                 _ => break,
             }
         }
-        let snippet: String = body.chars().take(400).collect();
+        let snippet: String = String::from_utf8_lossy(&body).chars().take(400).collect();
         return emit_err(&app, format!("{status}: {snippet}"));
     }
 
@@ -436,7 +486,11 @@ pub async fn chat(
     // stream is capped, and a stall triggers an idle timeout rather than hanging
     // forever.
     let mut stream = response.bytes_stream();
-    let mut buf = String::new();
+    // Raw bytes, split on b'\n' and decoded per complete line: a network chunk
+    // can end inside a multi-byte UTF-8 character (CJK, emoji, accents), and
+    // decoding chunk-by-chunk turned each such split into U+FFFD. A newline
+    // byte never occurs inside a multi-byte sequence, so lines are safe units.
+    let mut buf: Vec<u8> = Vec::new();
     let mut total: u64 = 0;
     const MAX_SSE_LINE: usize = 1024 * 1024; // 1 MiB for one un-terminated line
     const MAX_TOTAL: u64 = 16 * 1024 * 1024; // 16 MiB whole response
@@ -447,26 +501,41 @@ pub async fn chat(
             Err(_) => return emit_err(&app, "response stalled (idle timeout)".into()),
             Ok(None) => break,
             Ok(Some(Ok(bytes))) => bytes,
-            Ok(Some(Err(_))) => break,
+            // A dropped connection mid-answer is an error, not a clean finish:
+            // otherwise a truncated (or empty) reply is presented as complete.
+            Ok(Some(Err(e))) => return emit_err(&app, format!("stream interrupted: {e}")),
         };
         total = total.saturating_add(bytes.len() as u64);
         if total > MAX_TOTAL {
             return emit_err(&app, "response exceeded size limit".into());
         }
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        if buf.len() > MAX_SSE_LINE {
-            return emit_err(&app, "response line exceeded size limit".into());
-        }
+        buf.extend_from_slice(&bytes);
 
-        while let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim().to_string();
-            buf.drain(..=nl);
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = buf.drain(..=nl).collect();
+            let line = String::from_utf8_lossy(&raw).trim().to_string();
 
             let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
             if data == "[DONE]" {
                 continue;
             }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+
+            // In-band provider errors: Anthropic's `{"type":"error","error":{…}}`
+            // event (e.g. overloaded_error mid-stream) and OpenAI-compatible
+            // `{"error":{…}}`. Both carry no text delta, so without this check
+            // they were skipped and the run ended as a silent, empty success.
+            if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| err.to_string());
+                return emit_err(
+                    &app,
+                    format!("provider error: {}", msg.chars().take(400).collect::<String>()),
+                );
+            }
 
             let delta = if cfg.kind == "anthropic" {
                 v.get("delta")
@@ -496,6 +565,11 @@ pub async fn chat(
                 );
             }
         }
+        // Checked after the complete lines are drained, so a chunk carrying
+        // many short lines is not mistaken for one oversized line.
+        if buf.len() > MAX_SSE_LINE {
+            return emit_err(&app, "response line exceeded size limit".into());
+        }
     }
 
     let _ = app.emit(
@@ -506,7 +580,14 @@ pub async fn chat(
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_url;
+    use super::{is_loopback_url, same_origin};
+
+    #[test]
+    fn origin_match_ignores_only_trailing_slash() {
+        assert!(same_origin("anthropic", "https://api.anthropic.com", "anthropic", "https://api.anthropic.com/"));
+        assert!(!same_origin("anthropic", "https://api.anthropic.com", "openai", "https://api.anthropic.com"));
+        assert!(!same_origin("openai", "https://api.openai.com/v1", "openai", "http://localhost:11434/v1"));
+    }
 
     #[test]
     fn loopback_urls_allow_plain_http() {

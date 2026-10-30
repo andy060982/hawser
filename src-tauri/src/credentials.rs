@@ -34,6 +34,15 @@ pub fn target_name(host_id: &str) -> String {
     format!("skiff:host:{host_id}")
 }
 
+/// True for vault ids that belong to another namespace and must never be used
+/// as a host credential id. The AI provider key is stored at `ai:<profile>`
+/// (see utils::ai::vault_profile), which shares `target_name`'s prefix — so a
+/// host whose id were `ai:default` would otherwise address that key. Matched
+/// case-insensitively because Windows Credential Manager target names are.
+pub fn is_reserved_id(id: &str) -> bool {
+    id.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("ai:"))
+}
+
 /// Whether a secret exists, without exposing it. Lets the UI show "password
 /// saved" while the plaintext stays in the vault.
 pub fn has_secret(host_id: &str) -> bool {
@@ -89,7 +98,13 @@ mod imp {
         let result = unsafe {
             let cred = &*ptr;
             let len = cred.CredentialBlobSize as usize;
-            let bytes = std::slice::from_raw_parts(cred.CredentialBlob, len);
+            // An empty credential comes back with a NULL blob, and
+            // from_raw_parts(NULL, 0) is undefined behaviour — use an empty slice.
+            let bytes: &[u8] = if cred.CredentialBlob.is_null() || len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(cred.CredentialBlob, len)
+            };
 
             if len % 2 != 0 {
                 // Odd length cannot be UTF-16. Fall back to UTF-8, which is what
@@ -224,6 +239,22 @@ mod imp {
             Err(KeyringError::NoEntry) => Err(CredError::NotFound(target_name(host_id))),
             Err(e) => Err(CredError::Backend(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod reserved_tests {
+    use super::is_reserved_id;
+
+    #[test]
+    fn ai_namespace_is_reserved_case_insensitively() {
+        assert!(is_reserved_id("ai:default"));
+        assert!(is_reserved_id("AI:default"));
+        assert!(is_reserved_id("Ai:"));
+        assert!(!is_reserved_id("h-lq3x"));
+        assert!(!is_reserved_id("ai")); // too short to carry the prefix
+        assert!(!is_reserved_id("air-1"));
+        assert!(!is_reserved_id("h1:ai:"));
     }
 }
 

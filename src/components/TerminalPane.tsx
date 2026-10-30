@@ -31,9 +31,31 @@ import {
    bug returns through the side door.
 --------------------------------------------------------------------------- */
 
+/** Per-session chain of in-flight ssh_write calls. Each Tauri command runs as
+ *  its own task on a multi-threaded runtime, so fire-and-forget writes can
+ *  reach the PTY out of order ("ab" arriving as "ba", a terminal auto-reply
+ *  landing inside typed input). Chaining makes each write wait for the last. */
+const writeChains = new Map<string, Promise<unknown>>()
+
+function queueWrite(sessionId: string, data: number[]): Promise<unknown> {
+  const prev = writeChains.get(sessionId) ?? Promise.resolve()
+  const next = prev
+    .catch(() => {})
+    .then(() => safeInvoke('ssh_write', { sessionId, data }))
+  writeChains.set(sessionId, next)
+  // Drop the entry once settled so a closed session does not pin a promise.
+  void next.finally(() => {
+    if (writeChains.get(sessionId) === next) writeChains.delete(sessionId)
+  }).catch(() => {})
+  return next
+}
+
 interface Props {
   session: Session
   visible: boolean
+  /** This pane is the active (ringed) one. Keyboard focus follows it, so typing
+   *  always lands where the ring, status bar, find and broadcast point. */
+  focused?: boolean
   /** Reports the measured grid after every fit, so the status bar can show the
    *  real geometry instead of a guess. */
   onSize?: (sessionId: string, cols: number, rows: number) => void
@@ -42,7 +64,7 @@ interface Props {
   broadcastTo?: string[]
 }
 
-export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
+export function TerminalPane({ session, visible, focused = true, onSize, broadcastTo }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -54,6 +76,14 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
   onSizeRef.current = onSize
   const broadcastRef = useRef<string[]>(broadcastTo ?? [])
   broadcastRef.current = broadcastTo ?? []
+  /** Live session status: a PTY resize is only meaningful once connected. */
+  const statusRef = useRef(session.status)
+  statusRef.current = session.status
+  /** Fit + report + PTY resize, owned by the terminal effect; exposed so the
+   *  visibility and status effects can run it too. */
+  const pushResizeRef = useRef<(() => void) | null>(null)
+  /** Send the current grid as a PTY resize (no dedupe). */
+  const sendResizeRef = useRef<(() => void) | null>(null)
   const { settings } = useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
@@ -79,6 +109,10 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       // SSH servers send well-formed CRLF; converting again doubles line breaks.
       convertEol: false,
       allowProposedApi: true,
+      // xterm defaults this ON for macOS: a right-click first selects the word
+      // under the pointer, so our right-click handler saw a selection, copied
+      // that word over the user's clipboard, and never pasted.
+      rightClickSelectsWord: false,
     })
 
     const fit = new FitAddon()
@@ -170,7 +204,7 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
     // keystroke would paint the screen with duplicates.
     let warnedDead = false
     const send = (bytes: number[]) => {
-      void safeInvoke('ssh_write', { sessionId: session.id, data: bytes }).catch(
+      void queueWrite(session.id, bytes).catch(
         (e: unknown) => {
           if (warnedDead) return
           warnedDead = true
@@ -185,7 +219,7 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       // errors ignored — a dead sibling is not this pane's problem to report,
       // and the input-not-sent notice above already covers the focused one.
       for (const other of broadcastRef.current) {
-        void safeInvoke('ssh_write', { sessionId: other, data: bytes }).catch(() => {})
+        void queueWrite(other, bytes).catch(() => {})
       }
     }
 
@@ -270,11 +304,18 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
 
+      // Every branch below that handles the key also cancels the browser's own
+      // default for it: returning false only stops xterm, and on Windows
+      // (WebView2) Ctrl+Shift+V is the native "paste as plain text", which
+      // would fire a second, independent paste through onPaste.
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
+        e.preventDefault()
         copySelection()
         return false
       }
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
+        e.preventDefault()
+        e.stopPropagation()
         // Guarded paste — see pasteFromClipboard and the context-menu paste above.
         pasteFromClipboard()
         return false
@@ -286,20 +327,25 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       }
 
       // Font zoom: Ctrl +/- to resize this pane's text, Ctrl+0 to reset —
-      // like a browser. Clamped, then re-fit so the grid stays correct.
+      // like a browser. Clamped, then re-fit AND re-sent to the remote PTY: the
+      // host box does not change size, so the ResizeObserver never fires, and a
+      // bare fit() left the remote drawing at the old width.
       if (e.ctrlKey && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
+        e.preventDefault()
         term.options.fontSize = Math.min((term.options.fontSize ?? TERMINAL_FONT_SIZE) + 1, 32)
-        fit.fit()
+        pushResize()
         return false
       }
       if (e.ctrlKey && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
+        e.preventDefault()
         term.options.fontSize = Math.max((term.options.fontSize ?? TERMINAL_FONT_SIZE) - 1, 8)
-        fit.fit()
+        pushResize()
         return false
       }
       if (e.ctrlKey && (e.code === 'Digit0' || e.code === 'Numpad0')) {
+        e.preventDefault()
         term.options.fontSize = TERMINAL_FONT_SIZE
-        fit.fit()
+        pushResize()
         return false
       }
 
@@ -329,24 +375,28 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
 
     void safeListen<string>(`ssh://${session.id}`, (chunk) => {
       term.write(chunk)
-    }).then((un) => {
-      // The session may have closed while the listener was registering.
-      if (disposed) un()
-      else unlisten = un
     })
+      .then((un) => {
+        // The session may have closed while the listener was registering.
+        if (disposed) un()
+        else unlisten = un
+      })
+      .catch((e: unknown) => {
+        // Without this the failure is an unhandled rejection and the pane just
+        // stays blank while the session connects.
+        const msg = e instanceof Error ? e.message : String(e)
+        term.write(`\r\n\x1b[38;2;242;178;92m● cannot receive output\x1b[0m ${msg}\r\n`)
+      })
 
     /* ------------------------------------------------------------ sizing */
 
-    const pushResize = () => {
-      // fit() measures the container. A hidden pane measures 0 and would send a
-      // nonsense 0x0 PTY resize, which some servers answer by hanging up.
-      if (host.clientWidth === 0 || host.clientHeight === 0) return
-      fit.fit()
+    const sendResize = () => {
+      // Only a connected session has a PTY. Before that the size travels with
+      // ssh_connect (onSize -> dial at the measured size), and a resize sent
+      // now would just fail with "no open session" and print noise; on the way
+      // to "connected" the status effect below pushes the current size.
+      if (statusRef.current !== 'connected') return
       const { cols, rows } = term
-      if (cols === sizeRef.current.cols && rows === sizeRef.current.rows) return
-      sizeRef.current = { cols, rows }
-      onSizeRef.current?.(session.id, cols, rows)
-
       // Do not swallow the rejection. If the PTY resize fails the remote keeps
       // drawing to the old geometry, which looks exactly like "the terminal
       // does not expand" while the local grid has in fact resized fine.
@@ -357,6 +407,20 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
         },
       )
     }
+
+    const pushResize = () => {
+      // fit() measures the container. A hidden pane measures 0 and would send a
+      // nonsense 0x0 PTY resize, which some servers answer by hanging up.
+      if (host.clientWidth === 0 || host.clientHeight === 0) return
+      fit.fit()
+      const { cols, rows } = term
+      if (cols === sizeRef.current.cols && rows === sizeRef.current.rows) return
+      sizeRef.current = { cols, rows }
+      onSizeRef.current?.(session.id, cols, rows)
+      sendResize()
+    }
+    pushResizeRef.current = pushResize
+    sendResizeRef.current = sendResize
 
     // ResizeObserver rather than a window listener: this pane also changes size
     // when the sidebar is dragged, which fires no window resize event at all.
@@ -394,28 +458,42 @@ export function TerminalPane({ session, visible, onSize, broadcastTo }: Props) {
       term.dispose()
       termRef.current = null
       fitRef.current = null
+      pushResizeRef.current = null
+      sendResizeRef.current = null
       void safeInvoke('ssh_disconnect', { sessionId: session.id })
     }
   }, [session.id])
 
-  /* Becoming visible: the pane measured 0 while hidden, so re-fit before the
-     user sees a stale grid, then take focus so typing goes straight through. */
+  /* Just connected: push the grid as it is now. Resizes made while dialling
+     were held back (no PTY yet), and the window may have changed since the
+     size the connect was dialled with. */
+  useEffect(() => {
+    if (session.status === 'connected') sendResizeRef.current?.()
+  }, [session.status])
+
+  /* Becoming visible: the pane measured 0 while hidden, so re-fit (and tell
+     the PTY) before the user sees a stale grid. Keyboard focus goes only to the
+     ACTIVE pane — when a split tab is shown every pane becomes visible at once,
+     and focusing each in turn left the last one with the keyboard while the
+     ring, find bar and broadcast all pointed at another. Re-runs when this
+     pane becomes the active one (pane closed, Ctrl+Tab, tab switch) so focus
+     follows. */
   useEffect(() => {
     if (!visible) return
     const id = requestAnimationFrame(() => {
       const host = hostRef.current
       if (!host || host.clientWidth === 0) return
-      fitRef.current?.fit()
+      pushResizeRef.current?.()
       // A pane hidden with display:none has a zero-sized canvas, and the WebGL
       // renderer does not always repaint it on the way back. Without this the
       // returning tab can come up blank, which reads as "my session is gone"
       // even though the buffer is intact.
       const t = termRef.current
       if (t) t.refresh(0, t.rows - 1)
-      t?.focus()
+      if (focused) t?.focus()
     })
     return () => cancelAnimationFrame(id)
-  }, [visible])
+  }, [visible, focused])
 
   return (
     <div

@@ -31,14 +31,21 @@ export function useDirectory(side: PaneSide, sessionId: string, initialPath: str
     error: null,
   })
   const seq = useRef(0)
+  /** Last path asked for and last path actually shown, so an `initialPath`
+   *  that merely echoes our own navigation back (the parent persists the
+   *  pane's path and feeds it in again) does not list the directory twice. */
+  const requestedRef = useRef<string | null>(null)
+  const committedRef = useRef<string | null>(null)
 
   const read = useCallback(
     async (target: string) => {
       const ticket = ++seq.current
+      requestedRef.current = target
       setState((s) => ({ ...s, loading: true, error: null }))
       try {
         const listing = await listDirectory(side, sessionId, target)
         if (ticket !== seq.current) return // superseded
+        committedRef.current = listing.path
         setState({
           path: listing.path,
           entries: listing.entries,
@@ -58,7 +65,19 @@ export function useDirectory(side: PaneSide, sessionId: string, initialPath: str
     [side, sessionId],
   )
 
+  // Initial read, and a fresh read when the session (hence `read`) or a
+  // genuinely new initialPath arrives — but not for an initialPath that is just
+  // the pane's own current location round-tripped through the parent.
+  const lastReadFn = useRef<typeof read | null>(null)
   useEffect(() => {
+    const sameSource = lastReadFn.current === read
+    lastReadFn.current = read
+    if (
+      sameSource &&
+      (initialPath === committedRef.current || initialPath === requestedRef.current)
+    ) {
+      return
+    }
     void read(initialPath)
   }, [read, initialPath])
 

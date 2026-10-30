@@ -77,6 +77,18 @@ export function FilePane({
     setSelected(new Set())
   }, [dir.path, onPathChange])
 
+  // A refresh keeps the path, so names renamed/deleted away would otherwise
+  // linger in the selection and get transferred (or fail) later. Keep the
+  // same Set when nothing vanished to avoid a pointless re-render.
+  useEffect(() => {
+    setSelected((s) => {
+      if (s.size === 0) return s
+      const present = new Set(dir.entries.map((e) => e.name))
+      const kept = [...s].filter((n) => present.has(n))
+      return kept.length === s.size ? s : new Set(kept)
+    })
+  }, [dir.entries])
+
   const isLocal = side === 'local'
 
   const toggleSort = (key: SortKey) => {

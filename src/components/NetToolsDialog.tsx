@@ -37,17 +37,27 @@ export function NetToolsDialog({
   const unlistenRef = useRef<(() => void) | null>(null)
   const outRef = useRef<HTMLPreElement>(null)
 
+  // Read through a ref: the parent passes a fresh inline onClose on every
+  // render, and keying an effect on it re-ran the cleanup below — cancelling a
+  // live traceroute whenever anything else in the app re-rendered.
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onCloseRef.current()
     window.addEventListener('keydown', onKey, true)
-    return () => {
-      window.removeEventListener('keydown', onKey, true)
-      // Leaving the dialog cancels a live run: a traceroute nobody is
-      // watching is pure wasted probe traffic.
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+
+  // Unmount only: leaving the dialog cancels a live run — a traceroute nobody
+  // is watching is pure wasted probe traffic.
+  useEffect(
+    () => () => {
       if (runIdRef.current) void safeInvoke('net_tool_cancel', { runId: runIdRef.current })
       unlistenRef.current?.()
-    }
-  }, [onClose])
+    },
+    [],
+  )
 
   // Follow output as it arrives.
   useEffect(() => {
@@ -80,6 +90,8 @@ export function NetToolsDialog({
       append(`error: ${e instanceof Error ? e.message : e}`)
       setRunning(null)
       runIdRef.current = null
+      unlistenRef.current?.()
+      unlistenRef.current = null
     }
   }
 
@@ -89,6 +101,9 @@ export function NetToolsDialog({
       append('(cancelled)')
       setRunning(null)
       runIdRef.current = null
+      // A cancelled run never sends `done`, so drop its listener here.
+      unlistenRef.current?.()
+      unlistenRef.current = null
     }
   }
 

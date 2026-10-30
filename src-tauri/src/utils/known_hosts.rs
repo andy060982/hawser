@@ -36,7 +36,9 @@
 
 use std::path::{Path, PathBuf};
 
-use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
+use russh::keys::known_hosts::{
+    check_known_hosts_path, known_host_keys_path, learn_known_hosts_path,
+};
 use russh::keys::ssh_key::PublicKey;
 
 #[derive(Debug, thiserror::Error)]
@@ -161,12 +163,38 @@ fn classify(
             //   - host IS on file, key isn't -> treat as Changed -> refuse,
             //     never a silent trust prompt. Recovery is explicit: remove the
             //     host's known_hosts line, then reconnect to re-trust.
-            match host_entry_line(host, port, path)? {
-                Some(line) => Ok(HostKeyStatus::Changed { line }),
+            //
+            // russh matches host names case-SENSITIVELY, but DNS names are not:
+            // a host pinned as `FW01.corp` and dialled as `fw01.corp` with the
+            // SAME key is trusted, not "changed".
+            let entries = host_entries(host, port, path)?;
+            if entries.iter().any(|e| e.trust_entry && e.key.as_ref().is_some_and(|k| k.key_data() == key.key_data())) {
+                return Ok(HostKeyStatus::Trusted);
+            }
+            if let Some(first) = entries.first() {
+                return Ok(HostKeyStatus::Changed { line: first.line });
+            }
+            // Hashed `|1|…` entries (pasted from an OpenSSH known_hosts) can only
+            // be matched by russh. OpenSSH lowercases names before hashing.
+            let lower = host.to_ascii_lowercase();
+            let hashed = known_host_keys_path(&lower, port, path).map_err(|e| {
+                KnownHostsError::Parse(format!(
+                    "could not verify {host}:{port} against the known_hosts store: {e}"
+                ))
+            })?;
+            if hashed.iter().any(|(_, k)| k.key_data() == key.key_data()) {
+                return Ok(HostKeyStatus::Trusted);
+            }
+            match hashed.first() {
+                Some((line, _)) => Ok(HostKeyStatus::Changed { line: physical_line(path, *line) }),
                 None => Ok(HostKeyStatus::Unknown),
             }
         }
-        Err(russh::keys::Error::KeyChanged { line }) => Ok(HostKeyStatus::Changed { line }),
+        // russh's line counter skips `#` comment lines; report the real line so
+        // "remove line N by hand" points at the right entry.
+        Err(russh::keys::Error::KeyChanged { line }) => Ok(HostKeyStatus::Changed {
+            line: physical_line(path, line),
+        }),
         // Any OTHER error — an unreadable or corrupt store, a malformed line —
         // is propagated, NOT downgraded to a trust prompt. The store exists by
         // this point (ensure_store created it), so a read/parse failure here is
@@ -224,10 +252,41 @@ fn revoked_line(key: &PublicKey, path: &Path) -> Result<Option<usize>, KnownHost
     Ok(None)
 }
 
-/// The 1-based line number of the first known_hosts entry naming this host
-/// (plaintext host fields only — hashed `|1|…` entries can't be matched by
-/// name, but Skiff writes plaintext). `None` if the host is absent entirely.
-fn host_entry_line(host: &str, port: u16, path: &Path) -> Result<Option<usize>, KnownHostsError> {
+/// Map russh's line number — which does not count lines starting with `#` —
+/// to the physical 1-based line in the file. Falls back to russh's number if the
+/// file cannot be re-read.
+fn physical_line(path: &Path, russh_line: usize) -> usize {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return russh_line;
+    };
+    let mut counted = 0usize;
+    for (i, line) in text.lines().enumerate() {
+        if line.as_bytes().first() == Some(&b'#') {
+            continue;
+        }
+        counted += 1;
+        if counted == russh_line {
+            return i + 1;
+        }
+    }
+    russh_line
+}
+
+/// One plaintext known_hosts line naming a host.
+struct HostEntry {
+    /// 1-based physical line number.
+    line: usize,
+    /// The recorded key, when it parses.
+    key: Option<PublicKey>,
+    /// A plain trust line — not `@revoked` / `@cert-authority`, whose key is
+    /// not this host's key and must never make it trusted.
+    trust_entry: bool,
+}
+
+/// Every known_hosts entry naming this host, plaintext host fields only,
+/// matched case-insensitively (hashed `|1|…` entries can't be matched by name;
+/// see `classify`).
+fn host_entries(host: &str, port: u16, path: &Path) -> Result<Vec<HostEntry>, KnownHostsError> {
     let needle = if port == 22 {
         host.to_string()
     } else {
@@ -240,6 +299,7 @@ fn host_entry_line(host: &str, port: u16, path: &Path) -> Result<Option<usize>, 
         path: path.to_path_buf(),
         source,
     })?;
+    let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -248,7 +308,8 @@ fn host_entry_line(host: &str, port: u16, path: &Path) -> Result<Option<usize>, 
         let mut fields = line.split_whitespace();
         let Some(mut first) = fields.next() else { continue };
         // Skip an @revoked / @cert-authority marker to reach the host field.
-        if first.starts_with('@') {
+        let marker = first.starts_with('@');
+        if marker {
             first = match fields.next() {
                 Some(f) => f,
                 None => continue,
@@ -256,10 +317,14 @@ fn host_entry_line(host: &str, port: u16, path: &Path) -> Result<Option<usize>, 
         }
         // Host field may be a comma-separated list of patterns.
         if first.split(',').any(|h| h.eq_ignore_ascii_case(&needle)) {
-            return Ok(Some(i + 1));
+            let key = match (fields.next(), fields.next()) {
+                (Some(kind), Some(b64)) => PublicKey::from_openssh(&format!("{kind} {b64}")).ok(),
+                _ => None,
+            };
+            out.push(HostEntry { line: i + 1, key, trust_entry: !marker });
         }
     }
-    Ok(None)
+    Ok(out)
 }
 
 /// Append a host's public key to the store, creating the directory and file if
@@ -350,6 +415,45 @@ mod tests {
         assert!(revoked_line(&k1, &path).unwrap().is_some());
         // KEY2 is not on any @revoked line → not revoked.
         assert!(revoked_line(&k2, &path).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Host names compare case-insensitively (DNS does), and a changed key is
+    // reported at its PHYSICAL line even when comment lines precede it.
+    #[test]
+    fn case_insensitive_trust_and_physical_changed_line() {
+        const KEY1: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1EeRn1nUZ6oQiaSmrlPONbjg1FxJtr35MXzTndFYIe";
+        const KEY2: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHveLo5tgiTjyNgc98zwmigaaw1vJ/1IN9KDWqa0Z43a";
+        let k1 = PublicKey::from_openssh(KEY1).expect("k1 parses");
+        let k2 = PublicKey::from_openssh(KEY2).expect("k2 parses");
+
+        let dir = std::env::temp_dir().join(format!("skiff-casetest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        std::fs::write(
+            &path,
+            format!("# notes\n# more notes\nFW01.corp {KEY1}\nhostb.corp {KEY1}\n"),
+        )
+        .unwrap();
+
+        // Same key, different letter case: trusted, not changed.
+        assert_eq!(classify("fw01.corp", 22, &k1, &path).unwrap(), HostKeyStatus::Trusted);
+        // Different key, case-insensitive name match: changed at line 3.
+        assert_eq!(
+            classify("fw01.corp", 22, &k2, &path).unwrap(),
+            HostKeyStatus::Changed { line: 3 }
+        );
+        // Exact-name same-algorithm mismatch (russh's KeyChanged path): line 4,
+        // not russh's comment-skipping count of 2.
+        assert_eq!(
+            classify("hostb.corp", 22, &k2, &path).unwrap(),
+            HostKeyStatus::Changed { line: 4 }
+        );
+        // Absent host: unknown.
+        assert_eq!(classify("other.corp", 22, &k1, &path).unwrap(), HostKeyStatus::Unknown);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

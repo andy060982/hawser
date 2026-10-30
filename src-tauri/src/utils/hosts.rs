@@ -170,16 +170,39 @@ fn bindings_path() -> Result<PathBuf, KnownHostsError> {
         .join("credential_bindings.json"))
 }
 
-fn load_bindings() -> Value {
-    let Ok(path) = bindings_path() else {
-        return json!({});
-    };
+/// Held across every load→modify→write of the bindings file, so two concurrent
+/// saves (parallel credential_save commands, two tabs saving typed passwords)
+/// cannot drop each other's entry.
+static BINDINGS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Key in the bindings map recording that the one-time startup backfill has
+/// run. Its value is not an array, so `binding_is_authorized` can never treat
+/// it as a credential's destination list.
+const MIGRATED_MARKER: &str = "__skiff_migrated";
+
+/// The bindings map, distinguishing a missing file (`Ok({})` — nothing bound
+/// yet) from an unreadable or corrupt one (`Err`), which must fail closed and
+/// must not be mistaken for "never migrated".
+fn read_bindings() -> Result<Value, ()> {
+    let path = bindings_path().map_err(|_| ())?;
     match std::fs::read_to_string(&path) {
-        Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+        Ok(t) => match serde_json::from_str::<Value>(&t) {
+            Ok(v) if v.is_object() => Ok(v),
+            _ => Err(()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(_) => Err(()),
     }
 }
 
+/// For authorization: any read problem is an empty map, i.e. nothing is bound
+/// (fail closed).
+fn load_bindings() -> Value {
+    read_bindings().unwrap_or_else(|_| json!({}))
+}
+
+/// Same unique-temp, serialised, never-delete-the-original replace as the
+/// catalogue (`write_atomic`). Callers hold BINDINGS_LOCK.
 fn write_bindings(map: &Value) -> Result<(), KnownHostsError> {
     let path = bindings_path()?;
     if let Some(parent) = path.parent() {
@@ -190,22 +213,7 @@ fn write_bindings(map: &Value) -> Result<(), KnownHostsError> {
     }
     let text =
         serde_json::to_string_pretty(map).map_err(|e| KnownHostsError::Parse(e.to_string()))?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, text).map_err(|source| KnownHostsError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&path);
-        std::fs::rename(&tmp, &path).map_err(|source| {
-            let _ = std::fs::remove_file(&tmp);
-            KnownHostsError::Io {
-                path: path.clone(),
-                source,
-            }
-        })?;
-    }
-    Ok(())
+    write_atomic(&path, &text)
 }
 
 /// Catalogue destinations that legitimately use vault entry `cred_id`: the owner
@@ -245,17 +253,25 @@ pub fn snapshot_binding(
     port: u16,
     username: &str,
 ) -> Result<(), KnownHostsError> {
+    if crate::credentials::is_reserved_id(cred_id) || cred_id == MIGRATED_MARKER {
+        return Err(KnownHostsError::Parse(format!(
+            "'{cred_id}' is a reserved id and cannot be bound to a host"
+        )));
+    }
     let mut dests = dests_for_cred(cred_id);
     let owner = json!({ "host": host, "port": u64::from(port), "username": username });
     if !dests.contains(&owner) {
         dests.push(owner);
     }
-    let mut map = load_bindings();
-    if !map.is_object() {
-        map = json!({});
-    }
+    let _guard = BINDINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // A corrupt file is replaced rather than merged into. Either way the map
+    // is marked migrated (startup migration has already run by the time any
+    // command can save), so a later launch never re-backfills from the
+    // frontend-writable catalogue.
+    let mut map = read_bindings().unwrap_or_else(|_| json!({}));
     if let Some(obj) = map.as_object_mut() {
         obj.insert(cred_id.to_string(), Value::Array(dests));
+        obj.entry(MIGRATED_MARKER).or_insert(Value::Bool(true));
     }
     // Propagate a write failure so credential_save can be atomic from the user's
     // point of view: a saved secret whose binding failed to persist would later
@@ -265,7 +281,11 @@ pub fn snapshot_binding(
 
 /// Drop a credential's bindings (called when its secret is deleted).
 pub fn remove_binding(cred_id: &str) {
-    let mut map = load_bindings();
+    let _guard = BINDINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // An unreadable file has nothing to remove; leave it for inspection.
+    let Ok(mut map) = read_bindings() else {
+        return;
+    };
     if let Some(obj) = map.as_object_mut() {
         if obj.remove(cred_id).is_some() {
             let _ = write_bindings(&map);
@@ -278,6 +298,9 @@ pub fn remove_binding(cred_id: &str) {
 /// frontend-writable catalogue. Unknown credential or unmatched destination
 /// returns false (fail closed).
 pub fn binding_is_authorized(cred_id: &str, host: &str, port: u16, username: &str) -> bool {
+    if crate::credentials::is_reserved_id(cred_id) {
+        return false;
+    }
     let map = load_bindings();
     let Some(list) = map.get(cred_id).and_then(Value::as_array) else {
         return false;
@@ -296,11 +319,34 @@ fn dest_authorized_in(list: &[Value], host: &str, port: u16, username: &str) -> 
 /// binding yet, snapshot it now. Called at STARTUP, before the webview loads —
 /// so the catalogue it reads is last session's on-disk file, not something a
 /// compromised frontend could have poisoned this run.
+///
+/// Genuinely one-shot: a marker is recorded after the first run. Re-running on
+/// every launch would trust whatever hosts.json the PREVIOUS session's webview
+/// wrote, letting a planted node bind an unbound secret to an attacker
+/// destination. Reserved vault ids (the AI key at `ai:…`) are never bound.
 pub fn migrate_bindings() {
-    let Ok(Some(tree)) = load() else {
+    let Ok(existing) = read_bindings() else {
+        // Unreadable bindings: fail closed, and do not rebuild them from the
+        // frontend-writable catalogue.
         return;
     };
-    let mut done: std::collections::BTreeSet<String> = load_bindings()
+    if existing.get(MIGRATED_MARKER).is_some() {
+        return;
+    }
+    let mark_done = || {
+        let _guard = BINDINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut map) = read_bindings() {
+            if let Some(obj) = map.as_object_mut() {
+                obj.insert(MIGRATED_MARKER.to_string(), Value::Bool(true));
+            }
+            let _ = write_bindings(&map);
+        }
+    };
+    let Ok(Some(tree)) = load() else {
+        mark_done();
+        return;
+    };
+    let mut done: std::collections::BTreeSet<String> = existing
         .as_object()
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
@@ -323,7 +369,7 @@ pub fn migrate_bindings() {
     });
 
     for (cred, h, p, u) in rows {
-        if done.contains(&cred) {
+        if done.contains(&cred) || crate::credentials::is_reserved_id(&cred) {
             continue;
         }
         if crate::credentials::has_secret(&cred) {
@@ -333,6 +379,7 @@ pub fn migrate_bindings() {
             done.insert(cred);
         }
     }
+    mark_done();
 }
 
 /// Visit every `kind: "host"` object in the opaque catalogue tree, descending
@@ -433,7 +480,7 @@ pub fn save_named(name: &str, value: &Value) -> Result<(), KnownHostsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dest_authorized_in, walk_hosts};
+    use super::{dest_authorized_in, walk_hosts, MIGRATED_MARKER};
     use serde_json::{json, Value};
 
     // A recorded binding list is authorized only for the exact destinations in
@@ -450,6 +497,14 @@ mod tests {
         assert!(!dest_authorized_in(&list, "fw-01.corp", 23, "admin")); // wrong port
         assert!(!dest_authorized_in(&list, "fw-01.corp", 22, "root")); // wrong user
         assert!(!dest_authorized_in(&[], "fw-01.corp", 22, "admin")); // no binding
+    }
+
+    // The migration marker shares the bindings map; its value must never read
+    // as a destination list, whatever id is looked up.
+    #[test]
+    fn migrated_marker_is_not_a_binding() {
+        let map = json!({ (MIGRATED_MARKER): true });
+        assert!(map.get(MIGRATED_MARKER).and_then(Value::as_array).is_none());
     }
 
     // walk_hosts must reach hosts nested inside folders and an array root, since

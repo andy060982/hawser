@@ -20,6 +20,9 @@ interface AiConfig {
 interface Msg {
   role: 'user' | 'assistant'
   content: string
+  /** A local error notice shown in place of a reply. Never sent back to the
+   *  provider as if the model had said it. */
+  error?: boolean
 }
 
 interface AiEvent {
@@ -106,7 +109,13 @@ export function AiPanel({
   const [streaming, setStreaming] = useState(false)
   /** Held request awaiting the user's OK after a secret was detected in what
    *  would be sent. Null = nothing pending. */
-  const [pendingSend, setPendingSend] = useState<{ thread: Msg[]; systemContext: string; hits: SecretHit[] } | null>(null)
+  const [pendingSend, setPendingSend] = useState<{
+    /** The session the question was asked in — the reply belongs there. */
+    sid: string
+    thread: Msg[]
+    systemContext: string
+    hits: SecretHit[]
+  } | null>(null)
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
 
@@ -153,14 +162,21 @@ export function AiPanel({
     setShowSettings(false)
   }
 
+  /** Forget the saved key (and the origin it is bound to). The way out after
+   *  moving to a provider that needs none, e.g. local Ollama. */
+  const removeKey = async () => {
+    await safeInvoke('ai_key_delete', { profile: 'default' })
+    setKeySaved(false)
+  }
+
   /** Actually fire the request — reached either directly, or after the user
    *  clears the secret-warning gate below. */
   const dispatch = useCallback(
-    async (thread: Msg[], systemContext: string) => {
-      // Bind this run to the session it started in, so deltas keep landing in
-      // the right thread even if the user switches away mid-stream.
-      const target = sidRef.current
-      if (!target) return
+    async (target: string, thread: Msg[], systemContext: string) => {
+      // Bound to the session the question was ASKED in (captured by send()
+      // before any await), so the reply lands in that thread even if the user
+      // switched tabs before it was sent or while it streams. Reading the
+      // current session here put one host's conversation into another's.
       // Drop any prior listener before registering a new one — a dispatch that
       // errored without ever emitting `done` would otherwise leak its ai://…
       // subscription until the panel unmounts.
@@ -176,6 +192,7 @@ export function AiPanel({
             copy[copy.length - 1] = {
               role: 'assistant',
               content: `⚠ ${ev.error}`,
+              error: true,
             }
             return copy
           })
@@ -210,7 +227,7 @@ export function AiPanel({
         unlistenRef.current = null
         setThreadMsgs(target, (m) => [
           ...m.slice(0, -1),
-          { role: 'assistant', content: `⚠ ${e instanceof Error ? e.message : e}` },
+          { role: 'assistant', content: `⚠ ${e instanceof Error ? e.message : e}`, error: true },
         ])
       }
     },
@@ -223,8 +240,16 @@ export function AiPanel({
       // gate the sender explicitly too so a red/prod host can never have its
       // context sent to a provider, whatever calls send().
       if (!cfg || !session || !host || !allowed || streaming || !text.trim()) return
+      const targetSid = session.id
       const userMsg: Msg = { role: 'user', content: text.trim() }
-      const thread = [...messages, userMsg]
+      // What goes back to the provider is the real conversation: local error
+      // notices and replies that never streamed any text are not turns the
+      // model took. An empty assistant turn is rejected outright by the
+      // Anthropic API, which then broke every later message in the thread.
+      const sendable = messages.filter(
+        (m) => !(m.role === 'assistant' && (m.error || !m.content.trim())),
+      )
+      const thread = [...sendable, userMsg]
       setInput('')
 
       // Context: the transcript tail for THIS host. Labelled in the thread
@@ -248,10 +273,10 @@ export function AiPanel({
       // in the prompt should trip it as readily as one in an on-connect line.
       const hits = scanForSecrets(systemContext + '\n' + text)
       if (hits.length > 0) {
-        setPendingSend({ thread, systemContext, hits })
+        setPendingSend({ sid: targetSid, thread, systemContext, hits })
         return
       }
-      void dispatch(thread, systemContext)
+      void dispatch(targetSid, thread, systemContext)
     },
     [cfg, session, host, allowed, streaming, messages, dispatch],
   )
@@ -292,6 +317,7 @@ export function AiPanel({
           keyDraft={keyDraft}
           setKeyDraft={setKeyDraft}
           onSave={saveSettings}
+          onRemoveKey={removeKey}
         />
       ) : !session || !host ? (
         <p className="p-4 text-[12px] text-ink-faint">Open a session to use the assistant.</p>
@@ -418,7 +444,7 @@ export function AiPanel({
                 onClick={() => {
                   const p = pendingSend
                   setPendingSend(null)
-                  void dispatch(p.thread, p.systemContext)
+                  void dispatch(p.sid, p.thread, p.systemContext)
                 }}
                 className="rounded border border-warn/60 bg-warn/15 px-3 py-1 text-[12px] font-medium text-warn hover:bg-warn/25"
               >
@@ -519,13 +545,14 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
 /* -------------------------------------------------------------- settings */
 
 function SettingsForm({
-  cfg, keySaved, keyDraft, setKeyDraft, onSave,
+  cfg, keySaved, keyDraft, setKeyDraft, onSave, onRemoveKey,
 }: {
   cfg: AiConfig | null
   keySaved: boolean
   keyDraft: string
   setKeyDraft: (v: string) => void
   onSave: (cfg: AiConfig) => void
+  onRemoveKey: () => Promise<void>
 }) {
   const [draft, setDraft] = useState<AiConfig>(
     cfg ?? PRESETS[0].cfg,
@@ -618,7 +645,18 @@ function SettingsForm({
           an API key (console.anthropic.com / platform.openai.com) — chat
           subscriptions (claude.ai, ChatGPT) have no third-party API. Local
           Ollama / LM Studio need no key and send nothing off this machine.
+          A saved key is used only with the provider it was saved for — switch
+          provider and re-enter the key, or remove it.
         </span>
+        {keySaved && (
+          <button
+            type="button"
+            onClick={() => void onRemoveKey()}
+            className="mt-1 text-[10.5px] text-ink-faint underline hover:text-alert"
+          >
+            Remove saved key
+          </button>
+        )}
       </label>
 
       <button

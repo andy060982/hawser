@@ -67,18 +67,27 @@ export function ConfigHistoryDialog({
   }, [onClose])
 
   /* Selection drives the viewer: one snapshot shows its content, two show
-     their diff (chronologically ordered regardless of click order). */
+     their diff (chronologically ordered regardless of click order). A
+     superseded request's late reply is dropped so it can't overwrite the
+     current view (e.g. a slow diff landing after dropping back to one). */
   useEffect(() => {
+    let stale = false
+    const show = (c: string) => {
+      if (!stale) setContent(c)
+    }
     setContent('')
     if (selected.length === 1) {
       void safeInvoke<string>('config_read', { host: host.hostname, name: selected[0] })
-        .then((c) => setContent(c ?? ''))
-        .catch((e) => setContent(String(e)))
+        .then((c) => show(c ?? ''))
+        .catch((e) => show(String(e)))
     } else if (selected.length === 2) {
       const [a, b] = [...selected].sort() // timestamp names sort chronologically
       void safeInvoke<string>('config_diff', { host: host.hostname, older: a, newer: b })
-        .then((c) => setContent(c || '(no differences)'))
-        .catch((e) => setContent(String(e)))
+        .then((c) => show(c || '(no differences)'))
+        .catch((e) => show(String(e)))
+    }
+    return () => {
+      stale = true
     }
   }, [selected, host.hostname])
 

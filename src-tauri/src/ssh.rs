@@ -36,6 +36,10 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 const CHUNK: usize = 64 * 1024;
 
+/// After an exec channel's EOF, how long to keep reading for the exit status
+/// and close that normally follow it.
+const EXIT_STATUS_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
     #[error("no open session {0}")]
@@ -58,6 +62,9 @@ pub enum SshError {
     ChangedHostKey { host: String, line: usize },
     #[error("{0}")]
     PartialTransfer(String),
+    /// The tab that started this connect was closed before it finished.
+    #[error("connection {0} was cancelled")]
+    Cancelled(String),
     #[error(transparent)]
     KnownHosts(#[from] crate::utils::known_hosts::KnownHostsError),
     #[error(transparent)]
@@ -97,6 +104,10 @@ pub struct DirListing {
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgress {
     pub session_id: String,
+    /// The transfer's ROOT source path — what the queue row is keyed on. Equal
+    /// to `file_path` for a single file; for a folder, the folder, so per-file
+    /// events land on the folder's row (bytes are then cumulative for the tree).
+    pub root: String,
     pub file_path: String,
     pub bytes_transferred: u64,
     /// 0 when the server declines to report a size; the UI must treat that as
@@ -186,7 +197,9 @@ pub struct JumpParams {
 /// is handed back by the `host_key_respond` command.
 #[derive(Default)]
 pub struct HostKeyPrompts {
-    pending: DashMap<String, oneshot::Sender<bool>>,
+    /// request id -> (owning session id, answer channel). The session id lets a
+    /// closed tab drop its own prompts instead of leaving them on screen.
+    pending: DashMap<String, (String, oneshot::Sender<bool>)>,
 }
 
 impl HostKeyPrompts {
@@ -194,28 +207,67 @@ impl HostKeyPrompts {
     /// answered after a timeout, which is not an error worth surfacing.
     pub fn respond(&self, request_id: &str, accept: bool) -> bool {
         match self.pending.remove(request_id) {
-            Some((_, tx)) => tx.send(accept).is_ok(),
+            Some((_, (_, tx))) => tx.send(accept).is_ok(),
             None => false,
         }
     }
 
-    fn register(&self, request_id: String) -> oneshot::Receiver<bool> {
+    fn register(&self, request_id: String, session_id: &str) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(request_id, tx);
+        self.pending.insert(request_id, (session_id.to_string(), tx));
         rx
     }
 
     fn cancel(&self, request_id: &str) {
         self.pending.remove(request_id);
     }
+
+    /// Drop every prompt raised for `session_id`, returning their request ids so
+    /// the UI can be told to close them. Dropping the sender rejects the key,
+    /// which aborts that in-flight connect.
+    pub fn cancel_session(&self, session_id: &str) -> Vec<String> {
+        cancel_for_session(&self.pending, session_id)
+    }
+}
+
+/// Remove all pending prompts owned by `session_id` from a prompt map.
+fn cancel_for_session<T>(
+    pending: &DashMap<String, (String, oneshot::Sender<T>)>,
+    session_id: &str,
+) -> Vec<String> {
+    let ids: Vec<String> = pending
+        .iter()
+        .filter(|e| e.value().0 == session_id)
+        .map(|e| e.key().clone())
+        .collect();
+    for id in &ids {
+        pending.remove(id);
+    }
+    ids
+}
+
+/// Payload of `ssh://prompt-closed`: a host-key or auth prompt that no longer
+/// has anyone waiting on it (timed out, or its tab was closed), so the dialog
+/// queue can drop it instead of showing a stale question.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptClosed {
+    pub request_id: String,
+}
+
+pub fn emit_prompt_closed(app: &AppHandle, request_id: &str) {
+    let _ = app.emit(
+        "ssh://prompt-closed",
+        PromptClosed { request_id: request_id.to_string() },
+    );
 }
 
 /* ------------------------------------------- keyboard-interactive auth prompts */
 
-/// One field of a keyboard-interactive challenge shown to the user. Only ECHO
-/// (visible) prompts are ever sent to the UI — a hidden prompt is answered with
-/// the stored password entirely in the backend, so the password never crosses
-/// IPC (the "secrets never cross IPC outward" invariant).
+/// One field of a keyboard-interactive challenge shown to the user. The prompt
+/// that asks for the password is answered with the stored password entirely in
+/// the backend, so the password never crosses IPC (the "secrets never cross IPC
+/// outward" invariant); `echo: false` fields (a hidden OTP) are masked in the UI.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthPromptField {
@@ -251,22 +303,29 @@ pub struct AuthAnswer {
 /// `auth_prompt_respond`.
 #[derive(Default)]
 pub struct AuthPrompts {
-    pending: DashMap<String, oneshot::Sender<AuthAnswer>>,
+    /// request id -> (owning session id, answer channel); see HostKeyPrompts.
+    pending: DashMap<String, (String, oneshot::Sender<AuthAnswer>)>,
 }
 
 impl AuthPrompts {
     /// Resolve a pending auth prompt with the user's typed answers and save choice.
     pub fn respond(&self, request_id: &str, answers: Vec<String>, save: bool) -> bool {
         match self.pending.remove(request_id) {
-            Some((_, tx)) => tx.send(AuthAnswer { answers, save }).is_ok(),
+            Some((_, (_, tx))) => tx.send(AuthAnswer { answers, save }).is_ok(),
             None => false,
         }
     }
 
-    fn register(&self, request_id: String) -> oneshot::Receiver<AuthAnswer> {
+    fn register(&self, request_id: String, session_id: &str) -> oneshot::Receiver<AuthAnswer> {
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(request_id, tx);
+        self.pending.insert(request_id, (session_id.to_string(), tx));
         rx
+    }
+
+    /// Drop every prompt raised for `session_id` (see HostKeyPrompts). The
+    /// waiting auth then fails as cancelled, so nothing is sent.
+    pub fn cancel_session(&self, session_id: &str) -> Vec<String> {
+        cancel_for_session(&self.pending, session_id)
     }
 
     /// Drop the pending sender for a request. The waiting `request_auth_answers`
@@ -303,6 +362,8 @@ struct ClientHandler {
     port: u16,
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
+    /// The tab this connection belongs to, so closing it can drop the prompt.
+    session_id: String,
 }
 
 impl client::Handler for ClientHandler {
@@ -352,7 +413,7 @@ impl client::Handler for ClientHandler {
             .fingerprint(russh::keys::HashAlg::Sha256)
             .to_string();
 
-        let rx = self.prompts.register(request_id.clone());
+        let rx = self.prompts.register(request_id.clone(), &self.session_id);
 
         self.app
             .emit(
@@ -387,6 +448,7 @@ impl client::Handler for ClientHandler {
             }),
             Err(_) => {
                 self.prompts.cancel(&request_id);
+                emit_prompt_closed(&self.app, &request_id);
                 Err(SshError::HostKeyTimeout {
                     host: self.host.clone(),
                 })
@@ -424,7 +486,15 @@ pub struct Registry {
     pumps: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Active local/SOCKS forwards, keyed by forward id. See `Forward`.
     forwards: DashMap<String, Forward>,
+    /// Connects still in flight, session id -> generation. `remove` deletes the
+    /// entry, which is how closing a tab mid-connect cancels it: the connect
+    /// checks its generation at each step and before registering, and tears its
+    /// own transport down instead of leaving a logged-in shell no tab owns.
+    connecting: DashMap<String, u64>,
 }
+
+/// Generation counter for `Registry::connecting`.
+static CONNECT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Everything needed to tear a forward down *completely*.
 ///
@@ -445,6 +515,23 @@ struct Forward {
 /// an `.await`) is enough — pushes happen in the accept loop, and the whole set
 /// is drained on teardown.
 type TunnelHandles = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+/// Accept one connection. An accept error (EMFILE under fd pressure, a client
+/// that reset mid-handshake) is transient — the listener itself is still good —
+/// so back off briefly and report "nothing this time" instead of letting the
+/// caller's loop exit and silently kill a forward that stays listed as active.
+async fn accept_or_retry(
+    listener: &tokio::net::TcpListener,
+) -> Option<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    match listener.accept().await {
+        Ok(pair) => Some(pair),
+        Err(e) => {
+            eprintln!("skiff: forward accept failed (retrying): {e}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            None
+        }
+    }
+}
 
 /// Record a newly spawned tunnel task, pruning handles for tunnels that have
 /// already finished so a long-lived forward's set does not grow without bound.
@@ -485,6 +572,8 @@ impl Registry {
     /// aborted `JoinHandle`s makes "disconnected" mean the tasks have actually
     /// stopped and their session references are gone.
     pub async fn remove(&self, id: &str) {
+        // Cancel a connect that has not registered yet (see `connecting`).
+        self.connecting.remove(id);
         let session = self.sessions.remove(id).map(|(_, s)| s);
 
         // Stop the output pump first, and WAIT for it to unwind, so it has
@@ -536,6 +625,12 @@ impl Registry {
         }
     }
 
+    /// Whether connect `ticket` for `id` is still wanted (no
+    /// disconnect arrived for it since it started).
+    fn still_wanted(&self, id: &str, ticket: u64) -> bool {
+        self.connecting.get(id).is_some_and(|g| *g == ticket)
+    }
+
     /// Open a connection, authenticate, and start an interactive shell.
     ///
     /// The password is read from the Windows Credential Manager here, held in a
@@ -559,6 +654,46 @@ impl Registry {
         key_path: Option<&str>,
         jump: Option<JumpParams>,
         one_shot_password: Option<&str>,
+    ) -> Result<(), SshError> {
+        // A reconnect reuses the session id. Tear the previous connection down
+        // first: replacing the map entry alone would leave its transport alive
+        // (forward listeners hold their own Arc<Session>) and its forwards still
+        // listed under this id.
+        if self.sessions.contains_key(session_id) || self.pumps.contains_key(session_id) {
+            self.remove(session_id).await;
+        }
+        let ticket = CONNECT_SEQ.fetch_add(1, Ordering::Relaxed);
+        self.connecting.insert(session_id.to_string(), ticket);
+        let result = self
+            .connect_inner(
+                app, prompts, auth_prompts, session_id, host_id, host, port, username, cols,
+                rows, startup_commands, auth, key_path, jump, one_shot_password, ticket,
+            )
+            .await;
+        // Clear our in-flight marker, but only if it is still ours.
+        self.connecting.remove_if(session_id, |_, g| *g == ticket);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_inner(
+        &self,
+        app: AppHandle,
+        prompts: Arc<HostKeyPrompts>,
+        auth_prompts: Arc<AuthPrompts>,
+        session_id: &str,
+        host_id: &str,
+        host: &str,
+        port: u16,
+        username: &str,
+        cols: u32,
+        rows: u32,
+        startup_commands: &[String],
+        auth: &str,
+        key_path: Option<&str>,
+        jump: Option<JumpParams>,
+        one_shot_password: Option<&str>,
+        ticket: u64,
     ) -> Result<(), SshError> {
         // Before dialing anything, refuse to send a saved password to a
         // destination the catalogue never bound it to (both the target and any
@@ -598,6 +733,7 @@ impl Registry {
             port,
             app: app.clone(),
             prompts,
+            session_id: session_id.to_string(),
         };
 
         // With a jump host: dial the bastion, authenticate there, then open a
@@ -624,6 +760,7 @@ impl Registry {
                     port: j.port,
                     app: app.clone(),
                     prompts: Arc::clone(&self_prompts),
+                    session_id: session_id.to_string(),
                 };
                 let mut jh =
                     client::connect(jump_config, (j.host.as_str(), j.port), jump_handler).await?;
@@ -632,6 +769,12 @@ impl Registry {
                     j.key_path.as_deref(), None, &app, &auth_prompts, session_id,
                 )
                 .await?;
+                if !self.still_wanted(session_id, ticket) {
+                    let _ = jh
+                        .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
+                        .await;
+                    return Err(SshError::Cancelled(session_id.to_string()));
+                }
 
                 let tunnel = jh
                     .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
@@ -660,6 +803,21 @@ impl Registry {
             .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
             .await?;
         write_half.request_shell(true).await?;
+
+        // The tab may have been closed during any of the awaits above (a slow
+        // handshake, a host-key or password dialog). Stop before the startup
+        // commands run on the remote and before anything is registered.
+        if !self.still_wanted(session_id, ticket) {
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
+                .await;
+            if let Some(jh) = jump_handle.as_ref() {
+                let _ = jh
+                    .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
+                    .await;
+            }
+            return Err(SshError::Cancelled(session_id.to_string()));
+        }
 
         // Optional first line of input. Written as input rather than via
         // request_exec so it degrades gracefully: if the command does not exist
@@ -714,23 +872,30 @@ impl Registry {
             // difference matters to the user: one is expected, the other means
             // "your VPN dropped" or "the firewall timed you out".
             let mut reason = "connection closed by remote";
+            // Incomplete UTF-8 tails carried to the next chunk, one per stream:
+            // a packet boundary can split a multi-byte character, and decoding
+            // each chunk alone would print two U+FFFD for one real character.
+            let mut pending_out: Vec<u8> = Vec::new();
+            let mut pending_err: Vec<u8> = Vec::new();
 
             while let Some(msg) = read_half.wait().await {
                 match msg {
-                    ChannelMsg::Data { ref data }
-                    | ChannelMsg::ExtendedData { ref data, .. } => {
+                    ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
                         // Logged before display, so anything that reaches the
                         // screen is already durable if the app dies next.
                         if let Some(l) = log.as_mut() {
                             l.append(data);
                         }
 
-                        // from_utf8_lossy, not from_utf8: a chunk boundary can
-                        // split a multi-byte sequence, and dropping the whole
-                        // chunk over one partial codepoint would corrupt the
-                        // screen far worse than a replacement character.
-                        let text = String::from_utf8_lossy(data).to_string();
-                        let _ = pump_app.emit(&topic, text);
+                        let pending = if matches!(msg, ChannelMsg::Data { .. }) {
+                            &mut pending_out
+                        } else {
+                            &mut pending_err
+                        };
+                        let text = decode_utf8_stream(pending, data);
+                        if !text.is_empty() {
+                            let _ = pump_app.emit(&topic, text);
+                        }
                     }
                     ChannelMsg::Eof | ChannelMsg::Close => {
                         reason = "session closed";
@@ -770,6 +935,13 @@ impl Registry {
             );
         });
         self.pumps.insert(session_id.to_string(), pump);
+
+        // A disconnect that raced the registration above found nothing to tear
+        // down; it did clear our marker, so finish the teardown ourselves.
+        if !self.still_wanted(session_id, ticket) {
+            self.remove(session_id).await;
+            return Err(SshError::Cancelled(session_id.to_string()));
+        }
 
         Ok(())
     }
@@ -838,9 +1010,44 @@ impl Registry {
         Ok(sftp)
     }
 
-    pub async fn list_dir(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
-        let sftp = self.sftp(session_id).await?;
+    /// Forget the cached SFTP session if `r` failed because its channel is gone
+    /// (the sftp-server process exited or was killed while the SSH transport
+    /// stayed up). Without this every later file operation reuses the dead
+    /// session and fails until the whole tab is reconnected; with it the next
+    /// call reopens the subsystem.
+    async fn check_sftp<T>(&self, session_id: &str, r: Result<T, SshError>) -> Result<T, SshError> {
+        use russh_sftp::client::error::Error as SftpErr;
+        if let Err(SshError::Sftp(SftpErr::UnexpectedBehavior(_) | SftpErr::IO(_))) = &r {
+            if let Ok(session) = self.get(session_id) {
+                *session.sftp.lock().await = None;
+            }
+        }
+        r
+    }
 
+    pub async fn list_dir(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
+        let first = self.list_dir_once(session_id, path).await;
+        if matches!(first, Err(SshError::Sftp(_))) {
+            // A dead cached channel is dropped by check_sftp; one retry then
+            // runs on a fresh subsystem, so the pane recovers by itself.
+            let cleared = match self.get(session_id) {
+                Ok(s) => s.sftp.lock().await.is_none(),
+                Err(_) => false,
+            };
+            if cleared {
+                return self.list_dir_once(session_id, path).await;
+            }
+        }
+        first
+    }
+
+    async fn list_dir_once(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = self.list_dir_with(&sftp, path).await;
+        self.check_sftp(session_id, r).await
+    }
+
+    async fn list_dir_with(&self, sftp: &SftpSession, path: &str) -> Result<DirListing, SshError> {
         // Resolve first so the pane shows the real location: the server may
         // return something different for ".", "~", or a symlinked directory.
         let canonical = sftp
@@ -889,8 +1096,8 @@ impl Registry {
     /// the server's own rename, atomic where the filesystem allows.
     pub async fn sftp_rename(&self, session_id: &str, from: &str, to: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
-        sftp.rename(from, to).await?;
-        Ok(())
+        let r = sftp.rename(from, to).await.map_err(SshError::from);
+        self.check_sftp(session_id, r).await
     }
 
     /// Delete a remote file, or an EMPTY remote directory.
@@ -901,19 +1108,19 @@ impl Registry {
     /// terminal act.
     pub async fn sftp_delete(&self, session_id: &str, path: &str, is_dir: bool) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
-        if is_dir {
-            sftp.remove_dir(path).await?;
+        let r = if is_dir {
+            sftp.remove_dir(path).await
         } else {
-            sftp.remove_file(path).await?;
-        }
-        Ok(())
+            sftp.remove_file(path).await
+        };
+        self.check_sftp(session_id, r.map_err(SshError::from)).await
     }
 
     /// Create a remote directory.
     pub async fn sftp_mkdir(&self, session_id: &str, path: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
-        sftp.create_dir(path).await?;
-        Ok(())
+        let r = sftp.create_dir(path).await.map_err(SshError::from);
+        self.check_sftp(session_id, r).await
     }
 
     /* ------------------------------------------------------------ phase 2 */
@@ -954,7 +1161,8 @@ impl Registry {
             )));
         }
         if !is_dir {
-            return copy_remote_file(&sftp, app, session_id, remote, local).await;
+            return copy_remote_file(&sftp, app, session_id, remote, local, ProgressCtx::single(remote))
+                .await;
         }
 
         // Everything from `local` downward is built from server-chosen names and
@@ -976,11 +1184,15 @@ impl Registry {
         let mut dirs = vec![(remote.to_string(), local.to_string())];
         while let Some((rdir, ldir)) = dirs.pop() {
             visited += 1;
+            // The root failing is a real error; a subdirectory failing is one
+            // more item in the tally, like an unreadable file (see below).
+            let is_root = visited == 1;
             if visited > MAX_DIRS {
                 let reason = format!(
                     "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
                 );
-                emit_transfer_failure(app, session_id, remote, "(tree)", local, remote, reason.clone(), "download");
+                // Empty paths: not retryable — a retry would re-run the whole tree.
+                emit_transfer_failure(app, session_id, remote, "(tree)", "", "", reason.clone(), "download");
                 failed.push(reason);
                 break;
             }
@@ -990,8 +1202,22 @@ impl Registry {
                 failed.push(format!("{ldir}: {e}"));
                 continue;
             }
-            tokio::fs::create_dir_all(&ldir).await?;
-            for entry in sftp.read_dir(&rdir).await? {
+            let dir_name = rdir.rsplit('/').next().unwrap_or(&rdir).to_string();
+            let listing = match tokio::fs::create_dir_all(&ldir).await {
+                Err(e) if is_root => return Err(e.into()),
+                Err(e) => Err(SshError::from(e)),
+                Ok(()) => sftp.read_dir(&rdir).await.map_err(SshError::from),
+            };
+            let listing = match listing {
+                Ok(l) => l,
+                Err(e) if is_root => return Err(e),
+                Err(e) => {
+                    emit_transfer_failure(app, session_id, remote, &dir_name, &ldir, &rdir, format!("{e}"), "download");
+                    failed.push(format!("{rdir}: {e}"));
+                    continue;
+                }
+            };
+            for entry in listing {
                 let name = entry.file_name();
                 let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
                 // The server chose this name; refuse anything that is not a
@@ -1014,13 +1240,17 @@ impl Registry {
                     // open() on a dir-symlink fails, and following file links
                     // can duplicate or even loop. Recorded so the user learns
                     // it was left behind rather than silently missing it.
+                    // Emitted with an empty local path so it is NOT retryable:
+                    // a retry would copy it as a plain file, following the link
+                    // the walk deliberately refused to follow.
                     let reason = format!("{rpath} (symlink, skipped)");
-                    emit_transfer_failure(app, session_id, remote, &name, &lpath, &rpath, "symlink, skipped".into(), "download");
+                    emit_transfer_failure(app, session_id, remote, &name, "", &rpath, "symlink, skipped".into(), "download");
                     failed.push(reason);
                 } else {
                     // One unreadable file must not abort the other 499: keep
                     // walking, collect what failed, report the tally at the end.
-                    match copy_remote_file(&sftp, app, session_id, &rpath, &lpath).await {
+                    let ctx = ProgressCtx { root: remote, base: total, tree: true };
+                    match copy_remote_file(&sftp, app, session_id, &rpath, &lpath, ctx).await {
                         Ok(n) => total += n,
                         Err(e) => {
                             emit_transfer_failure(app, session_id, remote, &name, &lpath, &rpath, format!("{e}"), "download");
@@ -1058,7 +1288,8 @@ impl Registry {
             .unwrap_or(false);
 
         if !is_dir {
-            return copy_local_file(&sftp, app, session_id, local, remote).await;
+            return copy_local_file(&sftp, app, session_id, local, remote, ProgressCtx::single(local))
+                .await;
         }
 
         let mut total = 0u64;
@@ -1068,30 +1299,67 @@ impl Registry {
         let mut dirs = vec![(local.to_string(), remote.to_string())];
         while let Some((ldir, rdir)) = dirs.pop() {
             visited += 1;
+            let is_root = visited == 1;
             if visited > MAX_DIRS {
                 let reason = format!(
                     "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
                 );
-                emit_transfer_failure(app, session_id, local, "(tree)", local, remote, reason.clone(), "upload");
+                // Empty paths: not retryable — a retry would re-run the whole tree.
+                emit_transfer_failure(app, session_id, local, "(tree)", "", "", reason.clone(), "upload");
                 failed.push(reason);
                 break;
             }
             // create_dir on an existing directory is an error over SFTP; ignore
             // it so re-uploading into a partially-present tree just works.
             let _ = sftp.create_dir(&rdir).await;
-            let mut rd = tokio::fs::read_dir(&ldir).await?;
-            while let Some(entry) = rd.next_entry().await? {
+            // An unreadable SUBdirectory (another user's 0700 dir, a macOS
+            // TCC-protected folder) is one more failed item, not the end of the
+            // whole tree; only the root failing is fatal.
+            let dir_name = std::path::Path::new(&ldir)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| ldir.clone());
+            let mut rd = match tokio::fs::read_dir(&ldir).await {
+                Ok(rd) => rd,
+                Err(e) if is_root => return Err(e.into()),
+                Err(e) => {
+                    emit_transfer_failure(app, session_id, local, &dir_name, &ldir, &rdir, format!("{e}"), "upload");
+                    failed.push(format!("{ldir}: {e}"));
+                    continue;
+                }
+            };
+            loop {
+                let entry = match rd.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(e) => {
+                        failed.push(format!("{ldir}: {e}"));
+                        break;
+                    }
+                };
                 let name = entry.file_name().to_string_lossy().to_string();
                 let lpath = entry.path().to_string_lossy().to_string();
                 let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
-                let ft = entry.file_type().await?;
+                let ft = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(e) => {
+                        emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, format!("{e}"), "upload");
+                        failed.push(format!("{lpath}: {e}"));
+                        continue;
+                    }
+                };
                 if ft.is_dir() {
                     dirs.push((lpath, rpath));
                 } else if ft.is_symlink() {
-                    emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, "symlink, skipped".into(), "upload");
+                    // Empty local path: NOT retryable. A retry would open the
+                    // path as a plain file and upload whatever the link points
+                    // at (e.g. ~/.ssh/id_ed25519) — the very thing the walk
+                    // refused to do.
+                    emit_transfer_failure(app, session_id, local, &name, "", &rpath, "symlink, skipped".into(), "upload");
                     failed.push(format!("{lpath} (symlink, skipped)"));
                 } else {
-                    match copy_local_file(&sftp, app, session_id, &lpath, &rpath).await {
+                    let ctx = ProgressCtx { root: local, base: total, tree: true };
+                    match copy_local_file(&sftp, app, session_id, &lpath, &rpath, ctx).await {
                         Ok(n) => total += n,
                         Err(e) => {
                             emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, format!("{e}"), "upload");
@@ -1153,22 +1421,28 @@ impl Registry {
         let tunnels_loop = Arc::clone(&tunnels);
         let task = tokio::spawn(async move {
             loop {
-                let Ok((mut tcp, peer)) = listener.accept().await else { break };
-                let Ok(channel) = sess
-                    .handle
-                    .channel_open_direct_tcpip(
-                        rhost.clone(),
-                        remote_port as u32,
-                        peer.ip().to_string(),
-                        peer.port() as u32,
-                    )
-                    .await
-                else {
-                    // Remote refused (nothing listening there, or policy).
-                    // Drop this client and keep the listener alive.
-                    continue;
-                };
+                let Some((mut tcp, peer)) = accept_or_retry(&listener).await else { continue };
+                // The channel open is awaited in the per-connection task, not
+                // here: the server confirms it only once its own connect to the
+                // target completes, so a blackholed target would otherwise stall
+                // every other client of this forward for the remote TCP timeout.
+                let sess = Arc::clone(&sess);
+                let rhost = rhost.clone();
                 let h = tokio::spawn(async move {
+                    let Ok(channel) = sess
+                        .handle
+                        .channel_open_direct_tcpip(
+                            rhost,
+                            remote_port as u32,
+                            peer.ip().to_string(),
+                            peer.port() as u32,
+                        )
+                        .await
+                    else {
+                        // Remote refused (nothing listening there, or policy).
+                        // Drop this client; the listener stays up.
+                        return;
+                    };
                     let mut stream = channel.into_stream();
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
                 });
@@ -1176,15 +1450,24 @@ impl Registry {
             }
         });
 
-        self.forwards.insert(
-            info.id.clone(),
-            Forward {
-                info: info.clone(),
-                listener: task,
-                tunnels,
-            },
-        );
+        self.insert_forward(Forward {
+            info: info.clone(),
+            listener: task,
+            tunnels,
+        });
         Ok(info)
+    }
+
+    /// Register a forward. Ids are `<kind>-<session>-<port>`, so re-creating a
+    /// forward on a port whose old listener died yields the same id; tear the
+    /// old entry down rather than let `insert` silently detach its tunnels.
+    fn insert_forward(&self, fw: Forward) {
+        if let Some(old) = self.forwards.insert(fw.info.id.clone(), fw) {
+            for h in take_tunnels(&old.tunnels) {
+                h.abort();
+            }
+            old.listener.abort();
+        }
     }
 
     /// Stop one forward: abort its live tunnels AND its listener, so no traffic
@@ -1234,7 +1517,7 @@ impl Registry {
         let tunnels_loop = Arc::clone(&tunnels);
         let task = tokio::spawn(async move {
             loop {
-                let Ok((tcp, peer)) = listener.accept().await else { break };
+                let Some((tcp, peer)) = accept_or_retry(&listener).await else { continue };
                 let sess = Arc::clone(&sess);
                 let h = tokio::spawn(async move {
                     let _ = socks5_serve(sess, tcp, peer).await;
@@ -1243,14 +1526,11 @@ impl Registry {
             }
         });
 
-        self.forwards.insert(
-            info.id.clone(),
-            Forward {
-                info: info.clone(),
-                listener: task,
-                tunnels,
-            },
-        );
+        self.insert_forward(Forward {
+            info: info.clone(),
+            listener: task,
+            tunnels,
+        });
         Ok(info)
     }
 
@@ -1291,7 +1571,21 @@ impl Registry {
         let mut truncated = false;
         let mut exit_status: Option<u32> = None;
         let collect = async {
-            while let Some(msg) = channel.wait().await {
+            // Do not stop at EOF: OpenSSH sends the exit status AFTER EOF (when it
+            // reaps the child), so breaking on Eof meant a failed command was
+            // never seen as failed. After EOF, allow a short grace for the
+            // status/close, for appliances that EOF but never close.
+            let mut eof = false;
+            loop {
+                let msg = if eof {
+                    match tokio::time::timeout(EXIT_STATUS_GRACE, channel.wait()).await {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    }
+                } else {
+                    channel.wait().await
+                };
+                let Some(msg) = msg else { break };
                 match msg {
                     ChannelMsg::Data { ref data }
                     | ChannelMsg::ExtendedData { ref data, .. } => {
@@ -1305,7 +1599,8 @@ impl Registry {
                         }
                     }
                     ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
-                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    ChannelMsg::Eof => eof = true,
+                    ChannelMsg::Close => break,
                     _ => {}
                 }
             }
@@ -1364,13 +1659,26 @@ fn authorize_stored_password(
     username: &str,
     one_shot_password: Option<&str>,
 ) -> Result<(), SshError> {
+    // Ids in a reserved vault namespace (the AI provider key lives at `ai:…`)
+    // are never host credentials: refuse them for every auth method, so no
+    // host id can address — and send, or use as a passphrase — that secret.
+    if credentials::is_reserved_id(host_id) {
+        return Err(SshError::AuthFailed(format!(
+            "refusing to use '{host_id}' as a host credential: it is a reserved vault id"
+        )));
+    }
     if one_shot_password.is_some() || matches!(auth, "key" | "agent") {
         return Ok(());
     }
     // No saved secret for this id → nothing to leak; a bare password attempt
-    // simply fails later if the server demands one.
-    if !credentials::has_secret(host_id) {
-        return Ok(());
+    // simply fails later if the server demands one. Only a definite NotFound
+    // counts as "no secret": any other vault error (a locked keyring, a
+    // dismissed unlock prompt) fails CLOSED, since the later read in
+    // `authenticate` could succeed and send the secret unchecked.
+    match credentials::read_secret(host_id) {
+        Err(credentials::CredError::NotFound(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
     }
     if crate::utils::hosts::binding_is_authorized(host_id, host, port, username) {
         Ok(())
@@ -1486,10 +1794,19 @@ async fn authenticate(
             let result = if matches!(first, russh::client::AuthResult::Success) {
                 first
             } else {
+                // partial_success means the password itself was accepted and the
+                // server wants a second factor (AuthenticationMethods
+                // password,keyboard-interactive) — so an unlabelled hidden prompt
+                // that follows is NOT the password.
+                let password_accepted = matches!(
+                    first,
+                    russh::client::AuthResult::Failure { partial_success: true, .. }
+                );
                 keyboard_interactive_with_password(
                     handle,
                     username,
                     pw.as_str(),
+                    password_accepted,
                     app,
                     auth_prompts,
                     session_id,
@@ -1534,17 +1851,61 @@ async fn authenticate(
     Ok(())
 }
 
+/// True if a keyboard-interactive prompt's text asks for the account password
+/// (as opposed to an OTP / verification code, which PAM also sends hidden).
+fn looks_like_password_prompt(prompt: &str) -> bool {
+    let t = prompt.to_lowercase();
+    [
+        "password", "passphrase", "passwort", "mot de passe", "contraseña", "senha",
+        "пароль", "密码", "パスワード", "비밀번호",
+    ]
+    .iter()
+    .any(|w| t.contains(w))
+}
+
+/// Which prompts of one keyboard-interactive round get the password, in the
+/// backend. At most one per auth attempt (`password_used`), and only a hidden
+/// prompt that reads like a password — or, in the first round, a lone hidden
+/// prompt when the password has not already been accepted (the TACACS+ single
+/// unlabelled question). Every other prompt, hidden or not, goes to the user.
+fn password_slots(
+    prompts: &[(String, bool)],
+    first_round: bool,
+    password_used: bool,
+    password_accepted: bool,
+) -> Vec<bool> {
+    let mut used = password_used;
+    let lone_hidden = first_round && !password_accepted && prompts.len() == 1 && !prompts[0].1;
+    prompts
+        .iter()
+        .map(|(text, echo)| {
+            if used || *echo {
+                return false;
+            }
+            if lone_hidden || looks_like_password_prompt(text) {
+                used = true;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
 /// Keyboard-interactive auth.
 ///
-/// Hidden prompts (the common TACACS+/RADIUS single "Password:" question) are
-/// answered with the password on hand, in the backend — so the password never
-/// crosses IPC. A prompt that ECHOES (an OTP, token code, or security question
-/// the stored password cannot answer) is surfaced to the user through the UI
-/// via `request_auth_answers`, and their typed reply is interleaved back in.
+/// The hidden prompt asking for the password (the common TACACS+/RADIUS single
+/// "Password:" question) is answered with the password on hand, in the backend
+/// — so the password never crosses IPC. Every other prompt (an OTP, a token or
+/// verification code — which PAM often sends HIDDEN — or a security question)
+/// is surfaced to the user through the UI via `request_auth_answers`, masked
+/// when the server asked for no echo, and the typed replies are merged back in
+/// prompt order.
 async fn keyboard_interactive_with_password(
     handle: &mut Handle<ClientHandler>,
     username: &str,
     password: &str,
+    password_accepted: bool,
     app: &AppHandle,
     auth_prompts: &Arc<AuthPrompts>,
     session_id: &str,
@@ -1555,9 +1916,10 @@ async fn keyboard_interactive_with_password(
         .authenticate_keyboard_interactive_start(username, None)
         .await?;
 
+    let mut password_used = false;
     // A server may send several rounds; cap them so a misbehaving one cannot
     // loop us forever.
-    for _ in 0..5 {
+    for round in 0..5 {
         match reply {
             Kb::Success => return Ok(russh::client::AuthResult::Success),
             Kb::Failure { remaining_methods, partial_success } => {
@@ -1567,11 +1929,11 @@ async fn keyboard_interactive_with_password(
                 })
             }
             Kb::InfoRequest { name, instructions, prompts } => {
-                // An ECHO (visible) prompt is a live challenge the stored
-                // password can't answer — an OTP, a token code, a security
-                // question. Ask the user through the UI. Hidden prompts stay
-                // auto-answered with the password here in the backend, so the
-                // password itself never crosses IPC.
+                // The password answers only the prompt that asks for it (see
+                // password_slots); everything else — an OTP, a token or
+                // verification code, a security question — is a live challenge
+                // the stored password can't answer, so ask the user through the
+                // UI. The password itself never crosses IPC.
                 //
                 // `password` is borrowed from the caller's Zeroizing buffer.
                 // Residual (documented, upstream-bounded): russh 0.63's
@@ -1579,35 +1941,40 @@ async fn keyboard_interactive_with_password(
                 // internal message queue, so that one transient plaintext copy
                 // lives inside russh for the round-trip and cannot be zeroized
                 // here — no additional copy is retained on Skiff's side.
-                let answers: Vec<String> = if prompts.iter().any(|p| p.echo) {
-                    let echo_fields: Vec<AuthPromptField> = prompts
-                        .iter()
-                        .filter(|p| p.echo)
-                        .map(|p| AuthPromptField { prompt: p.prompt.clone(), echo: true })
-                        .collect();
-                    let typed = request_auth_answers(
-                        app, auth_prompts, session_id, &name, &instructions, echo_fields, false,
-                    )
-                    .await?;
-                    // Interleave the user's typed answers (echo prompts, in order)
-                    // with the password (hidden prompts).
-                    let mut typed = typed.answers.into_iter();
-                    prompts
-                        .iter()
-                        .map(|p| {
-                            if p.echo {
-                                typed.next().unwrap_or_default()
-                            } else {
-                                password.to_string()
-                            }
-                        })
-                        .collect()
+                let shape: Vec<(String, bool)> =
+                    prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect();
+                let slots = password_slots(&shape, round == 0, password_used, password_accepted);
+                if slots.iter().any(|b| *b) {
+                    password_used = true;
+                }
+                let ask: Vec<AuthPromptField> = prompts
+                    .iter()
+                    .zip(&slots)
+                    .filter(|(_, auto)| !**auto)
+                    .map(|(p, _)| AuthPromptField { prompt: p.prompt.clone(), echo: p.echo })
+                    .collect();
+                let mut typed = if ask.is_empty() {
+                    Vec::new().into_iter()
                 } else {
-                    prompts
-                        .iter()
-                        .map(|p| if p.echo { String::new() } else { password.to_string() })
-                        .collect()
+                    request_auth_answers(
+                        app, auth_prompts, session_id, &name, &instructions, ask, false,
+                    )
+                    .await?
+                    .answers
+                    .into_iter()
                 };
+                // Merge back in prompt order: password slots get the password,
+                // the rest take the user's answers in the order they were shown.
+                let answers: Vec<String> = slots
+                    .iter()
+                    .map(|auto| {
+                        if *auto {
+                            password.to_string()
+                        } else {
+                            typed.next().unwrap_or_default()
+                        }
+                    })
+                    .collect();
                 reply = handle
                     .authenticate_keyboard_interactive_respond(answers)
                     .await?;
@@ -1620,8 +1987,9 @@ async fn keyboard_interactive_with_password(
 }
 
 /// Raise a keyboard-interactive challenge to the UI and park on a oneshot until
-/// the user answers (or a timeout). Only the ECHO prompts are sent out; the
-/// returned vector is one typed answer per prompt shown, in order.
+/// the user answers (or a timeout). Only the prompts the password does not
+/// answer are sent out; the returned vector is one typed answer per prompt
+/// shown, in order.
 async fn request_auth_answers(
     app: &AppHandle,
     auth_prompts: &Arc<AuthPrompts>,
@@ -1636,7 +2004,7 @@ async fn request_auth_answers(
         session_id,
         AUTH_PROMPT_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let rx = auth_prompts.register(request_id.clone());
+    let rx = auth_prompts.register(request_id.clone(), session_id);
 
     if app
         .emit(
@@ -1666,6 +2034,7 @@ async fn request_auth_answers(
         Ok(Err(_)) => Err(SshError::AuthFailed("interactive auth cancelled".into())),
         Err(_) => {
             auth_prompts.cancel(&request_id);
+            emit_prompt_closed(app, &request_id);
             Err(SshError::AuthFailed("interactive auth prompt timed out".into()))
         }
     }
@@ -1721,6 +2090,7 @@ pub async fn copy_id(
         port,
         app: app.clone(),
         prompts,
+        session_id: "install-key".to_string(),
     };
     let mut handle = client::connect(config, (host, port), handler).await?;
 
@@ -1738,8 +2108,15 @@ pub async fn copy_id(
     // step — including the append — actually succeeded. (The earlier version
     // used `;` before chmod/echo, which printed the success marker even when the
     // append failed, e.g. a full or read-only home directory.)
+    //
+    // A file whose last line has no trailing newline gets one first (as
+    // OpenSSH's ssh-copy-id does); otherwise the key is glued onto that line,
+    // grep never sees it as its own line, and "success" is reported for a key
+    // sshd cannot parse.
     let cmd = format!(
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys \
+         && {{ [ ! -s ~/.ssh/authorized_keys ] || [ -z \"$(tail -c 1 ~/.ssh/authorized_keys)\" ] \
+               || printf '\\n' >> ~/.ssh/authorized_keys; }} \
          && {{ grep -qxF '{key}' ~/.ssh/authorized_keys || printf '%s\n' '{key}' >> ~/.ssh/authorized_keys; }} \
          && chmod 600 ~/.ssh/authorized_keys && echo SKIFF_KEY_OK"
     );
@@ -1749,13 +2126,25 @@ pub async fn copy_id(
     let mut out = Vec::new();
     let mut exit_status: Option<u32> = None;
     let collect = async {
-        while let Some(msg) = channel.wait().await {
+        // Read past EOF for the exit status (sent after EOF), as exec_capture does.
+        let mut eof = false;
+        loop {
+            let msg = if eof {
+                match tokio::time::timeout(EXIT_STATUS_GRACE, channel.wait()).await {
+                    Ok(m) => m,
+                    Err(_) => break,
+                }
+            } else {
+                channel.wait().await
+            };
+            let Some(msg) = msg else { break };
             match msg {
                 ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
                     out.extend_from_slice(data)
                 }
                 ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
-                ChannelMsg::Eof | ChannelMsg::Close => break,
+                ChannelMsg::Eof => eof = true,
+                ChannelMsg::Close => break,
                 _ => {}
             }
         }
@@ -1881,7 +2270,9 @@ fn safe_local_component(name: &str) -> bool {
         && name != ".."
         && !name.contains('/')
         && !name.contains('\\')
-        && !name.contains(':') // drive letters / ADS on Windows
+        // Drive letters / alternate data streams are a Windows hazard only; on
+        // macOS/Linux ':' is an ordinary filename character (timestamped logs).
+        && !(cfg!(windows) && name.contains(':'))
         && !name.contains('\0')
         && !is_windows_reserved(name)
 }
@@ -1995,11 +2386,13 @@ async fn copy_remote_file(
     session_id: &str,
     remote: &str,
     local: &str,
+    ctx: ProgressCtx<'_>,
 ) -> Result<u64, SshError> {
     // Never write THROUGH an existing symlink at the destination: a
     // server-controlled tree must not use a pre-placed link to redirect a
     // download outside the folder the user chose.
-    if let Ok(meta) = tokio::fs::symlink_metadata(local).await {
+    let existing = tokio::fs::symlink_metadata(local).await.ok();
+    if let Some(meta) = existing.as_ref() {
         if meta.file_type().is_symlink() {
             return Err(SshError::PartialTransfer(format!(
                 "refusing to overwrite a symlink: {local}"
@@ -2016,7 +2409,7 @@ async fn copy_remote_file(
     let tmp = temp_sibling(local);
     let copy_result: Result<u64, SshError> = async {
         let mut dst = tokio::fs::File::create(&tmp).await?;
-        let mut reporter = Reporter::new(app, session_id, remote, total, "download");
+        let mut reporter = Reporter::new(app, session_id, remote, total, "download", ctx);
         let mut buf = vec![0u8; CHUNK];
         let mut done = 0u64;
         loop {
@@ -2043,6 +2436,11 @@ async fn copy_remote_file(
 
     match copy_result {
         Ok(done) => {
+            // The temp was created with default permissions; an overwritten file
+            // keeps the mode it had (a 0600 secret must not come back 0644).
+            if let Some(meta) = existing.as_ref().filter(|m| m.is_file()) {
+                let _ = tokio::fs::set_permissions(&tmp, meta.permissions()).await;
+            }
             // Atomic replace. std::fs::rename replaces an existing file on both
             // Unix and Windows; if the platform refuses (e.g. dest locked),
             // fall back to remove-then-rename rather than lose the new content.
@@ -2063,6 +2461,21 @@ async fn copy_remote_file(
     }
 }
 
+/// The local file's permission bits, for a new remote file. Unix only — the
+/// Windows metadata carries no POSIX mode.
+fn local_mode(meta: Option<&std::fs::Metadata>) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.map(|m| m.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
 /// A unique sibling path for atomic writes: `<name>.<n>.skiffpart`. The counter
 /// makes concurrent transfers to the same directory collision-free.
 fn temp_sibling(path: &str) -> String {
@@ -2078,9 +2491,28 @@ async fn copy_local_file(
     session_id: &str,
     local: &str,
     remote: &str,
+    ctx: ProgressCtx<'_>,
 ) -> Result<u64, SshError> {
-    let total = tokio::fs::metadata(local).await.map(|m| m.len()).unwrap_or(0);
+    let local_meta = tokio::fs::metadata(local).await.ok();
+    let total = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mut src = tokio::fs::File::open(local).await?;
+
+    // The temp-and-rename below replaces the remote inode, so its mode must be
+    // carried over explicitly: an overwritten file keeps its own permissions (a
+    // 0600 secret must not become 0644, a deploy script must keep +x); a new
+    // file takes the local file's mode where the platform has one. Refuse up
+    // front to replace a remote DIRECTORY with a file.
+    let remote_meta = sftp.metadata(remote).await.ok();
+    if remote_meta.as_ref().is_some_and(|m| m.file_type().is_dir()) {
+        return Err(SshError::PartialTransfer(format!(
+            "{remote} is a directory on the server; refusing to replace it with a file"
+        )));
+    }
+    let mode = remote_meta
+        .as_ref()
+        .and_then(|m| m.permissions)
+        .map(|p| p & 0o7777)
+        .or_else(|| local_mode(local_meta.as_ref()));
 
     // Stream to a unique temp file beside the destination, then rename over it,
     // exactly as the download does. `sftp.create` truncates, so writing straight
@@ -2089,8 +2521,23 @@ async fn copy_local_file(
     // remote file with the original gone.
     let tmp = temp_sibling(remote);
     let copy_result: Result<u64, SshError> = async {
-        let mut dst = sftp.create(&tmp).await?;
-        let mut reporter = Reporter::new(app, session_id, local, total, "upload");
+        // Created WITH the mode, so a secret is never briefly world-readable in
+        // the temp; set again after the write because the server's umask may
+        // have trimmed it at create time.
+        let attrs = russh_sftp::protocol::FileAttributes {
+            permissions: mode,
+            ..Default::default()
+        };
+        let mut dst = sftp
+            .open_with_flags_and_attributes(
+                tmp.clone(),
+                russh_sftp::protocol::OpenFlags::CREATE
+                    | russh_sftp::protocol::OpenFlags::TRUNCATE
+                    | russh_sftp::protocol::OpenFlags::WRITE,
+                attrs,
+            )
+            .await?;
+        let mut reporter = Reporter::new(app, session_id, local, total, "upload", ctx);
         let mut buf = vec![0u8; CHUNK];
         let mut done = 0u64;
         loop {
@@ -2101,6 +2548,14 @@ async fn copy_local_file(
             dst.write_all(&buf[..n]).await?;
             done += n as u64;
             reporter.tick(done);
+        }
+        if let Some(m) = mode {
+            let _ = dst
+                .set_metadata(russh_sftp::protocol::FileAttributes {
+                    permissions: Some(m),
+                    ..Default::default()
+                })
+                .await;
         }
         // shutdown (not just flush) closes the remote handle, which must happen
         // before the rename and also avoids leaking the SFTP handle.
@@ -2155,6 +2610,25 @@ struct Reporter<'a> {
     app: &'a AppHandle,
     payload: TransferProgress,
     last: Instant,
+    /// Bytes already moved by earlier files of the same tree.
+    base: u64,
+    /// Part of a folder transfer: the row's total is unknown, so never report
+    /// one file's size (or completion) as the tree's.
+    tree: bool,
+}
+
+/// Where a single file copy sits in its transfer, for progress reporting.
+#[derive(Clone, Copy)]
+struct ProgressCtx<'a> {
+    root: &'a str,
+    base: u64,
+    tree: bool,
+}
+
+impl<'a> ProgressCtx<'a> {
+    fn single(path: &'a str) -> Self {
+        Self { root: path, base: 0, tree: false }
+    }
 }
 
 impl<'a> Reporter<'a> {
@@ -2164,12 +2638,14 @@ impl<'a> Reporter<'a> {
         file_path: &str,
         total_bytes: u64,
         direction: &'static str,
+        ctx: ProgressCtx<'_>,
     ) -> Self {
         let payload = TransferProgress {
             session_id: session_id.to_string(),
+            root: ctx.root.to_string(),
             file_path: file_path.to_string(),
-            bytes_transferred: 0,
-            total_bytes,
+            bytes_transferred: ctx.base,
+            total_bytes: if ctx.tree { 0 } else { total_bytes },
             direction,
             done: false,
         };
@@ -2180,6 +2656,8 @@ impl<'a> Reporter<'a> {
             app,
             payload,
             last: Instant::now(),
+            base: ctx.base,
+            tree: ctx.tree,
         }
     }
 
@@ -2188,17 +2666,19 @@ impl<'a> Reporter<'a> {
             return;
         }
         self.last = Instant::now();
-        self.payload.bytes_transferred = bytes;
+        self.payload.bytes_transferred = self.base + bytes;
         let _ = self.app.emit("sftp://progress", self.payload.clone());
     }
 
     /// Always emitted, regardless of throttling, so the UI never stalls at 97%.
     fn finish(&mut self, bytes: u64) {
-        self.payload.bytes_transferred = bytes;
-        if self.payload.total_bytes == 0 {
-            self.payload.total_bytes = bytes;
+        self.payload.bytes_transferred = self.base + bytes;
+        if !self.tree {
+            if self.payload.total_bytes == 0 {
+                self.payload.total_bytes = bytes;
+            }
+            self.payload.done = true;
         }
-        self.payload.done = true;
         let _ = self.app.emit("sftp://progress", self.payload.clone());
     }
 }
@@ -2277,6 +2757,39 @@ async fn socks5_serve(
     Ok(())
 }
 
+/// Streaming UTF-8 decode: append `data` to `pending`, return every complete
+/// character, and keep an incomplete trailing sequence (at most 3 bytes) in
+/// `pending` for the next chunk. Only genuinely invalid bytes become U+FFFD.
+fn decode_utf8_stream(pending: &mut Vec<u8>, data: &[u8]) -> String {
+    pending.extend_from_slice(data);
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                return out;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // The prefix up to valid_up_to() is valid UTF-8 by definition.
+                out.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or_default());
+                match e.error_len() {
+                    // Incomplete sequence at the end: wait for the rest.
+                    None => {
+                        pending.drain(..valid);
+                        return out;
+                    }
+                    Some(n) => {
+                        out.push('\u{FFFD}');
+                        pending.drain(..valid + n);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render POSIX permission bits as `drwxr-xr-x`.
 fn mode_string(permissions: Option<u32>, kind: &str) -> String {
     let Some(bits) = permissions else {
@@ -2287,16 +2800,30 @@ fn mode_string(permissions: Option<u32>, kind: &str) -> String {
         "symlink" => 'l',
         _ => '-',
     };
-    let rwx = |shift: u32| {
+    // `special` is the setuid / setgid / sticky bit for this triad, shown in the
+    // execute slot as ls does: lowercase when x is also set, uppercase when not.
+    let rwx = |shift: u32, special: u32, set: char| {
         let v = (bits >> shift) & 0b111;
+        let x = v & 0b001 != 0;
+        let exec = match (bits & special != 0, x) {
+            (true, true) => set,
+            (true, false) => set.to_ascii_uppercase(),
+            (false, true) => 'x',
+            (false, false) => '-',
+        };
         format!(
             "{}{}{}",
             if v & 0b100 != 0 { 'r' } else { '-' },
             if v & 0b010 != 0 { 'w' } else { '-' },
-            if v & 0b001 != 0 { 'x' } else { '-' },
+            exec,
         )
     };
-    format!("{lead}{}{}{}", rwx(6), rwx(3), rwx(0))
+    format!(
+        "{lead}{}{}{}",
+        rwx(6, 0o4000, 's'),
+        rwx(3, 0o2000, 's'),
+        rwx(0, 0o1000, 't')
+    )
 }
 
 #[cfg(test)]
@@ -2313,7 +2840,59 @@ mod tests {
         assert!(!safe_local_component("../etc/passwd"));
         assert!(!safe_local_component("..\\Windows\\evil"));
         assert!(!safe_local_component("sub/dir"));
-        assert!(!safe_local_component("C:evil")); // drive-relative
+        // Drive-relative on Windows; an ordinary name elsewhere.
+        assert_eq!(safe_local_component("C:evil"), !cfg!(windows));
+        assert_eq!(safe_local_component("app-2026-10-30T10:15:00.log"), !cfg!(windows));
+    }
+
+    #[test]
+    fn mode_string_shows_special_bits() {
+        use super::mode_string;
+        assert_eq!(mode_string(Some(0o755), "file"), "-rwxr-xr-x");
+        assert_eq!(mode_string(Some(0o1777), "directory"), "drwxrwxrwt");
+        assert_eq!(mode_string(Some(0o4755), "file"), "-rwsr-xr-x");
+        assert_eq!(mode_string(Some(0o2750), "directory"), "drwxr-s---");
+        assert_eq!(mode_string(Some(0o4644), "file"), "-rwSr--r--");
+        assert_eq!(mode_string(Some(0o1666), "file"), "-rw-rw-rwT");
+        assert_eq!(mode_string(None, "file"), "");
+    }
+
+    #[test]
+    fn utf8_stream_carries_split_characters() {
+        use super::decode_utf8_stream;
+        let mut pending = Vec::new();
+        let text = "a\u{4e2d}b\u{1F600}";
+        let bytes = text.as_bytes();
+        // Split inside the 3-byte CJK char and inside the 4-byte emoji.
+        let mut out = String::new();
+        out += &decode_utf8_stream(&mut pending, &bytes[..2]);
+        out += &decode_utf8_stream(&mut pending, &bytes[2..6]);
+        out += &decode_utf8_stream(&mut pending, &bytes[6..]);
+        assert_eq!(out, text);
+        assert!(pending.is_empty());
+        // Genuinely invalid bytes still become U+FFFD and do not stall output.
+        assert_eq!(decode_utf8_stream(&mut pending, b"x\xffy"), "x\u{FFFD}y");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn kbd_interactive_password_only_answers_password_prompts() {
+        use super::password_slots;
+        let p = |t: &str, echo: bool| (t.to_string(), echo);
+        // TACACS+-style lone unlabelled hidden prompt in round 1: the password.
+        assert_eq!(password_slots(&[p("Enter:", false)], true, false, false), vec![true]);
+        // Password + hidden OTP in one round: only the password slot.
+        assert_eq!(
+            password_slots(&[p("Password:", false), p("Verification code:", false)], true, false, false),
+            vec![true, false]
+        );
+        // OTP in a later round after the password was used: ask the user.
+        assert_eq!(password_slots(&[p("Verification code:", false)], false, true, false), vec![false]);
+        // After password auth returned partial_success, a lone hidden prompt is
+        // the second factor, not the password.
+        assert_eq!(password_slots(&[p("Verification code:", false)], true, false, true), vec![false]);
+        // Echo prompts never get the password.
+        assert_eq!(password_slots(&[p("Password:", true)], true, false, false), vec![false]);
     }
 
     #[test]

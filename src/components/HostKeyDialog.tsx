@@ -50,21 +50,30 @@ export function HostKeyDialog() {
   const request = queue[0] ?? null
 
   useEffect(() => {
-    let un: (() => void) | null = null
+    const uns: (() => void)[] = []
     let dead = false
+    const add = (p: Promise<() => void>) =>
+      void p.then((fn) => (dead ? fn() : uns.push(fn)))
 
-    void safeListen<HostKeyRequest>('ssh://host-key-prompt', (payload) => {
-      // Append, de-duping by requestId so a re-emitted event cannot enqueue the
-      // same prompt twice.
-      setQueue((q) => (q.some((r) => r.requestId === payload.requestId) ? q : [...q, payload]))
-    }).then((fn) => {
-      if (dead) fn()
-      else un = fn
-    })
+    add(
+      safeListen<HostKeyRequest>('ssh://host-key-prompt', (payload) => {
+        // Append, de-duping by requestId so a re-emitted event cannot enqueue
+        // the same prompt twice.
+        setQueue((q) => (q.some((r) => r.requestId === payload.requestId) ? q : [...q, payload]))
+      }),
+    )
+    // The backend gave up on a prompt (120s timeout, or its tab was closed).
+    // Drop it so a dead question does not sit at the head of the queue in
+    // front of live ones — answering it would do nothing anyway.
+    add(
+      safeListen<{ requestId: string }>('ssh://prompt-closed', ({ requestId }) => {
+        setQueue((q) => q.filter((r) => r.requestId !== requestId))
+      }),
+    )
 
     return () => {
       dead = true
-      un?.()
+      uns.forEach((fn) => fn())
     }
   }, [])
 

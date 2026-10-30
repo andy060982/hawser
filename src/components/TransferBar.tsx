@@ -76,8 +76,12 @@ function TransferRow({ transfer: t, onRetry }: { transfer: Transfer; onRetry: (t
   const failures = t.failures ?? []
   const hasFailures = failures.length > 0
   // A row with failures opens by default so the problem is visible without a
-  // click; the user can collapse it.
-  const [open, setOpen] = useState(hasFailures)
+  // click; the user can collapse it. Derived rather than seeded into state:
+  // rows mount with no failures (they arrive later over sftp://failure), so a
+  // useState(hasFailures) initial value was always false. Once the user
+  // toggles, their choice wins.
+  const [userOpen, setOpen] = useState<boolean | null>(null)
+  const open = userOpen ?? hasFailures
 
   // A zero total means the server declined to report a size. Show an
   // indeterminate bar rather than inventing a denominator.
@@ -97,7 +101,7 @@ function TransferRow({ transfer: t, onRetry }: { transfer: Transfer; onRetry: (t
         {hasFailures ? (
           <button
             type="button"
-            onClick={() => setOpen((o) => !o)}
+            onClick={() => setOpen(!open)}
             className="flex min-w-0 flex-1 items-center gap-1 text-left"
             aria-expanded={open}
           >
