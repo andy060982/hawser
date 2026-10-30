@@ -904,8 +904,9 @@ impl Registry {
             );
         }
 
-        // The session is registered BEFORE the pump starts so the pump can hold
-        // a handle to it and clear the liveness flag when the channel ends.
+        // The pump holds its own Arc so it can clear the liveness flag when the
+        // channel ends. Registration in the maps happens below, atomically with
+        // the cancellation check.
         let session = Arc::new(Session {
             handle,
             shell: Mutex::new(Some(write_half)),
@@ -913,8 +914,6 @@ impl Registry {
             _jump: jump_handle,
             alive: AtomicBool::new(true),
         });
-        self.sessions
-            .insert(session_id.to_string(), Arc::clone(&session));
 
         let pump_session = Arc::clone(&session);
         let sid = session_id.to_string();
@@ -986,12 +985,45 @@ impl Registry {
                 },
             );
         });
-        self.pumps.insert(session_id.to_string(), pump);
-
-        // A disconnect that raced the registration above found nothing to tear
-        // down; it did clear our marker, so finish the teardown ourselves.
-        if !self.still_wanted(session_id, ticket) {
-            self.remove(session_id).await;
+        // Register only while our ticket is still current, holding the
+        // `connecting` entry (a shard lock, no await) so a concurrent
+        // `remove()` — which deletes that entry first — either runs before us
+        // (we see no ticket and do not register) or after us (it finds and
+        // tears down what we registered). Never `remove()` by id here: a newer
+        // connect may own this id now, and that would cancel or tear down ITS
+        // session instead of ours.
+        let mut pump = Some(pump);
+        let registered = match self.connecting.get(session_id) {
+            Some(g) if g.0 == ticket => {
+                self.sessions
+                    .insert(session_id.to_string(), Arc::clone(&session));
+                if let Some(p) = pump.take() {
+                    self.pumps.insert(session_id.to_string(), p);
+                }
+                true
+            }
+            _ => false,
+        };
+        if !registered {
+            // Superseded or cancelled: tear down only this attempt's own
+            // resources. Detached, because the cancel that brought us here also
+            // makes `connect`'s select drop this future at its next await — an
+            // inline teardown would be cut off half-way.
+            if let Some(p) = pump.take() {
+                p.abort();
+            }
+            session.alive.store(false, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let _ = session
+                    .handle
+                    .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
+                    .await;
+                if let Some(jh) = session._jump.as_ref() {
+                    let _ = jh
+                        .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
+                        .await;
+                }
+            });
             return Err(SshError::Cancelled(session_id.to_string()));
         }
 
