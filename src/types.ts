@@ -179,6 +179,10 @@ export interface TransferFailureItem {
  *  src-tauri/src/ssh.rs — change the two together. */
 export interface TransferProgressEvent {
   sessionId: string
+  /** The transfer's ROOT source path — the queue row's `path`. Equals
+   *  `filePath` for a single file; for a folder it is the folder, and
+   *  `bytesTransferred` is cumulative across the tree (with `totalBytes` 0). */
+  root: string
   filePath: string
   bytesTransferred: number
   /** 0 means the server did not report a size: render indeterminate, never

@@ -110,23 +110,38 @@ impl SessionLog {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let path = dir.join(format!("{}_{}.log", slug(host), timestamp_name(now)));
-
-        let mut open = OpenOptions::new();
-        open.create(true).append(true);
-        // Create the file 0600 up front on Unix so it is never briefly world-
-        // readable between create and chmod.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open.mode(0o600);
-        }
-        let mut file = open.open(&path).map_err(|source| KnownHostsError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        // Also tighten an already-existing log (mode above only applies on
-        // create), so appending to an older transcript locks it down too.
+        // Two sessions to the same host can start in the same second (split
+        // pane, restored tabs). create_new + a numeric suffix gives each its own
+        // file instead of interleaving both into one transcript with a doubled
+        // size cap — same scheme as save_capture.
+        let base = format!("{}_{}", slug(host), timestamp_name(now));
+        let mut path = dir.join(format!("{base}.log"));
+        let mut n = 0u32;
+        let mut file = loop {
+            let mut open = OpenOptions::new();
+            open.create_new(true).append(true);
+            // Create the file 0600 up front on Unix so it is never briefly
+            // world-readable between create and chmod.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                open.mode(0o600);
+            }
+            match open.open(&path) {
+                Ok(f) => break f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => {
+                    n += 1;
+                    path = dir.join(format!("{base}.{n}.log"));
+                }
+                Err(source) => {
+                    return Err(KnownHostsError::Io {
+                        path: path.clone(),
+                        source,
+                    })
+                }
+            }
+        };
+        // Belt-and-braces for platforms where the mode above does not apply.
         super::platform::restrict_perms(&path, 0o600);
 
         let _ = writeln!(
@@ -249,7 +264,21 @@ pub(crate) fn strip_ansi(input: &[u8]) -> (Vec<u8>, Vec<u8>) {
                     }
                     i = j;
                 }
-                // Two-byte escapes (ESC =, ESC >, ESC M, charset selection, ...)
+                // nF escapes: ESC, one or more intermediates (0x20..=0x2f), then
+                // a final byte — charset designators like ESC ( B (emitted by
+                // ncurses' sgr0 on every reset), ESC ) 0, ESC # 8. Skipping only
+                // two bytes would leak the final byte as a stray letter.
+                0x20..=0x2f => {
+                    let mut j = i + 1;
+                    while j < input.len() && (0x20..=0x2f).contains(&input[j]) {
+                        j += 1;
+                    }
+                    if j >= input.len() {
+                        return (out, input[i..].to_vec());
+                    }
+                    i = j + 1;
+                }
+                // Two-byte escapes (ESC =, ESC >, ESC M, ...)
                 _ => i += 2,
             }
             continue;
@@ -305,6 +334,42 @@ mod tests {
     }
 
     #[test]
+    fn strips_charset_designators() {
+        let (out, rest) = strip_ansi(b"a\x1b(B\x1b[mb\x1b)0c\x1b#8d");
+        assert_eq!(String::from_utf8_lossy(&out), "abcd");
+        assert!(rest.is_empty());
+
+        // Designator split before its final byte is carried, not leaked.
+        let (out1, rest1) = strip_ansi(b"x\x1b(");
+        assert_eq!(String::from_utf8_lossy(&out1), "x");
+        let mut joined = rest1;
+        joined.extend_from_slice(b"By");
+        let (out2, _) = strip_ansi(&joined);
+        assert_eq!(String::from_utf8_lossy(&out2), "y");
+    }
+
+    #[test]
+    fn log_stem_parsing_handles_suffix_and_rejects_other_hosts() {
+        assert_eq!(
+            split_log_name("192.0.2.10_20260918-141530.log"),
+            Some(("192.0.2.10", "20260918-141530"))
+        );
+        assert_eq!(
+            split_log_name("192.0.2.10_20260918-141530.2.log"),
+            Some(("192.0.2.10", "20260918-141530"))
+        );
+        assert_eq!(split_log_name("notes.log"), None);
+
+        // "fw" must not pick up "fw_lab" transcripts, nor "2001:db8::1" those
+        // of "2001:db8::1:5".
+        assert!(is_log_for("fw_", "fw_20261030-101500.log"));
+        assert!(is_log_for("fw_", "fw_20261030-101500.3.log"));
+        assert!(!is_log_for("fw_", "fw_lab_20261030-101500.log"));
+        let p = format!("{}_", slug("2001:db8::1"));
+        assert!(!is_log_for(&p, &format!("{}_20261030-101500.log", slug("2001:db8::1:5"))));
+    }
+
+    #[test]
     fn timestamp_is_readable_and_sorts() {
         // 2026-09-17T12:00:00Z
         let name = timestamp_name(1_789_646_400);
@@ -343,7 +408,10 @@ pub fn latest_transcript(host: &str, max_bytes: usize) -> Result<Option<String>,
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) || !name.ends_with(".log") {
+        // The rest of the name must be exactly a timestamp: slug() maps ':' and
+        // '_' to '_', so a bare prefix match lets "fw" pick up "fw_lab"'s logs
+        // (or one IPv6 address another's) and replay the wrong host's session.
+        if !is_log_for(&prefix, &name) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -465,13 +533,18 @@ pub fn list() -> Result<Vec<LogEntry>, KnownHostsError> {
         }
         let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
 
-        // Filename shape is "<host>_<YYYYMMDD-HHMMSS>.log". Split on the LAST
-        // underscore so hosts containing underscores (slugged dots, etc.) keep
-        // their name intact.
-        let stem = name.trim_end_matches(".log");
-        let (host, started) = match stem.rfind('_') {
-            Some(i) => (stem[..i].to_string(), parse_stamp(&stem[i + 1..])),
-            None => (stem.to_string(), None),
+        // Filename shape is "<host>_<YYYYMMDD-HHMMSS>[.<n>].log". Split on the
+        // LAST underscore so hosts containing underscores (slugged dots, etc.)
+        // keep their name intact.
+        let (host, started) = match split_log_name(&name) {
+            Some((h, stamp)) => (h.to_string(), parse_stamp(stamp)),
+            None => {
+                let stem = name.trim_end_matches(".log");
+                match stem.rfind('_') {
+                    Some(i) => (stem[..i].to_string(), parse_stamp(&stem[i + 1..])),
+                    None => (stem.to_string(), None),
+                }
+            }
         };
         out.push(LogEntry { name, host, started, bytes });
     }
@@ -513,7 +586,35 @@ pub fn read_log(name: &str) -> Result<String, KnownHostsError> {
         }
     }
 
-    std::fs::read_to_string(&path).map_err(|source| KnownHostsError::Io { path, source })
+    // Lossy, like latest_transcript: strip_ansi keeps raw high bytes (Latin-1
+    // gear output, a cat'd binary) and the size cap can cut a multibyte char,
+    // so a strict UTF-8 read would make the whole transcript unviewable.
+    let bytes = std::fs::read(&path).map_err(|source| KnownHostsError::Io { path, source })?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Split "<host>_<YYYYMMDD-HHMMSS>[.<n>].log" into (host slug, stamp), where
+/// ".<n>" is the collision suffix `SessionLog::create` adds. None unless the
+/// part after the last underscore is a well-formed timestamp.
+fn split_log_name(name: &str) -> Option<(&str, &str)> {
+    let stem = name.strip_suffix(".log")?;
+    let stem = match stem.rsplit_once('.') {
+        Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => stem,
+    };
+    let (host, stamp) = stem.rsplit_once('_')?;
+    parse_stamp(stamp)?;
+    Some((host, stamp))
+}
+
+/// True when `name` is a transcript whose host slug is exactly `prefix` minus
+/// its trailing underscore — i.e. nothing but a timestamp (and optional
+/// collision suffix) follows the prefix.
+fn is_log_for(prefix: &str, name: &str) -> bool {
+    match (name.strip_prefix(prefix), split_log_name(name)) {
+        (Some(_), Some((host, _))) => host.len() + 1 == prefix.len(),
+        _ => false,
+    }
 }
 
 /// Inverse of `timestamp_name`: "YYYYMMDD-HHMMSS" back to epoch seconds.

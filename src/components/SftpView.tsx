@@ -4,6 +4,7 @@ import type { FileEntry, PaneSide, Session } from '../types'
 import { FilePane } from './FilePane'
 import { ResizeHandle } from './ResizeHandle'
 import { joinPath } from '../lib/sftp'
+import { useDialogs } from '../lib/dialogs'
 import { onFileDrop, safeInvoke } from '../lib/tauri'
 import { ContextMenu, type MenuState } from './ContextMenu'
 import { X } from 'lucide-react'
@@ -19,6 +20,15 @@ function defaultLocal(): string {
     return sep() === '\\' ? 'C:\\' : '/'
   } catch {
     return '/'
+  }
+}
+/** True when the LOCAL side is Windows, where ':' in a file name means a drive
+ *  letter or an alternate data stream. */
+function localIsWindows(): boolean {
+  try {
+    return sep() === '\\'
+  } catch {
+    return false
   }
 }
 const DEFAULT_REMOTE = '/'
@@ -53,6 +63,7 @@ export function SftpView({
   /** Bumps when any transfer completes, so the destination pane re-reads. */
   transferTick: number
 }) {
+  const { confirm, alert, prompt } = useDialogs()
   const [ratio, setRatio] = useState(0.5)
   const [focus, setFocus] = useState<PaneSide>('local')
   const [localPath, setLocalPath] = useState(savedPaths?.local || defaultLocal())
@@ -106,7 +117,7 @@ export function SftpView({
   const runOp = (side: PaneSide, op: Promise<unknown>) => {
     void op
       .then(() => bump(side))
-      .catch((e) => window.alert(e instanceof Error ? e.message : String(e)))
+      .catch((e) => void alert(e instanceof Error ? e.message : String(e)))
   }
 
   const openRowMenu = (side: PaneSide) => (entry: FileEntry, x: number, y: number) => {
@@ -124,11 +135,11 @@ export function SftpView({
         {
           label: 'Rename…',
           dividerBefore: true,
-          onSelect: () => {
-            const next = window.prompt('New name', entry.name)?.trim()
+          onSelect: async () => {
+            const next = (await prompt('New name', { title: 'Rename', defaultValue: entry.name }))?.trim()
             if (!next || next === entry.name) return
             if (/[\\/]/.test(next)) {
-              window.alert('Names cannot contain slashes.')
+              void alert('Names cannot contain slashes.')
               return
             }
             const to = joinPath(side, base, next)
@@ -138,11 +149,11 @@ export function SftpView({
         },
         {
           label: 'New folder here…',
-          onSelect: () => {
-            const name = window.prompt('Folder name')?.trim()
+          onSelect: async () => {
+            const name = (await prompt('Folder name', { title: 'New folder' }))?.trim()
             if (!name) return
             if (/[\\/]/.test(name)) {
-              window.alert('Names cannot contain slashes.')
+              void alert('Names cannot contain slashes.')
               return
             }
             const target = joinPath(side, base, name)
@@ -162,11 +173,17 @@ export function SftpView({
             // Non-recursive by design: rm -rf from a GUI click is how
             // production directories die. Non-empty folders fail server-side
             // and the error is shown.
-            if (!window.confirm(`Delete ${entry.name}? This cannot be undone.`)) return
-            runOp(side, safeInvoke(side === 'local' ? 'local_delete' : 'sftp_delete',
-              side === 'local'
-                ? { path: full, isDir }
-                : { sessionId: session.id, path: full, isDir }))
+            void confirm(`Delete ${entry.name}? This cannot be undone.`, {
+              title: 'Delete',
+              confirmLabel: 'Delete',
+              danger: true,
+            }).then((ok) => {
+              if (!ok) return
+              runOp(side, safeInvoke(side === 'local' ? 'local_delete' : 'sftp_delete',
+                side === 'local'
+                  ? { path: full, isDir }
+                  : { sessionId: session.id, path: full, isDir }))
+            })
           },
         },
       ],
@@ -194,6 +211,14 @@ export function SftpView({
     const onMove = (e: PointerEvent) => {
       const d = dragRef.current
       if (!d) return
+      // No button held: the press that armed this drag ended somewhere we did
+      // not see. Never let plain hovering activate it.
+      if ((e.buttons & 1) === 0) {
+        document.body.classList.remove('skiff-dragging')
+        setDrag(null)
+        setHoverTarget(null)
+        return
+      }
       const dist = Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y)
       if (!d.active && dist <= 6) return
       e.preventDefault()
@@ -222,13 +247,34 @@ export function SftpView({
       if (target && target !== d.from) start(d.from, d.names)
     }
 
+    // The pointer stream can end WITHOUT a pointerup — a native text drag of
+    // the selectable filename, an OS gesture, the window losing focus. Abandon
+    // the drag then (never transfer), or it stays armed and the next unrelated
+    // click over the other pane would start a transfer.
+    const abandon = () => {
+      document.body.classList.remove('skiff-dragging')
+      setDrag(null)
+      setHoverTarget(null)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && dragRef.current) abandon()
+    }
+
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', abandon)
+    window.addEventListener('blur', abandon)
+    window.addEventListener('dragstart', abandon)
+    window.addEventListener('keydown', onKey)
     return () => {
       // Covers unmount mid-drag too, so the class can never stick.
       document.body.classList.remove('skiff-dragging')
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', abandon)
+      window.removeEventListener('blur', abandon)
+      window.removeEventListener('dragstart', abandon)
+      window.removeEventListener('keydown', onKey)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drag !== null])
@@ -268,16 +314,22 @@ export function SftpView({
   ) => {
     // A download turns a server-chosen name into a LOCAL path. Reject any name
     // that is not a plain component — EITHER separator (`\` is the traversal
-    // char on the Windows local side), `.`/`..`, or a drive-letter `:` — so a
-    // malicious server cannot write outside the target folder. The backend
-    // enforces this too; this is the friendly front-line message. Uploads are
-    // safe (remote is the server's own fs) but guarding both keeps the rule
-    // simple.
+    // char on the Windows local side) or `.`/`..` — so a malicious server
+    // cannot write outside the target folder. The backend enforces this too;
+    // this is the friendly front-line message. ':' (drive letter / ADS) is a
+    // hazard only for a download onto a Windows machine: on macOS/Linux it is
+    // an ordinary name character (timestamped logs), and an upload's name
+    // becomes a remote POSIX component.
+    const colonUnsafe = direction === 'download' && localIsWindows()
     const unsafe = jobs.filter(
-      (j) => /[\\/]/.test(j.name) || j.name === '.' || j.name === '..' || j.name.includes(':'),
+      (j) =>
+        /[\\/]/.test(j.name) ||
+        j.name === '.' ||
+        j.name === '..' ||
+        (colonUnsafe && j.name.includes(':')),
     )
     if (unsafe.length > 0) {
-      window.alert(`Refusing unsafe name(s): ${unsafe.map((j) => j.name).join(', ')}`)
+      void alert(`Refusing unsafe name(s): ${unsafe.map((j) => j.name).join(', ')}`)
       jobs = jobs.filter((j) => !unsafe.includes(j))
       if (jobs.length === 0) return
     }
@@ -302,7 +354,14 @@ export function SftpView({
       } catch {
         exists = false
       }
-      if (exists && !window.confirm(`${job.name} already exists at the destination. Overwrite it?`)) {
+      if (
+        exists &&
+        !(await confirm(`${job.name} already exists at the destination. Overwrite it?`, {
+          title: 'Overwrite?',
+          confirmLabel: 'Overwrite',
+          danger: true,
+        }))
+      ) {
         continue
       }
       kept.push(job)

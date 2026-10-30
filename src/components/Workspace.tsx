@@ -1,6 +1,7 @@
-import { Columns2, FolderTree, Radio, Rows2, ServerOff, SquareTerminal, Unlink } from 'lucide-react'
+import { FolderTree, Radio, ServerOff, SplitSquareHorizontal, SplitSquareVertical, SquareTerminal, Unlink } from 'lucide-react'
 import type { Session, WorkspaceView } from '../types'
-import { TerminalDeck, type SplitOrientation } from './TerminalDeck'
+import { TerminalDeck } from './TerminalDeck'
+import type { LayoutNode, SplitDir } from '../lib/paneLayout'
 import { SftpView } from './SftpView'
 
 interface Props {
@@ -9,16 +10,18 @@ interface Props {
   session?: Session
   onChangeView: (view: WorkspaceView) => void
   onSize?: (sessionId: string, cols: number, rows: number) => void
-  /** Sessions sharing the active session's group, left to right. */
+  /** Sessions sharing the active session's group. */
   groupSessions: Session[]
   onFocusSession: (sessionId: string) => void
-  onSplit: () => void
+  /** Split the focused pane in the given direction, opening a new session. */
+  onSplit: (dir: SplitDir) => void
   onSeparate: (sessionId: string) => void
-  orientation: SplitOrientation
-  onToggleOrientation: () => void
-  paneSizes: Record<string, number>
-  onPaneResize: (sessionId: string, deltaPx: number, containerPx: number) => void
-  onResetPaneSizes: () => void
+  /** Close a single pane (session) within a split. */
+  onClosePane: (sessionId: string) => void
+  /** The active group's layout tree (null while the SFTP lens is up). */
+  layout: LayoutNode | null
+  onResizeSplit: (splitId: string, ratioDelta: number) => void
+  onResetSplit: (splitId: string) => void
   onStartTransfer: (
     sessionId: string,
     direction: 'upload' | 'download',
@@ -39,7 +42,7 @@ interface Props {
 
 export function Workspace({
   sessions, session, onChangeView, onSize, groupSessions, onFocusSession, onSplit, onSeparate,
-  orientation, onToggleOrientation, paneSizes, onPaneResize, onResetPaneSizes,
+  onClosePane, layout, onResizeSplit, onResetSplit,
   onStartTransfer, sftpPaths, onSftpPathsChange, transferTick, accentHex, broadcast, broadcastExcluded, onToggleBroadcast,
 }: Props) {
   if (!session || sessions.length === 0) return <EmptyState />
@@ -78,59 +81,54 @@ export function Workspace({
         <div className="ml-auto flex items-center gap-1">
           {session.view === 'terminal' && (
             <>
+              {/* Split stays labeled (discoverable) and shrink-0 so it can never
+                  be squeezed out of the toolbar when the pane actions appear. */}
               <button
                 type="button"
-                onClick={onSplit}
-                title="Open a second session to this host, side by side"
-                className="flex h-[22px] items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
+                onClick={() => onSplit('row')}
+                title="Split the focused pane — new session to the right"
+                className="flex h-[22px] shrink-0 items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
               >
-                <Columns2 size={12} aria-hidden />
-                Split
+                <SplitSquareHorizontal size={12} aria-hidden />
+                Split right
               </button>
-              {groupSessions.length > 1 && (
-                <button
-                  type="button"
-                  onClick={onToggleOrientation}
-                  title={
-                    orientation === 'columns'
-                      ? 'Stack panes top and bottom'
-                      : 'Place panes side by side'
-                  }
-                  className="flex h-[22px] items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
-                >
-                  {orientation === 'columns' ? (
-                    <Rows2 size={12} aria-hidden />
-                  ) : (
-                    <Columns2 size={12} aria-hidden />
-                  )}
-                  {orientation === 'columns' ? 'Stack' : 'Side by side'}
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => onSplit('col')}
+                title="Split the focused pane — new session below"
+                className="flex h-[22px] shrink-0 items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
+              >
+                <SplitSquareVertical size={12} aria-hidden />
+                Split down
+              </button>
+              {/* Broadcast + Separate are icon-only: they only appear at 2+ panes,
+                  which is exactly when the toolbar would otherwise overflow and
+                  push the Split buttons off-screen. */}
               {groupSessions.length > 1 && (
                 <button
                   type="button"
                   onClick={onToggleBroadcast}
                   aria-pressed={broadcast}
-                  title="Type once, send to every pane in this tab"
-                  className={`flex h-[22px] items-center gap-1 rounded border px-1.5 text-[11.5px] transition-colors ${
+                  aria-label="Broadcast input to all panes"
+                  title={broadcast ? 'Broadcasting — input goes to every pane' : 'Broadcast input to every pane in this tab'}
+                  className={`grid h-[22px] w-[22px] shrink-0 place-items-center rounded border transition-colors ${
                     broadcast
                       ? 'border-warn/60 bg-warn/15 text-warn'
                       : 'border-line text-ink-dim hover:bg-surface-3 hover:text-ink'
                   }`}
                 >
-                  <Radio size={12} aria-hidden />
-                  {broadcast ? 'Broadcasting' : 'Broadcast'}
+                  <Radio size={13} aria-hidden />
                 </button>
               )}
               {groupSessions.length > 1 && (
                 <button
                   type="button"
                   onClick={() => onSeparate(session.id)}
+                  aria-label="Separate this pane into its own tab"
                   title="Move this pane out into its own tab"
-                  className="flex h-[22px] items-center gap-1 rounded border border-line px-1.5 text-[11.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
+                  className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded border border-line text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
                 >
-                  <Unlink size={12} aria-hidden />
-                  Separate
+                  <Unlink size={13} aria-hidden />
                 </button>
               )}
             </>
@@ -146,16 +144,13 @@ export function Workspace({
       <div className="relative min-h-0 flex-1">
         <TerminalDeck
           sessions={sessions}
-          visibleIds={
-            session.view === 'terminal' ? groupSessions.map((g) => g.id) : []
-          }
+          layout={session.view === 'terminal' ? layout : null}
           focusedId={session.id}
-          orientation={orientation}
-          sizes={paneSizes}
           broadcast={broadcast}
           broadcastExcluded={broadcastExcluded}
-          onResize={onPaneResize}
-          onResetSizes={onResetPaneSizes}
+          onResizeSplit={onResizeSplit}
+          onResetSplit={onResetSplit}
+          onClosePane={onClosePane}
           onFocus={onFocusSession}
           onSize={onSize}
         />

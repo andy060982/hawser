@@ -13,6 +13,9 @@ interface AuthPromptRequest {
   name: string
   instruction: string
   prompts: AuthPromptField[]
+  /** When true, offer a "save to the OS vault" checkbox (up-front password
+   *  prompt only — never for a single-use server challenge). */
+  offerSave?: boolean
 }
 
 /* ---------------------------------------------------------------------------
@@ -22,10 +25,11 @@ interface AuthPromptRequest {
    oneshot while this is open, so submitting is what unblocks the handshake, and
    the 120s backend timeout is why it can't hang open forever.
 
-   Only ECHO (visible) prompts ever reach here — a hidden "Password:" prompt is
-   answered with the stored password entirely in the backend, so the password
-   never crosses IPC. The user types only the live challenge (a token code, an
-   SMS/TOTP one-time code, a security answer).
+   The prompt that asks for the password is answered with the stored password
+   entirely in the backend, so the password never crosses IPC. The user types
+   only the live challenge (a token code, an SMS/TOTP one-time code, a security
+   answer); a challenge the server marked no-echo (PAM's hidden "Verification
+   code:") is masked.
 
    Cancel is the safe default (focus goes to the first field, Escape cancels the
    whole connection) — an unattended dialog must not silently accept anything.
@@ -37,26 +41,35 @@ export function AuthPromptDialog() {
   // bug HostKeyDialog avoids). Show the head; reveal the next after answering.
   const [queue, setQueue] = useState<AuthPromptRequest[]>([])
   const [answers, setAnswers] = useState<string[]>([])
+  const [save, setSave] = useState(false)
   const [busy, setBusy] = useState(false)
   const firstRef = useRef<HTMLInputElement>(null)
 
   const request = queue[0] ?? null
 
   useEffect(() => {
-    let un: (() => void) | null = null
+    const uns: (() => void)[] = []
     let dead = false
+    const add = (p: Promise<() => void>) =>
+      void p.then((fn) => (dead ? fn() : uns.push(fn)))
 
-    void safeListen<AuthPromptRequest>('ssh://auth-prompt', (payload) => {
-      // Append, de-duping by requestId so a re-emit can't enqueue twice.
-      setQueue((q) => (q.some((r) => r.requestId === payload.requestId) ? q : [...q, payload]))
-    }).then((fn) => {
-      if (dead) fn()
-      else un = fn
-    })
+    add(
+      safeListen<AuthPromptRequest>('ssh://auth-prompt', (payload) => {
+        // Append, de-duping by requestId so a re-emit can't enqueue twice.
+        setQueue((q) => (q.some((r) => r.requestId === payload.requestId) ? q : [...q, payload]))
+      }),
+    )
+    // The backend gave up on a prompt (120s timeout, or its tab was closed):
+    // drop it so stale questions do not queue in front of live ones.
+    add(
+      safeListen<{ requestId: string }>('ssh://prompt-closed', ({ requestId }) => {
+        setQueue((q) => q.filter((r) => r.requestId !== requestId))
+      }),
+    )
 
     return () => {
       dead = true
-      un?.()
+      uns.forEach((fn) => fn())
     }
   }, [])
 
@@ -64,6 +77,7 @@ export function AuthPromptDialog() {
   useEffect(() => {
     if (!request) return
     setAnswers(request.prompts.map(() => ''))
+    setSave(false)
     setBusy(false)
     firstRef.current?.focus()
 
@@ -83,7 +97,12 @@ export function AuthPromptDialog() {
   async function submit(vals: string[]) {
     if (!request) return
     setBusy(true)
-    await safeInvoke('auth_prompt_respond', { requestId: request.requestId, answers: vals })
+    await safeInvoke('auth_prompt_respond', {
+      requestId: request.requestId,
+      answers: vals,
+      // Only meaningful when the save checkbox was offered; harmless otherwise.
+      save: request.offerSave ? save : false,
+    })
     // Drop THIS prompt (by id) so the next queued challenge shows.
     setQueue((q) => q.filter((r) => r.requestId !== request.requestId))
   }
@@ -159,6 +178,18 @@ export function AuthPromptDialog() {
             </label>
           ))}
         </div>
+
+        {request.offerSave && (
+          <label className="mx-5 mt-3 flex cursor-pointer items-center gap-2 text-[12.5px] text-ink-dim">
+            <input
+              type="checkbox"
+              checked={save}
+              onChange={(e) => setSave(e.target.checked)}
+              className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+            />
+            Save this password to your OS keychain
+          </label>
+        )}
 
         <footer className="mt-4 flex justify-end gap-2 border-t border-line bg-surface-1 px-5 py-3">
           <button

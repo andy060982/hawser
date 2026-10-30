@@ -57,27 +57,6 @@ pub fn restrict_perms(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 pub fn restrict_perms(_path: &Path, _mode: u32) {}
 
-/// Create (or truncate) a file **owner-only and then write** `contents`, in one
-/// step, so it is never briefly group/world-readable in the window between a
-/// plain create and a later chmod. On Unix the `0600` mode is applied at
-/// `open` time via `O_CREAT` mode bits; on other platforms this is a plain
-/// create+write (the per-user profile already restricts access there).
-pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    // Belt-and-suspenders for the rare pre-existing file: the mode above only
-    // applies on creation, so tighten an existing one too.
-    restrict_perms(path, 0o600);
-    f.write_all(contents)
-}
-
 /// The current user's home directory, resolved through the platform's own
 /// environment variable (`USERPROFILE` on Windows, `HOME` on macOS/Linux).
 /// Keeping this in one place stops Windows-only assumptions (`USERPROFILE`)

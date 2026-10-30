@@ -9,6 +9,7 @@ import { safeInvoke, safeListen } from '../lib/tauri'
 import { transfer as runTransfer } from '../lib/sftp'
 import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { policyFor, useSettings } from '../lib/settings'
+import { useDialogs } from '../lib/dialogs'
 import { isDangerousCommand } from '../lib/dangerous'
 import { clearLocal, emitLocal } from '../lib/localTerm'
 import { TitleBar } from './TitleBar'
@@ -16,7 +17,15 @@ import { HostSidebar } from './HostSidebar'
 import { ResizeHandle } from './ResizeHandle'
 import { SessionTabs } from './SessionTabs'
 import { Workspace } from './Workspace'
-import type { SplitOrientation } from './TerminalDeck'
+import {
+  findRatio,
+  leaf,
+  reconcile,
+  setRatio,
+  splitLeaf,
+  type LayoutNode,
+  type SplitDir,
+} from '../lib/paneLayout'
 import { StatusBar } from './StatusBar'
 import { HostKeyDialog } from './HostKeyDialog'
 import { AuthPromptDialog } from './AuthPromptDialog'
@@ -64,6 +73,14 @@ import { QuickConnect } from './QuickConnect'
    into Zustand and keep this component purely compositional.
 --------------------------------------------------------------------------- */
 
+/** A session id embedding a host id. Tauri event names allow only
+ *  alphanumerics and - / : _, and the id becomes the `ssh://<id>` output topic,
+ *  so an imported host id like `core.sw1` or `fw 01` would otherwise leave the
+ *  pane silently blank. */
+function sessionIdFor(hostId: string, ...suffix: (string | number)[]): string {
+  return ['s', hostId.replace(/[^A-Za-z0-9_-]/g, '_'), ...suffix].join('-')
+}
+
 const SIDEBAR_MIN = 180
 const SIDEBAR_MAX = 460
 const SIDEBAR_DEFAULT = 260
@@ -91,16 +108,19 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [menu, setMenu] = useState<MenuState | null>(null)
   /** Guards the first render from writing the seed back over a real file. */
   const loadedRef = useRef(false)
+  /** State twin of loadedRef, so the session-restore effect can wait for the
+   *  real catalogue instead of running against the seed. */
+  const [catalogueLoaded, setCatalogueLoaded] = useState(false)
   const [sessions, setSessions] = useState<Session[]>(initialSessions)
   const [activeId, setActiveId] = useState<string | null>(
     initialSessions[0]?.id ?? null,
   )
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
   const [sizes, setSizes] = useState<Record<string, { cols: number; rows: number }>>({})
-  /** Split direction per group, and flex-grow per pane. Kept here rather than
-   *  in the deck so it survives tab switches and view toggles. */
-  const [orientations, setOrientations] = useState<Record<string, SplitOrientation>>({})
-  const [paneSizes, setPaneSizes] = useState<Record<string, number>>({})
+  /** The pane layout tree per group (tab). Kept here rather than in the deck so
+   *  it survives tab switches and view toggles, and reconciled against the live
+   *  session set below so a closed or separated pane leaves the tree cleanly. */
+  const [layouts, setLayouts] = useState<Record<string, LayoutNode>>({})
   /** Last local/remote path per session, so switching to the terminal and
    *  back does not reset the file panes to root. */
   const [sftpPaths, setSftpPaths] = useState<Record<string, { local?: string; remote?: string }>>({})
@@ -121,6 +141,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const { settings } = useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
+  const { confirm, alert, prompt } = useDialogs()
   const sizesRef = useRef<Record<string, { cols: number; rows: number }>>({})
   sizesRef.current = sizes
   /** Sessions whose PTY has not been requested yet, keyed by session id.
@@ -128,6 +149,15 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const pendingRef = useRef<
     Map<string, { host: Host; paneIndex: number; oneShotPassword?: string | null }>
   >(new Map())
+  /** Quick-connect hosts, which never enter the catalogue, keyed by host id —
+   *  so a quick-connect tab can still be reconnected or split. Never holds the
+   *  one-shot password; a reconnect asks for it again. */
+  const ephemeralHostsRef = useRef<Map<string, Host>>(new Map())
+  /** Catalogue lookup that also knows quick-connect hosts. */
+  const lookupHost = useCallback(
+    (hostId: string) => findHost(hostsRef.current, hostId) ?? ephemeralHostsRef.current.get(hostId),
+    [],
+  )
   /** Hidden <input type=file> that backs "Import hosts". A file input is the
    *  one file-picking primitive the webview gives us without a dialog plugin,
    *  and reading is all import needs. */
@@ -168,18 +198,24 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   useEffect(() => {
     void safeInvoke<HostNode[] | null>('hosts_load')
       .then((tree) => {
-        if (Array.isArray(tree) && tree.length > 0) setHosts(tree)
+        // An EMPTY saved list is the user's choice (they deleted every host),
+        // not a first run — only a missing file seeds the demo catalogue.
+        if (Array.isArray(tree)) setHosts(tree)
         else void safeInvoke('hosts_save', { tree: seedHosts })
       })
       .finally(() => {
         loadedRef.current = true
+        setCatalogueLoaded(true)
       })
   }, [seedHosts])
 
-  /* Reopen last session's tabs once the catalogue is in memory. Runs once. */
+  /* Reopen last session's tabs once the REAL catalogue is in memory. Runs
+     once. Gated on the load finishing, not on hosts being non-empty: the seed
+     is non-empty too, and restoring against it dropped every real host's tab
+     (and the next save then overwrote sessions.json). */
   const restoredRef = useRef(false)
   useEffect(() => {
-    if (restoredRef.current || hosts.length === 0) return
+    if (restoredRef.current || !catalogueLoaded) return
     restoredRef.current = true
 
     void safeInvoke<
@@ -187,14 +223,14 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     >('sessions_load').then((list) => {
       if (!Array.isArray(list)) return
       list.forEach((entry, i) => {
-        const host = findHost(hosts, entry.hostId)
+        const host = findHost(hostsRef.current, entry.hostId)
         if (!host) return
         // Restore DORMANT, not connected. Auto-dialling on launch would open SSH
         // sessions to production firewalls the moment the app starts, before the
         // user has decided to touch anything — a bad default for live gear. The
         // tab comes back; the user clicks Reconnect when ready. `-${i}` keeps
         // ids unique when several restore in the same millisecond.
-        const sid = `s-${host.id}-${Date.now()}-${i}`
+        const sid = sessionIdFor(host.id, Date.now(), i)
         const session: Session = {
           id: sid,
           hostId: host.id,
@@ -212,9 +248,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         )
       })
     })
-    // openHost/findHost are stable; hosts is the trigger.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hosts])
+  }, [catalogueLoaded])
 
   const persistHosts = useCallback((next: HostNode[]) => {
     setHosts(next)
@@ -233,9 +267,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
 
     add(
       safeListen<TransferProgressEvent>('sftp://progress', (p) => {
+        // Matched on the transfer ROOT: a folder transfer's per-file events
+        // carry the child's path in filePath, which never equals the row.
+        const root = p.root ?? p.filePath
         setTransfers((list) =>
           list.map((t) =>
-            t.sessionId === p.sessionId && t.path === p.filePath && t.status === 'active'
+            t.sessionId === p.sessionId && t.path === root && t.status === 'active'
               ? { ...t, bytesDone: p.bytesTransferred, bytesTotal: p.totalBytes }
               : t,
           ),
@@ -362,7 +399,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  transcript logs showed was going wrong: every return trip to a host was
    *  silently creating a second connection and a second log file, while the
    *  original tab sat untouched further along the strip. */
-  const openHost = useCallback((host: Host, force = false, restoredPane?: number) => {
+  const openHost = useCallback(async (host: Host, force = false, restoredPane?: number) => {
     if (!force) {
       const existing = sessionsRef.current.find(
         (s) => s.hostId === host.id && s.status !== 'disconnected' && s.status !== 'error',
@@ -376,11 +413,14 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // Colour policy: prompt before dialing a host whose colour (own or
     // inherited from its folder) is configured to confirm on connect.
     const policy = policyFor(settingsRef.current, effectiveHostColor(hostsRef.current, host.id))
-    if (policy.confirmConnect && !window.confirm(`Connect to ${host.name} (${host.hostname})?`)) {
+    if (
+      policy.confirmConnect &&
+      !(await confirm(`Connect to ${host.name} (${host.hostname})?`, { title: 'Connect', confirmLabel: 'Connect' }))
+    ) {
       return
     }
 
-    const sid = `s-${host.id}-${Date.now()}`
+    const sid = sessionIdFor(host.id, Date.now())
     const session: Session = {
       id: sid,
       hostId: host.id,
@@ -428,7 +468,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     window.setTimeout(() => {
       if (pendingRef.current.has(session.id)) connectPending(session.id, 80, 24)
     }, 1500)
-  }, [nextPaneIndex])
+  }, [nextPaneIndex, confirm])
 
   /** Performs the deferred connect once a real terminal size is known. */
   const connectPending = useCallback((sessionId: string, cols: number, rows: number) => {
@@ -459,7 +499,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         const j = findHost(hostsRef.current, host.jumpHostId)
         if (!j) return null
         return {
-          hostId: j.id,
+          // Same vault-key rule as the target: a bastion that borrows another
+          // host's credential reads THAT entry.
+          hostId: j.credentialId ?? j.id,
           host: j.hostname,
           port: j.port,
           username: j.username,
@@ -468,12 +510,24 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         }
       })(),
     })
-      .then(() =>
+      .then(() => {
+        // The tab was closed while the connect was in flight: the backend has
+        // just registered a session nothing owns, so tear it down.
+        if (!sessionsRef.current.some((s) => s.id === sessionId)) {
+          void safeInvoke('ssh_disconnect', { sessionId })
+          return
+        }
+        // Promote only from 'connecting': a shell that closed at once may
+        // already have reported 'disconnected', which must not be overwritten.
         setSessions((prev) =>
-          prev.map((s) => (s.id === sessionId ? { ...s, status: 'connected' } : s)),
-        ),
-      )
+          prev.map((s) =>
+            s.id === sessionId && s.status === 'connecting' ? { ...s, status: 'connected' } : s,
+          ),
+        )
+      })
       .catch((e: unknown) => {
+        // A tab closed mid-connect fails here as "cancelled"; nothing to show.
+        if (!sessionsRef.current.some((s) => s.id === sessionId)) return
         setSessions((prev) =>
           prev.map((s) => (s.id === sessionId ? { ...s, status: 'error' } : s)),
         )
@@ -494,7 +548,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const reconnectSession = useCallback((sessionId: string) => {
     const s = sessionsRef.current.find((x) => x.id === sessionId)
     if (!s || s.status === 'connected' || s.status === 'connecting') return
-    const host = findHost(hostsRef.current, s.hostId)
+    const host = lookupHost(s.hostId)
     if (!host) {
       // The saved host was deleted while this tab sat disconnected. Say so —
       // a button that silently does nothing reads as a broken button.
@@ -513,7 +567,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     pendingRef.current.set(sessionId, { host, paneIndex: s.paneIndex })
     const sz = sizesRef.current[sessionId]
     connectPending(sessionId, sz?.cols ?? 80, sz?.rows ?? 24)
-  }, [connectPending])
+  }, [connectPending, lookupHost])
 
   const saveHost = useCallback(
     (host: Host) => persistHosts(upsertHost(hosts, host)),
@@ -521,12 +575,20 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   )
 
   const deleteHost = useCallback(
-    (hostId: string) => persistHosts(removeHost(hosts, hostId)),
+    (hostId: string) => {
+      const next = removeHost(hosts, hostId)
+      persistHosts(next)
+      // Remove its saved password (and binding) from the OS vault too — unless
+      // another host still borrows that entry via credentialId.
+      if (!allHosts(next).some((h) => h.credentialId === hostId)) {
+        void safeInvoke('credential_delete', { hostId }).catch(() => {})
+      }
+    },
     [hosts, persistHosts],
   )
 
   /** Closes a whole tab: every pane in that session's group. */
-  const closeSession = useCallback((id: string) => {
+  const closeSession = useCallback(async (id: string) => {
     // Confirm-close guard: if the setting is on and any pane in this tab is
     // still connected, make the user acknowledge before tearing it down.
     if (settingsRef.current.confirmCloseActive) {
@@ -535,7 +597,16 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       const live = cur
         .filter((s) => (t ? s.groupId === t.groupId : s.id === id))
         .some((s) => s.status === 'connected' || s.status === 'connecting')
-      if (live && !window.confirm('This tab has a live connection. Close it?')) return
+      if (
+        live &&
+        !(await confirm('This tab has a live connection. Close it?', {
+          title: 'Close tab',
+          confirmLabel: 'Close',
+          danger: true,
+        }))
+      ) {
+        return
+      }
     }
     setSessions((prev) => {
       const target = prev.find((s) => s.id === id)
@@ -544,6 +615,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       )
       doomed.forEach((d) => {
         clearLocal(d)
+        // Disarm a connect that has not dialled yet, or its fallback timer
+        // would open a shell for a tab that no longer exists.
+        pendingRef.current.delete(d)
         void safeInvoke('ssh_disconnect', { sessionId: d })
       })
       const next = prev.filter((s) => !doomed.has(s.id))
@@ -555,7 +629,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       })
       return next
     })
-  }, [])
+  }, [confirm])
 
   const setView = useCallback(
     (view: WorkspaceView) =>
@@ -622,18 +696,39 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     return [...byGroup.entries()].map(([id, list]) => ({ id, sessions: list }))
   }, [sessions])
 
+  /* Keep the layout trees in step with the live sessions. A directional split
+   *  writes the tree precisely (see splitSession); everything else — a restored
+   *  tab, a closed pane, a pane separated into its own tab — only changes the
+   *  session set, and this reconciliation folds those in: it drops leaves whose
+   *  session is gone and appends any session that has no leaf yet. reconcile
+   *  returns the same reference when nothing changed, so this cannot loop. */
+  useEffect(() => {
+    setLayouts((prev) => {
+      const next: Record<string, LayoutNode> = {}
+      let changed = false
+      for (const g of groups) {
+        const tree = reconcile(prev[g.id], g.sessions.map((s) => s.id))
+        if (tree) next[g.id] = tree
+        if (tree !== prev[g.id]) changed = true
+      }
+      // A group that lost all its sessions drops out of `next` entirely.
+      if (Object.keys(prev).length !== Object.keys(next).length) changed = true
+      return changed ? next : prev
+    })
+  }, [groups])
+
   /** Open another session to a given session's host, in that session's tab.
    *
    *  Takes the target session id explicitly rather than reading `active`: the
    *  tab context menu fires this for the tab under the cursor, which need not
    *  be the focused one — and a stale closure over `active` was exactly the
    *  bug that made right-click Split act on the wrong tab. */
-  const splitSession = useCallback((sessionId: string) => {
+  const splitSession = useCallback((sessionId: string, dir: SplitDir = 'row') => {
     const target = sessionsRef.current.find((t) => t.id === sessionId)
     if (!target) return
-    const host = findHost(hostsRef.current, target.hostId)
+    const host = lookupHost(target.hostId)
     if (!host) return
-    const sid = `s-${host.id}-${Date.now()}`
+    const sid = sessionIdFor(host.id, Date.now())
     const session: Session = {
       id: sid,
       hostId: host.id,
@@ -644,24 +739,40 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       view: 'terminal',
     }
     setSessions((prev) => [...prev, session])
+    // Place the new pane by splitting the focused one, so the split lands exactly
+    // where the user is looking rather than tacking on at the end. Reconciliation
+    // then sees the leaf already present and leaves it alone.
+    setLayouts((prev) => {
+      const base = prev[target.groupId] ?? leaf(target.id)
+      return { ...prev, [target.groupId]: splitLeaf(base, target.id, sid, dir) }
+    })
     setActiveId(sid)
     pendingRef.current.set(sid, { host, paneIndex: session.paneIndex })
     window.setTimeout(() => {
       if (pendingRef.current.has(sid)) connectPending(sid, 80, 24)
     }, 1500)
-  }, [connectPending, nextPaneIndex])
+  }, [connectPending, nextPaneIndex, lookupHost])
 
-  const splitActive = useCallback(() => {
-    if (activeId) splitSession(activeId)
+  const splitActive = useCallback((dir: SplitDir) => {
+    if (activeId) splitSession(activeId, dir)
   }, [activeId, splitSession])
 
   /** Send a snippet to the focused pane, as if typed. */
-  const sendSnippet = useCallback((sessionId: string, command: string, autoRun: boolean) => {
+  const sendSnippet = useCallback(async (sessionId: string, command: string, autoRun: boolean) => {
     // Dangerous-command guard: a snippet carries a full command, so we can
     // check it before it hits the wire (unlike live keystrokes).
     if (settingsRef.current.dangerousGuard) {
       const reason = isDangerousCommand(command)
-      if (reason && !window.confirm(`This snippet looks destructive (${reason}). Send it?`)) return
+      if (
+        reason &&
+        !(await confirm(`This snippet looks destructive (${reason}). Send it?`, {
+          title: 'Destructive snippet',
+          confirmLabel: 'Send',
+          danger: true,
+        }))
+      ) {
+        return
+      }
     }
     const text = autoRun ? `${command}
 ` : command
@@ -670,7 +781,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       const msg = e instanceof Error ? e.message : String(e)
       emitLocal(sessionId, `\r\n\x1b[38;2;242;178;92m● snippet not sent\x1b[0m ${msg}\r\n`)
     })
-  }, [])
+  }, [confirm])
 
   /** Quick connect: an ephemeral host, never saved, password (if any) used
    *  once. The session looks like any other; the catalogue never learns. */
@@ -698,6 +809,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       }
       setSessions((prev) => [...prev, session])
       setActiveId(sid)
+      ephemeralHostsRef.current.set(host.id, host)
       pendingRef.current.set(sid, { host, paneIndex: 1, oneShotPassword: password })
       window.setTimeout(() => {
         if (pendingRef.current.has(sid)) connectPending(sid, 80, 24)
@@ -715,17 +827,22 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       const targets = allHosts(hostsRef.current).map(
         (h) => [h.id, h.hostname, h.port] as [string, string, number],
       )
+      // One out-of-range port (hand-edited hosts.json) would fail the whole
+      // u16 deserialisation and leave every host without a result; skip it.
+      const valid = targets.filter(([, , p]) => Number.isInteger(p) && p >= 1 && p <= 65535)
       const results = await safeInvoke<{ id: string; reachable: boolean; ms?: number }[]>(
         'hosts_probe',
-        { targets },
+        { targets: valid },
       )
       const map: Record<string, { ok: boolean; ms?: number }> = {}
       for (const r of results ?? []) map[r.id] = { ok: r.reachable, ms: r.ms }
       setReachability(map)
+    } catch (e) {
+      void alert(`Reachability check failed: ${e instanceof Error ? e.message : e}`)
     } finally {
       setProbing(false)
     }
-  }, [])
+  }, [alert])
 
   /** Right-click on a host row in the sidebar. */
   const openHostMenu = useCallback((host: Host, x: number, y: number) => {
@@ -783,20 +900,23 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         // Deleting from a context menu must not be a single misclick on
         // something that also removes the stored password's referent.
         onSelect: () => {
-          if (window.confirm(`Delete "${host.name}"? Its saved password is kept in Credential Manager until removed there.`)) {
-            deleteHost(host.id)
-          }
+          void confirm(
+            `Delete "${host.name}"? Its saved password is removed from the OS keychain too, unless another host shares it.`,
+            { title: 'Delete host', confirmLabel: 'Delete', danger: true },
+          ).then((ok) => {
+            if (ok) deleteHost(host.id)
+          })
         },
       },
     ]
     setMenu({ x, y, items })
-  }, [openHost, deleteHost, persistHosts])
+  }, [openHost, deleteHost, persistHosts, confirm])
 
   /** Right-click on a tab in the strip. */
   const openTabMenu = useCallback((sessionId: string, x: number, y: number) => {
     const s = sessionsRef.current.find((t) => t.id === sessionId)
     if (!s) return
-    const host = findHost(hostsRef.current, s.hostId)
+    const host = lookupHost(s.hostId)
     const dead = s.status === 'disconnected' || s.status === 'error'
     const items: MenuItem[] = [
       {
@@ -811,8 +931,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       },
       {
         label: 'Rename tab…',
-        onSelect: () => {
-          const next = window.prompt('Tab name', s.title)
+        onSelect: async () => {
+          const next = await prompt('Tab name', { title: 'Rename tab', defaultValue: s.title })
           if (next === null) return
           const title = next.trim() || (host?.name ?? s.title)
           setSessions((prev) => prev.map((x) => (x.id === sessionId ? { ...x, title } : x)))
@@ -829,9 +949,11 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       {
         label: 'Capture command output…',
         disabled: dead || !host,
-        onSelect: () => {
-          const command = window.prompt(
-            'Command to run — its full output is saved to a file (e.g. show tech-support):',
+        onSelect: async () => {
+          const command = (
+            await prompt('Command to run — its full output is saved to a file (e.g. show tech-support):', {
+              title: 'Capture command output',
+            })
           )?.trim()
           if (!command || !host) return
           void safeInvoke<{ path: string; bytes: number; lines: number }>('capture_output', {
@@ -840,15 +962,15 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             command,
           })
             .then((r) => {
-              if (r) window.alert(`Saved ${r.lines} line(s), ${r.bytes} bytes to:\n${r.path}`)
+              if (r) void alert(`Saved ${r.lines} line(s), ${r.bytes} bytes to:\n${r.path}`)
             })
-            .catch((e) => window.alert(`Capture failed: ${e instanceof Error ? e.message : e}`))
+            .catch((e) => void alert(`Capture failed: ${e instanceof Error ? e.message : e}`))
         },
       },
       { label: 'Close tab', danger: true, dividerBefore: true, onSelect: () => closeSession(sessionId) },
     ]
     setMenu({ x, y, items })
-  }, [reconnectSession, splitSession, closeSession])
+  }, [reconnectSession, splitSession, closeSession, lookupHost])
 
   /** Right-click on a folder row in the sidebar. */
   const openFolderMenu = useCallback((folderId: string, name: string, x: number, y: number) => {
@@ -858,8 +980,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       items: [
         {
           label: 'Rename folder…',
-          onSelect: () => {
-            const next = window.prompt('Folder name', name)
+          onSelect: async () => {
+            const next = await prompt('Folder name', { title: 'Rename folder', defaultValue: name })
             if (next?.trim()) persistHosts(renameFolder(hostsRef.current, folderId, next.trim()))
           },
         },
@@ -901,8 +1023,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       { label: 'New host…', dividerBefore: true, onSelect: () => setEditing({ host: null }) },
       {
         label: 'New folder…',
-        onSelect: () => {
-          const name = window.prompt('Folder name')
+        onSelect: async () => {
+          const name = await prompt('Folder name', { title: 'New folder' })
           if (name?.trim()) persistHosts(addFolder(hostsRef.current, name.trim()))
         },
       },
@@ -913,13 +1035,13 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         onSelect: () =>
           void safeInvoke<string>('hosts_export')
             .then((p) => {
-              if (p) window.alert(`Host catalogue exported to:
+              if (p) void alert(`Host catalogue exported to:
 ${p}
 
 Passwords are NOT included — they stay in Windows Credential Manager.`)
             })
             .catch((err) =>
-              window.alert(`Export failed: ${err instanceof Error ? err.message : err}`),
+              void alert(`Export failed: ${err instanceof Error ? err.message : err}`),
             ),
       },
       {
@@ -947,8 +1069,8 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       { label: 'New Connection…', onSelect: () => setEditing({ host: null }) },
       {
         label: 'New Folder…',
-        onSelect: () => {
-          const name = window.prompt('Folder name')
+        onSelect: async () => {
+          const name = await prompt('Folder name', { title: 'New folder' })
           if (name?.trim()) persistHosts(addFolder(hostsRef.current, name.trim()))
         },
       },
@@ -956,16 +1078,49 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     setMenu({ x, y, items })
   }, [persistHosts])
 
-  /** Move a pane out of its group and into a tab of its own. */
+  /** Move a pane out of its group and into a tab of its own.
+   *
+   *  Uses a FRESH group id, not the session's own id: a tab's group id is its
+   *  first pane's id, so `groupId = s.id` would be a no-op for that anchor pane —
+   *  it would silently stay in the split. A unique id separates any pane. */
   const separateSession = useCallback((sessionId: string) => {
+    const newGid = `grp-${Date.now().toString(36)}-${sessionId}`
     setSessions((prev) =>
-      prev.map((s) => (s.id === sessionId ? { ...s, groupId: s.id } : s)),
+      prev.map((s) => (s.id === sessionId ? { ...s, groupId: newGid } : s)),
     )
     setActiveId(sessionId)
   }, [])
 
-  const orientation: SplitOrientation =
-    (active && orientations[active.groupId]) ?? 'columns'
+  /** Close a single pane (one session), leaving the rest of its tab to re-tile.
+   *  The tab-level closeSession still closes every pane at once.
+   *
+   *  No confirm here on purpose: closing one pane of a split is low-stakes and
+   *  instantly redone (reconnect), the way iTerm/VS Code close a pane without a
+   *  prompt — and it keeps this off the synchronous window.confirm path, which is
+   *  unreliable inside the webview. The whole-tab close keeps its guard. */
+  const closePane = useCallback((sessionId: string) => {
+    clearLocal(sessionId)
+    pendingRef.current.delete(sessionId)
+    void safeInvoke('ssh_disconnect', { sessionId })
+    setSessions((prev) => {
+      const closed = prev.find((s) => s.id === sessionId)
+      const next = prev.filter((s) => s.id !== sessionId)
+      setActiveId((cur) => {
+        if (cur && cur !== sessionId) return cur
+        // Prefer a sibling in the same tab, so closing a pane keeps you in that
+        // tab rather than jumping away; else fall back to any remaining session.
+        const sib = closed && next.find((s) => s.groupId === closed.groupId)
+        return (sib ?? next[next.length - 1])?.id ?? null
+      })
+      return next
+    })
+  }, [])
+
+  /** The active tab's layout tree. Falls back to a single leaf for the focused
+   *  session on the one frame before the reconcile effect has populated it. */
+  const activeLayout: LayoutNode | null = active
+    ? (layouts[active.groupId] ?? leaf(active.id))
+    : null
 
   /** Groups currently broadcasting input to all their panes. Cleared when a
    *  group drops to one pane, so a stale broadcast flag can't linger. */
@@ -982,6 +1137,19 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     return s
   }, [sessions, hosts, settings])
 
+  /* Make the comment above true: drop the flag for any group that no longer
+     exists or is down to one pane. Otherwise closing the second pane hides the
+     (still-on) toggle, and the next split silently mirrors keystrokes into the
+     new shell. Returns the same Set when nothing changes, so it cannot loop. */
+  useEffect(() => {
+    setBroadcastGroups((prev) => {
+      if (prev.size === 0) return prev
+      const counts = new Map(groups.map((g) => [g.id, g.sessions.length]))
+      const next = new Set([...prev].filter((gid) => (counts.get(gid) ?? 0) > 1))
+      return next.size === prev.size ? prev : next
+    })
+  }, [groups])
+
   const toggleBroadcast = useCallback(() => {
     if (!active) return
     setBroadcastGroups((prev) => {
@@ -991,53 +1159,39 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     })
   }, [active])
 
-  const toggleOrientation = useCallback(() => {
-    if (!active) return
-    setOrientations((prev) => ({
-      ...prev,
-      [active.groupId]: (prev[active.groupId] ?? 'columns') === 'columns' ? 'rows' : 'columns',
-    }))
-  }, [active])
-
-  /** Move space between the pane before a divider and the pane after it.
+  /** Move a divider: nudge one split's ratio by a fraction of its own extent.
    *
-   *  Works in flex-grow units rather than pixels so the split holds its
-   *  proportions when the window resizes — dragging to 70/30 and then
-   *  maximising should stay 70/30, not snap back. */
-  const resizePane = useCallback(
-    (sessionId: string, deltaPx: number, containerPx: number) => {
-      if (containerPx <= 0) return
-      const group = sessionsRef.current.filter(
-        (s) => s.groupId === sessionsRef.current.find((x) => x.id === sessionId)?.groupId,
-      )
-      const idx = group.findIndex((s) => s.id === sessionId)
-      if (idx <= 0) return
-      const prevId = group[idx - 1].id
-
-      setPaneSizes((cur) => {
-        const total = group.reduce((sum, s) => sum + (cur[s.id] ?? 1), 0)
-        const shift = (deltaPx / containerPx) * total
-        const a = (cur[prevId] ?? 1) + shift
-        const b = (cur[sessionId] ?? 1) - shift
-        // A pane that can collapse to nothing is a pane you cannot get back.
-        const MIN = 0.15
-        if (a < MIN || b < MIN) return cur
-        return { ...cur, [prevId]: a, [sessionId]: b }
+   *  The delta is already normalised to the split (dPx / extentPx in the deck),
+   *  so a split holds its proportions when the window resizes — dragging to
+   *  70/30 and then maximising stays 70/30 rather than snapping back. */
+  const resizeSplit = useCallback(
+    (splitId: string, ratioDelta: number) => {
+      if (!active) return
+      setLayouts((prev) => {
+        const tree = prev[active.groupId]
+        if (!tree || tree.t !== 'split') return prev
+        // Walk once to read the current ratio, then set the absolute value; the
+        // helper clamps so neither side collapses.
+        const cur = findRatio(tree, splitId)
+        if (cur == null) return prev
+        return { ...prev, [active.groupId]: setRatio(tree, splitId, cur + ratioDelta) }
       })
     },
-    [],
+    [active],
   )
 
-  const resetPaneSizes = useCallback(() => {
-    if (!active) return
-    setPaneSizes((cur) => {
-      const next = { ...cur }
-      sessionsRef.current
-        .filter((s) => s.groupId === active.groupId)
-        .forEach((s) => delete next[s.id])
-      return next
-    })
-  }, [active])
+  /** Double-click a divider: reset that split to an even 50/50. */
+  const resetSplit = useCallback(
+    (splitId: string) => {
+      if (!active) return
+      setLayouts((prev) => {
+        const tree = prev[active.groupId]
+        if (!tree || tree.t !== 'split') return prev
+        return { ...prev, [active.groupId]: setRatio(tree, splitId, 0.5) }
+      })
+    },
+    [active],
+  )
 
   const openHostIds = useMemo(
     () =>
@@ -1058,14 +1212,28 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     [connectPending],
   )
 
+  /** Remember the last focused pane per tab, so jumping back to a split tab
+   *  lands on the pane the user left, not always its first. */
+  const lastPaneRef = useRef<Record<string, string>>({})
+  if (active) lastPaneRef.current[active.groupId] = active.id
+
+  /** The pane to focus when tab `g` is selected by keyboard. */
+  const paneForGroup = useCallback((g: { id: string; sessions: Session[] }) => {
+    const last = lastPaneRef.current[g.id]
+    return (g.sessions.find((s) => s.id === last) ?? g.sessions[0]).id
+  }, [])
+
+  /** Ctrl+Tab steps through TABS (groups), as the strip shows them — not
+   *  through panes, which made a split tab eat extra presses. */
   const cycleTab = useCallback(
     (dir: 1 | -1) =>
       setActiveId((cur) => {
-        if (sessions.length === 0) return cur
-        const i = sessions.findIndex((s) => s.id === cur)
-        return sessions[(i + dir + sessions.length) % sessions.length].id
+        if (groups.length === 0) return cur
+        const curGroup = sessions.find((s) => s.id === cur)?.groupId
+        const i = groups.findIndex((g) => g.id === curGroup)
+        return paneForGroup(groups[(i + dir + groups.length) % groups.length])
       }),
-    [sessions],
+    [groups, sessions, paneForGroup],
   )
 
   /* ------------------------------------------------------------- shortcuts */
@@ -1089,10 +1257,11 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       }
 
       // Ctrl+1..9 jumps to a tab by ordinal — also unclaimed by readline.
+      // Ordinal of the TAB strip (groups), not of the flat pane list.
       const n = Number(e.key)
-      if (!e.shiftKey && Number.isInteger(n) && n >= 1 && n <= 9 && sessions[n - 1]) {
+      if (!e.shiftKey && Number.isInteger(n) && n >= 1 && n <= 9 && groups[n - 1]) {
         e.preventDefault()
-        setActiveId(sessions[n - 1].id)
+        setActiveId(paneForGroup(groups[n - 1]))
         return
       }
 
@@ -1141,7 +1310,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [active?.view, activeId, sessions, setView, closeSession, cycleTab, sendSnippet])
+  }, [active?.view, activeId, groups, paneForGroup, setView, closeSession, cycleTab, sendSnippet])
 
   /* ---------------------------------------------------------------- render */
 
@@ -1205,11 +1374,10 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
             onFocusSession={setActiveId}
             onSplit={splitActive}
             onSeparate={separateSession}
-            orientation={orientation}
-            onToggleOrientation={toggleOrientation}
-            paneSizes={paneSizes}
-            onPaneResize={resizePane}
-            onResetPaneSizes={resetPaneSizes}
+            onClosePane={closePane}
+            layout={activeLayout}
+            onResizeSplit={resizeSplit}
+            onResetSplit={resetSplit}
             onStartTransfer={startTransfer}
             sftpPaths={sftpPaths}
             onSftpPathsChange={setSftpPaths}
@@ -1274,9 +1442,9 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
               // can never corrupt the tree or silently drop nested hosts.
               const fresh = reidentify(tree, hostsRef.current)
               persistHosts([...hostsRef.current, ...fresh])
-              window.alert(`Imported ${fresh.length} top-level entr${fresh.length === 1 ? 'y' : 'ies'}. Passwords are never in exports — set them per host after importing.`)
+              void alert(`Imported ${fresh.length} top-level entr${fresh.length === 1 ? 'y' : 'ies'}. Passwords are never in exports — set them per host after importing.`)
             } catch (err) {
-              window.alert(`Import failed: ${err instanceof Error ? err.message : err}`)
+              void alert(`Import failed: ${err instanceof Error ? err.message : err}`)
             }
           })
         }}

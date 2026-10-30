@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Clock, FileText, Search, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
 
@@ -50,14 +50,28 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
     return () => window.removeEventListener('keydown', onKey, true)
   }, [onClose])
 
+  /* Reads run concurrently on the backend, so a large transcript clicked first
+     can resolve after a small one clicked second. Only the latest request may
+     touch the viewer. */
+  const latest = useRef<string | null>(null)
+
   const open = (name: string) => {
+    latest.current = name
     setSelected(name)
     setLoading(true)
     setContent('')
     void safeInvoke<string>('log_read', { name })
-      .then((c) => setContent(c ?? ''))
-      .catch((e) => setContent(`Could not read ${name}: ${e instanceof Error ? e.message : e}`))
-      .finally(() => setLoading(false))
+      .then((c) => {
+        if (latest.current === name) setContent(c ?? '')
+      })
+      .catch((e) => {
+        if (latest.current === name) {
+          setContent(`Could not read ${name}: ${e instanceof Error ? e.message : e}`)
+        }
+      })
+      .finally(() => {
+        if (latest.current === name) setLoading(false)
+      })
   }
 
   const filtered = useMemo(() => {

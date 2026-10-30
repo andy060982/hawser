@@ -29,11 +29,21 @@ const RULES: { re: RegExp; reason: string }[] = [
   { re: /\bgh[pousr]_[0-9A-Za-z]{20,}/, reason: 'GitHub token' },
 ]
 
-/** Mask everything after the first 3 chars of the longest run of non-space, so
- *  the preview shows context without reproducing the secret. */
+const MASK = '•'.repeat(6)
+
+/** Keep only the first 3 chars of the first token (the command/label, for
+ *  context) and replace every later token with a fixed-width mask. Masking by
+ *  position rather than token length matters: a length threshold let short
+ *  secrets (`Password: hunter`, `sshpass -p s3cret`) through in clear text.
+ *  Bare short flags like `-p` carry no secret and stay visible for context. */
 function maskLine(line: string): string {
-  const trimmed = line.trim().slice(0, 120)
-  return trimmed.replace(/(\S{3})(\S{4,})/g, (_, head) => `${head}${'•'.repeat(6)}`)
+  const tokens = line.trim().slice(0, 120).split(/\s+/)
+  return tokens
+    .map((tok, i) => {
+      if (i === 0) return tok.length > 3 ? tok.slice(0, 3) + MASK : tok
+      return /^--?[A-Za-z]{1,2}$/.test(tok) ? tok : MASK
+    })
+    .join(' ')
 }
 
 /** Scan text; return one hit per matching line (deduped by reason+line). */

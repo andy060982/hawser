@@ -83,8 +83,9 @@ async fn auth_prompt_respond(
     auth_prompts: State<'_, Arc<AuthPrompts>>,
     request_id: String,
     answers: Vec<String>,
+    #[allow(non_snake_case)] save: Option<bool>,
 ) -> CmdResult<()> {
-    auth_prompts.respond(&request_id, answers);
+    auth_prompts.respond(&request_id, answers, save.unwrap_or(false));
     Ok(())
 }
 
@@ -137,8 +138,26 @@ async fn ssh_resize(
 }
 
 #[tauri::command]
-async fn ssh_disconnect(registry: State<'_, Registry>, session_id: String) -> CmdResult<()> {
+async fn ssh_disconnect(
+    app: AppHandle,
+    registry: State<'_, Registry>,
+    prompts: State<'_, Arc<HostKeyPrompts>>,
+    auth_prompts: State<'_, Arc<AuthPrompts>>,
+    session_id: String,
+) -> CmdResult<()> {
+    // Cancel an in-flight connect FIRST: once it is cancelled it cannot raise
+    // a new prompt, so the sweep below cannot miss one registered behind it.
     registry.remove(&session_id).await;
+    // A tab closed mid-connect may still have a host-key or password dialog up.
+    // Drop those prompts and tell the UI to close them, rather than leave a
+    // question nobody owns on screen.
+    let closed = prompts
+        .cancel_session(&session_id)
+        .into_iter()
+        .chain(auth_prompts.cancel_session(&session_id));
+    for request_id in closed {
+        ssh::emit_prompt_closed(&app, &request_id);
+    }
     Ok(())
 }
 
@@ -276,8 +295,21 @@ async fn sftp_mkdir(
 
 /// Local-side mutations, mirroring the sftp_* trio so the two panes offer the
 /// same menu. Delete is not recursive here either, for the same reason.
+///
+/// Rename never clobbers: std::fs::rename silently replaces an existing file
+/// (and, on Unix, an empty directory), which a typo in the new name would turn
+/// into data loss. The remote side's SFTP rename refuses too, so the panes agree.
 #[tauri::command]
 async fn local_rename(from: String, to: String) -> CmdResult<()> {
+    // A case-only rename on a case-insensitive filesystem (macOS, Windows)
+    // resolves `to` to `from` itself; that is not a collision.
+    let same_entry = match (std::fs::canonicalize(&from), std::fs::canonicalize(&to)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if std::fs::symlink_metadata(&to).is_ok() && !same_entry {
+        return Err(format!("{to} already exists"));
+    }
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
@@ -683,6 +715,13 @@ async fn ai_key_status(profile: String) -> CmdResult<bool> {
     Ok(utils::ai::key_exists(&profile))
 }
 
+/// Remove a profile's saved API key and its origin binding — the way out after
+/// switching to a provider that needs no key (e.g. local Ollama).
+#[tauri::command]
+async fn ai_key_delete(profile: String) -> CmdResult<()> {
+    utils::ai::delete_key(&profile)
+}
+
 /// Provider settings (kind/baseUrl/model — never the key) as opaque JSON at
 /// %APPDATA%\skiffi.json, same pattern as the host catalogue.
 #[tauri::command]
@@ -723,6 +762,9 @@ async fn credential_save(
     host: String,
     port: u16,
 ) -> CmdResult<()> {
+    if credentials::is_reserved_id(&host_id) {
+        return Err(format!("'{host_id}' is a reserved vault id, not a host"));
+    }
     credentials::write_secret(&host_id, &username, &password).map_err(|e| e.to_string())?;
     // Record, in backend-owned state, that this secret may be sent to this
     // destination (and to any catalogue borrower of it). ssh_connect authorizes
@@ -739,14 +781,22 @@ async fn credential_save(
 /// "password saved" with no plaintext in the webview.
 #[tauri::command]
 async fn credential_status(host_id: String) -> CmdResult<bool> {
-    Ok(credentials::has_secret(&host_id))
+    Ok(!credentials::is_reserved_id(&host_id) && credentials::has_secret(&host_id))
 }
 
 #[tauri::command]
 async fn credential_delete(host_id: String) -> CmdResult<()> {
-    credentials::delete_secret(&host_id).map_err(|e| e.to_string())?;
+    if credentials::is_reserved_id(&host_id) {
+        return Err(format!("'{host_id}' is a reserved vault id, not a host"));
+    }
+    // Drop the binding even when the secret is already gone, so stale bindings
+    // do not accumulate.
+    let deleted = credentials::delete_secret(&host_id);
     utils::hosts::remove_binding(&host_id);
-    Ok(())
+    match deleted {
+        Ok(()) | Err(credentials::CredError::NotFound(_)) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /* --------------------------------------------------------------------- run */
@@ -825,6 +875,7 @@ pub fn run() {
             ai_chat,
             ai_key_save,
             ai_key_status,
+            ai_key_delete,
             ai_config_load,
             ai_config_save,
             settings_load,

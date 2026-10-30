@@ -151,6 +151,41 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               </span>
             </label>
           </section>
+
+          {/* --- Terminal: copy / paste --- */}
+          <section className="mt-4">
+            <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">Terminal</h3>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.copyOnSelect}
+                onChange={(e) => update({ copyOnSelect: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Copy on select</span>
+                <span className="block text-[11px] text-ink-faint">
+                  Highlighting text with the mouse copies it to the clipboard automatically — no
+                  Ctrl-chord or right-click needed.
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.middleClickPaste}
+                onChange={(e) => update({ middleClickPaste: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Middle-click paste</span>
+                <span className="block text-[11px] text-ink-faint">
+                  Pressing the mouse wheel button pastes the clipboard. Right-click also pastes
+                  (or copies the selection if one is active).
+                </span>
+              </span>
+            </label>
+          </section>
         </div>
       </div>
     </div>

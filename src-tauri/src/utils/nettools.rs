@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -59,6 +59,37 @@ fn validate_target(target: &str) -> Result<(), String> {
         return Err(format!("target contains invalid characters: {target}"));
     }
     Ok(())
+}
+
+/// Decode one raw output line. Lossy on purpose: localized Windows ping and
+/// tracert write the OEM code page (CP850 "ausgeführt", CP866, GBK...), which
+/// is not UTF-8. A strict decode fails the whole stream at the first accented
+/// byte; a lossy one shows a replacement char and keeps every reply line.
+fn decode_line(raw: &[u8]) -> String {
+    let mut end = raw.len();
+    while end > 0 && matches!(raw[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+/// Stream a child pipe to the frontend line by line until EOF. A read error
+/// is treated as end of stream; bad encoding is not an error (see above).
+async fn emit_lines<R: AsyncRead + Unpin>(pipe: R, app: &AppHandle, rid: &str) {
+    let mut reader = BufReader::new(pipe);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let _ = app.emit(
+                    &format!("net://{rid}"),
+                    ToolEvent { run_id: rid.to_string(), line: decode_line(&buf), done: false },
+                );
+            }
+        }
+    }
 }
 
 impl NetTools {
@@ -129,22 +160,10 @@ impl NetTools {
             let err_app = app.clone();
             let err_rid = rid.clone();
             let err_reader = tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = err_app.emit(
-                        &format!("net://{err_rid}"),
-                        ToolEvent { run_id: err_rid.clone(), line, done: false },
-                    );
-                }
+                emit_lines(stderr, &err_app, &err_rid).await;
             });
 
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app.emit(
-                    &format!("net://{rid}"),
-                    ToolEvent { run_id: rid.clone(), line, done: false },
-                );
-            }
+            emit_lines(stdout, &app, &rid).await;
             let _ = err_reader.await;
 
             // Report a non-zero or failed exit rather than concealing it behind
@@ -161,7 +180,14 @@ impl NetTools {
                 ToolEvent { run_id: rid.clone(), line: final_line, done: true },
             );
         });
-        self.runs.insert(run_id, task);
+        // Runs that ended on their own are never cancelled, so nothing else
+        // removes them: prune finished handles here to keep the map bounded.
+        // A replaced handle for the same id is aborted, not silently dropped,
+        // so its child cannot outlive the ability to cancel it.
+        self.runs.retain(|_, h| !h.is_finished());
+        if let Some(old) = self.runs.insert(run_id, task) {
+            old.abort();
+        }
         Ok(())
     }
 
@@ -260,4 +286,28 @@ pub async fn probe_hosts(targets: Vec<(String, String, u16)>) -> Vec<ProbeResult
         out.push(r);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_line;
+
+    #[test]
+    fn decode_line_strips_crlf_and_keeps_utf8() {
+        assert_eq!(decode_line(b"Reply from 1.1.1.1\r\n"), "Reply from 1.1.1.1");
+        assert_eq!(decode_line(b"no newline"), "no newline");
+        assert_eq!(decode_line(b"\r\n"), "");
+        assert_eq!(decode_line("Обмен пакетами\n".as_bytes()), "Обмен пакетами");
+    }
+
+    #[test]
+    fn decode_line_survives_oem_code_page_bytes() {
+        // CP850 "Ping wird ausgeführt für" (ü = 0x81): invalid UTF-8, which a
+        // strict line reader turns into an error that ends the stream.
+        let raw = b"Ping wird ausgef\x81hrt f\x81r 1.1.1.1\r\n";
+        let line = decode_line(raw);
+        assert!(line.starts_with("Ping wird ausgef"));
+        assert!(line.ends_with("r 1.1.1.1"));
+        assert!(line.contains('\u{FFFD}'));
+    }
 }

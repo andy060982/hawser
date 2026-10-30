@@ -56,14 +56,28 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
   const [showAdvanced, setShowAdvanced] = useState(
     () => customCommands(rawStartupCommands(host ?? {})).length > 0,
   )
-  const [hasSaved, setHasSaved] = useState(false)
+  /** null while the vault lookup for the current credKey is in flight. */
+  const [hasSaved, setHasSaved] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   /** Public key from a just-generated pair, shown for copying to the server. */
   const [generatedPub, setGeneratedPub] = useState<string | null>(null)
   /** Masked password entry for "Install on host" — window.prompt can't mask. */
   const [installPw, setInstallPw] = useState<string | null>(null)
+  /** Read by the window Escape handler, which runs in the capture phase BEFORE
+   *  the install overlay's own handler and so must know the overlay is up. */
+  const installPwRef = useRef(installPw)
+  installPwRef.current = installPw
   const firstRef = useRef<HTMLInputElement>(null)
+
+  /** The vault entry this host actually uses: a borrowed one when "Same as …"
+   *  is chosen. Connect reads the vault by this id, so status and saves must
+   *  use it too — saving under the host's own id stored a password that was
+   *  never read. */
+  const credKey = draft.credentialId ?? draft.id
+  const lender = draft.credentialId
+    ? allHosts(catalogue).find((h) => h.id === draft.credentialId)
+    : undefined
 
   useEffect(() => {
     firstRef.current?.focus()
@@ -71,15 +85,30 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
 
   // Whether a secret already exists, without ever decrypting it.
   useEffect(() => {
-    if (!host) return
-    void safeInvoke<boolean>('credential_status', { hostId: host.id }).then((v) =>
-      setHasSaved(Boolean(v)),
-    )
-  }, [host])
+    let live = true
+    // Unknown until this entry's lookup returns, so a stale answer for the
+    // previous entry can never gate (or wave through) a save.
+    setHasSaved(null)
+    void safeInvoke<boolean>('credential_status', { hostId: credKey }).then((v) => {
+      if (live) setHasSaved(Boolean(v))
+    })
+    return () => {
+      live = false
+    }
+  }, [credKey])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { e.preventDefault(); onClose() }
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      // Esc in the install-password overlay cancels only the overlay; closing
+      // the whole editor here discarded every unsaved edit (and the path of a
+      // key generated a moment ago).
+      if (installPwRef.current !== null) {
+        setInstallPw(null)
+        return
+      }
+      onClose()
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
@@ -103,12 +132,41 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
       setError(`Fill in required field(s): ${missing.join(', ')}`)
       return
     }
+    // The input's min/max are not enforced while typing; an out-of-range or
+    // fractional port would save, then fail every connect and the whole
+    // reachability sweep (the backend takes a u16).
+    if (!Number.isInteger(draft.port) || draft.port < 1 || draft.port > 65535) {
+      setError('Port must be a whole number from 1 to 65535.')
+      return
+    }
+    // A saved password is only ever sent to the destinations it was saved for
+    // (the backend binding). A new destination for it — this host now sharing
+    // another's credential, or its hostname/port/username edited — must be
+    // confirmed by typing the password, or every connect would be refused.
+    const destChanged =
+      !host ||
+      host.hostname !== draft.hostname ||
+      host.port !== draft.port ||
+      host.username !== draft.username ||
+      (host.credentialId ?? host.id) !== credKey
+    if (hasSaved === null) {
+      setError('Still checking the saved password — try again in a moment.')
+      return
+    }
+    if (draft.auth === 'password' && hasSaved && destChanged && !password) {
+      setError(
+        lender
+          ? `Enter ${lender.name}'s password to let this host use it — a saved password is only sent to destinations it was saved for.`
+          : 'Re-enter the password to confirm the new destination — a saved password is only sent to destinations it was saved for.',
+      )
+      return
+    }
     setBusy(true)
     setError(null)
     try {
       if (password) {
         await safeInvoke('credential_save', {
-          hostId: draft.id,
+          hostId: credKey,
           username: draft.username,
           password,
           // The backend binds this secret to this destination (see
@@ -237,7 +295,13 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           >
             <select
               value={draft.credentialId ?? ''}
-              onChange={(e) => set('credentialId', e.target.value || undefined)}
+              onChange={(e) => {
+                // A password typed for the previous vault entry must not be
+                // saved into the newly chosen one: typing A's password, then
+                // picking "Same as B", would overwrite B's shared secret.
+                setPassword('')
+                set('credentialId', e.target.value || undefined)
+              }}
               className={`${inputCls} appearance-none`}
             >
               <option value="">Own credential (this host&apos;s vault entry)</option>
@@ -307,7 +371,12 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 <button
                   key={m}
                   type="button"
-                  onClick={() => set('auth', m)}
+                  onClick={() => {
+                    // One field serves as password AND key passphrase; a value
+                    // typed for one method must not be saved as the other.
+                    if (m !== draft.auth) setPassword('')
+                    set('auth', m)
+                  }}
                   className={`flex-1 rounded border px-2 py-1 text-[12px] capitalize transition-colors ${
                     draft.auth === m
                       ? 'border-accent/60 bg-accent/15 text-accent'
@@ -324,9 +393,11 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
             <Field
               label="Password"
               hint={
-                hasSaved
-                  ? 'A password is already saved in Windows Credential Manager. Type to replace it.'
-                  : 'Stored in Windows Credential Manager, never in the host file.'
+                lender
+                  ? `Shared with ${lender.name}: typing here replaces that shared password for every host using it.`
+                  : hasSaved
+                    ? 'A password is already saved in Windows Credential Manager. Type to replace it.'
+                    : 'Stored in Windows Credential Manager, never in the host file.'
               }
             >
               <div className="relative">

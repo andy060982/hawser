@@ -31,6 +31,11 @@ export interface Settings {
   dangerousGuard: boolean
   /** Confirm before closing a tab whose session is still connected. */
   confirmCloseActive: boolean
+  /** Finishing a mouse selection copies it straight to the clipboard, so no
+   *  Ctrl-chord or right-click is needed to copy (iTerm2 / PuTTY behaviour). */
+  copyOnSelect: boolean
+  /** Middle-click (mouse wheel button) pastes the clipboard, X11 / PuTTY style. */
+  middleClickPaste: boolean
 }
 
 const PERMISSIVE: ColorPolicy = { ai: 'on', confirmConnect: false, excludeFromBroadcast: false }
@@ -54,7 +59,13 @@ const ALL_COLORS: HostColor[] = [
 export function defaultSettings(): Settings {
   const colorPolicies = {} as Record<HostColor, ColorPolicy>
   for (const c of ALL_COLORS) colorPolicies[c] = defaultPolicy(c)
-  return { colorPolicies, dangerousGuard: true, confirmCloseActive: true }
+  return {
+    colorPolicies,
+    dangerousGuard: true,
+    confirmCloseActive: true,
+    copyOnSelect: true,
+    middleClickPaste: true,
+  }
 }
 
 /** Merge a loaded (possibly partial / older) settings object onto the defaults
@@ -70,6 +81,8 @@ function hydrate(raw: unknown): Settings {
   }
   if (typeof r.dangerousGuard === 'boolean') base.dangerousGuard = r.dangerousGuard
   if (typeof r.confirmCloseActive === 'boolean') base.confirmCloseActive = r.confirmCloseActive
+  if (typeof r.copyOnSelect === 'boolean') base.copyOnSelect = r.copyOnSelect
+  if (typeof r.middleClickPaste === 'boolean') base.middleClickPaste = r.middleClickPaste
   return base
 }
 
