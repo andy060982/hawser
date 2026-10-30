@@ -145,9 +145,12 @@ async fn ssh_disconnect(
     auth_prompts: State<'_, Arc<AuthPrompts>>,
     session_id: String,
 ) -> CmdResult<()> {
+    // Cancel an in-flight connect FIRST: once it is cancelled it cannot raise
+    // a new prompt, so the sweep below cannot miss one registered behind it.
+    registry.remove(&session_id).await;
     // A tab closed mid-connect may still have a host-key or password dialog up.
-    // Drop those prompts (which rejects them, aborting that connect) and tell
-    // the UI to close them, rather than leave a question nobody owns on screen.
+    // Drop those prompts and tell the UI to close them, rather than leave a
+    // question nobody owns on screen.
     let closed = prompts
         .cancel_session(&session_id)
         .into_iter()
@@ -155,7 +158,6 @@ async fn ssh_disconnect(
     for request_id in closed {
         ssh::emit_prompt_closed(&app, &request_id);
     }
-    registry.remove(&session_id).await;
     Ok(())
 }
 

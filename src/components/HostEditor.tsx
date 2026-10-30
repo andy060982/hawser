@@ -56,7 +56,8 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
   const [showAdvanced, setShowAdvanced] = useState(
     () => customCommands(rawStartupCommands(host ?? {})).length > 0,
   )
-  const [hasSaved, setHasSaved] = useState(false)
+  /** null while the vault lookup for the current credKey is in flight. */
+  const [hasSaved, setHasSaved] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   /** Public key from a just-generated pair, shown for copying to the server. */
@@ -85,6 +86,9 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
   // Whether a secret already exists, without ever decrypting it.
   useEffect(() => {
     let live = true
+    // Unknown until this entry's lookup returns, so a stale answer for the
+    // previous entry can never gate (or wave through) a save.
+    setHasSaved(null)
     void safeInvoke<boolean>('credential_status', { hostId: credKey }).then((v) => {
       if (live) setHasSaved(Boolean(v))
     })
@@ -145,6 +149,10 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
       host.port !== draft.port ||
       host.username !== draft.username ||
       (host.credentialId ?? host.id) !== credKey
+    if (hasSaved === null) {
+      setError('Still checking the saved password — try again in a moment.')
+      return
+    }
     if (draft.auth === 'password' && hasSaved && destChanged && !password) {
       setError(
         lender
@@ -287,7 +295,13 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           >
             <select
               value={draft.credentialId ?? ''}
-              onChange={(e) => set('credentialId', e.target.value || undefined)}
+              onChange={(e) => {
+                // A password typed for the previous vault entry must not be
+                // saved into the newly chosen one: typing A's password, then
+                // picking "Same as B", would overwrite B's shared secret.
+                setPassword('')
+                set('credentialId', e.target.value || undefined)
+              }}
               className={`${inputCls} appearance-none`}
             >
               <option value="">Own credential (this host&apos;s vault entry)</option>
@@ -357,7 +371,12 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 <button
                   key={m}
                   type="button"
-                  onClick={() => set('auth', m)}
+                  onClick={() => {
+                    // One field serves as password AND key passphrase; a value
+                    // typed for one method must not be saved as the other.
+                    if (m !== draft.auth) setPassword('')
+                    set('auth', m)
+                  }}
                   className={`flex-1 rounded border px-2 py-1 text-[12px] capitalize transition-colors ${
                     draft.auth === m
                       ? 'border-accent/60 bg-accent/15 text-accent'

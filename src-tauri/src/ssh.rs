@@ -20,7 +20,7 @@ use russh_sftp::protocol::FileType;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 
 use crate::credentials;
 
@@ -35,10 +35,6 @@ const HOST_KEY_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 const CHUNK: usize = 64 * 1024;
-
-/// After an exec channel's EOF, how long to keep reading for the exit status
-/// and close that normally follow it.
-const EXIT_STATUS_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
@@ -364,6 +360,17 @@ struct ClientHandler {
     prompts: Arc<HostKeyPrompts>,
     /// The tab this connection belongs to, so closing it can drop the prompt.
     session_id: String,
+    /// Closes (sender dropped) when the tab is closed mid-connect. Host-key
+    /// checks run in russh's own session task, which outlives the cancelled
+    /// connect future, so the handler must look itself before prompting.
+    /// `None` for connections with no tab (copy_id).
+    cancel: Option<watch::Receiver<()>>,
+}
+
+impl ClientHandler {
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|rx| rx.has_changed().is_err())
+    }
 }
 
 impl client::Handler for ClientHandler {
@@ -413,7 +420,17 @@ impl client::Handler for ClientHandler {
             .fingerprint(russh::keys::HashAlg::Sha256)
             .to_string();
 
+        if self.cancelled() {
+            return Err(SshError::Cancelled(self.session_id.clone()));
+        }
         let rx = self.prompts.register(request_id.clone(), &self.session_id);
+        // A disconnect between the check above and the register would have
+        // swept the prompt map before this entry existed; look again so the
+        // prompt is never shown for a closed tab.
+        if self.cancelled() {
+            self.prompts.cancel(&request_id);
+            return Err(SshError::Cancelled(self.session_id.clone()));
+        }
 
         self.app
             .emit(
@@ -490,7 +507,11 @@ pub struct Registry {
     /// entry, which is how closing a tab mid-connect cancels it: the connect
     /// checks its generation at each step and before registering, and tears its
     /// own transport down instead of leaving a logged-in shell no tab owns.
-    connecting: DashMap<String, u64>,
+    ///
+    /// Each entry also holds the sender of a `watch` channel. Removing the entry
+    /// drops it, which interrupts the connect at whatever await it is parked on
+    /// (see `connect`) and tells the russh handlers to stop prompting.
+    connecting: DashMap<String, (u64, watch::Sender<()>)>,
 }
 
 /// Generation counter for `Registry::connecting`.
@@ -628,7 +649,7 @@ impl Registry {
     /// Whether connect `ticket` for `id` is still wanted (no
     /// disconnect arrived for it since it started).
     fn still_wanted(&self, id: &str, ticket: u64) -> bool {
-        self.connecting.get(id).is_some_and(|g| *g == ticket)
+        self.connecting.get(id).is_some_and(|g| g.0 == ticket)
     }
 
     /// Open a connection, authenticate, and start an interactive shell.
@@ -663,15 +684,43 @@ impl Registry {
             self.remove(session_id).await;
         }
         let ticket = CONNECT_SEQ.fetch_add(1, Ordering::Relaxed);
-        self.connecting.insert(session_id.to_string(), ticket);
-        let result = self
-            .connect_inner(
+        let (cancel_tx, cancel_rx) = watch::channel(());
+        self.connecting.insert(session_id.to_string(), (ticket, cancel_tx));
+        let mut closed = cancel_rx.clone();
+        let (sweep_hk, sweep_auth) = (Arc::clone(&prompts), Arc::clone(&auth_prompts));
+        let sweep_app = app.clone();
+        // Race the whole connect against cancellation. `still_wanted` checks
+        // between stages are not enough: a disconnect during the TCP/kex
+        // handshake or authentication must stop it there, before a password is
+        // sent or a new prompt raised. Dropping the future drops every Handle it
+        // owns, which ends those transports.
+        let result = tokio::select! {
+            biased;
+            _ = closed.changed() => Err(SshError::Cancelled(session_id.to_string())),
+            r = self.connect_inner(
                 app, prompts, auth_prompts, session_id, host_id, host, port, username, cols,
                 rows, startup_commands, auth, key_path, jump, one_shot_password, ticket,
-            )
-            .await;
+                cancel_rx,
+            ) => r,
+        };
         // Clear our in-flight marker, but only if it is still ours.
-        self.connecting.remove_if(session_id, |_, g| *g == ticket);
+        self.connecting.remove_if(session_id, |_, g| g.0 == ticket);
+        // Cancelled mid-connect: a prompt registered in the poll that raced the
+        // caller's sweep (or a cancel by a newer connect, which sweeps nothing)
+        // would be orphaned — its timeout cleanup lived in the dropped future.
+        // Sweep here too, unless a newer connect now owns this id and its
+        // prompts.
+        if matches!(result, Err(SshError::Cancelled(_)))
+            && !self.connecting.contains_key(session_id)
+        {
+            let closed = sweep_hk
+                .cancel_session(session_id)
+                .into_iter()
+                .chain(sweep_auth.cancel_session(session_id));
+            for request_id in closed {
+                emit_prompt_closed(&sweep_app, &request_id);
+            }
+        }
         result
     }
 
@@ -694,6 +743,7 @@ impl Registry {
         jump: Option<JumpParams>,
         one_shot_password: Option<&str>,
         ticket: u64,
+        cancel: watch::Receiver<()>,
     ) -> Result<(), SshError> {
         // Before dialing anything, refuse to send a saved password to a
         // destination the catalogue never bound it to (both the target and any
@@ -734,6 +784,7 @@ impl Registry {
             app: app.clone(),
             prompts,
             session_id: session_id.to_string(),
+            cancel: Some(cancel.clone()),
         };
 
         // With a jump host: dial the bastion, authenticate there, then open a
@@ -761,6 +812,7 @@ impl Registry {
                     app: app.clone(),
                     prompts: Arc::clone(&self_prompts),
                     session_id: session_id.to_string(),
+                    cancel: Some(cancel.clone()),
                 };
                 let mut jh =
                     client::connect(jump_config, (j.host.as_str(), j.port), jump_handler).await?;
@@ -1566,76 +1618,129 @@ impl Registry {
 
         let mut channel = session.handle.channel_open_session().await?;
         channel.exec(true, command).await?;
-
-        let mut out: Vec<u8> = Vec::new();
-        let mut truncated = false;
-        let mut exit_status: Option<u32> = None;
-        let collect = async {
-            // Do not stop at EOF: OpenSSH sends the exit status AFTER EOF (when it
-            // reaps the child), so breaking on Eof meant a failed command was
-            // never seen as failed. After EOF, allow a short grace for the
-            // status/close, for appliances that EOF but never close.
-            let mut eof = false;
-            loop {
-                let msg = if eof {
-                    match tokio::time::timeout(EXIT_STATUS_GRACE, channel.wait()).await {
-                        Ok(m) => m,
-                        Err(_) => break,
-                    }
-                } else {
-                    channel.wait().await
-                };
-                let Some(msg) = msg else { break };
-                match msg {
-                    ChannelMsg::Data { ref data }
-                    | ChannelMsg::ExtendedData { ref data, .. } => {
-                        out.extend_from_slice(data);
-                        // A config dump has a sane bound; a runaway command
-                        // (someone snapshots `tail -f`) must not eat RAM
-                        // until the timeout.
-                        if out.len() > 16 * 1024 * 1024 {
-                            truncated = true;
-                            break;
-                        }
-                    }
-                    ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
-                    ChannelMsg::Eof => eof = true,
-                    ChannelMsg::Close => break,
-                    _ => {}
-                }
-            }
-        };
-        // The timeout is the guard against commands that never EOF.
-        let completed = tokio::time::timeout(Duration::from_secs(timeout_secs), collect)
-            .await
-            .is_ok();
+        let run = run_exec(&mut channel, 16 * 1024 * 1024, Duration::from_secs(timeout_secs)).await;
 
         // Don't pass off a partial or failed capture as a valid snapshot:
-        //  - timed out  -> we have no idea if the config finished printing
-        //  - truncated  -> hit the size cap mid-dump
-        //  - exit != 0  -> the command itself reported failure (missing status
-        //    is tolerated: much network gear never sends one over exec)
-        if !completed {
-            return Err(SshError::PartialTransfer(format!(
-                "capture timed out after {timeout_secs}s; output discarded"
-            )));
+        //  - timed out   -> we have no idea if the config finished printing
+        //  - truncated   -> hit the size cap mid-dump
+        //  - unconfirmed -> the channel/transport ended before the server
+        //    confirmed the run (EOF, then a status or close)
+        //  - killed / exit != 0 -> the command itself reported failure (a
+        //    missing status after EOF + close is tolerated: much network gear
+        //    never sends one over exec)
+        if run.timed_out {
+            return Err(SshError::PartialTransfer(if run.eof {
+                format!(
+                    "device ended its output but never confirmed completion within \
+                     {timeout_secs}s; output discarded"
+                )
+            } else {
+                format!("capture timed out after {timeout_secs}s; output discarded")
+            }));
         }
-        if truncated {
+        if run.truncated {
             return Err(SshError::PartialTransfer(
                 "capture exceeded 16 MiB; output discarded".into(),
             ));
         }
-        if let Some(code) = exit_status {
+        if !run.confirmed {
+            return Err(SshError::PartialTransfer(
+                "connection ended before the capture completed; output discarded".into(),
+            ));
+        }
+        if let Some(sig) = run.signal {
+            return Err(SshError::PartialTransfer(format!(
+                "capture command was killed by signal {sig}"
+            )));
+        }
+        if let Some(code) = run.exit_status {
             if code != 0 {
                 return Err(SshError::PartialTransfer(format!(
                     "capture command exited with status {code}"
                 )));
             }
         }
+        let out = run.out;
 
         let (clean, _) = crate::utils::session_log::strip_ansi(&out);
         Ok(String::from_utf8_lossy(&clean).to_string())
     }
+}
+
+/// How an exec channel's run ended, as far as the server confirmed it.
+struct ExecRun {
+    out: Vec<u8>,
+    exit_status: Option<u32>,
+    /// Name of the signal that killed the command (`exit-signal`).
+    signal: Option<String>,
+    eof: bool,
+    truncated: bool,
+    timed_out: bool,
+    /// The server confirmed the run finished: EOF, then an exit status/signal
+    /// or a channel close (in either order). A transport that drops, or a
+    /// close with no EOF first, is NOT confirmation.
+    confirmed: bool,
+}
+
+/// Collect an exec channel's output under `deadline`, then close the channel.
+///
+/// Do not stop at EOF: OpenSSH sends the exit status AFTER EOF (when it reaps
+/// the child), while other stacks send it before — so the run ends when the
+/// second of {EOF, status/signal} arrives, or on close after EOF. No short
+/// post-EOF grace: that passed off a command that closed its output and then
+/// failed as success. A device that EOFs but never confirms now times out.
+async fn run_exec(
+    channel: &mut russh::Channel<client::Msg>,
+    cap: usize,
+    deadline: Duration,
+) -> ExecRun {
+    let mut run = ExecRun {
+        out: Vec::new(),
+        exit_status: None,
+        signal: None,
+        eof: false,
+        truncated: false,
+        timed_out: false,
+        confirmed: false,
+    };
+    // These commands read no stdin. Send our EOF (like `ssh host cmd
+    // </dev/null`) so stacks that wait for the peer's EOF before closing do.
+    let _ = channel.eof().await;
+    let collect = async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                    run.out.extend_from_slice(data);
+                    // A runaway command (`tail -f`) must not eat RAM until the
+                    // deadline.
+                    if run.out.len() > cap {
+                        run.truncated = true;
+                        return;
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => run.exit_status = Some(exit_status),
+                ChannelMsg::ExitSignal { signal_name, .. } => {
+                    run.signal = Some(format!("{signal_name:?}"))
+                }
+                ChannelMsg::Eof => run.eof = true,
+                ChannelMsg::Close => {
+                    run.confirmed = run.eof;
+                    return;
+                }
+                _ => {}
+            }
+            if run.eof && (run.exit_status.is_some() || run.signal.is_some()) {
+                run.confirmed = true;
+                return;
+            }
+        }
+        // wait() == None: the session ended with no close — unconfirmed.
+    };
+    run.timed_out = tokio::time::timeout(deadline, collect).await.is_err();
+    // A plain russh Channel sends no CHANNEL_CLOSE on drop; without this a
+    // timed-out exec would leak a channel on the user's live session.
+    let _ = channel.close().await;
+    run
 }
 
 /// Authenticate an open handle by the host's configured method.
@@ -1863,11 +1968,44 @@ fn looks_like_password_prompt(prompt: &str) -> bool {
     .any(|w| t.contains(w))
 }
 
+/// True if a prompt asks for a second factor: an OTP, token or verification
+/// code. Checked BEFORE the password test and overrides it — "One-time
+/// password:" contains "password", and a lone hidden "Verification code:" must
+/// not be read as the TACACS+ unlabelled password question. Sending the
+/// reusable password to an OTP verifier both fails auth and leaks it there.
+fn looks_like_otp_prompt(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    // Ignore whatever names the account: "Password for root@shipping-db:" or
+    // "Password for jpinto@REALM:" must not read as a PIN/OTP prompt because a
+    // username or host happens to contain one of the short stems.
+    let t = lower.split(" for ").next().unwrap_or(&lower);
+    // Distinctive phrases, matched as substrings (incl. localized OTP wording;
+    // the password list above is localized, so a localized "one-time
+    // password" would otherwise be read as the account password).
+    const PHRASES: &[&str] = &[
+        "one-time", "one time", "onetime", "verification", "passcode", "two-factor",
+        "two factor", "second factor", "factor", "faktor", "authenticator", "yubikey",
+        "security key", "einmal", "bestätigung", "ワンタイム", "一次性", "动态", "验证码",
+        "驗證碼", "認証コード", "確認コード", "일회용", "인증", "одноразов", "код ",
+        "un solo uso", "uso único", "usage unique", "código", "codice", "monouso",
+    ];
+    // Short stems, matched only as whole words.
+    const WORDS: &[&str] = &[
+        "otp", "code", "token", "pin", "mfa", "2fa", "duo", "verify", "oath", "sms",
+        "response", "digit", "digits", "challenge", "код",
+    ];
+    PHRASES.iter().any(|p| t.contains(p))
+        || t
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| WORDS.contains(&w))
+}
+
 /// Which prompts of one keyboard-interactive round get the password, in the
 /// backend. At most one per auth attempt (`password_used`), and only a hidden
 /// prompt that reads like a password — or, in the first round, a lone hidden
 /// prompt when the password has not already been accepted (the TACACS+ single
-/// unlabelled question). Every other prompt, hidden or not, goes to the user.
+/// unlabelled question). A prompt that reads like a second factor never does.
+/// Every other prompt, hidden or not, goes to the user.
 fn password_slots(
     prompts: &[(String, bool)],
     first_round: bool,
@@ -1875,14 +2013,18 @@ fn password_slots(
     password_accepted: bool,
 ) -> Vec<bool> {
     let mut used = password_used;
-    let lone_hidden = first_round && !password_accepted && prompts.len() == 1 && !prompts[0].1;
+    let lone_hidden = first_round
+        && !password_accepted
+        && prompts.len() == 1
+        && !prompts[0].1
+        && !looks_like_otp_prompt(&prompts[0].0);
     prompts
         .iter()
         .map(|(text, echo)| {
             if used || *echo {
                 return false;
             }
-            if lone_hidden || looks_like_password_prompt(text) {
+            if lone_hidden || (looks_like_password_prompt(text) && !looks_like_otp_prompt(text)) {
                 used = true;
                 true
             } else {
@@ -2091,6 +2233,7 @@ pub async fn copy_id(
         app: app.clone(),
         prompts,
         session_id: "install-key".to_string(),
+        cancel: None,
     };
     let mut handle = client::connect(config, (host, port), handler).await?;
 
@@ -2123,37 +2266,11 @@ pub async fn copy_id(
 
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
-    let mut out = Vec::new();
-    let mut exit_status: Option<u32> = None;
-    let collect = async {
-        // Read past EOF for the exit status (sent after EOF), as exec_capture does.
-        let mut eof = false;
-        loop {
-            let msg = if eof {
-                match tokio::time::timeout(EXIT_STATUS_GRACE, channel.wait()).await {
-                    Ok(m) => m,
-                    Err(_) => break,
-                }
-            } else {
-                channel.wait().await
-            };
-            let Some(msg) = msg else { break };
-            match msg {
-                ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                    out.extend_from_slice(data)
-                }
-                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
-                ChannelMsg::Eof => eof = true,
-                ChannelMsg::Close => break,
-                _ => {}
-            }
-        }
-    };
     // A timeout is a failure, not a silent success: don't judge the run by
     // whatever partial output happened to arrive before the clock ran out.
-    let completed = tokio::time::timeout(Duration::from_secs(20), collect)
-        .await
-        .is_ok();
+    let run = run_exec(&mut channel, 1024 * 1024, Duration::from_secs(20)).await;
+    let completed = !run.timed_out && !run.truncated && run.confirmed && run.signal.is_none();
+    let (out, exit_status) = (run.out, run.exit_status);
 
     // Three signals must agree before we claim the key is installed:
     //   - the command actually finished within the timeout,
@@ -2502,7 +2619,32 @@ async fn copy_local_file(
     // 0600 secret must not become 0644, a deploy script must keep +x); a new
     // file takes the local file's mode where the platform has one. Refuse up
     // front to replace a remote DIRECTORY with a file.
-    let remote_meta = sftp.metadata(remote).await.ok();
+    // Only a definite "no such file" means the destination is new. Permission
+    // denied (write-only dropboxes: SFTPGo upload-only users, ProFTPD
+    // <Limit READ>) leaves it UNKNOWN: still upload, but never replace an
+    // existing file whose mode we could not read — see `no_clobber` below. Any
+    // other STAT failure aborts.
+    use russh_sftp::protocol::StatusCode;
+    let mut no_clobber = false;
+    let remote_meta = match sftp.metadata(remote).await {
+        Ok(m) => Some(m),
+        Err(russh_sftp::client::error::Error::Status(st))
+            if st.status_code == StatusCode::NoSuchFile =>
+        {
+            None
+        }
+        Err(russh_sftp::client::error::Error::Status(st))
+            if st.status_code == StatusCode::PermissionDenied =>
+        {
+            no_clobber = true;
+            None
+        }
+        Err(e) => {
+            return Err(SshError::PartialTransfer(format!(
+                "could not check whether {remote} already exists ({e}); not overwriting it"
+            )))
+        }
+    };
     if remote_meta.as_ref().is_some_and(|m| m.file_type().is_dir()) {
         return Err(SshError::PartialTransfer(format!(
             "{remote} is a directory on the server; refusing to replace it with a file"
@@ -2512,7 +2654,13 @@ async fn copy_local_file(
         .as_ref()
         .and_then(|m| m.permissions)
         .map(|p| p & 0o7777)
-        .or_else(|| local_mode(local_meta.as_ref()));
+        .or_else(|| local_mode(local_meta.as_ref()))
+        // Destination unknown: take the server's default rather than impose
+        // the local mode on what may be an existing file.
+        .filter(|_| !no_clobber);
+    // Overwriting a file whose mode we know: it MUST survive the replace. A new
+    // file's mode is only a best effort (the server's umask may trim it).
+    let preserve_required = remote_meta.as_ref().and_then(|m| m.permissions).is_some();
 
     // Stream to a unique temp file beside the destination, then rename over it,
     // exactly as the download does. `sftp.create` truncates, so writing straight
@@ -2550,12 +2698,42 @@ async fn copy_local_file(
             reporter.tick(done);
         }
         if let Some(m) = mode {
-            let _ = dst
+            let set = dst
                 .set_metadata(russh_sftp::protocol::FileAttributes {
                     permissions: Some(m),
                     ..Default::default()
                 })
                 .await;
+            // FSETSTAT may be denied or unsupported. Retry by path (SETSTAT; the
+            // temp is our own unique sibling), then accept it if the permission
+            // bits match. Otherwise, for an overwrite, fail BEFORE the rename so
+            // the original (and its permissions) stays. Special bits are not
+            // compared: servers/kernels routinely strip setuid/setgid.
+            if set.is_err() && preserve_required {
+                let _ = sftp
+                    .set_metadata(
+                        tmp.clone(),
+                        russh_sftp::protocol::FileAttributes {
+                            permissions: Some(m),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                let actual = sftp
+                    .metadata(tmp.clone())
+                    .await
+                    .ok()
+                    .and_then(|md| md.permissions)
+                    .map(|p| p & 0o777);
+                if actual != Some(m & 0o777) {
+                    // Close explicitly so it completes before the temp is
+                    // removed (some servers cannot delete an open file).
+                    let _ = dst.shutdown().await;
+                    return Err(SshError::PartialTransfer(format!(
+                        "could not preserve the permissions ({m:o}) of {remote}; left it unchanged"
+                    )));
+                }
+            }
         }
         // shutdown (not just flush) closes the remote handle, which must happen
         // before the rename and also avoids leaking the SFTP handle.
@@ -2572,7 +2750,16 @@ async fn copy_local_file(
             // file ASIDE to a backup (never delete it) before putting the new
             // one in place — so a second failure or a dropped connection cannot
             // destroy the original with nothing to recover.
-            if sftp.rename(tmp.clone(), remote.to_string()).await.is_err() {
+            if let Err(e) = sftp.rename(tmp.clone(), remote.to_string()).await {
+                // Existence/mode unknown: SFTPv3 RENAME does not overwrite, so a
+                // failure likely means a file is there. Leave it alone.
+                if no_clobber {
+                    let _ = sftp.remove_file(tmp).await;
+                    return Err(SshError::PartialTransfer(format!(
+                        "{remote} may already exist and its permissions could not be read; \
+                         not overwriting it ({e})"
+                    )));
+                }
                 let bak = format!("{tmp}.bak");
                 let _ = sftp.remove_file(bak.clone()).await; // clear any stale backup
                 let moved = sftp.rename(remote.to_string(), bak.clone()).await.is_ok();
@@ -2893,6 +3080,27 @@ mod tests {
         assert_eq!(password_slots(&[p("Verification code:", false)], true, false, true), vec![false]);
         // Echo prompts never get the password.
         assert_eq!(password_slots(&[p("Password:", true)], true, false, false), vec![false]);
+        // A lone hidden second-factor prompt in round 1 is NOT the TACACS+
+        // unlabelled password question.
+        assert_eq!(password_slots(&[p("Verification code:", false)], true, false, false), vec![false]);
+        assert_eq!(password_slots(&[p("Enter PASSCODE:", false)], true, false, false), vec![false]);
+        // "One-time password" names a password but is an OTP, in any round.
+        assert_eq!(password_slots(&[p("One-time password:", false)], true, false, false), vec![false]);
+        assert_eq!(password_slots(&[p("One-time password:", false)], false, false, true), vec![false]);
+        assert_eq!(
+            password_slots(&[p("Password:", false), p("OTP password:", false)], true, false, false),
+            vec![true, false]
+        );
+        // Usernames / hosts containing a short stem are still password prompts
+        // (FreeBSD / OpenPAM "Password for %u@%h:").
+        assert_eq!(password_slots(&[p("Password for root@shipping-db:", false)], true, false, false), vec![true]);
+        assert_eq!(password_slots(&[p("Password for jpinto@host:", false)], false, false, false), vec![true]);
+        assert_eq!(password_slots(&[p("Password for unicode@otpbox:", false)], false, false, false), vec![true]);
+        // Short stems as whole words, and localized one-time passwords.
+        assert_eq!(password_slots(&[p("Enter PIN:", false)], true, false, false), vec![false]);
+        assert_eq!(password_slots(&[p("OTP:", false)], true, false, false), vec![false]);
+        assert_eq!(password_slots(&[p("Einmalpasswort:", false)], false, false, false), vec![false]);
+        assert_eq!(password_slots(&[p("ワンタイムパスワード:", false)], false, false, false), vec![false]);
     }
 
     #[test]
