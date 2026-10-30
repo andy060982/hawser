@@ -6,6 +6,11 @@ All notable changes to Skiff are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0-beta.1] - 2026-10-30
+
+First public beta. Includes the full bug-sprint hardening pass and a security
+dependency update on top of the features below.
+
 ### Added
 
 - **Copy-on-select and middle-click paste** in the terminal: finishing a mouse
@@ -36,6 +41,21 @@ All notable changes to Skiff are documented here. Format follows
   own tab like any other pane.
 - Native paste (Cmd/Ctrl+V, platform/WebView paste) bypassed the
   destructive-command guard; it is now intercepted and routed through the guard.
+- **72 verified defects** across the SSH backend, SFTP, auth, and the frontend,
+  found and fixed in a dedicated audit sprint (connect cancellation on tab
+  close, hidden keyboard-interactive OTP prompts, `exec_capture` reading past
+  EOF, `copy_id` newline handling, and others). Full detail in PR #47.
+
+### Security
+
+- Reserved the `ai:` vault namespace and added a one-shot credential-binding
+  migration marker so a compromised WebView cannot forge a credential→host
+  binding source.
+- Patched 8 advisories in transitive dependencies (lockfile only, no source
+  change): `rustls` 0.23.46 (RUSTSEC-2026-0346/0347/0348/0349, incl. a `Debug`
+  impl that could log TLS secrets), `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382),
+  `webpki-root-certs` 1.0.10 (RUSTSEC-2026-0383), `crypto-bigint` 0.7.6
+  (RUSTSEC-2026-0387), and `ctutils` 0.4.7 (RUSTSEC-2026-0385).
 
 ## [0.4.0] - 2026-09-26
 
