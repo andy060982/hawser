@@ -39,6 +39,7 @@ import { ContextMenu, type MenuItem, type MenuState } from './ContextMenu'
 import { NetToolsDialog } from './NetToolsDialog'
 import { AiPanel } from './AiPanel'
 import { ConfigHistoryDialog } from './ConfigHistoryDialog'
+import { AuditDialog } from './AuditDialog'
 import { QuickConnect } from './QuickConnect'
 
 /* ---------------------------------------------------------------------------
@@ -95,6 +96,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [hosts, setHosts] = useState<HostNode[]>(seedHosts)
   const [editing, setEditing] = useState<{ host: Host | null } | null>(null)
   const [showHistory, setShowHistory] = useState(false)
+  const [showAudit, setShowAudit] = useState(false)
   const [showFind, setShowFind] = useState(false)
   const [tunnelFor, setTunnelFor] = useState<Session | null>(null)
   const [netTools, setNetTools] = useState<{ target: string; port: number } | null>(null)
@@ -1029,6 +1031,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         },
       },
       { label: 'Session history…', onSelect: () => setShowHistory(true) },
+      { label: 'Audit log…', onSelect: () => setShowAudit(true) },
       {
         label: 'Export hosts…',
         dividerBefore: true,
@@ -1414,6 +1417,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       <AuthPromptDialog />
 
       {showHistory && <HistoryBrowser onClose={() => setShowHistory(false)} />}
+      {showAudit && <AuditDialog onClose={() => setShowAudit(false)} />}
 
       {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
 
