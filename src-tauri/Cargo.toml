@@ -31,6 +31,9 @@ ssh-key = { version = "0.7.0-rc.11", features = ["getrandom"] }
 tokio = { version = "1.53.1", features = ["full"] }
 zeroize = "1.8.2"
 dashmap = "6.2.1"
+# SHA-256 for the tamper-evident audit-log hash chain (utils::audit). Already in
+# the dependency tree transitively, so naming it here adds no new download.
+sha2 = "0.10"
 thiserror = "2.0.20"
 similar = "2.7.0"
 futures-util = "0.3.34"

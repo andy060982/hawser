@@ -36,7 +36,7 @@ async fn ssh_connect(
     jump: Option<ssh::JumpParams>,
     one_shot_password: Option<String>,
 ) -> CmdResult<()> {
-    registry
+    let result = registry
         .connect(
             app,
             Arc::clone(&prompts),
@@ -55,7 +55,23 @@ async fn ssh_connect(
             one_shot_password.as_deref(),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // Audit the authentication outcome. host/port/user are not secret; the error
+    // string is an SSH/protocol message (e.g. "authentication failed"), never a
+    // password. The connect result folds the host-key and auth steps together.
+    match &result {
+        Ok(()) => utils::audit::record(
+            "connect",
+            format!("connected {username}@{host}:{port}"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "connect.fail",
+            format!("connection to {username}@{host}:{port} failed"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 /// Answer a host-key prompt raised by the `ssh://host-key-prompt` event.
@@ -183,10 +199,23 @@ async fn sftp_get(
     remote_path: String,
     local_path: String,
 ) -> CmdResult<u64> {
-    registry
+    let result = registry
         .download(&app, &session_id, &remote_path, &local_path)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    match &result {
+        Ok(bytes) => utils::audit::record(
+            "sftp.get",
+            format!("downloaded {remote_path} ({bytes} bytes)"),
+            serde_json::json!({ "remote": remote_path, "local": local_path, "bytes": bytes, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.get.fail",
+            format!("download of {remote_path} failed"),
+            serde_json::json!({ "remote": remote_path, "local": local_path, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -197,10 +226,23 @@ async fn sftp_put(
     local_path: String,
     remote_path: String,
 ) -> CmdResult<u64> {
-    registry
+    let result = registry
         .upload(&app, &session_id, &local_path, &remote_path)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    match &result {
+        Ok(bytes) => utils::audit::record(
+            "sftp.put",
+            format!("uploaded {remote_path} ({bytes} bytes)"),
+            serde_json::json!({ "local": local_path, "remote": remote_path, "bytes": bytes, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.put.fail",
+            format!("upload to {remote_path} failed"),
+            serde_json::json!({ "local": local_path, "remote": remote_path, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 /* ----------------------------------------------------------------- tunnels */
@@ -271,7 +313,15 @@ async fn sftp_rename(
     from: String,
     to: String,
 ) -> CmdResult<()> {
-    registry.sftp_rename(&session_id, &from, &to).await.map_err(|e| e.to_string())
+    let result = registry.sftp_rename(&session_id, &from, &to).await.map_err(|e| e.to_string());
+    if result.is_ok() {
+        utils::audit::record(
+            "sftp.rename",
+            format!("renamed {from} to {to}"),
+            serde_json::json!({ "from": from, "to": to, "ok": true }),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -281,7 +331,20 @@ async fn sftp_delete(
     path: String,
     is_dir: bool,
 ) -> CmdResult<()> {
-    registry.sftp_delete(&session_id, &path, is_dir).await.map_err(|e| e.to_string())
+    let result = registry.sftp_delete(&session_id, &path, is_dir).await.map_err(|e| e.to_string());
+    match &result {
+        Ok(()) => utils::audit::record(
+            "sftp.delete",
+            format!("deleted {}{path}", if is_dir { "directory " } else { "" }),
+            serde_json::json!({ "path": path, "isDir": is_dir, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.delete.fail",
+            format!("delete of {path} failed"),
+            serde_json::json!({ "path": path, "isDir": is_dir, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -290,7 +353,15 @@ async fn sftp_mkdir(
     session_id: String,
     path: String,
 ) -> CmdResult<()> {
-    registry.sftp_mkdir(&session_id, &path).await.map_err(|e| e.to_string())
+    let result = registry.sftp_mkdir(&session_id, &path).await.map_err(|e| e.to_string());
+    if result.is_ok() {
+        utils::audit::record(
+            "sftp.mkdir",
+            format!("created directory {path}"),
+            serde_json::json!({ "path": path, "ok": true }),
+        );
+    }
+    result
 }
 
 /// Local-side mutations, mirroring the sftp_* trio so the two panes offer the
@@ -457,6 +528,20 @@ async fn log_read(name: String) -> CmdResult<String> {
     utils::session_log::read_log(&name).map_err(|e| e.to_string())
 }
 
+/// Most recent audit-log entries, newest first, for the Audit panel.
+#[tauri::command]
+async fn audit_list(limit: usize) -> CmdResult<Vec<utils::audit::AuditView>> {
+    // Clamp so a bad/huge limit cannot ask the UI to render the entire history.
+    utils::audit::list(limit.min(2000)).map_err(|e| e.to_string())
+}
+
+/// Walk the audit chain and report whether it is intact, where it broke, and
+/// whether the file head matches the keychain anchor.
+#[tauri::command]
+async fn audit_verify() -> CmdResult<utils::audit::VerifyReport> {
+    utils::audit::verify().map_err(|e| e.to_string())
+}
+
 /// Export the host catalogue to Documents\hawser-hosts.json and reveal it.
 ///
 /// Topology only — names, addresses, folders, snippets. Passwords live in the
@@ -477,6 +562,11 @@ async fn hosts_export() -> CmdResult<String> {
 
     // Reveal rather than open: the point is "here is the file to copy".
     let _ = utils::platform::reveal_file(&path);
+    utils::audit::record(
+        "hosts.export",
+        "exported the host catalogue",
+        serde_json::json!({ "path": path.to_string_lossy(), "ok": true }),
+    );
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -582,7 +672,17 @@ async fn capture_output(
                 .to_string(),
         );
     }
-    utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string())
+    let saved = utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string());
+    if let Ok(cap) = &saved {
+        // The command string is audited (it is operator intent, not a secret);
+        // the captured output is never logged — only its size and destination.
+        utils::audit::record(
+            "exec.capture",
+            format!("captured output of '{command}' on {host}"),
+            serde_json::json!({ "host": host, "command": command, "bytes": cap.bytes, "lines": cap.lines, "ok": true }),
+        );
+    }
+    saved
 }
 
 /// Generate an Ed25519 keypair into ~/.ssh, returning the private-key path
@@ -606,7 +706,7 @@ async fn ssh_copy_id(
     password: String,
     public_key: String,
 ) -> CmdResult<()> {
-    ssh::copy_id(
+    let result = ssh::copy_id(
         app,
         std::sync::Arc::clone(&prompts),
         std::sync::Arc::clone(&auth_prompts),
@@ -617,7 +717,22 @@ async fn ssh_copy_id(
         &public_key,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    // The public key is not a secret (it is meant to be published); the password
+    // used for the one-shot login is never logged.
+    match &result {
+        Ok(()) => utils::audit::record(
+            "key.install",
+            format!("installed a public key for {username}@{host}:{port}"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "publicKey": public_key, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "key.install.fail",
+            format!("key install for {username}@{host}:{port} failed"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -676,6 +791,12 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     std::fs::write(&pub_path, format!("{public}
 ")).map_err(|e| e.to_string())?;
 
+    utils::audit::record(
+        "key.generate",
+        format!("generated an Ed25519 key at {}", path.to_string_lossy()),
+        serde_json::json!({ "privatePath": path.to_string_lossy(), "publicKey": public, "ok": true }),
+    );
+
     Ok(serde_json::json!({
         "privatePath": path.to_string_lossy(),
         "publicKey": public,
@@ -707,7 +828,17 @@ async fn ai_key_save(
     kind: String,
     base_url: String,
 ) -> CmdResult<()> {
-    utils::ai::save_key(&profile, &key, &kind, &base_url)
+    let result = utils::ai::save_key(&profile, &key, &kind, &base_url);
+    if result.is_ok() {
+        // The API key itself is never logged — only that a key was saved for this
+        // provider profile.
+        utils::audit::record(
+            "aikey.save",
+            format!("saved an AI provider key for profile '{profile}'"),
+            serde_json::json!({ "profile": profile, "kind": kind, "ok": true }),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -719,7 +850,15 @@ async fn ai_key_status(profile: String) -> CmdResult<bool> {
 /// switching to a provider that needs no key (e.g. local Ollama).
 #[tauri::command]
 async fn ai_key_delete(profile: String) -> CmdResult<()> {
-    utils::ai::delete_key(&profile)
+    let result = utils::ai::delete_key(&profile);
+    if result.is_ok() {
+        utils::audit::record(
+            "aikey.delete",
+            format!("removed the AI provider key for profile '{profile}'"),
+            serde_json::json!({ "profile": profile, "ok": true }),
+        );
+    }
+    result
 }
 
 /// Provider settings (kind/baseUrl/model — never the key) as opaque JSON at
@@ -774,6 +913,13 @@ async fn credential_save(
     // the save is atomic: if the binding cannot be written, the save fails
     // rather than silently leaving a secret that ssh_connect will later refuse.
     utils::hosts::snapshot_binding(&host_id, &host, port, &username).map_err(|e| e.to_string())?;
+    // The password is never logged — only that a credential was saved and bound
+    // to this destination.
+    utils::audit::record(
+        "credential.save",
+        format!("saved a password for {username}@{host}:{port}"),
+        serde_json::json!({ "hostId": host_id, "host": host, "port": port, "user": username, "ok": true }),
+    );
     Ok(())
 }
 
@@ -794,7 +940,14 @@ async fn credential_delete(host_id: String) -> CmdResult<()> {
     let deleted = credentials::delete_secret(&host_id);
     utils::hosts::remove_binding(&host_id);
     match deleted {
-        Ok(()) | Err(credentials::CredError::NotFound(_)) => Ok(()),
+        Ok(()) | Err(credentials::CredError::NotFound(_)) => {
+            utils::audit::record(
+                "credential.delete",
+                format!("removed the saved password for host '{host_id}'"),
+                serde_json::json!({ "hostId": host_id, "ok": true }),
+            );
+            Ok(())
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -889,6 +1042,8 @@ pub fn run() {
             logs_list,
             open_logs_folder,
             log_read,
+            audit_list,
+            audit_verify,
             credential_save,
             credential_status,
             credential_delete,
