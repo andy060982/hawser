@@ -208,12 +208,6 @@ impl HostKeyPrompts {
         }
     }
 
-    fn register(&self, request_id: String, session_id: &str) -> oneshot::Receiver<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.pending.insert(request_id, (session_id.to_string(), tx));
-        rx
-    }
-
     fn cancel(&self, request_id: &str) {
         self.pending.remove(request_id);
     }
@@ -240,6 +234,40 @@ fn cancel_for_session<T>(
         pending.remove(id);
     }
     ids
+}
+
+/// Register a prompt and show it, atomically with respect to
+/// `cancel_for_session`.
+///
+/// The entry's shard lock is held from insert until the emit has returned, and
+/// the sweep must take that same lock to see or remove the entry. So a sweep
+/// lands either wholly BEFORE the registration — the watch sender it follows
+/// is already dropped, `cancelled()` sees it, and nothing is emitted — or
+/// wholly AFTER the emit, so its `prompt-closed` always follows the prompt in
+/// the UI's event order. Without this, a cancel between the check and the emit
+/// left a dialog no backend task would ever resolve.
+///
+/// Returns `None` (with nothing left registered) when cancelled or when the
+/// emit fails. `emit` must not touch `pending`.
+fn register_and_emit<T>(
+    pending: &DashMap<String, (String, oneshot::Sender<T>)>,
+    request_id: &str,
+    session_id: &str,
+    cancelled: impl FnOnce() -> bool,
+    emit: impl FnOnce() -> bool,
+) -> Option<oneshot::Receiver<T>> {
+    let (tx, rx) = oneshot::channel();
+    let guard = pending
+        .entry(request_id.to_string())
+        .insert((session_id.to_string(), tx));
+    let shown = !cancelled() && emit();
+    drop(guard);
+    if shown {
+        Some(rx)
+    } else {
+        pending.remove(request_id);
+        None
+    }
 }
 
 /// Payload of `ssh://prompt-closed`: a host-key or auth prompt that no longer
@@ -310,12 +338,6 @@ impl AuthPrompts {
             Some((_, (_, tx))) => tx.send(AuthAnswer { answers, save }).is_ok(),
             None => false,
         }
-    }
-
-    fn register(&self, request_id: String, session_id: &str) -> oneshot::Receiver<AuthAnswer> {
-        let (tx, rx) = oneshot::channel();
-        self.pending.insert(request_id, (session_id.to_string(), tx));
-        rx
     }
 
     /// Drop every prompt raised for `session_id` (see HostKeyPrompts). The
@@ -420,33 +442,32 @@ impl client::Handler for ClientHandler {
             .fingerprint(russh::keys::HashAlg::Sha256)
             .to_string();
 
-        if self.cancelled() {
-            return Err(SshError::Cancelled(self.session_id.clone()));
-        }
-        let rx = self.prompts.register(request_id.clone(), &self.session_id);
-        // A disconnect between the check above and the register would have
-        // swept the prompt map before this entry existed; look again so the
-        // prompt is never shown for a closed tab.
-        if self.cancelled() {
-            self.prompts.cancel(&request_id);
-            return Err(SshError::Cancelled(self.session_id.clone()));
-        }
-
-        self.app
-            .emit(
-                "ssh://host-key-prompt",
-                HostKeyRequest {
-                    request_id: request_id.clone(),
-                    host: self.host.clone(),
-                    ip: self.ip.clone(),
-                    port: self.port,
-                    key_type: server_public_key.algorithm().to_string(),
-                    fingerprint,
-                },
-            )
-            .map_err(|_| SshError::HostKeyRejected {
-                host: self.host.clone(),
-            })?;
+        let request = HostKeyRequest {
+            request_id: request_id.clone(),
+            host: self.host.clone(),
+            ip: self.ip.clone(),
+            port: self.port,
+            key_type: server_public_key.algorithm().to_string(),
+            fingerprint,
+        };
+        let mut was_cancelled = false;
+        let rx = register_and_emit(
+            &self.prompts.pending,
+            &request_id,
+            &self.session_id,
+            || {
+                was_cancelled = self.cancelled();
+                was_cancelled
+            },
+            || self.app.emit("ssh://host-key-prompt", request).is_ok(),
+        );
+        let Some(rx) = rx else {
+            return Err(if was_cancelled {
+                SshError::Cancelled(self.session_id.clone())
+            } else {
+                SshError::HostKeyRejected { host: self.host.clone() }
+            });
+        };
 
         match tokio::time::timeout(HOST_KEY_PROMPT_TIMEOUT, rx).await {
             Ok(Ok(true)) => {
@@ -459,10 +480,16 @@ impl client::Handler for ClientHandler {
             Ok(Ok(false)) => Err(SshError::HostKeyRejected {
                 host: self.host.clone(),
             }),
-            // Sender dropped, or nobody answered in time.
-            Ok(Err(_)) => Err(SshError::HostKeyRejected {
-                host: self.host.clone(),
-            }),
+            // Sender dropped: the tab was closed (or the session swept). The
+            // sweep already emitted prompt-closed after our prompt; repeat it
+            // so a close always follows the prompt even on a path that missed
+            // it (the UI ignores a close for an id it no longer holds).
+            Ok(Err(_)) => {
+                emit_prompt_closed(&self.app, &request_id);
+                Err(SshError::HostKeyRejected {
+                    host: self.host.clone(),
+                })
+            }
             Err(_) => {
                 self.prompts.cancel(&request_id);
                 emit_prompt_closed(&self.app, &request_id);
@@ -2178,34 +2205,40 @@ async fn request_auth_answers(
         session_id,
         AUTH_PROMPT_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let rx = auth_prompts.register(request_id.clone(), session_id);
-
-    if app
-        .emit(
-            "ssh://auth-prompt",
-            AuthPromptRequest {
-                request_id: request_id.clone(),
-                session_id: session_id.to_string(),
-                name: name.to_string(),
-                instruction: instruction.to_string(),
-                prompts: fields,
-                offer_save,
-            },
-        )
-        .is_err()
-    {
+    let request = AuthPromptRequest {
+        request_id: request_id.clone(),
+        session_id: session_id.to_string(),
+        name: name.to_string(),
+        instruction: instruction.to_string(),
+        prompts: fields,
+        offer_save,
+    };
+    // No cancellation check here: this runs inside the connect future, which
+    // the cancel select drops at its next await. A sweep that ran just before
+    // this registration is followed by connect()'s own post-cancel sweep, which
+    // then closes the prompt — after it was emitted (see register_and_emit).
+    let Some(rx) = register_and_emit(
+        &auth_prompts.pending,
+        &request_id,
+        session_id,
+        || false,
+        || app.emit("ssh://auth-prompt", request).is_ok(),
+    ) else {
         // The dialog will never be shown, so nothing will ever resolve this
-        // request — drop the pending entry instead of leaking it until timeout.
-        auth_prompts.cancel(&request_id);
+        // request; register_and_emit has already dropped the pending entry.
         return Err(SshError::AuthFailed(
             "could not raise the interactive auth prompt".into(),
         ));
-    }
+    };
 
     match tokio::time::timeout(AUTH_PROMPT_TIMEOUT, rx).await {
         Ok(Ok(answer)) => Ok(answer),
-        // Sender dropped (dialog cancelled) — abort auth cleanly.
-        Ok(Err(_)) => Err(SshError::AuthFailed("interactive auth cancelled".into())),
+        // Sender dropped (dialog cancelled, or the tab's prompts swept) —
+        // abort auth cleanly, and make sure a close follows the prompt.
+        Ok(Err(_)) => {
+            emit_prompt_closed(app, &request_id);
+            Err(SshError::AuthFailed("interactive auth cancelled".into()))
+        }
         Err(_) => {
             auth_prompts.cancel(&request_id);
             emit_prompt_closed(app, &request_id);
@@ -3133,6 +3166,40 @@ mod tests {
         assert_eq!(password_slots(&[p("OTP:", false)], true, false, false), vec![false]);
         assert_eq!(password_slots(&[p("Einmalpasswort:", false)], false, false, false), vec![false]);
         assert_eq!(password_slots(&[p("ワンタイムパスワード:", false)], false, false, false), vec![false]);
+    }
+
+    // The prompt must stay locked while it is emitted, so a concurrent
+    // cancel_for_session cannot remove it between the cancellation check and
+    // the emit (it would then emit prompt-closed BEFORE the prompt). A
+    // cancellation seen at registration leaves nothing registered.
+    #[test]
+    fn prompt_registration_is_atomic_with_cancel_sweep() {
+        use super::{cancel_for_session, register_and_emit};
+        use dashmap::{try_result::TryResult, DashMap};
+        use tokio::sync::oneshot;
+
+        let pending: DashMap<String, (String, oneshot::Sender<bool>)> = DashMap::new();
+        let mut locked_during_emit = false;
+        let rx = register_and_emit(&pending, "hk-1", "s1", || false, || {
+            locked_during_emit = matches!(pending.try_get_mut("hk-1"), TryResult::Locked);
+            true
+        });
+        assert!(locked_during_emit, "sweep could interleave between check and emit");
+        assert!(rx.is_some());
+        // A sweep after the emit removes it (and the caller emits prompt-closed).
+        assert_eq!(cancel_for_session(&pending, "s1"), vec!["hk-1".to_string()]);
+
+        // Cancelled at registration: never emitted, nothing left behind.
+        let mut emitted = false;
+        let rx = register_and_emit(&pending, "hk-2", "s1", || true, || {
+            emitted = true;
+            true
+        });
+        assert!(rx.is_none() && !emitted && pending.is_empty());
+
+        // Emit failure also leaves nothing registered.
+        assert!(register_and_emit(&pending, "hk-3", "s1", || false, || false).is_none());
+        assert!(pending.is_empty());
     }
 
     #[test]
