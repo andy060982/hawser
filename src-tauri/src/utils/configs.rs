@@ -84,16 +84,7 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
 
     let (added, removed) = match previous {
         Some(old) => {
-            let diff = similar::TextDiff::from_lines(old.as_str(), content);
-            let mut a = 0usize;
-            let mut r = 0usize;
-            for change in diff.iter_all_changes() {
-                match change.tag() {
-                    similar::ChangeTag::Insert => a += 1,
-                    similar::ChangeTag::Delete => r += 1,
-                    similar::ChangeTag::Equal => {}
-                }
-            }
+            let (a, r) = line_delta(&old, content);
             (Some(a), Some(r))
         }
         None => (None, None),
@@ -102,6 +93,98 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
     Ok(SnapshotResult {
         name,
         lines: content.lines().count(),
+        added,
+        removed,
+    })
+}
+
+/// (lines added, lines removed) going from `old` to `new`.
+fn line_delta(old: &str, new: &str) -> (usize, usize) {
+    let diff = similar::TextDiff::from_lines(old, new);
+    let (mut a, mut r) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => a += 1,
+            similar::ChangeTag::Delete => r += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (a, r)
+}
+
+/// Outcome of a "has this box changed since I last looked?" check.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigCheck {
+    /// "first" (no earlier snapshot: this one is the baseline), "unchanged"
+    /// (identical to the newest snapshot: nothing saved), or "changed".
+    pub status: &'static str,
+    /// The snapshot saved by this check; None when unchanged.
+    pub name: Option<String>,
+    /// The newest snapshot before this check, and when it was taken.
+    pub previous: Option<String>,
+    pub previous_modified: Option<u64>,
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Compare a fresh capture with the newest stored snapshot, saving it only if
+/// it differs. Unlike `save_snapshot` this never stores a duplicate, so it is
+/// safe to run on every connect without piling up identical files.
+pub fn check_snapshot(host: &str, content: &str) -> Result<ConfigCheck, KnownHostsError> {
+    let dir = configs_dir(host)?;
+    std::fs::create_dir_all(&dir).map_err(|source| KnownHostsError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    super::platform::restrict_perms(&dir, 0o700);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    check_in(&dir, content, &super::session_log::timestamp_for(now))
+}
+
+fn check_in(dir: &PathBuf, content: &str, stamp: &str) -> Result<ConfigCheck, KnownHostsError> {
+    let prev = newest(dir).map(|p| {
+        let modified = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+        (name, modified, std::fs::read_to_string(&p).unwrap_or_default())
+    });
+    let (previous, previous_modified) = match &prev {
+        Some((n, m, _)) => (n.clone(), *m),
+        None => (None, None),
+    };
+    // Line endings and trailing blank lines vary between captures of the same
+    // config (exec channels, pagers); they are not a change.
+    let norm = |t: &str| t.replace("\r\n", "\n").trim_end().to_string();
+    let (status, added, removed) = match &prev {
+        None => ("first", 0, 0),
+        Some((_, _, old)) if norm(old) == norm(content) => {
+            return Ok(ConfigCheck {
+                status: "unchanged",
+                name: None,
+                previous,
+                previous_modified,
+                added: 0,
+                removed: 0,
+            })
+        }
+        Some((_, _, old)) => {
+            let (a, r) = line_delta(old, content);
+            ("changed", a, r)
+        }
+    };
+    let name = write_new_snapshot(dir, stamp, content)?;
+    Ok(ConfigCheck {
+        status,
+        name: Some(name),
+        previous,
+        previous_modified,
         added,
         removed,
     })
@@ -224,6 +307,35 @@ pub fn read_snapshot(host: &str, name: &str) -> Result<String, KnownHostsError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_dir() -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("hawser-cfg-test-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn check_saves_baseline_then_only_real_changes() {
+        let d = tmp_dir();
+        let first = check_in(&d, "hostname fw1\nntp server 1.1.1.1\n", "20261031-090000").unwrap();
+        assert_eq!((first.status, first.previous.as_deref()), ("first", None));
+        assert!(first.name.is_some());
+
+        // Same config, different line endings / trailing newline: no new file.
+        let same = check_in(&d, "hostname fw1\r\nntp server 1.1.1.1\r\n\r\n", "20261031-100000").unwrap();
+        assert_eq!(same.status, "unchanged");
+        assert_eq!(same.name, None);
+        assert_eq!(same.previous, first.name);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+
+        let changed = check_in(&d, "hostname fw1\nntp server 9.9.9.9\nlogging host 10.0.0.5\n", "20261031-110000").unwrap();
+        assert_eq!((changed.status, changed.added, changed.removed), ("changed", 2, 1));
+        assert_eq!(changed.previous, first.name);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+    }
 
     #[test]
     fn checked_accepts_plain_snapshot_names() {

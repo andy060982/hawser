@@ -37,15 +37,19 @@ const fmtWhen = (epoch: number | null) => {
 export function ConfigHistoryDialog({
   host,
   liveSessionId,
+  initialSelected,
   onClose,
 }: {
   host: Host
   /** A connected session to this host, if any — required for Snapshot now. */
   liveSessionId: string | null
+  /** Snapshots to open with — two of them opens straight into their diff (used
+   *  by the "config changed since last visit" chip). */
+  initialSelected?: string[]
   onClose: () => void
 }) {
   const [snaps, setSnaps] = useState<SnapshotInfo[] | null>(null)
-  const [selected, setSelected] = useState<string[]>([])
+  const [selected, setSelected] = useState<string[]>(initialSelected ?? [])
   const [content, setContent] = useState('')
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)

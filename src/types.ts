@@ -53,6 +53,10 @@ export interface Host {
    *  `cat /etc/network/interfaces` (Linux). Runs over a fresh exec channel,
    *  never through the visible terminal. */
   configCommand?: string
+  /** Run `configCommand` on every connect and report whether the config
+   *  changed since the last snapshot ("what changed since my last visit").
+   *  Opt-in: it executes a command on the device, so never on by default. */
+  checkConfigOnConnect?: boolean
   /** Borrow another host's Credential Manager entry ("same password as
    *  fw-01"). One vault edit then covers every host that points here —
    *  the TACACS/AD-account case. */

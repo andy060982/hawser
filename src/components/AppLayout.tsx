@@ -101,6 +101,15 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [tunnelFor, setTunnelFor] = useState<Session | null>(null)
   const [netTools, setNetTools] = useState<{ target: string; port: number } | null>(null)
   const [configFor, setConfigFor] = useState<Host | null>(null)
+  /** Snapshots to preselect when the config dialog opens from the change chip. */
+  const [configSelect, setConfigSelect] = useState<string[] | undefined>(undefined)
+  /** Per session: what the on-connect config check found, when it found a change. */
+  const [configChanges, setConfigChanges] = useState<
+    Record<string, { hostId: string; added: number; removed: number; previous: string; name: string }>
+  >({})
+  /** hostId → when its config was last checked, so split panes and quick
+   *  reconnects to one box don't each run the capture command again. */
+  const configCheckedRef = useRef(new Map<string, number>())
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -472,6 +481,55 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     }, 1500)
   }, [nextPaneIndex, confirm])
 
+  /** "What changed since my last visit": for hosts that opt in, capture the
+   *  config over a side exec channel and compare it with the newest snapshot.
+   *  Reported as a dim line in the terminal, plus a status-bar chip that opens
+   *  the diff when something changed. */
+  const checkConfigOnConnect = useCallback((sessionId: string, host: Host) => {
+    const command = host.configCommand?.trim()
+    if (!host.checkConfigOnConnect || !command) return
+    const last = configCheckedRef.current.get(host.id)
+    if (last !== undefined && Date.now() - last < 120_000) return
+    configCheckedRef.current.set(host.id, Date.now())
+
+    const note = (text: string) => emitLocal(sessionId, `\x1b[38;5;244m● ${text}\x1b[0m\r\n`)
+    const when = (epoch: number | null) => {
+      if (!epoch) return 'your last snapshot'
+      const d = new Date(epoch * 1000)
+      return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+    }
+    void safeInvoke<{
+      status: 'first' | 'unchanged' | 'changed'
+      name: string | null
+      previous: string | null
+      previousModified: number | null
+      added: number
+      removed: number
+    }>('config_check', { sessionId, host: host.hostname, command })
+      .then((r) => {
+        if (!r) return
+        if (r.status === 'first') {
+          note('config baseline saved; future connects will report changes against it')
+        } else if (r.status === 'unchanged') {
+          note(`config unchanged since ${when(r.previousModified)}`)
+        } else if (r.name && r.previous) {
+          emitLocal(
+            sessionId,
+            `\x1b[38;2;242;178;92m● config changed since ${when(r.previousModified)}: ` +
+              `+${r.added} −${r.removed} lines\x1b[0m \x1b[38;5;244m(status bar → view diff)\x1b[0m\r\n`,
+          )
+          const { name, previous } = r
+          setConfigChanges((m) => ({
+            ...m,
+            [sessionId]: { hostId: host.id, added: r.added, removed: r.removed, previous, name },
+          }))
+        }
+      })
+      .catch((e: unknown) => {
+        note(`config check failed: ${e instanceof Error ? e.message : String(e)}`)
+      })
+  }, [])
+
   /** Performs the deferred connect once a real terminal size is known. */
   const connectPending = useCallback((sessionId: string, cols: number, rows: number) => {
     const entry = pendingRef.current.get(sessionId)
@@ -526,6 +584,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             s.id === sessionId && s.status === 'connecting' ? { ...s, status: 'connected' } : s,
           ),
         )
+        checkConfigOnConnect(sessionId, host)
       })
       .catch((e: unknown) => {
         // A tab closed mid-connect fails here as "cancelled"; nothing to show.
@@ -540,7 +599,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         const msg = e instanceof Error ? e.message : String(e)
         emitLocal(sessionId, `\r\n\x1b[38;2;185;139;250m● connection failed\x1b[0m\r\n${msg}\r\n`)
       })
-  }, [])
+  }, [checkConfigOnConnect])
 
   /** Re-dial a dropped or dormant session, reusing its id so the terminal pane,
    *  scrollback, group, and pane number are all preserved — the pane never
@@ -1409,6 +1468,16 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
         hostCount={countHosts(hosts)}
         size={activeId ? sizes[activeId] : undefined}
         onReconnect={activeId ? () => reconnectSession(activeId) : undefined}
+        configChange={activeId ? configChanges[activeId] : undefined}
+        onViewConfigChange={(() => {
+          const c = activeId ? configChanges[activeId] : undefined
+          const h = c && lookupHost(c.hostId)
+          if (!c || !h) return undefined
+          return () => {
+            setConfigSelect([c.previous, c.name])
+            setConfigFor(h)
+          }
+        })()}
       />
 
       {/* Rendered at the shell root so the modal covers the whole window; it
@@ -1470,7 +1539,11 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
               (t) => t.hostId === configFor.id && t.status === 'connected',
             )?.id ?? null
           }
-          onClose={() => setConfigFor(null)}
+          initialSelected={configSelect}
+          onClose={() => {
+            setConfigFor(null)
+            setConfigSelect(undefined)
+          }}
         />
       )}
 

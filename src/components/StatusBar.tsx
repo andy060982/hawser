@@ -1,14 +1,17 @@
-import { Lock, RotateCw, Wifi, WifiOff } from 'lucide-react'
+import { FileDiff, Lock, RotateCw, Wifi, WifiOff } from 'lucide-react'
 import type { Session } from '../types'
 
 export function StatusBar({
-  session, hostCount, size, onReconnect,
+  session, hostCount, size, onReconnect, configChange, onViewConfigChange,
 }: {
   session?: Session
   hostCount: number
   /** Measured terminal grid for the active session, if it has one. */
   size?: { cols: number; rows: number }
   onReconnect?: () => void
+  /** Set when the on-connect config check found changes since the last visit. */
+  configChange?: { added: number; removed: number }
+  onViewConfigChange?: () => void
 }) {
   const dead = session && session.status !== 'connected' && session.status !== 'connecting'
   return (
@@ -36,6 +39,17 @@ export function StatusBar({
             >
               <RotateCw size={10} aria-hidden />
               Reconnect
+            </button>
+          )}
+          {configChange && onViewConfigChange && (
+            <button
+              type="button"
+              onClick={onViewConfigChange}
+              title="The device config differs from your last snapshot — view the diff"
+              className="flex items-center gap-1 rounded border border-warn/50 bg-warn/10 px-1.5 text-[10.5px] text-warn transition-colors hover:bg-warn/20"
+            >
+              <FileDiff size={10} aria-hidden />
+              Config changed +{configChange.added} −{configChange.removed}
             </button>
           )}
           {session.status === 'connected' && (

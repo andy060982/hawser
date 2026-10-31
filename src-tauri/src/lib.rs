@@ -654,6 +654,42 @@ async fn config_snapshot(
     utils::configs::save_snapshot(&host, &output).map_err(|e| e.to_string())
 }
 
+/// "What changed since my last visit": capture the config over a fresh exec
+/// channel and compare it with the newest snapshot, saving only if it differs.
+/// Run on connect for hosts that opt in (Host editor), never otherwise.
+#[tauri::command]
+async fn config_check(
+    registry: State<'_, Registry>,
+    session_id: String,
+    host: String,
+    command: String,
+) -> CmdResult<utils::configs::ConfigCheck> {
+    let output = registry
+        .exec_capture(&session_id, &command, 60)
+        .await
+        .map_err(|e| e.to_string())?;
+    if output.trim().is_empty() {
+        return Err(
+            "capture returned nothing — the device may not support exec-channel commands"
+                .to_string(),
+        );
+    }
+    let audited_host = host.clone();
+    let check = tauri::async_runtime::spawn_blocking(move || {
+        utils::configs::check_snapshot(&host, &output)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    // Like capture_output: host and outcome only — never the command or config.
+    utils::audit::record(
+        "config.check",
+        format!("checked the config on {audited_host}: {}", check.status),
+        serde_json::json!({ "host": audited_host, "status": check.status, "added": check.added, "removed": check.removed, "ok": true }),
+    );
+    Ok(check)
+}
+
 #[tauri::command]
 async fn config_list(host: String) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
     utils::configs::list_snapshots(&host).map_err(|e| e.to_string())
@@ -1040,6 +1076,7 @@ pub fn run() {
             net_dns_lookup,
             hosts_probe,
             config_snapshot,
+            config_check,
             capture_output,
             config_list,
             config_diff,

@@ -21,6 +21,12 @@ All notable changes to Hawser are documented here. Format follows
   the chain broke. Records hold metadata only: no passwords, keys, command
   text, or command output. "Archive and start new" sets a failed log aside
   (kept, and pinned by fingerprint in the new log).
+- **"What changed since my last visit."** Opt-in per host (Host editor →
+  "Check for config changes on connect"): on each connect Hawser runs the host's
+  config command on a side channel and compares it with the newest snapshot. You
+  get a one-line note in the terminal ("config unchanged since …" or "config
+  changed since …: +12 −3 lines") and a status-bar chip that opens the diff. A
+  snapshot is saved only when the config actually changed.
 - **Search inside sessions** in Session history: full-text search across every
   recorded transcript, grouped by session, newest first; click a match to open
   the transcript at that line.
