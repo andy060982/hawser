@@ -554,19 +554,19 @@ impl ReadyFd {
         Ok(Self(owned))
     }
 
-    /// Readable (or hung up / errored) within `timeout`? Errors count as
-    /// readable so the following read() surfaces them.
+    /// Wait up to `timeout` for the terminal to become readable (data, hang-up,
+    /// or an error condition that the following read() will surface).
     #[cfg(target_os = "linux")]
-    fn ready(&self, timeout: Duration) -> bool {
+    fn ready(&self, timeout: Duration) -> Wait {
         use std::os::fd::AsRawFd;
         let mut p = libc::pollfd { fd: self.0.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         // SAFETY: one valid pollfd on the stack for the duration of the call.
         let n = unsafe { libc::poll(&mut p, 1, timeout.as_millis() as libc::c_int) };
-        n != 0
+        Wait::classify(n)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn ready(&self, timeout: Duration) -> bool {
+    fn ready(&self, timeout: Duration) -> Wait {
         use std::os::fd::AsRawFd;
         let fd = self.0.as_raw_fd();
         // SAFETY: fd < FD_SETSIZE (checked in `dup`); fd_set is plain data and
@@ -580,7 +580,33 @@ impl ReadyFd {
                 tv_usec: timeout.subsec_micros() as _,
             };
             let n = libc::select(fd + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv);
-            n != 0
+            Wait::classify(n)
+        }
+    }
+}
+
+/// Outcome of one readiness wait.
+#[cfg(unix)]
+#[derive(Debug, PartialEq)]
+enum Wait {
+    /// A read() will not block.
+    Ready,
+    /// Nothing yet: the timeout passed, or a signal interrupted the wait
+    /// (EINTR). Re-check `finished` and wait again; never read on this.
+    Again,
+    /// The wait itself failed: stop reading rather than risk a blocking read.
+    Failed,
+}
+
+#[cfg(unix)]
+impl Wait {
+    /// From a poll()/select() return value (errno read on -1).
+    fn classify(n: libc::c_int) -> Self {
+        match n {
+            0 => Wait::Again,
+            n if n > 0 => Wait::Ready,
+            _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => Wait::Again,
+            _ => Wait::Failed,
         }
     }
 }
@@ -602,8 +628,10 @@ fn pump<R: Runtime>(
             break;
         }
         #[cfg(unix)]
-        if !wake.ready(Duration::from_millis(100)) {
-            continue;
+        match wake.ready(Duration::from_millis(100)) {
+            Wait::Ready => {}
+            Wait::Again => continue,
+            Wait::Failed => break,
         }
         match reader.read(&mut buf) {
             // EOF, or EIO on Linux once the shell is gone: either way, done.
@@ -684,7 +712,9 @@ mod tests {
         shells.write("t1", b"exit 0\n").unwrap();
         let status = st_rx.recv_timeout(std::time::Duration::from_secs(20)).expect("status");
         assert!(status.contains("disconnected") && status.contains("t1"), "{status}");
-        assert!(!shells.owns("t1"), "exited shell deregisters itself");
+        // The status is published just before the id is released (by design:
+        // nothing of this shell may follow it), so wait for the release.
+        wait_until("the exited shell to deregister", 5, || !shells.owns("t1"));
     }
 
     /// A disowned background job can keep the terminal open after the shell
@@ -714,8 +744,9 @@ mod tests {
             .recv_timeout(EXIT_GRACE + std::time::Duration::from_secs(15))
             .expect("finished despite the background job");
         assert!(status.contains("bg1") && status.contains("disconnected"), "{status}");
-        assert!(!shells.owns("bg1"));
-        // A restart on the same id is accepted straight away.
+        // A restart on the same id is accepted straight away, even in the
+        // instant between the status and the id's release (the old session is
+        // already marked finished).
         shells.start(&handle, "bg1", &login.id, 80, 24, false).unwrap();
         shells.close("bg1");
     }
@@ -799,6 +830,48 @@ mod tests {
         }
         wait_until("no reader left", 10, || shells.readers.load(Ordering::SeqCst) == 0);
         drop(hold);
+    }
+
+    /// A signal interrupting the readiness wait (EINTR) must not count as
+    /// readable: the reader would fall into a blocking read with no data and
+    /// could stay there past the finish. Deterministic: a thread waits on an
+    /// empty pipe, and SIGUSR1 (no-op handler, no SA_RESTART) interrupts it.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_wait_is_not_readiness() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        extern "C" fn noop(_: libc::c_int) {}
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe() fills two fds we then own; sigaction installs a
+        // no-op handler without SA_RESTART so the wait returns EINTR.
+        let (rd, _wr) = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop as extern "C" fn(libc::c_int) as *const () as usize;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()), 0);
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        };
+        let wake = ReadyFd(rd);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            // SAFETY: pthread_self has no preconditions.
+            tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
+            let start = std::time::Instant::now();
+            let outcome = wake.ready(Duration::from_secs(10));
+            (outcome, start.elapsed())
+        });
+        let tid = rx.recv().unwrap() as libc::pthread_t;
+        std::thread::sleep(Duration::from_millis(200));
+        // SAFETY: the target thread is alive (blocked in the wait).
+        assert_eq!(unsafe { libc::pthread_kill(tid, libc::SIGUSR1) }, 0);
+        let (outcome, took) = waiter.join().unwrap();
+        assert!(took < Duration::from_secs(5), "the signal did not interrupt the wait");
+        assert_eq!(outcome, Wait::Again);
+        // And the pure classification for the other cases.
+        assert_eq!(Wait::classify(1), Wait::Ready);
+        assert_eq!(Wait::classify(0), Wait::Again);
     }
 
     #[test]
