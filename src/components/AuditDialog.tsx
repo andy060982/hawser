@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, ShieldCheck, X } from 'lucide-react'
+import { AlertTriangle, Archive, CheckCircle2, Info, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
+import { useDialogs } from '../lib/dialogs'
 
 interface AuditView {
   seq: number
@@ -10,8 +11,15 @@ interface AuditView {
   detail: Record<string, unknown>
 }
 
+/* verified = intact and anchored; warning = intact but something cannot be
+   vouched for (unanchored entries, unreadable keychain); failed = broken chain
+   or file/anchor mismatch; empty = nothing recorded yet. Only `verified` gets
+   the green check. */
+type VerifyStatus = 'verified' | 'warning' | 'failed' | 'empty'
+
 interface VerifyReport {
   ok: boolean
+  status: VerifyStatus
   count: number
   message: string
   brokenAt: number | null
@@ -28,11 +36,11 @@ const fmtWhen = (epoch: number) => {
    failed transfer stands out when scanning the log. */
 const isFailure = (event: string) => event.endsWith('.fail')
 
-/* Compact one-line detail: the fields worth seeing at a glance, secrets never
-   among them (the backend only ever records metadata). */
+/* Compact one-line detail: the fields worth seeing at a glance. The backend
+   records metadata only — never passwords, keys, command text, or output. */
 const detailLine = (d: Record<string, unknown>): string => {
   const parts: string[] = []
-  for (const k of ['user', 'host', 'port', 'remote', 'local', 'path', 'bytes', 'error']) {
+  for (const k of ['user', 'host', 'port', 'remote', 'local', 'path', 'bytes', 'keyFingerprint', 'error']) {
     const v = d[k]
     if (v !== undefined && v !== null && v !== '') parts.push(`${k}=${v}`)
   }
@@ -45,13 +53,16 @@ const detailLine = (d: Record<string, unknown>): string => {
    Every connect, file transfer, key install, and credential change is appended
    to a hash-chained log on disk, with the chain head sealed into the OS
    keychain. "Verify integrity" walks the chain and reports whether it is intact
-   or exactly where it was altered — so the log can be trusted as evidence, not
-   just read. Read-only here; the record is written as actions happen.
+   and anchored, where it was altered, or what cannot be vouched for. Entries are
+   never edited here; the only write is archiving, which sets the whole log
+   aside (kept on disk) and starts a fresh anchored one.
 --------------------------------------------------------------------------- */
 export function AuditDialog({ onClose }: { onClose: () => void }) {
   const [entries, setEntries] = useState<AuditView[] | null>(null)
   const [report, setReport] = useState<VerifyReport | null>(null)
   const [verifying, setVerifying] = useState(false)
+  const [archiving, setArchiving] = useState(false)
+  const { confirm } = useDialogs()
 
   const refresh = useCallback(() => {
     void safeInvoke<AuditView[]>('audit_list', { limit: 500 }).then((l) => setEntries(l ?? []))
@@ -73,6 +84,21 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
         if (r) setReport(r)
       })
       .finally(() => setVerifying(false))
+  }
+
+  const archive = async () => {
+    const ok = await confirm(
+      'The current log is renamed and kept beside the new one, never deleted. The new log starts with an entry naming the archive, and is anchored from its first entry.',
+      { title: 'Archive this log and start a new one?', confirmLabel: 'Archive and start new' },
+    )
+    if (!ok) return
+    setArchiving(true)
+    void safeInvoke<string>('audit_archive')
+      .then(() => {
+        refresh()
+        verify()
+      })
+      .finally(() => setArchiving(false))
   }
 
   const empty = useMemo(() => (entries?.length ?? 0) === 0, [entries])
@@ -115,23 +141,51 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
         {report && (
           <div
             role="status"
-            className={`flex items-start gap-2 border-b px-4 py-2 text-[12px] ${
-              report.ok
-                ? 'border-line bg-accent-soft/40 text-ink'
-                : 'border-warn/60 bg-warn/10 text-ink'
+            className={`flex items-start gap-2 border-b px-4 py-2 text-[12px] text-ink ${
+              report.status === 'verified'
+                ? 'border-line bg-accent-soft/40'
+                : report.status === 'empty'
+                  ? 'border-line bg-surface-1'
+                  : report.status === 'failed'
+                    ? 'border-warn bg-warn/20'
+                    : 'border-warn/60 bg-warn/10'
             }`}
           >
-            {report.ok ? (
+            {report.status === 'verified' ? (
               <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-accent" aria-hidden />
+            ) : report.status === 'empty' ? (
+              <Info size={14} className="mt-0.5 shrink-0 text-ink-faint" aria-hidden />
+            ) : report.status === 'failed' ? (
+              <ShieldAlert size={14} className="mt-0.5 shrink-0 text-warn" aria-hidden />
             ) : (
               <AlertTriangle size={14} className="mt-0.5 shrink-0 text-warn" aria-hidden />
             )}
-            <span className="min-w-0">
+            <span className="min-w-0 flex-1">
+              <span className="font-medium">
+                {report.status === 'verified'
+                  ? 'Verified. '
+                  : report.status === 'failed'
+                    ? 'Integrity check failed. '
+                    : report.status === 'warning'
+                      ? 'Not fully verified. '
+                      : ''}
+              </span>
               {report.message}
               {report.brokenAt !== null && (
                 <span className="font-mono"> (entry {report.brokenAt})</span>
               )}
             </span>
+            {(report.status === 'failed' || report.status === 'warning') && (
+              <button
+                type="button"
+                onClick={() => void archive()}
+                disabled={archiving}
+                className="flex h-6 shrink-0 items-center gap-1.5 rounded border border-line bg-surface-1 px-2 text-[11.5px] text-ink hover:border-accent hover:text-accent disabled:opacity-50"
+              >
+                <Archive size={12} aria-hidden />
+                {archiving ? 'Archiving…' : 'Archive and start new'}
+              </button>
+            )}
           </div>
         )}
 

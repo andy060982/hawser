@@ -532,14 +532,22 @@ async fn log_read(name: String) -> CmdResult<String> {
 #[tauri::command]
 async fn audit_list(limit: usize) -> CmdResult<Vec<utils::audit::AuditView>> {
     // Clamp so a bad/huge limit cannot ask the UI to render the entire history.
-    utils::audit::list(limit.min(2000)).map_err(|e| e.to_string())
+    utils::audit::list(limit.min(2000))
 }
 
 /// Walk the audit chain and report whether it is intact, where it broke, and
 /// whether the file head matches the keychain anchor.
 #[tauri::command]
 async fn audit_verify() -> CmdResult<utils::audit::VerifyReport> {
-    utils::audit::verify().map_err(|e| e.to_string())
+    utils::audit::verify()
+}
+
+/// Set the current audit log aside (renamed, never deleted) and start a fresh,
+/// anchored one whose first entry names the archive. The only way back to a
+/// clean "verified" state after a failed or gapped check.
+#[tauri::command]
+async fn audit_archive() -> CmdResult<String> {
+    utils::audit::archive()
 }
 
 /// Export the host catalogue to Documents\hawser-hosts.json and reveal it.
@@ -674,12 +682,13 @@ async fn capture_output(
     }
     let saved = utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string());
     if let Ok(cap) = &saved {
-        // The command string is audited (it is operator intent, not a secret);
-        // the captured output is never logged — only its size and destination.
+        // Neither the command nor its output is logged: a command line can carry
+        // a token or password (`curl -H 'Authorization: …'`). Only the host and
+        // the size of what was saved.
         utils::audit::record(
             "exec.capture",
-            format!("captured output of '{command}' on {host}"),
-            serde_json::json!({ "host": host, "command": command, "bytes": cap.bytes, "lines": cap.lines, "ok": true }),
+            format!("captured command output on {host}"),
+            serde_json::json!({ "host": host, "bytes": cap.bytes, "lines": cap.lines, "ok": true }),
         );
     }
     saved
@@ -718,18 +727,20 @@ async fn ssh_copy_id(
     )
     .await
     .map_err(|e| e.to_string());
-    // The public key is not a secret (it is meant to be published); the password
+    // The key is logged by fingerprint (its comment is free text); the password
     // used for the one-shot login is never logged.
     match &result {
         Ok(()) => utils::audit::record(
             "key.install",
             format!("installed a public key for {username}@{host}:{port}"),
-            serde_json::json!({ "host": host, "port": port, "user": username, "publicKey": public_key, "ok": true }),
+            serde_json::json!({ "host": host, "port": port, "user": username, "keyFingerprint": utils::audit::key_fingerprint(&public_key), "ok": true }),
         ),
-        Err(e) => utils::audit::record(
+        Err(_) => utils::audit::record(
             "key.install.fail",
             format!("key install for {username}@{host}:{port} failed"),
-            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false, "error": e }),
+            // No error text: on failure it carries up to 200 chars of the remote
+            // command's output, and command output is never logged.
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false }),
         ),
     }
     result
@@ -794,7 +805,7 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     utils::audit::record(
         "key.generate",
         format!("generated an Ed25519 key at {}", path.to_string_lossy()),
-        serde_json::json!({ "privatePath": path.to_string_lossy(), "publicKey": public, "ok": true }),
+        serde_json::json!({ "privatePath": path.to_string_lossy(), "keyFingerprint": utils::audit::key_fingerprint(&public), "ok": true }),
     );
 
     Ok(serde_json::json!({
@@ -1044,6 +1055,7 @@ pub fn run() {
             log_read,
             audit_list,
             audit_verify,
+            audit_archive,
             credential_save,
             credential_status,
             credential_delete,

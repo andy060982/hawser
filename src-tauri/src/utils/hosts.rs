@@ -543,6 +543,17 @@ mod tests {
     use super::{binding_key, dest_authorized_in, normalize_keys, walk_hosts};
     use serde_json::{json, Value};
 
+    // The audit anchor lives in the vault beside host secrets; it must never be
+    // bindable or usable as a host credential, in any letter case. Both checks
+    // return before touching the bindings file.
+    #[test]
+    fn audit_seal_id_cannot_be_bound_or_authorized() {
+        for id in [crate::utils::audit::SEAL_ID, "HAWSER:AUDIT-HEAD"] {
+            assert!(super::snapshot_binding(id, "fw1", 22, "admin").is_err());
+            assert!(!super::binding_is_authorized(id, "fw1", 22, "admin"));
+        }
+    }
+
     // A recorded binding list is authorized only for the exact destinations in
     // it, whatever their host/port/user — matching the tuple, nothing looser.
     #[test]

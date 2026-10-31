@@ -34,13 +34,21 @@ pub fn target_name(host_id: &str) -> String {
     format!("hawser:host:{host_id}")
 }
 
-/// True for vault ids that belong to another namespace and must never be used
-/// as a host credential id. The AI provider key is stored at `ai:<profile>`
-/// (see utils::ai::vault_profile), which shares `target_name`'s prefix — so a
-/// host whose id were `ai:default` would otherwise address that key. Matched
-/// case-insensitively because Windows Credential Manager target names are.
+/// Vault id prefixes owned by the app itself, never usable as a host
+/// credential id. Every item shares `target_name`'s prefix, so without this a
+/// host whose id were `ai:default` would address the AI provider key
+/// (utils::ai::vault_profile), and one named `hawser:audit-head` the audit-log
+/// anchor (utils::audit::SEAL_ID).
+const RESERVED_PREFIXES: [&str; 2] = ["ai:", "hawser:"];
+
+/// True for vault ids in a reserved namespace. Matched case-insensitively
+/// because Windows Credential Manager target names are, and with full Unicode
+/// folding rather than ASCII-only: upper- then lower-casing maps look-alikes
+/// such as `ſ` (long s) and `K` (Kelvin sign) onto `s` / `k`, so `hawſer:` cannot
+/// slip past if the vault folds them together.
 pub fn is_reserved_id(id: &str) -> bool {
-    id.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("ai:"))
+    let folded = id.to_uppercase().to_lowercase();
+    RESERVED_PREFIXES.iter().any(|p| folded.starts_with(p))
 }
 
 /// Whether a secret exists, without exposing it. Lets the UI show "password
@@ -255,6 +263,18 @@ mod reserved_tests {
         assert!(!is_reserved_id("ai")); // too short to carry the prefix
         assert!(!is_reserved_id("air-1"));
         assert!(!is_reserved_id("h1:ai:"));
+    }
+
+    #[test]
+    fn audit_seal_namespace_is_reserved_case_insensitively() {
+        assert!(is_reserved_id(crate::utils::audit::SEAL_ID));
+        assert!(is_reserved_id("HAWSER:audit-head"));
+        assert!(is_reserved_id("Hawser:anything"));
+        assert!(!is_reserved_id("hawser"));
+        assert!(!is_reserved_id("hawser-audit-head-seal"));
+        assert!(!is_reserved_id("my-hawser:x"));
+        assert!(is_reserved_id("haw\u{17f}er:audit-head")); // long s
+        assert!(is_reserved_id("Ai:x"));
     }
 }
 
