@@ -182,8 +182,13 @@ async fn ssh_disconnect(
     local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
 ) -> CmdResult<()> {
-    // A local terminal closes its shell; no-op for any other id.
-    local.close(&session_id);
+    // A local terminal closes its shell (no-op for any other id). Off the
+    // async runtime: the kill escalates with a short grace period.
+    if local.owns(&session_id) {
+        let local = Arc::clone(&local);
+        let id = session_id.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || local.close(&id)).await;
+    }
     // Cancel an in-flight connect FIRST: once it is cancelled it cannot raise
     // a new prompt, so the sweep below cannot miss one registered behind it.
     registry.remove(&session_id).await;

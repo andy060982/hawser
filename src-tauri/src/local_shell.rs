@@ -21,11 +21,12 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Runtime};
 
@@ -139,20 +140,28 @@ struct LocalShell {
     writer: Mutex<Box<dyn Write + Send>>,
     /// None once the shell has exited: dropping the master closes the PTY.
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    /// Set by the waiter when the shell has been reaped. After that its pid
-    /// may belong to another process, so `close` must not signal it.
-    exited: AtomicBool,
-    /// Set once the session has been reported finished (exactly once, by
-    /// whichever of reader / waiter gets there first). Output read after it
-    /// is dropped: the id may already belong to a restarted shell.
+    /// The shell process; None once reaped. Reaping (the waiter) and killing
+    /// (`close`) both happen under this lock, so a kill can never reach a pid
+    /// that was already reaped and possibly reused.
+    child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
+    /// Publication gate: true once the session has been reported finished.
+    /// Output is emitted while holding it and the finish happens under it, so
+    /// nothing from this shell is published after its "disconnected" status,
+    /// and its id is released only after that status went out.
+    gate: Mutex<bool>,
+    /// Lock-free mirror of `gate`, for the reader's loop condition.
     finished: AtomicBool,
+    /// `close` was requested: input is refused from then on.
+    closing: AtomicBool,
 }
 
 /// Running local shells by session id.
 #[derive(Default)]
 pub struct LocalShells {
     shells: Arc<DashMap<String, Arc<LocalShell>>>,
+    /// Live reader threads (for tests: proves a finished session's reader
+    /// actually exits and releases the terminal).
+    readers: Arc<AtomicUsize>,
 }
 
 /// PTY geometry, clamped to what every backend accepts: ConPTY sizes are
@@ -170,7 +179,9 @@ fn size(cols: u32, rows: u32) -> PtySize {
 /// How long after the shell exits its output may keep draining before the
 /// session is reported finished anyway. On Linux a disowned background job
 /// can hold the terminal open indefinitely, so EOF alone is not a signal.
-const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// How often the waiter checks whether the shell has exited.
+const REAP_POLL: Duration = Duration::from_millis(50);
 
 /// Thread-name-safe form of a session id (names may not contain NUL).
 fn thread_tag(id: &str) -> String {
@@ -178,6 +189,14 @@ fn thread_tag(id: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(40)
         .collect()
+}
+
+fn exit_reason(status: portable_pty::ExitStatus) -> String {
+    if status.success() {
+        "shell exited".to_string()
+    } else {
+        format!("shell exited with code {}", status.exit_code())
+    }
 }
 
 impl LocalShells {
@@ -200,9 +219,7 @@ impl LocalShells {
             .into_iter()
             .find(|p| p.id == profile_id)
             .ok_or_else(|| format!("no local shell profile '{profile_id}' on this machine"))?;
-        if self.owns(session_id) {
-            return Err(format!("session {session_id} is already running"));
-        }
+        self.ensure_free(session_id)?;
 
         // Everything that can fail happens before the shell exists, so a
         // failure never leaves an orphaned process behind. No registry lock is
@@ -212,6 +229,8 @@ impl LocalShells {
             .map_err(|e| format!("could not open a terminal: {e}"))?;
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let wake = ReadyFd::dup(&*pair.master)?;
         let mut cmd = CommandBuilder::new(&prof.program);
         cmd.args(&prof.args);
         if let Some(home) = crate::utils::platform::home_dir() {
@@ -220,7 +239,7 @@ impl LocalShells {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Hawser");
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("could not start {}: {e}", prof.label))?;
@@ -231,23 +250,22 @@ impl LocalShells {
         let shell = Arc::new(LocalShell {
             writer: Mutex::new(writer),
             master: Mutex::new(Some(pair.master)),
-            killer: Mutex::new(child.clone_killer()),
-            exited: AtomicBool::new(false),
+            child: Mutex::new(Some(child)),
+            gate: Mutex::new(false),
             finished: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
         });
-        let mut abort = |why: String| {
-            let _ = child.kill();
-            let _ = child.wait();
-            why
-        };
         // Register; a concurrent start for the same id that got here first wins.
-        match self.shells.entry(session_id.to_string()) {
-            dashmap::Entry::Occupied(_) => {
-                return Err(abort(format!("session {session_id} is already running")))
-            }
+        let registered = match self.shells.entry(session_id.to_string()) {
+            dashmap::Entry::Occupied(_) => false,
             dashmap::Entry::Vacant(v) => {
                 v.insert(Arc::clone(&shell));
+                true
             }
+        };
+        if !registered {
+            terminate(&shell);
+            return Err(format!("session {session_id} is already running"));
         }
 
         let topic = format!("ssh://{session_id}");
@@ -268,15 +286,15 @@ impl LocalShells {
 
         // Two plain threads (PTY handles are blocking everywhere, and a tokio
         // worker must never sit in read()):
-        //  * the waiter owns the child. When the shell exits it marks it
-        //    exited, closes the PTY (ConPTY otherwise never EOFs), and, if the
-        //    reader hasn't finished within EXIT_GRACE (a background job still
-        //    holding the terminal on Linux), finishes the session itself.
-        //  * the reader streams output until EOF, then finishes the session.
+        //  * the waiter reaps the shell (polling under the child lock), closes
+        //    the PTY (ConPTY otherwise never EOFs), and, if the reader hasn't
+        //    finished within EXIT_GRACE (a background job still holding the
+        //    terminal on Linux), finishes the session itself.
+        //  * the reader streams output until EOF or the finish, then finishes.
         let fin = Finisher {
             app: app.clone(),
             sid: session_id.to_string(),
-            topic: topic.clone(),
+            topic,
             shell: Arc::clone(&shell),
             registry: Arc::clone(&self.shells),
         };
@@ -286,12 +304,7 @@ impl LocalShells {
         let waiter = std::thread::Builder::new()
             .name(format!("hawser-local-wait-{tag}"))
             .spawn(move || {
-                let reason = match child.wait() {
-                    Ok(s) if s.success() => "shell exited".to_string(),
-                    Ok(s) => format!("shell exited with code {}", s.exit_code()),
-                    Err(_) => "terminal closed".to_string(),
-                };
-                fin_waiter.shell.exited.store(true, Ordering::SeqCst);
+                let reason = reap(&fin_waiter.shell);
                 if let Ok(mut m) = fin_waiter.shell.master.lock() {
                     m.take();
                 }
@@ -300,26 +313,53 @@ impl LocalShells {
                 fin_waiter.finish(&reason);
             });
         if let Err(e) = waiter {
-            // The child moved into the failed closure and was dropped; kill
-            // through the shared killer and deregister.
-            if let Ok(mut k) = shell.killer.lock() {
-                let _ = k.kill();
-            }
+            terminate(&shell);
             self.shells.remove_if(session_id, |_, s| Arc::ptr_eq(s, &shell));
             return Err(format!("could not start the exit watcher: {e}"));
         }
+        let readers = Arc::clone(&self.readers);
+        readers.fetch_add(1, Ordering::SeqCst);
         let reader_thread = std::thread::Builder::new()
             .name(format!("hawser-local-read-{tag}"))
-            .spawn(move || pump(fin, reader, log, exit_rx));
+            .spawn(move || {
+                #[cfg(unix)]
+                pump(fin, reader, wake, log, exit_rx);
+                #[cfg(not(unix))]
+                pump(fin, reader, log, exit_rx);
+                readers.fetch_sub(1, Ordering::SeqCst);
+            });
         if let Err(e) = reader_thread {
-            self.close(session_id);
+            self.readers.fetch_sub(1, Ordering::SeqCst);
+            terminate(&shell);
             return Err(format!("could not start the output reader: {e}"));
         }
         Ok(prof)
     }
 
+    /// Ok if `session_id` is free, or held only by a session that has finished
+    /// (its last events are out and it is about to release the id).
+    fn ensure_free(&self, session_id: &str) -> Result<(), String> {
+        // Clone the Arc and drop the map guard before taking the gate: the
+        // finisher holds the gate while it removes the map entry.
+        let Some(existing) = self.shells.get(session_id).map(|s| Arc::clone(&s)) else {
+            return Ok(());
+        };
+        let done = existing.gate.lock().map(|g| *g).unwrap_or(true);
+        if done {
+            // Finished under the gate, which also released the entry.
+            Ok(())
+        } else if existing.closing.load(Ordering::SeqCst) {
+            Err("the previous terminal in this tab is still closing; try again in a moment".into())
+        } else {
+            Err(format!("session {session_id} is already running"))
+        }
+    }
+
     pub fn write(&self, session_id: &str, data: &[u8]) -> Result<(), String> {
         let shell = self.get(session_id)?;
+        if shell.closing.load(Ordering::SeqCst) || shell.finished.load(Ordering::SeqCst) {
+            return Err("the terminal is closing".to_string());
+        }
         let mut w = shell.writer.lock().map_err(|_| "terminal writer poisoned")?;
         w.write_all(data).and_then(|_| w.flush()).map_err(|e| e.to_string())
     }
@@ -333,17 +373,23 @@ impl LocalShells {
         }
     }
 
-    /// End the shell. The waiter then closes the PTY and the session reports
-    /// itself finished.
+    /// End the shell: SIGHUP, then SIGKILL if it is still alive shortly after
+    /// (TerminateProcess on Windows). Blocks up to ~250 ms; call off the async
+    /// runtime. The session then finishes through the normal path, which is
+    /// what releases the id — so a reused id never receives this shell's
+    /// final events.
     pub fn close(&self, session_id: &str) {
-        if let Some((_, shell)) = self.shells.remove(session_id) {
-            // Never signal a pid the waiter already reaped: it may be reused.
-            if !shell.exited.load(Ordering::SeqCst) {
-                if let Ok(mut k) = shell.killer.lock() {
-                    let _ = k.kill();
-                }
-            }
+        if let Ok(shell) = self.get(session_id) {
+            shell.closing.store(true, Ordering::SeqCst);
+            terminate(&shell);
         }
+    }
+
+    #[cfg(test)]
+    fn pid(&self, session_id: &str) -> Option<u32> {
+        let shell = self.get(session_id).ok()?;
+        let g = shell.child.lock().ok()?;
+        g.as_ref().and_then(|c| c.process_id())
     }
 
     fn get(&self, session_id: &str) -> Result<Arc<LocalShell>, String> {
@@ -351,6 +397,42 @@ impl LocalShells {
             .get(session_id)
             .map(|s| Arc::clone(&s))
             .ok_or_else(|| format!("no local terminal {session_id}"))
+    }
+}
+
+/// Kill the shell if it has not been reaped yet. `Child::kill` escalates
+/// (SIGHUP, short grace, SIGKILL on Unix) and never signals a child whose exit
+/// it already collected; holding the child lock keeps the waiter from reaping
+/// in between.
+fn terminate(shell: &LocalShell) {
+    if let Ok(mut g) = shell.child.lock() {
+        if let Some(c) = g.as_mut() {
+            let _ = c.kill();
+        }
+    }
+}
+
+/// Wait for the shell to exit, reaping it under the child lock.
+fn reap(shell: &LocalShell) -> String {
+    loop {
+        let done = match shell.child.lock() {
+            Ok(mut g) => match g.as_mut().map(|c| c.try_wait()) {
+                Some(Ok(Some(status))) => {
+                    *g = None;
+                    Some(exit_reason(status))
+                }
+                Some(Ok(None)) => None,
+                Some(Err(_)) | None => {
+                    *g = None;
+                    Some("terminal closed".to_string())
+                }
+            },
+            Err(_) => Some("terminal closed".to_string()),
+        };
+        if let Some(reason) = done {
+            return reason;
+        }
+        std::thread::sleep(REAP_POLL);
     }
 }
 
@@ -376,22 +458,27 @@ impl<R: Runtime> Clone for Finisher<R> {
 }
 
 impl<R: Runtime> Finisher<R> {
-    fn finished(&self) -> bool {
-        self.shell.finished.load(Ordering::SeqCst)
+    /// Emit output unless the session already finished (under the gate, so it
+    /// can't interleave with the finish). False once finished.
+    fn emit_output(&self, text: String) -> bool {
+        let Ok(gate) = self.shell.gate.lock() else { return false };
+        if *gate {
+            return false;
+        }
+        let _ = self.app.emit(&self.topic, text);
+        true
     }
 
     fn finish(&self, reason: &str) {
-        if self.shell.finished.swap(true, Ordering::SeqCst) {
+        let Ok(mut gate) = self.shell.gate.lock() else { return };
+        if *gate {
             return;
         }
-        // Deregister only if the id still maps to THIS shell: after a close the
-        // id may already belong to a new terminal, which must not be torn down.
-        self.registry.remove_if(&self.sid, |_, s| Arc::ptr_eq(s, &self.shell));
-        // Drop our write handle so a background job left on the terminal sees
-        // it close rather than keeping it alive through us.
-        if let Ok(mut w) = self.shell.writer.lock() {
-            *w = Box::new(std::io::sink());
-        }
+        *gate = true;
+        self.shell.finished.store(true, Ordering::SeqCst);
+        // Final line and status go out BEFORE the id is released, and nothing
+        // of this shell's is published after them (the gate), so a terminal
+        // restarted on the same id can never receive them.
         let _ = self.app.emit(
             &self.topic,
             format!("\r\n\x1b[38;2;242;178;92m\u{25cf} {reason}\x1b[0m\r\n"),
@@ -404,38 +491,97 @@ impl<R: Runtime> Finisher<R> {
                 detail: reason.to_string(),
             },
         );
+        // Only if the id still maps to THIS shell.
+        self.registry.remove_if(&self.sid, |_, s| Arc::ptr_eq(s, &self.shell));
+        // Drop our write handle so a background job left on the terminal sees
+        // it close rather than keeping it alive through us.
+        if let Ok(mut w) = self.shell.writer.lock() {
+            *w = Box::new(std::io::sink());
+        }
     }
 }
 
-/// Stream output until EOF, then finish the session with the exit reason.
+/// A duplicate of the PTY master's descriptor, used only to wait for
+/// readability with a timeout, so the reader can notice the session finished
+/// and let go of the terminal even while a background job keeps it open.
+/// `select` rather than `poll`: macOS poll() is unreliable on tty devices.
+#[cfg(unix)]
+struct ReadyFd(std::os::fd::OwnedFd);
+
+#[cfg(unix)]
+impl ReadyFd {
+    fn dup(master: &dyn MasterPty) -> Result<Self, String> {
+        use std::os::fd::{BorrowedFd, OwnedFd};
+        let fd = master.as_raw_fd().ok_or("terminal has no descriptor")?;
+        // SAFETY: `fd` is the live master descriptor, borrowed only to dup it.
+        let owned: OwnedFd = unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .map_err(|e| e.to_string())?;
+        Ok(Self(owned))
+    }
+
+    /// Readable (or hung up) within `timeout`? Errors count as readable so the
+    /// following read() surfaces them.
+    fn ready(&self, timeout: Duration) -> bool {
+        use std::os::fd::AsRawFd;
+        let fd = self.0.as_raw_fd();
+        if fd as usize >= libc::FD_SETSIZE {
+            return true; // can't select on it; fall back to a blocking read
+        }
+        // SAFETY: fd_set is plain data; FD_ZERO/FD_SET/select get a valid fd
+        // below FD_SETSIZE and pointers to locals that outlive the call.
+        unsafe {
+            let mut set: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut set);
+            libc::FD_SET(fd, &mut set);
+            let mut tv = libc::timeval {
+                tv_sec: timeout.as_secs() as _,
+                tv_usec: timeout.subsec_micros() as _,
+            };
+            let n = libc::select(fd + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv);
+            n != 0
+        }
+    }
+}
+
+/// Stream output until EOF or the session finishing, then finish it with the
+/// exit reason. Returning drops the reader (and on Unix the wake descriptor),
+/// releasing our hold on the terminal.
 fn pump<R: Runtime>(
     fin: Finisher<R>,
     mut reader: Box<dyn Read + Send>,
+    #[cfg(unix)] wake: ReadyFd,
     mut log: Option<SessionLog>,
     exit: std::sync::mpsc::Receiver<String>,
 ) {
     let mut pending = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
+        if fin.shell.finished.load(Ordering::SeqCst) {
+            break;
+        }
+        #[cfg(unix)]
+        if !wake.ready(Duration::from_millis(100)) {
+            continue;
+        }
         match reader.read(&mut buf) {
             // EOF, or EIO on Linux once the shell is gone: either way, done.
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                // Past the finish line (the waiter gave up on EOF): this is a
-                // background job's output on a session the tab no longer owns.
-                if fin.finished() {
-                    continue;
+                let text = decode_utf8_stream(&mut pending, &buf[..n]);
+                if fin.shell.finished.load(Ordering::SeqCst) {
+                    break;
                 }
                 if let Some(l) = log.as_mut() {
                     l.append(&buf[..n]);
                 }
-                let text = decode_utf8_stream(&mut pending, &buf[..n]);
-                if !text.is_empty() {
-                    let _ = fin.app.emit(&fin.topic, text);
+                if !text.is_empty() && !fin.emit_output(text) {
+                    break;
                 }
             }
         }
     }
+    // If the waiter already finished (grace expired), the reason is waiting.
     let reason = exit.recv().unwrap_or_else(|_| "terminal closed".to_string());
     if let Some(l) = log.as_mut() {
         l.footer(&reason);
@@ -538,15 +684,99 @@ mod tests {
         assert_eq!(thread_tag("s-local\0evil/../x"), "s-localevilx");
     }
 
+    fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while !ok() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for `needle` on a session's output topic.
+    fn await_output(rx: &std::sync::mpsc::Receiver<String>, needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = String::new();
+        while !seen.contains(needle) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            seen.push_str(&rx.recv_timeout(left).unwrap_or_else(|_| panic!("no {needle} in {seen:?}")));
+        }
+    }
+
+    /// Closing must actually terminate the process, even one that ignores
+    /// SIGHUP (the cloned killer alone only sends SIGHUP).
+    #[cfg(unix)]
     #[test]
-    fn close_kills_the_shell() {
+    fn close_terminates_a_shell_that_ignores_sighup() {
+        use tauri::Listener;
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        handle.listen("ssh://h1", move |e| {
+            let _ = tx.send(e.payload().to_string());
+        });
+        let shells = LocalShells::default();
+        let login = profiles().into_iter().next().unwrap();
+        shells.start(&handle, "h1", &login.id, 80, 24, false).unwrap();
+        let pid = shells.pid("h1").unwrap() as i32;
+        shells.write("h1", b"trap '' HUP; echo trap-$((1+1))-set\n").unwrap();
+        await_output(&rx, "trap-2-set");
+        shells.close("h1");
+        // SAFETY: signal 0 only probes for existence.
+        wait_until("the process to die", 10, || unsafe { libc::kill(pid, 0) } != 0);
+        wait_until("the id to be released", 10, || !shells.owns("h1"));
+        assert!(shells.write("h1", b"x").is_err());
+    }
+
+    /// close → immediate restart on the same id: the restarted terminal must
+    /// never receive the old shell's final line or its "disconnected" status.
+    #[cfg(unix)]
+    #[test]
+    fn restart_on_the_same_id_never_receives_the_old_shells_events() {
+        use tauri::Listener;
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        for topic in ["ssh://r1", "ssh://status"] {
+            let ev = Arc::clone(&events);
+            handle.listen(topic, move |e| ev.lock().unwrap().push(e.payload().to_string()));
+        }
+        let shells = LocalShells::default();
+        let login = profiles().into_iter().next().unwrap();
+        shells.start(&handle, "r1", &login.id, 80, 24, false).unwrap();
+        shells.close("r1");
+        // Retry until the old session has published its end and freed the id.
+        wait_until("restart to be accepted", 10, || {
+            shells.start(&handle, "r1", &login.id, 80, 24, false).is_ok()
+        });
+        let boundary = events.lock().unwrap().len();
+        let statuses = |evs: &[String]| evs.iter().filter(|e| e.contains("disconnected")).count();
+        assert_eq!(statuses(&events.lock().unwrap()[..boundary]), 1, "old shell reported once");
+        shells.write("r1", b"echo second-$((2+3))\n").unwrap();
+        wait_until("the new shell's output", 20, || {
+            events.lock().unwrap()[boundary..].iter().any(|e| e.contains("second-5"))
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let after = events.lock().unwrap()[boundary..].to_vec();
+        assert_eq!(statuses(&after), 0, "nothing from the old shell after the restart: {after:?}");
+        assert!(after.iter().all(|e| !e.contains("shell exited")), "{after:?}");
+        assert!(shells.owns("r1"));
+        shells.close("r1");
+    }
+
+    /// A background job holding the terminal: once the session finishes, the
+    /// reader thread must exit (releasing its descriptors and the transcript),
+    /// not block on the job forever.
+    #[cfg(unix)]
+    #[test]
+    fn finished_session_releases_its_reader_despite_a_background_job() {
         let app = tauri::test::mock_app();
         let shells = LocalShells::default();
         let login = profiles().into_iter().next().unwrap();
-        shells.start(app.handle(), "c1", &login.id, 80, 24, false).unwrap();
-        shells.close("c1");
-        assert!(!shells.owns("c1"));
-        assert!(shells.write("c1", b"x").is_err());
+        shells.start(app.handle(), "k1", &login.id, 80, 24, false).unwrap();
+        assert_eq!(shells.readers.load(Ordering::SeqCst), 1);
+        shells.write("k1", b"(sleep 300 &)\nexit\n").unwrap();
+        wait_until("the session to finish", 20, || !shells.owns("k1"));
+        wait_until("the reader thread to exit", 10, || shells.readers.load(Ordering::SeqCst) == 0);
     }
 
     /// A real PTY round trip with the platform's shell: input in, output out,
