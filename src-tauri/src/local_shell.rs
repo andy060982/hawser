@@ -144,6 +144,9 @@ struct LocalShell {
     /// (`close`) both happen under this lock, so a kill can never reach a pid
     /// that was already reaped and possibly reused.
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
+    /// Why the shell ended, recorded by whoever reaped it (the waiter, or a
+    /// kill that collected the exit) under the child lock.
+    exit_reason: Mutex<Option<String>>,
     /// Publication gate: true once the session has been reported finished.
     /// Output is emitted while holding it and the finish happens under it, so
     /// nothing from this shell is published after its "disconnected" status,
@@ -251,6 +254,7 @@ impl LocalShells {
             writer: Mutex::new(writer),
             master: Mutex::new(Some(pair.master)),
             child: Mutex::new(Some(child)),
+            exit_reason: Mutex::new(None),
             gate: Mutex::new(false),
             finished: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -400,37 +404,55 @@ impl LocalShells {
     }
 }
 
-/// Kill the shell if it has not been reaped yet. `Child::kill` escalates
-/// (SIGHUP, short grace, SIGKILL on Unix) and never signals a child whose exit
-/// it already collected; holding the child lock keeps the waiter from reaping
-/// in between.
-fn terminate(shell: &LocalShell) {
-    if let Ok(mut g) = shell.child.lock() {
-        if let Some(c) = g.as_mut() {
-            let _ = c.kill();
-        }
+/// Collect the child's exit if it has one: clear the slot (so nothing ever
+/// signals that pid again) and record why it ended. Call with the child lock
+/// held. True once reaped.
+fn collect(slot: &mut Option<Box<dyn Child + Send + Sync>>, shell: &LocalShell) -> bool {
+    let reason = match slot.as_mut().map(|c| c.try_wait()) {
+        None => return true,
+        Some(Ok(None)) => return false,
+        Some(Ok(Some(status))) => exit_reason(status),
+        Some(Err(_)) => "terminal closed".to_string(),
+    };
+    *slot = None;
+    if let Ok(mut r) = shell.exit_reason.lock() {
+        r.get_or_insert(reason);
     }
+    true
 }
 
-/// Wait for the shell to exit, reaping it under the child lock.
+/// Kill the shell if it is still running. Everything happens under the child
+/// lock, so it can't interleave with the waiter's reaping: an already-exited
+/// child is collected instead of signalled (portable-pty's kill sends SIGHUP
+/// before it checks), and an exit the kill itself collected is recorded right
+/// after, so a later close finds the slot empty rather than signalling a pid
+/// that may have been reused. `Child::kill` escalates: SIGHUP, short grace,
+/// SIGKILL on Unix; TerminateProcess on Windows.
+fn terminate(shell: &LocalShell) {
+    let Ok(mut g) = shell.child.lock() else { return };
+    if collect(&mut g, shell) {
+        return;
+    }
+    if let Some(c) = g.as_mut() {
+        let _ = c.kill();
+    }
+    collect(&mut g, shell);
+}
+
+/// Wait for the shell to exit (polling under the child lock) and say why.
 fn reap(shell: &LocalShell) -> String {
     loop {
         let done = match shell.child.lock() {
-            Ok(mut g) => match g.as_mut().map(|c| c.try_wait()) {
-                Some(Ok(Some(status))) => {
-                    *g = None;
-                    Some(exit_reason(status))
-                }
-                Some(Ok(None)) => None,
-                Some(Err(_)) | None => {
-                    *g = None;
-                    Some("terminal closed".to_string())
-                }
-            },
-            Err(_) => Some("terminal closed".to_string()),
+            Ok(mut g) => collect(&mut g, shell),
+            Err(_) => true,
         };
-        if let Some(reason) = done {
-            return reason;
+        if done {
+            return shell
+                .exit_reason
+                .lock()
+                .ok()
+                .and_then(|r| r.clone())
+                .unwrap_or_else(|| "terminal closed".to_string());
         }
         std::thread::sleep(REAP_POLL);
     }
@@ -504,32 +526,51 @@ impl<R: Runtime> Finisher<R> {
 /// A duplicate of the PTY master's descriptor, used only to wait for
 /// readability with a timeout, so the reader can notice the session finished
 /// and let go of the terminal even while a background job keeps it open.
-/// `select` rather than `poll`: macOS poll() is unreliable on tty devices.
+///
+/// Linux uses poll(), which has no descriptor-number limit. macOS poll() does
+/// not support tty devices, so it uses select(), which cannot take
+/// descriptors >= FD_SETSIZE; such a descriptor is refused before the shell is
+/// spawned (falling back to an uncancellable blocking read would reintroduce
+/// the leak).
 #[cfg(unix)]
 struct ReadyFd(std::os::fd::OwnedFd);
 
 #[cfg(unix)]
 impl ReadyFd {
     fn dup(master: &dyn MasterPty) -> Result<Self, String> {
-        use std::os::fd::{BorrowedFd, OwnedFd};
+        use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
         let fd = master.as_raw_fd().ok_or("terminal has no descriptor")?;
         // SAFETY: `fd` is the live master descriptor, borrowed only to dup it.
         let owned: OwnedFd = unsafe { BorrowedFd::borrow_raw(fd) }
             .try_clone_to_owned()
             .map_err(|e| e.to_string())?;
+        if !cfg!(target_os = "linux") && owned.as_raw_fd() as usize >= libc::FD_SETSIZE {
+            return Err(format!(
+                "too many open files to start a terminal (descriptor {} is beyond {})",
+                owned.as_raw_fd(),
+                libc::FD_SETSIZE
+            ));
+        }
         Ok(Self(owned))
     }
 
-    /// Readable (or hung up) within `timeout`? Errors count as readable so the
-    /// following read() surfaces them.
+    /// Readable (or hung up / errored) within `timeout`? Errors count as
+    /// readable so the following read() surfaces them.
+    #[cfg(target_os = "linux")]
+    fn ready(&self, timeout: Duration) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut p = libc::pollfd { fd: self.0.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd on the stack for the duration of the call.
+        let n = unsafe { libc::poll(&mut p, 1, timeout.as_millis() as libc::c_int) };
+        n != 0
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn ready(&self, timeout: Duration) -> bool {
         use std::os::fd::AsRawFd;
         let fd = self.0.as_raw_fd();
-        if fd as usize >= libc::FD_SETSIZE {
-            return true; // can't select on it; fall back to a blocking read
-        }
-        // SAFETY: fd_set is plain data; FD_ZERO/FD_SET/select get a valid fd
-        // below FD_SETSIZE and pointers to locals that outlive the call.
+        // SAFETY: fd < FD_SETSIZE (checked in `dup`); fd_set is plain data and
+        // every pointer refers to a local that outlives the call.
         unsafe {
             let mut set: libc::fd_set = std::mem::zeroed();
             libc::FD_ZERO(&mut set);
@@ -610,6 +651,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn registry_start_write_exit_end_to_end() {
+        let _serial = serial();
         use std::sync::mpsc;
         use tauri::Listener;
 
@@ -651,6 +693,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit_is_reported_even_with_a_background_job_holding_the_terminal() {
+        let _serial = serial();
         use std::sync::mpsc;
         use tauri::Listener;
 
@@ -677,11 +720,99 @@ mod tests {
         shells.close("bg1");
     }
 
+    /// Close twice, and close concurrently with the shell's own exit: the slot
+    /// is emptied by whoever collects the exit, so no later close signals the
+    /// (possibly reused) pid, and the exit reason still reaches the session.
+    #[cfg(unix)]
+    #[test]
+    fn repeated_and_racing_closes_never_signal_a_collected_pid() {
+        let _serial = serial();
+        let app = tauri::test::mock_app();
+        let shells = Arc::new(LocalShells::default());
+        let login = profiles().into_iter().next().unwrap();
+        for round in 0..5 {
+            let id = format!("rc{round}");
+            shells.start(app.handle(), &id, &login.id, 80, 24, false).unwrap();
+            let shell = shells.get(&id).unwrap();
+            // Racing: the shell exits on its own while three closers pile in.
+            shells.write(&id, b"exit\n").unwrap();
+            let closers: Vec<_> = (0..3)
+                .map(|_| {
+                    let (shells, id) = (Arc::clone(&shells), id.clone());
+                    std::thread::spawn(move || shells.close(&id))
+                })
+                .collect();
+            for c in closers {
+                c.join().unwrap();
+            }
+            // Whoever collected the exit emptied the slot and kept a reason.
+            wait_until("the child to be collected", 10, || shell.child.lock().unwrap().is_none());
+            assert!(shell.exit_reason.lock().unwrap().is_some());
+            // Further closes find nothing to signal.
+            shells.close(&id);
+            terminate(&shell);
+            assert!(shell.child.lock().unwrap().is_none());
+            wait_until("the session to finish", 10, || !shells.owns(&id));
+        }
+    }
+
+    /// Descriptor numbers beyond FD_SETSIZE: Linux (poll) still runs and
+    /// finishes cleanly; elsewhere (select) the start is refused up front
+    /// rather than falling back to an uncancellable read. Either way no reader
+    /// is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn high_descriptors_never_leave_an_uncancellable_reader() {
+        let _serial = serial();
+        // Make room above FD_SETSIZE, then fill the table up to it.
+        // SAFETY: plain rlimit get/set on this test process.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+            let want = (libc::FD_SETSIZE as libc::rlim_t + 256).min(lim.rlim_max);
+            if lim.rlim_cur < want {
+                lim.rlim_cur = want;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            }
+        }
+        let mut hold = Vec::new();
+        loop {
+            let f = std::fs::File::open("/dev/null").unwrap();
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&f) as usize;
+            hold.push(f);
+            if fd >= libc::FD_SETSIZE {
+                break;
+            }
+        }
+        let app = tauri::test::mock_app();
+        let shells = LocalShells::default();
+        let login = profiles().into_iter().next().unwrap();
+        let started = shells.start(app.handle(), "fd1", &login.id, 80, 24, false);
+        if cfg!(target_os = "linux") {
+            started.unwrap();
+            shells.write("fd1", b"(sleep 300 &)\nexit\n").unwrap();
+            wait_until("the session to finish", 20, || !shells.owns("fd1"));
+        } else {
+            let err = started.unwrap_err();
+            assert!(err.contains("too many open files"), "{err}");
+            assert!(!shells.owns("fd1"));
+        }
+        wait_until("no reader left", 10, || shells.readers.load(Ordering::SeqCst) == 0);
+        drop(hold);
+    }
+
     #[test]
     fn sizes_clamp_to_conpty_limits_and_thread_tags_are_safe() {
         let s = size(100_000, 0);
         assert_eq!((s.cols, s.rows), (i16::MAX as u16, 1));
         assert_eq!(thread_tag("s-local\0evil/../x"), "s-localevilx");
+    }
+
+    /// Shell tests run one at a time: the descriptor-exhaustion test fills the
+    /// process's fd table, which would starve a concurrent test's PTY.
+    static SHELL_TESTS: Mutex<()> = Mutex::new(());
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SHELL_TESTS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
@@ -707,6 +838,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn close_terminates_a_shell_that_ignores_sighup() {
+        let _serial = serial();
         use tauri::Listener;
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
@@ -732,6 +864,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restart_on_the_same_id_never_receives_the_old_shells_events() {
+        let _serial = serial();
         use tauri::Listener;
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
@@ -769,6 +902,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn finished_session_releases_its_reader_despite_a_background_job() {
+        let _serial = serial();
         let app = tauri::test::mock_app();
         let shells = LocalShells::default();
         let login = profiles().into_iter().next().unwrap();
@@ -785,6 +919,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pty_round_trip_with_the_login_shell() {
+        let _serial = serial();
         let pair = native_pty_system().openpty(size(80, 24)).unwrap();
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.env("TERM", "xterm-256color");
