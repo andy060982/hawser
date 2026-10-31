@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { Clock, FileText, Search, TextSearch, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
+import { foldMatches } from '../lib/foldMatch'
 
 interface LogEntry {
   name: string
@@ -32,47 +33,20 @@ interface SearchResult {
   truncated: boolean
 }
 
-/* `text` lowercased, plus where each lowercased UTF-16 unit came from in the
-   original. Lowercasing can change length ('İ' becomes two units), so matching
-   on the lowercase string and slicing the original at the same offsets would
-   drift; this map turns lowercase offsets back into original ones. */
-function fold(text: string): { lower: string; origin: number[] } {
-  let lower = ''
-  const origin: number[] = []
-  let i = 0
-  for (const ch of text) {
-    const l = ch.toLowerCase()
-    lower += l
-    for (let k = 0; k < l.length; k++) origin.push(i)
-    i += ch.length
-  }
-  origin.push(i) // sentinel: end of text
-  return { lower, origin }
-}
-
-/* `text` with every case-insensitive occurrence of `q` wrapped in <mark>. */
+/* `text` with every case-insensitive occurrence of `q` wrapped in <mark>.
+   Ranges come from foldMatches, which maps case-folded matches back to the
+   original characters (see lib/foldMatch.ts). */
 function Highlight({ text, q }: { text: string; q: string }) {
-  const needle = q.trim().toLowerCase()
-  if (!needle) return <>{text}</>
-  const { lower, origin } = fold(text)
   const parts: React.ReactNode[] = []
-  let from = 0 // in lowercase units
-  let shown = 0 // in original units
-  for (let at = lower.indexOf(needle); at !== -1; at = lower.indexOf(needle, from)) {
-    const start = origin[at]
-    const end = origin[at + needle.length]
-    // A match that starts inside one expanded char can map back to a start
-    // already shown; skip rather than duplicate text.
-    if (start >= shown) {
-      parts.push(text.slice(shown, start))
-      parts.push(
-        <mark key={at} className="rounded-sm bg-accent-soft text-ink">
-          {text.slice(start, end)}
-        </mark>,
-      )
-      shown = end
-    }
-    from = at + needle.length
+  let shown = 0
+  for (const [start, end] of foldMatches(text, q)) {
+    parts.push(text.slice(shown, start))
+    parts.push(
+      <mark key={start} className="rounded-sm bg-accent-soft text-ink">
+        {text.slice(start, end)}
+      </mark>,
+    )
+    shown = end
   }
   parts.push(text.slice(shown))
   return <>{parts}</>

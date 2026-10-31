@@ -365,6 +365,12 @@ mod tests {
         check_in(&d, "a\n", "20261031-090000").unwrap();
         let second = check_in(&d, "b\n", "20261031-090000").unwrap(); // -> .1.txt
         assert_eq!(second.name.as_deref(), Some("20261031-090000.1.txt"));
+        // Force identical mtimes, with the older name made to look newer by
+        // nothing but the tie-break: name order must decide.
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        for n in ["20261031-090000.txt", "20261031-090000.1.txt"] {
+            std::fs::File::options().write(true).open(d.join(n)).unwrap().set_modified(t).unwrap();
+        }
         // Same mtime second: the tie-break must pick .1.txt as newest.
         let third = check_in(&d, "b\n", "20261031-090000").unwrap();
         assert_eq!(third.status, "unchanged");

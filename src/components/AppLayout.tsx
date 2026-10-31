@@ -12,6 +12,7 @@ import { policyFor, useSettings } from '../lib/settings'
 import { useDialogs } from '../lib/dialogs'
 import { isDangerousCommand } from '../lib/dangerous'
 import { clearLocal, emitLocal } from '../lib/localTerm'
+import { ReplyGuard } from '../lib/replyGuard'
 import { TitleBar } from './TitleBar'
 import { HostSidebar } from './HostSidebar'
 import { ResizeHandle } from './ResizeHandle'
@@ -110,9 +111,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   /** hostId → when its config was last checked, so split panes and quick
    *  reconnects to one box don't each run the capture command again. */
   const configCheckedRef = useRef(new Map<string, number>())
-  /** sessionId → token of its latest config check. A reply from an older check
-   *  (the tab reconnected, or closed and the id was reused) is ignored. */
-  const configGenRef = useRef(new Map<string, number>())
+  /** Latest config check per session. Every (re)connect invalidates it, so a
+   *  reply from before a redial — or for a closed tab — is ignored. */
+  const configReplies = useRef(new ReplyGuard())
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -494,13 +495,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     const last = configCheckedRef.current.get(host.id)
     if (last !== undefined && Date.now() - last < 120_000) return
     configCheckedRef.current.set(host.id, Date.now())
-    const gen = (configGenRef.current.get(sessionId) ?? 0) + 1
-    configGenRef.current.set(sessionId, gen)
+    const latest = configReplies.current.begin(sessionId)
     /* Only the latest check for a tab that still exists may write anything:
        a late reply must not print into (or badge) a closed or redialled tab. */
-    const current = () =>
-      configGenRef.current.get(sessionId) === gen &&
-      sessionsRef.current.some((s) => s.id === sessionId)
+    const current = () => latest() && sessionsRef.current.some((s) => s.id === sessionId)
     const dropChip = () =>
       setConfigChanges((m) => {
         if (!(sessionId in m)) return m
@@ -552,9 +550,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   /* Closed tabs take their config-change chip and check token with them. */
   useEffect(() => {
     const live = new Set(sessions.map((s) => s.id))
-    for (const id of configGenRef.current.keys()) {
-      if (!live.has(id)) configGenRef.current.delete(id)
-    }
+    configReplies.current.retain(live)
     setConfigChanges((m) => {
       const stale = Object.keys(m).filter((id) => !live.has(id))
       if (stale.length === 0) return m
@@ -570,6 +566,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     if (!entry) return
     const { host, paneIndex, oneShotPassword } = entry
     pendingRef.current.delete(sessionId)
+    // A new connection for this tab: any config check from the previous one is
+    // stale, even if this connect ends up throttled and runs no check of its own.
+    configReplies.current.invalidate(sessionId)
 
     void safeInvoke('ssh_connect', {
       sessionId,
