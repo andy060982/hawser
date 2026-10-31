@@ -87,5 +87,11 @@ inherits = "release"
 strip = false
 debug = 1
 
-[dev-dependencies]
+# Mock Tauri runtime for the local-shell end-to-end tests (all Unix-only). Not
+# on Windows: it links comctl32 v6 symbols, and a test exe without an app
+# manifest then fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+[target.'cfg(not(windows))'.dev-dependencies]
 tauri = { version = "2", features = ["test"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

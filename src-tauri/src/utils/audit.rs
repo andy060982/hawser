@@ -569,7 +569,13 @@ impl<A: Anchor> Log<A> {
             // that fails, the caller drops its cached head and the next append
             // re-reads the file, where an unsealed tail is noted, not reused.
             if let Some(len) = before {
-                let _ = file.set_len(len).and_then(|_| file.sync_data());
+                // Through a separate non-append handle: on Windows an append
+                // handle has no FILE_WRITE_DATA, so it cannot truncate.
+                drop(file);
+                let _ = OpenOptions::new()
+                    .write(true)
+                    .open(&self.path)
+                    .and_then(|f| f.set_len(len).and_then(|_| f.sync_data()));
             }
             return Err(io_err(&self.path)(e));
         }

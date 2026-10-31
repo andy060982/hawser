@@ -2056,6 +2056,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "keyring",
+ "libc",
  "portable-pty",
  "rand_core 0.6.4",
  "reqwest",
