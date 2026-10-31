@@ -1,4 +1,5 @@
 mod credentials;
+mod local_shell;
 mod utils;
 mod ssh;
 
@@ -36,7 +37,7 @@ async fn ssh_connect(
     jump: Option<ssh::JumpParams>,
     one_shot_password: Option<String>,
 ) -> CmdResult<()> {
-    registry
+    let result = registry
         .connect(
             app,
             Arc::clone(&prompts),
@@ -55,7 +56,23 @@ async fn ssh_connect(
             one_shot_password.as_deref(),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // Audit the authentication outcome. host/port/user are not secret; the error
+    // string is an SSH/protocol message (e.g. "authentication failed"), never a
+    // password. The connect result folds the host-key and auth steps together.
+    match &result {
+        Ok(()) => utils::audit::record(
+            "connect",
+            format!("connected {username}@{host}:{port}"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "connect.fail",
+            format!("connection to {username}@{host}:{port} failed"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 /// Answer a host-key prompt raised by the `ssh://host-key-prompt` event.
@@ -112,9 +129,19 @@ async fn auth_prompt_cancel(
 #[tauri::command]
 async fn ssh_write(
     registry: State<'_, Registry>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
     data: Vec<u8>,
 ) -> CmdResult<()> {
+    // Local terminals share the session commands (see local_shell). A PTY
+    // write can block while the shell isn't reading, so it runs off the
+    // async runtime.
+    if local.owns(&session_id) {
+        let local = Arc::clone(&local);
+        return tauri::async_runtime::spawn_blocking(move || local.write(&session_id, &data))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     registry
         .write(&session_id, &data)
         .await
@@ -127,10 +154,19 @@ async fn ssh_write(
 #[tauri::command]
 async fn ssh_resize(
     registry: State<'_, Registry>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
     cols: u32,
     rows: u32,
 ) -> CmdResult<()> {
+    if local.owns(&session_id) {
+        // Off the async runtime: the master lock can briefly wait on the exit
+        // watcher closing the console.
+        let local = Arc::clone(&local);
+        return tauri::async_runtime::spawn_blocking(move || local.resize(&session_id, cols, rows))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     registry
         .resize(&session_id, cols, rows)
         .await
@@ -143,8 +179,16 @@ async fn ssh_disconnect(
     registry: State<'_, Registry>,
     prompts: State<'_, Arc<HostKeyPrompts>>,
     auth_prompts: State<'_, Arc<AuthPrompts>>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
 ) -> CmdResult<()> {
+    // A local terminal closes its shell (no-op for any other id). Off the
+    // async runtime: the kill escalates with a short grace period.
+    if local.owns(&session_id) {
+        let local = Arc::clone(&local);
+        let id = session_id.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || local.close(&id)).await;
+    }
     // Cancel an in-flight connect FIRST: once it is cancelled it cannot raise
     // a new prompt, so the sweep below cannot miss one registered behind it.
     registry.remove(&session_id).await;
@@ -159,6 +203,52 @@ async fn ssh_disconnect(
         ssh::emit_prompt_closed(&app, &request_id);
     }
     Ok(())
+}
+
+/* ------------------------------------------------------------ local shells */
+
+/// Shells available on this machine for "New local terminal".
+#[tauri::command]
+async fn local_shell_profiles() -> CmdResult<Vec<local_shell::ShellProfile>> {
+    Ok(local_shell::profiles())
+}
+
+/// Start a local shell in a PTY for `session_id`. `profile` is a profile id
+/// from `local_shell_profiles`, never a program path. `record` keeps a
+/// transcript like an SSH session does (Settings → Terminal).
+#[tauri::command]
+async fn local_shell_start(
+    app: AppHandle,
+    local: State<'_, Arc<local_shell::LocalShells>>,
+    session_id: String,
+    profile: String,
+    cols: u32,
+    rows: u32,
+    record: bool,
+) -> CmdResult<()> {
+    let local = Arc::clone(&local);
+    let started = tauri::async_runtime::spawn_blocking(move || {
+        local.start(&app, &session_id, &profile, cols, rows, record)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // Audited like a connect (which shell, never what is typed), but off the
+    // command's path: sealing writes the keychain, which can show a prompt, and
+    // the terminal must not wait on it.
+    let (event, summary, detail) = match &started {
+        Ok(p) => (
+            "local.open",
+            format!("opened a local terminal ({})", p.label),
+            serde_json::json!({ "profile": p.id, "ok": true }),
+        ),
+        Err(e) => (
+            "local.open.fail",
+            "a local terminal failed to start".to_string(),
+            serde_json::json!({ "error": e, "ok": false }),
+        ),
+    };
+    tauri::async_runtime::spawn_blocking(move || utils::audit::record(event, summary, detail));
+    started.map(|_| ())
 }
 
 /* --------------------------------------------------------------------- sftp */
@@ -183,10 +273,23 @@ async fn sftp_get(
     remote_path: String,
     local_path: String,
 ) -> CmdResult<u64> {
-    registry
+    let result = registry
         .download(&app, &session_id, &remote_path, &local_path)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    match &result {
+        Ok(bytes) => utils::audit::record(
+            "sftp.get",
+            format!("downloaded {remote_path} ({bytes} bytes)"),
+            serde_json::json!({ "remote": remote_path, "local": local_path, "bytes": bytes, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.get.fail",
+            format!("download of {remote_path} failed"),
+            serde_json::json!({ "remote": remote_path, "local": local_path, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -197,10 +300,23 @@ async fn sftp_put(
     local_path: String,
     remote_path: String,
 ) -> CmdResult<u64> {
-    registry
+    let result = registry
         .upload(&app, &session_id, &local_path, &remote_path)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    match &result {
+        Ok(bytes) => utils::audit::record(
+            "sftp.put",
+            format!("uploaded {remote_path} ({bytes} bytes)"),
+            serde_json::json!({ "local": local_path, "remote": remote_path, "bytes": bytes, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.put.fail",
+            format!("upload to {remote_path} failed"),
+            serde_json::json!({ "local": local_path, "remote": remote_path, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 /* ----------------------------------------------------------------- tunnels */
@@ -271,7 +387,15 @@ async fn sftp_rename(
     from: String,
     to: String,
 ) -> CmdResult<()> {
-    registry.sftp_rename(&session_id, &from, &to).await.map_err(|e| e.to_string())
+    let result = registry.sftp_rename(&session_id, &from, &to).await.map_err(|e| e.to_string());
+    if result.is_ok() {
+        utils::audit::record(
+            "sftp.rename",
+            format!("renamed {from} to {to}"),
+            serde_json::json!({ "from": from, "to": to, "ok": true }),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -281,7 +405,20 @@ async fn sftp_delete(
     path: String,
     is_dir: bool,
 ) -> CmdResult<()> {
-    registry.sftp_delete(&session_id, &path, is_dir).await.map_err(|e| e.to_string())
+    let result = registry.sftp_delete(&session_id, &path, is_dir).await.map_err(|e| e.to_string());
+    match &result {
+        Ok(()) => utils::audit::record(
+            "sftp.delete",
+            format!("deleted {}{path}", if is_dir { "directory " } else { "" }),
+            serde_json::json!({ "path": path, "isDir": is_dir, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.delete.fail",
+            format!("delete of {path} failed"),
+            serde_json::json!({ "path": path, "isDir": is_dir, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -290,7 +427,15 @@ async fn sftp_mkdir(
     session_id: String,
     path: String,
 ) -> CmdResult<()> {
-    registry.sftp_mkdir(&session_id, &path).await.map_err(|e| e.to_string())
+    let result = registry.sftp_mkdir(&session_id, &path).await.map_err(|e| e.to_string());
+    if result.is_ok() {
+        utils::audit::record(
+            "sftp.mkdir",
+            format!("created directory {path}"),
+            serde_json::json!({ "path": path, "ok": true }),
+        );
+    }
+    result
 }
 
 /// Local-side mutations, mirroring the sftp_* trio so the two panes offer the
@@ -457,7 +602,39 @@ async fn log_read(name: String) -> CmdResult<String> {
     utils::session_log::read_log(&name).map_err(|e| e.to_string())
 }
 
-/// Export the host catalogue to Documents\skiff-hosts.json and reveal it.
+/// Search every transcript for a line containing `query` (case-insensitive),
+/// newest session first. Runs on the blocking pool: it reads every log file.
+#[tauri::command]
+async fn logs_search(query: String, limit: usize) -> CmdResult<utils::session_log::SearchResult> {
+    tauri::async_runtime::spawn_blocking(move || utils::session_log::search(&query, limit))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Most recent audit-log entries, newest first, for the Audit panel.
+#[tauri::command]
+async fn audit_list(limit: usize) -> CmdResult<Vec<utils::audit::AuditView>> {
+    // Clamp so a bad/huge limit cannot ask the UI to render the entire history.
+    utils::audit::list(limit.min(2000))
+}
+
+/// Walk the audit chain and report whether it is intact, where it broke, and
+/// whether the file head matches the keychain anchor.
+#[tauri::command]
+async fn audit_verify() -> CmdResult<utils::audit::VerifyReport> {
+    utils::audit::verify()
+}
+
+/// Set the current audit log aside (renamed, never deleted) and start a fresh,
+/// anchored one whose first entry names the archive. The only way back to a
+/// clean "verified" state after a failed or gapped check.
+#[tauri::command]
+async fn audit_archive() -> CmdResult<String> {
+    utils::audit::archive()
+}
+
+/// Export the host catalogue to Documents\hawser-hosts.json and reveal it.
 ///
 /// Topology only — names, addresses, folders, snippets. Passwords live in the
 /// Credential Manager and are structurally absent from hosts.json, so an
@@ -471,12 +648,17 @@ async fn hosts_export() -> CmdResult<String> {
 
     let docs = utils::platform::documents_dir().ok_or("cannot resolve Documents folder")?;
     std::fs::create_dir_all(&docs).map_err(|e| e.to_string())?;
-    let path = docs.join("skiff-hosts.json");
+    let path = docs.join("hawser-hosts.json");
     let text = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
 
     // Reveal rather than open: the point is "here is the file to copy".
     let _ = utils::platform::reveal_file(&path);
+    utils::audit::record(
+        "hosts.export",
+        "exported the host catalogue",
+        serde_json::json!({ "path": path.to_string_lossy(), "ok": true }),
+    );
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -546,6 +728,42 @@ async fn config_snapshot(
     utils::configs::save_snapshot(&host, &output).map_err(|e| e.to_string())
 }
 
+/// "What changed since my last visit": capture the config over a fresh exec
+/// channel and compare it with the newest snapshot, saving only if it differs.
+/// Run on connect for hosts that opt in (Host editor), never otherwise.
+#[tauri::command]
+async fn config_check(
+    registry: State<'_, Registry>,
+    session_id: String,
+    host: String,
+    command: String,
+) -> CmdResult<utils::configs::ConfigCheck> {
+    let output = registry
+        .exec_capture(&session_id, &command, 60)
+        .await
+        .map_err(|e| e.to_string())?;
+    if output.trim().is_empty() {
+        return Err(
+            "capture returned nothing — the device may not support exec-channel commands"
+                .to_string(),
+        );
+    }
+    let audited_host = host.clone();
+    let check = tauri::async_runtime::spawn_blocking(move || {
+        utils::configs::check_snapshot(&host, &output)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    // Like capture_output: host and outcome only — never the command or config.
+    utils::audit::record(
+        "config.check",
+        format!("checked the config on {audited_host}: {}", check.status),
+        serde_json::json!({ "host": audited_host, "status": check.status, "added": check.added, "removed": check.removed, "ok": true }),
+    );
+    Ok(check)
+}
+
 #[tauri::command]
 async fn config_list(host: String) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
     utils::configs::list_snapshots(&host).map_err(|e| e.to_string())
@@ -582,7 +800,18 @@ async fn capture_output(
                 .to_string(),
         );
     }
-    utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string())
+    let saved = utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string());
+    if let Ok(cap) = &saved {
+        // Neither the command nor its output is logged: a command line can carry
+        // a token or password (`curl -H 'Authorization: …'`). Only the host and
+        // the size of what was saved.
+        utils::audit::record(
+            "exec.capture",
+            format!("captured command output on {host}"),
+            serde_json::json!({ "host": host, "bytes": cap.bytes, "lines": cap.lines, "ok": true }),
+        );
+    }
+    saved
 }
 
 /// Generate an Ed25519 keypair into ~/.ssh, returning the private-key path
@@ -606,7 +835,7 @@ async fn ssh_copy_id(
     password: String,
     public_key: String,
 ) -> CmdResult<()> {
-    ssh::copy_id(
+    let result = ssh::copy_id(
         app,
         std::sync::Arc::clone(&prompts),
         std::sync::Arc::clone(&auth_prompts),
@@ -617,7 +846,24 @@ async fn ssh_copy_id(
         &public_key,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    // The key is logged by fingerprint (its comment is free text); the password
+    // used for the one-shot login is never logged.
+    match &result {
+        Ok(()) => utils::audit::record(
+            "key.install",
+            format!("installed a public key for {username}@{host}:{port}"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "keyFingerprint": utils::audit::key_fingerprint(&public_key), "ok": true }),
+        ),
+        Err(_) => utils::audit::record(
+            "key.install.fail",
+            format!("key install for {username}@{host}:{port} failed"),
+            // No error text: on failure it carries up to 200 chars of the remote
+            // command's output, and command output is never logged.
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -634,13 +880,13 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     // twenty servers is irreplaceable. Reserve the name ATOMICALLY with an
     // exclusive create (O_EXCL) and bump the suffix on collision — a plain
     // exists()-then-write races two concurrent keygens onto the same path.
-    let mut path = dir.join("skiff_ed25519");
+    let mut path = dir.join("hawser_ed25519");
     let mut n = 1;
     let mut file = loop {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(f) => break f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                path = dir.join(format!("skiff_ed25519_{n}"));
+                path = dir.join(format!("hawser_ed25519_{n}"));
                 n += 1;
             }
             Err(e) => return Err(e.to_string()),
@@ -676,6 +922,12 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     std::fs::write(&pub_path, format!("{public}
 ")).map_err(|e| e.to_string())?;
 
+    utils::audit::record(
+        "key.generate",
+        format!("generated an Ed25519 key at {}", path.to_string_lossy()),
+        serde_json::json!({ "privatePath": path.to_string_lossy(), "keyFingerprint": utils::audit::key_fingerprint(&public), "ok": true }),
+    );
+
     Ok(serde_json::json!({
         "privatePath": path.to_string_lossy(),
         "publicKey": public,
@@ -707,7 +959,17 @@ async fn ai_key_save(
     kind: String,
     base_url: String,
 ) -> CmdResult<()> {
-    utils::ai::save_key(&profile, &key, &kind, &base_url)
+    let result = utils::ai::save_key(&profile, &key, &kind, &base_url);
+    if result.is_ok() {
+        // The API key itself is never logged — only that a key was saved for this
+        // provider profile.
+        utils::audit::record(
+            "aikey.save",
+            format!("saved an AI provider key for profile '{profile}'"),
+            serde_json::json!({ "profile": profile, "kind": kind, "ok": true }),
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -719,11 +981,19 @@ async fn ai_key_status(profile: String) -> CmdResult<bool> {
 /// switching to a provider that needs no key (e.g. local Ollama).
 #[tauri::command]
 async fn ai_key_delete(profile: String) -> CmdResult<()> {
-    utils::ai::delete_key(&profile)
+    let result = utils::ai::delete_key(&profile);
+    if result.is_ok() {
+        utils::audit::record(
+            "aikey.delete",
+            format!("removed the AI provider key for profile '{profile}'"),
+            serde_json::json!({ "profile": profile, "ok": true }),
+        );
+    }
+    result
 }
 
 /// Provider settings (kind/baseUrl/model — never the key) as opaque JSON at
-/// %APPDATA%\skiffi.json, same pattern as the host catalogue.
+/// %APPDATA%\hawseri.json, same pattern as the host catalogue.
 #[tauri::command]
 async fn ai_config_load() -> CmdResult<Option<serde_json::Value>> {
     utils::hosts::load_named("ai.json").map_err(|e| e.to_string())
@@ -735,7 +1005,7 @@ async fn ai_config_save(config: serde_json::Value) -> CmdResult<()> {
 }
 
 /// App-wide settings (colour policies, device profiles, UI defaults).
-/// %APPDATA%\skiff\settings.json — opaque JSON owned by the frontend, same
+/// %APPDATA%\hawser\settings.json — opaque JSON owned by the frontend, same
 /// corrupt-tolerant contract as the host catalogue.
 #[tauri::command]
 async fn settings_load() -> CmdResult<Option<serde_json::Value>> {
@@ -774,6 +1044,13 @@ async fn credential_save(
     // the save is atomic: if the binding cannot be written, the save fails
     // rather than silently leaving a secret that ssh_connect will later refuse.
     utils::hosts::snapshot_binding(&host_id, &host, port, &username).map_err(|e| e.to_string())?;
+    // The password is never logged — only that a credential was saved and bound
+    // to this destination.
+    utils::audit::record(
+        "credential.save",
+        format!("saved a password for {username}@{host}:{port}"),
+        serde_json::json!({ "hostId": host_id, "host": host, "port": port, "user": username, "ok": true }),
+    );
     Ok(())
 }
 
@@ -794,7 +1071,14 @@ async fn credential_delete(host_id: String) -> CmdResult<()> {
     let deleted = credentials::delete_secret(&host_id);
     utils::hosts::remove_binding(&host_id);
     match deleted {
-        Ok(()) | Err(credentials::CredError::NotFound(_)) => Ok(()),
+        Ok(()) | Err(credentials::CredError::NotFound(_)) => {
+            utils::audit::record(
+                "credential.delete",
+                format!("removed the saved password for host '{host_id}'"),
+                serde_json::json!({ "hostId": host_id, "ok": true }),
+            );
+            Ok(())
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -806,6 +1090,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             app.manage(Registry::default());
+            app.manage(Arc::new(local_shell::LocalShells::default()));
             app.manage(Arc::new(HostKeyPrompts::default()));
             app.manage(Arc::new(AuthPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
@@ -830,9 +1115,9 @@ pub fn run() {
                 // vanishing mid-scan) is reported rather than silently swallowed
                 // by a dead background thread.
                 match std::panic::catch_unwind(|| utils::session_log::prune(30, 500)) {
-                    Ok(n) if n > 0 => eprintln!("skiff: pruned {n} old session log(s)"),
+                    Ok(n) if n > 0 => eprintln!("hawser: pruned {n} old session log(s)"),
                     Ok(_) => {}
-                    Err(_) => eprintln!("skiff: session-log pruning thread panicked"),
+                    Err(_) => eprintln!("hawser: session-log pruning thread panicked"),
                 }
             });
             Ok(())
@@ -866,6 +1151,7 @@ pub fn run() {
             net_dns_lookup,
             hosts_probe,
             config_snapshot,
+            config_check,
             capture_output,
             config_list,
             config_diff,
@@ -889,6 +1175,12 @@ pub fn run() {
             logs_list,
             open_logs_folder,
             log_read,
+            logs_search,
+            audit_list,
+            audit_verify,
+            audit_archive,
+            local_shell_profiles,
+            local_shell_start,
             credential_save,
             credential_status,
             credential_delete,

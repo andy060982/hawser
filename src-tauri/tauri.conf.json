@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Skiff",
+  "productName": "Hawser",
   "version": "0.5.0-beta.1",
-  "identifier": "io.github.andy060982.skiffssh",
+  "identifier": "io.github.andy060982.hawser",
 
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -14,7 +14,7 @@
   "app": {
     "windows": [
       {
-        "title": "Skiff",
+        "title": "Hawser",
         "width": 1280,
         "height": 800,
         "minWidth": 900,
@@ -41,7 +41,7 @@
     "copyright": "Copyright (c) 2026 Andy Arevalo",
     "category": "DeveloperTool",
     "shortDescription": "SSH and SFTP client",
-    "longDescription": "Skiff is a desktop SSH terminal and SFTP file manager for network and systems administration.",
+    "longDescription": "Hawser is a desktop SSH terminal and SFTP file manager for network and systems administration.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

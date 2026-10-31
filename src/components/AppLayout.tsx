@@ -12,6 +12,7 @@ import { policyFor, useSettings } from '../lib/settings'
 import { useDialogs } from '../lib/dialogs'
 import { isDangerousCommand } from '../lib/dangerous'
 import { clearLocal, emitLocal } from '../lib/localTerm'
+import { ReplyGuard } from '../lib/replyGuard'
 import { TitleBar } from './TitleBar'
 import { HostSidebar } from './HostSidebar'
 import { ResizeHandle } from './ResizeHandle'
@@ -39,6 +40,7 @@ import { ContextMenu, type MenuItem, type MenuState } from './ContextMenu'
 import { NetToolsDialog } from './NetToolsDialog'
 import { AiPanel } from './AiPanel'
 import { ConfigHistoryDialog } from './ConfigHistoryDialog'
+import { AuditDialog } from './AuditDialog'
 import { QuickConnect } from './QuickConnect'
 
 /* ---------------------------------------------------------------------------
@@ -95,10 +97,23 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [hosts, setHosts] = useState<HostNode[]>(seedHosts)
   const [editing, setEditing] = useState<{ host: Host | null } | null>(null)
   const [showHistory, setShowHistory] = useState(false)
+  const [showAudit, setShowAudit] = useState(false)
   const [showFind, setShowFind] = useState(false)
   const [tunnelFor, setTunnelFor] = useState<Session | null>(null)
   const [netTools, setNetTools] = useState<{ target: string; port: number } | null>(null)
   const [configFor, setConfigFor] = useState<Host | null>(null)
+  /** Snapshots to preselect when the config dialog opens from the change chip. */
+  const [configSelect, setConfigSelect] = useState<string[] | undefined>(undefined)
+  /** Per session: what the on-connect config check found, when it found a change. */
+  const [configChanges, setConfigChanges] = useState<
+    Record<string, { hostId: string; added: number; removed: number; previous: string; name: string }>
+  >({})
+  /** hostId → when its config was last checked, so split panes and quick
+   *  reconnects to one box don't each run the capture command again. */
+  const configCheckedRef = useRef(new Map<string, number>())
+  /** Latest config check per session. Every (re)connect invalidates it, so a
+   *  reply from before a redial — or for a closed tab — is ignored. */
+  const configReplies = useRef(new ReplyGuard())
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -138,7 +153,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   sessionsRef.current = sessions
   const hostsRef = useRef<HostNode[]>(seedHosts)
   hostsRef.current = hosts
-  const { settings } = useSettings()
+  const { settings, ready: settingsReady } = useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
   const { confirm, alert, prompt } = useDialogs()
@@ -187,8 +202,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // kept on purpose: a dropped link or a dormant-restored tab should come
     // back next launch too, not just live ones. Only 'error' (auth failed, bad
     // host key) is dropped, since re-restoring a doomed connection is noise.
+    // Local terminals are left out too: they are not catalogue hosts, so they
+    // could never be restored (the "open at startup" setting covers them).
     const open = sessions
-      .filter((s) => s.status !== 'error')
+      .filter((s) => s.status !== 'error' && !s.hostId.startsWith('local-'))
       .map((s) => ({ hostId: s.hostId, view: s.view, paneIndex: s.paneIndex }))
     void safeInvoke('sessions_save', { list: open })
   }, [sessions])
@@ -380,7 +397,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   /** Lowest unused 1-based pane number for a host.
    *
    *  Reuses gaps rather than always incrementing, so closing pane 1 of two and
-   *  reopening lands back on `skiff-1` instead of drifting to `skiff-3` and
+   *  reopening lands back on `hawser-1` instead of drifting to `hawser-3` and
    *  orphaning tmux sessions on the server forever. */
   const nextPaneIndex = useCallback((hostId: string) => {
     const taken = new Set(
@@ -438,10 +455,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // On a device that cannot run tmux — which is most network gear — this is
     // the only continuity available: the box kept nothing, but we did. Dimmed
     // and fenced so it can never be mistaken for live output.
-    void safeInvoke<string | null>('session_history', {
-      host: host.hostname,
-      maxBytes: 12_000,
-    }).then((history) => {
+    // Not for local terminals: a shell on this machine starts fresh, like any
+    // other terminal app.
+    void (host.local
+      ? Promise.resolve(null)
+      : safeInvoke<string | null>('session_history', { host: host.hostname, maxBytes: 12_000 })
+    ).then((history) => {
       if (!history) return
       emitLocal(
         session.id,
@@ -470,14 +489,100 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     }, 1500)
   }, [nextPaneIndex, confirm])
 
+  /** "What changed since my last visit": for hosts that opt in, capture the
+   *  config over a side exec channel and compare it with the newest snapshot.
+   *  Reported as a dim line in the terminal, plus a status-bar chip that opens
+   *  the diff when something changed. */
+  const checkConfigOnConnect = useCallback((sessionId: string, host: Host) => {
+    const command = host.configCommand?.trim()
+    if (!host.checkConfigOnConnect || !command) return
+    const last = configCheckedRef.current.get(host.id)
+    if (last !== undefined && Date.now() - last < 120_000) return
+    configCheckedRef.current.set(host.id, Date.now())
+    const latest = configReplies.current.begin(sessionId)
+    /* Only the latest check for a tab that still exists may write anything:
+       a late reply must not print into (or badge) a closed or redialled tab. */
+    const current = () => latest() && sessionsRef.current.some((s) => s.id === sessionId)
+    const dropChip = () =>
+      setConfigChanges((m) => {
+        if (!(sessionId in m)) return m
+        const { [sessionId]: _gone, ...rest } = m
+        return rest
+      })
+
+    const note = (text: string) => emitLocal(sessionId, `\x1b[38;5;244m● ${text}\x1b[0m\r\n`)
+    const when = (epoch: number | null) => {
+      if (!epoch) return 'your last snapshot'
+      const d = new Date(epoch * 1000)
+      return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+    }
+    void safeInvoke<{
+      status: 'first' | 'unchanged' | 'changed'
+      name: string | null
+      previous: string | null
+      previousModified: number | null
+      added: number
+      removed: number
+    }>('config_check', { sessionId, host: host.hostname, command })
+      .then((r) => {
+        if (!r || !current()) return
+        if (r.status === 'first') {
+          dropChip()
+          note('config baseline saved; future connects will report changes against it')
+        } else if (r.status === 'unchanged') {
+          dropChip()
+          note(`config unchanged since ${when(r.previousModified)}`)
+        } else if (r.name && r.previous) {
+          emitLocal(
+            sessionId,
+            `\x1b[38;2;242;178;92m● config changed since ${when(r.previousModified)}: ` +
+              `+${r.added} −${r.removed} lines\x1b[0m \x1b[38;5;244m(status bar → view diff)\x1b[0m\r\n`,
+          )
+          const { name, previous } = r
+          setConfigChanges((m) => ({
+            ...m,
+            [sessionId]: { hostId: host.id, added: r.added, removed: r.removed, previous, name },
+          }))
+        }
+      })
+      .catch((e: unknown) => {
+        if (!current()) return
+        note(`config check failed: ${e instanceof Error ? e.message : String(e)}`)
+      })
+  }, [])
+
+  /* Closed tabs take their config-change chip and check token with them. */
+  useEffect(() => {
+    const live = new Set(sessions.map((s) => s.id))
+    configReplies.current.retain(live)
+    setConfigChanges((m) => {
+      const stale = Object.keys(m).filter((id) => !live.has(id))
+      if (stale.length === 0) return m
+      const next = { ...m }
+      for (const id of stale) delete next[id]
+      return next
+    })
+  }, [sessions])
+
   /** Performs the deferred connect once a real terminal size is known. */
   const connectPending = useCallback((sessionId: string, cols: number, rows: number) => {
     const entry = pendingRef.current.get(sessionId)
     if (!entry) return
     const { host, paneIndex, oneShotPassword } = entry
     pendingRef.current.delete(sessionId)
+    // A new connection for this tab: any config check from the previous one is
+    // stale, even if this connect ends up throttled and runs no check of its own.
+    configReplies.current.invalidate(sessionId)
 
-    void safeInvoke('ssh_connect', {
+    const dial = host.local
+      ? safeInvoke('local_shell_start', {
+          sessionId,
+          profile: host.local.profile,
+          cols,
+          rows,
+          record: settingsRef.current.recordLocalTranscripts,
+        })
+      : safeInvoke('ssh_connect', {
       sessionId,
       // Credential sharing: the vault is keyed by this id, so pointing it at
       // another host's id is the whole feature — one entry, many hosts.
@@ -510,6 +615,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         }
       })(),
     })
+    void dial
       .then(() => {
         // The tab was closed while the connect was in flight: the backend has
         // just registered a session nothing owns, so tear it down.
@@ -524,6 +630,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             s.id === sessionId && s.status === 'connecting' ? { ...s, status: 'connected' } : s,
           ),
         )
+        checkConfigOnConnect(sessionId, host)
       })
       .catch((e: unknown) => {
         // A tab closed mid-connect fails here as "cancelled"; nothing to show.
@@ -538,7 +645,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         const msg = e instanceof Error ? e.message : String(e)
         emitLocal(sessionId, `\r\n\x1b[38;2;185;139;250m● connection failed\x1b[0m\r\n${msg}\r\n`)
       })
-  }, [])
+  }, [checkConfigOnConnect])
 
   /** Re-dial a dropped or dormant session, reusing its id so the terminal pane,
    *  scrollback, group, and pane number are all preserved — the pane never
@@ -634,9 +741,14 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const setView = useCallback(
     (view: WorkspaceView) =>
       setSessions((prev) =>
-        prev.map((s) => (s.id === activeId ? { ...s, view } : s)),
+        prev.map((s) =>
+          // Local terminals have no SFTP side; stay on the terminal.
+          s.id === activeId && !(view === 'sftp' && lookupHost(s.hostId)?.local)
+            ? { ...s, view }
+            : s,
+        ),
       ),
-    [activeId],
+    [activeId, lookupHost],
   )
 
   /* Connection lifecycle from the backend. This is the only way the UI learns a
@@ -785,6 +897,50 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
 
   /** Quick connect: an ephemeral host, never saved, password (if any) used
    *  once. The session looks like any other; the catalogue never learns. */
+  /** Shells this machine offers (PowerShell, cmd, WSL, Git Bash / login shell…). */
+  const [shellProfiles, setShellProfiles] = useState<{ id: string; label: string }[]>([])
+  useEffect(() => {
+    void safeInvoke<{ id: string; label: string }[]>('local_shell_profiles').then((p) =>
+      setShellProfiles(p ?? []),
+    )
+  }, [])
+
+  /** Open a local terminal tab. The tab rides on a synthetic host (one per
+   *  shell profile, never saved to the catalogue), so splitting, restart,
+   *  find, and transcripts all work as for SSH. AI access is off by default:
+   *  a local shell sees the whole machine. */
+  const openLocal = useCallback(
+    (profileId?: string) => {
+      const prof =
+        shellProfiles.find((p) => p.id === (profileId ?? settingsRef.current.defaultLocalShell)) ??
+        shellProfiles[0]
+      if (!prof) return
+      const host: Host = {
+        kind: 'host',
+        id: `local-${prof.id}`,
+        name: prof.label,
+        hostname: 'localhost',
+        port: 0,
+        username: '',
+        auth: 'agent',
+        aiAllowed: false,
+        local: { profile: prof.id },
+      }
+      ephemeralHostsRef.current.set(host.id, host)
+      void openHost(host, true)
+    },
+    [shellProfiles, openHost],
+  )
+
+  /* "Open a local terminal at startup": once, after settings and the shell
+     list have loaded. */
+  const startupLocalDone = useRef(false)
+  useEffect(() => {
+    if (startupLocalDone.current || !settingsReady || shellProfiles.length === 0) return
+    startupLocalDone.current = true
+    if (settingsRef.current.localShellOnStartup) openLocal()
+  }, [settingsReady, shellProfiles, openLocal])
+
   const quickConnect = useCallback(
     (username: string, hostname: string, port: number, password: string | null) => {
       const host: Host = {
@@ -796,6 +952,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         username,
         // With no password given, the agent is the only thing worth trying.
         auth: password ? 'password' : 'agent',
+        // Ad-hoc hosts carry no colour or per-host choice, so the AI assistant
+        // stays off for them (as it always effectively was), rather than
+        // inheriting the permissive default policy.
+        aiAllowed: false,
       }
       const sid = `s-${host.id}`
       const session: Session = {
@@ -940,7 +1100,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       },
       {
         label: 'Port forwarding…',
-        disabled: dead,
+        disabled: dead || !!host?.local,
         onSelect: () => {
           const cur = sessionsRef.current.find((t) => t.id === sessionId)
           if (cur) setTunnelFor(cur)
@@ -948,7 +1108,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       },
       {
         label: 'Capture command output…',
-        disabled: dead || !host,
+        disabled: dead || !host || !!host.local,
         onSelect: async () => {
           const command = (
             await prompt('Command to run — its full output is saved to a file (e.g. show tech-support):', {
@@ -1016,7 +1176,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  was previously only reachable by knowing where to click. */
   const openAppMenu = useCallback((x: number, y: number) => {
     const items: MenuItem[] = [
-      { label: 'Quick connect… Ctrl+Shift+P', onSelect: () => setShowQuickConnect(true) },
+      { label: 'New local terminal  Ctrl+Shift+T', onSelect: () => openLocal() },
+      ...shellProfiles.map((p) => ({ label: `    ${p.label}`, onSelect: () => openLocal(p.id) })),
+      { label: 'Quick connect… Ctrl+Shift+P', dividerBefore: true, onSelect: () => setShowQuickConnect(true) },
       { label: 'Network tools…', onSelect: () => setNetTools({ target: '', port: 22 }) },
       { label: 'AI assistant… Ctrl+Shift+A', onSelect: () => setShowAi(true) },
       { label: 'Settings…', onSelect: () => setShowSettings(true) },
@@ -1029,6 +1191,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         },
       },
       { label: 'Session history…', onSelect: () => setShowHistory(true) },
+      { label: 'Audit log…', onSelect: () => setShowAudit(true) },
       {
         label: 'Export hosts…',
         dividerBefore: true,
@@ -1060,7 +1223,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       },
     ]
     setMenu({ x, y, items })
-  }, [activeId, closeSession, persistHosts])
+  }, [activeId, closeSession, persistHosts, openLocal, shellProfiles])
 
   /** Right-click on the host sidebar's empty area: the fast path to a new
    *  connection without hunting for the "+" button. */
@@ -1290,6 +1453,10 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
           e.preventDefault()
           setShowQuickConnect(true)
           break
+        case 'KeyT': // new local terminal (default shell)
+          e.preventDefault()
+          openLocal()
+          break
         case 'KeyF': // find in the focused terminal
           if (!activeId) break
           e.preventDefault()
@@ -1310,7 +1477,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [active?.view, activeId, groups, paneForGroup, setView, closeSession, cycleTab, sendSnippet])
+  }, [active?.view, activeId, groups, paneForGroup, setView, closeSession, cycleTab, sendSnippet, openLocal])
 
   /* ---------------------------------------------------------------- render */
 
@@ -1360,8 +1527,9 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
               // With no quick-connect UI yet, the most useful meaning of "+" is
               // a second session to the host you are already on. With nothing
               // open there is no host to duplicate, so offer to define one.
-              const current = active && findHost(hosts, active.hostId)
-              if (current) openHost(current, true)
+              const current = active && lookupHost(active.hostId)
+              if (current?.local) openLocal(current.local.profile)
+              else if (current && findHost(hosts, current.id)) openHost(current, true)
               else setEditing({ host: null })
             }}
           />
@@ -1386,13 +1554,14 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
             broadcast={broadcast}
             broadcastExcluded={broadcastExcluded}
             onToggleBroadcast={toggleBroadcast}
+            filesAvailable={!(active && lookupHost(active.hostId)?.local)}
           />
         </main>
 
         {showAi && (
           <AiPanel
             session={active}
-            host={active ? findHost(hosts, active.hostId) : undefined}
+            host={active ? lookupHost(active.hostId) : undefined}
             effectiveColor={activeColor}
             onClose={() => setShowAi(false)}
           />
@@ -1406,6 +1575,17 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
         hostCount={countHosts(hosts)}
         size={activeId ? sizes[activeId] : undefined}
         onReconnect={activeId ? () => reconnectSession(activeId) : undefined}
+        configChange={activeId ? configChanges[activeId] : undefined}
+        local={!!(active && lookupHost(active.hostId)?.local)}
+        onViewConfigChange={(() => {
+          const c = activeId ? configChanges[activeId] : undefined
+          const h = c && lookupHost(c.hostId)
+          if (!c || !h) return undefined
+          return () => {
+            setConfigSelect([c.previous, c.name])
+            setConfigFor(h)
+          }
+        })()}
       />
 
       {/* Rendered at the shell root so the modal covers the whole window; it
@@ -1414,6 +1594,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       <AuthPromptDialog />
 
       {showHistory && <HistoryBrowser onClose={() => setShowHistory(false)} />}
+      {showAudit && <AuditDialog onClose={() => setShowAudit(false)} />}
 
       {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
 
@@ -1435,7 +1616,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
               // Merging is deliberate — import ADDS to the catalogue rather
               // than replacing it, so a bad file cannot wipe existing hosts.
               if (!Array.isArray(tree) || tree.some((n) => typeof n !== 'object' || !('kind' in n))) {
-                throw new Error('not a Skiff host export')
+                throw new Error('not a Hawser host export')
               }
               // Colliding ids (importing the same export twice, or an export
               // from this machine) get fresh ids at every depth, so a re-import
@@ -1466,7 +1647,11 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
               (t) => t.hostId === configFor.id && t.status === 'connected',
             )?.id ?? null
           }
-          onClose={() => setConfigFor(null)}
+          initialSelected={configSelect}
+          onClose={() => {
+            setConfigFor(null)
+            setConfigSelect(undefined)
+          }}
         />
       )}
 

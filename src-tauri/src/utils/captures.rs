@@ -1,7 +1,7 @@
 //! "Capture command output to file" — run one command over a fresh, hidden exec
 //! channel (see `Registry::exec_capture`) and store the output timestamped under
-//! `<appdata>/skiff/captures/<host>/`. One plain-text file per capture — the
-//! same greppable, Skiff-independent storage as config snapshots, but for an
+//! `<appdata>/hawser/captures/<host>/`. One plain-text file per capture — the
+//! same greppable, Hawser-independent storage as config snapshots, but for an
 //! arbitrary command (a `show tech-support`, a `dmesg`, a big log) rather than
 //! the host's saved config command.
 

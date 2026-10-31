@@ -1,12 +1,12 @@
 [package]
-name = "skiff"
+name = "hawser"
 version = "0.5.0-beta.1"
 description = "SSH and SFTP client"
 edition = "2021"
 rust-version = "1.77.2"
 
 [lib]
-name = "skiff_lib"
+name = "hawser_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -31,11 +31,15 @@ ssh-key = { version = "0.7.0-rc.11", features = ["getrandom"] }
 tokio = { version = "1.53.1", features = ["full"] }
 zeroize = "1.8.2"
 dashmap = "6.2.1"
+# SHA-256 for the tamper-evident audit-log hash chain (utils::audit). Already in
+# the dependency tree transitively, so naming it here adds no new download.
+sha2 = "0.10"
 thiserror = "2.0.20"
 similar = "2.7.0"
 futures-util = "0.3.34"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "rustls"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+portable-pty = "0.9"
 
 # --- Platform credential vaults -------------------------------------------
 # Windows: hand-rolled Credential Manager access (see src/credentials.rs).
@@ -82,3 +86,12 @@ panic = "abort"     # no unwinding tables, no landing pads
 inherits = "release"
 strip = false
 debug = 1
+
+# Mock Tauri runtime for the local-shell end-to-end tests (all Unix-only). Not
+# on Windows: it links comctl32 v6 symbols, and a test exe without an app
+# manifest then fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+[target.'cfg(not(windows))'.dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

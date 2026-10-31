@@ -19,7 +19,7 @@ IOS / Junos / Linux one-pick command fill); **subnet-aware host filter**
 
 ### Core
 - Terminal: xterm.js + WebGL, persistent scrollback across tab switches,
-  split panes (columns/rows, resizable, per-pane tmux `skiff-{pane}`),
+  split panes (columns/rows, resizable, per-pane tmux `hawser-{pane}`),
   broadcast-to-panes, right-click paste, find (Ctrl+Shift+F)
 - Auth: password / private key / SSH agent (Windows OpenSSH pipe + Pageant) /
   keyboard-interactive fallback (TACACS+-style hidden prompts answered with the
@@ -48,7 +48,7 @@ IOS / Junos / Linux one-pick command fill); **subnet-aware host filter**
 - Reachability sweep: on-demand concurrent TCP probe of every host's SSH port,
   results shown in the sidebar. On demand only — never a background scanner
 - Config snapshots: per-host capture command runs over a hidden exec channel,
-  stored as plain text under `%APPDATA%\skiff\configs\<host>\`, with
+  stored as plain text under `%APPDATA%\hawser\configs\<host>\`, with
   added/removed counts on capture and unified diff between any two snapshots
 
 ## Planned (backlog, rough priority)
@@ -89,7 +89,7 @@ signed + notarised Developer ID `.dmg`; `macos-latest` in CI)._
 ## Deliberately rejected
 
 - **SNMP polling / NetFlow / continuous monitoring** — that is LibreNMS/
-  Zabbix territory. Skiff complements monitoring systems; competing with
+  Zabbix territory. Hawser complements monitoring systems; competing with
   them would sink the small-fast-sharp identity (and the 4-5 MB binary).
 - **Automatic background reachability probes** — an SSH client that
   continuously port-scans the management network trips IDS and violates

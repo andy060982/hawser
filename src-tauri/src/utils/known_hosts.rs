@@ -25,7 +25,7 @@
 //! `russh::keys::known_hosts::check_known_hosts` resolves to
 //! `%USERPROFILE%\ssh\known_hosts` on Windows — note the missing dot, which is
 //! not where OpenSSH for Windows actually looks. Owning the path explicitly
-//! avoids that quirk and keeps Skiff's trust store separate from the system
+//! avoids that quirk and keeps Hawser's trust store separate from the system
 //! one, so a mistake here can never corrupt the file `ssh` itself depends on.
 //!
 //! Parsing and serialisation are delegated to russh's implementation rather
@@ -75,7 +75,7 @@ pub enum HostKeyStatus {
     Revoked { line: usize },
 }
 
-/// `%APPDATA%\skiff\known_hosts` on Windows.
+/// `%APPDATA%\hawser\known_hosts` on Windows.
 ///
 /// Roaming rather than Local on purpose: host trust is a user decision that
 /// should follow the user to another domain-joined machine, unlike the
@@ -83,7 +83,7 @@ pub enum HostKeyStatus {
 #[cfg(target_os = "windows")]
 pub fn store_path() -> Result<PathBuf, KnownHostsError> {
     let appdata = std::env::var_os("APPDATA").ok_or(KnownHostsError::NoAppDataDir)?;
-    Ok(PathBuf::from(appdata).join("skiff").join("known_hosts"))
+    Ok(PathBuf::from(appdata).join("hawser").join("known_hosts"))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -91,7 +91,7 @@ pub fn store_path() -> Result<PathBuf, KnownHostsError> {
     let home = std::env::var_os("HOME").ok_or(KnownHostsError::NoAppDataDir)?;
     Ok(PathBuf::from(home)
         .join(".config")
-        .join("skiff")
+        .join("hawser")
         .join("known_hosts"))
 }
 
@@ -372,7 +372,7 @@ mod tests {
     fn store_path_is_under_appdata() {
         // Only asserts shape; the directory need not exist.
         let p = store_path().expect("path resolves");
-        assert!(p.ends_with("skiff/known_hosts") || p.ends_with(r"skiff\known_hosts"));
+        assert!(p.ends_with("hawser/known_hosts") || p.ends_with(r"hawser\known_hosts"));
     }
 
     #[test]
@@ -396,7 +396,7 @@ mod tests {
         let k2 = PublicKey::from_openssh(KEY2).expect("k2 parses");
         let k1_body = KEY1.trim_start_matches("ssh-ed25519 ").trim_end_matches(" revtest");
 
-        let dir = std::env::temp_dir().join(format!("skiff-revtest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hawser-revtest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("known_hosts");
         // A wildcard-host @revoked line and a hashed-host one, both for KEY1.
@@ -430,7 +430,7 @@ mod tests {
         let k1 = PublicKey::from_openssh(KEY1).expect("k1 parses");
         let k2 = PublicKey::from_openssh(KEY2).expect("k2 parses");
 
-        let dir = std::env::temp_dir().join(format!("skiff-casetest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hawser-casetest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("known_hosts");
         std::fs::write(

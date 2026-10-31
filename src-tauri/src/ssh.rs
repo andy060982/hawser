@@ -52,7 +52,7 @@ pub enum SshError {
     HostKeyTimeout { host: String },
     #[error(
         "host key for {host} CHANGED (known_hosts line {line}). This is either a rebuilt \
-         server or an interception attempt. Skiff will not connect until the old entry is \
+         server or an interception attempt. Hawser will not connect until the old entry is \
          removed by hand."
     )]
     ChangedHostKey { host: String, line: usize },
@@ -402,7 +402,7 @@ impl client::Handler for ClientHandler {
         &mut self,
         presented: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // russh 0.63 hands us a key-or-certificate. Skiff pins the plain public
+        // russh 0.63 hands us a key-or-certificate. Hawser pins the plain public
         // key; for a certificate we pin the embedded key. Either way the trust
         // decision below runs against a concrete PublicKey.
         let server_public_key = match presented {
@@ -574,7 +574,7 @@ async fn accept_or_retry(
     match listener.accept().await {
         Ok(pair) => Some(pair),
         Err(e) => {
-            eprintln!("skiff: forward accept failed (retrying): {e}");
+            eprintln!("hawser: forward accept failed (retrying): {e}");
             tokio::time::sleep(Duration::from_millis(100)).await;
             None
         }
@@ -1983,7 +1983,7 @@ async fn authenticate(
             if matches!(result, russh::client::AuthResult::Success) {
                 if let Some(secret) = &save_typed {
                     if let Err(e) = credentials::write_secret(host_id, username, secret.as_str()) {
-                        eprintln!("skiff: could not save password for {host_id}: {e}");
+                        eprintln!("hawser: could not save password for {host_id}: {e}");
                     } else if let Err(e) =
                         crate::utils::hosts::snapshot_binding(host_id, host, port, username)
                     {
@@ -1995,7 +1995,7 @@ async fn authenticate(
                         // so the user is simply prompted again next time instead of
                         // hitting an inexplicable "not an authorized destination".
                         eprintln!(
-                            "skiff: could not bind saved credential {host_id}: {e}; \
+                            "hawser: could not bind saved credential {host_id}: {e}; \
                              rolling back the saved password"
                         );
                         let _ = credentials::delete_secret(host_id);
@@ -2141,7 +2141,7 @@ async fn keyboard_interactive_with_password(
                 // `..._respond` takes the answers `Vec<String>` by value into its
                 // internal message queue, so that one transient plaintext copy
                 // lives inside russh for the round-trip and cannot be zeroized
-                // here — no additional copy is retained on Skiff's side.
+                // here — no additional copy is retained on Hawser's side.
                 let shape: Vec<(String, bool)> =
                     prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect();
                 let slots = password_slots(&shape, round == 0, password_used, password_accepted);
@@ -2312,7 +2312,7 @@ pub async fn copy_id(
 
     // grep -qxF: only append if the exact line is not already present, so
     // running this twice does not duplicate the key. The append is BRACE-GROUPED
-    // so the whole chain is conjunctive: SKIFF_KEY_OK is printed only if every
+    // so the whole chain is conjunctive: HAWSER_KEY_OK is printed only if every
     // step — including the append — actually succeeded. (The earlier version
     // used `;` before chmod/echo, which printed the success marker even when the
     // append failed, e.g. a full or read-only home directory.)
@@ -2326,7 +2326,7 @@ pub async fn copy_id(
          && {{ [ ! -s ~/.ssh/authorized_keys ] || [ -z \"$(tail -c 1 ~/.ssh/authorized_keys)\" ] \
                || printf '\\n' >> ~/.ssh/authorized_keys; }} \
          && {{ grep -qxF '{key}' ~/.ssh/authorized_keys || printf '%s\n' '{key}' >> ~/.ssh/authorized_keys; }} \
-         && chmod 600 ~/.ssh/authorized_keys && echo SKIFF_KEY_OK"
+         && chmod 600 ~/.ssh/authorized_keys && echo HAWSER_KEY_OK"
     );
 
     let mut channel = handle.channel_open_session().await?;
@@ -2346,7 +2346,7 @@ pub async fn copy_id(
     //     if every step (including the append) succeeded.
     // Deciding on the marker alone let a non-zero exit or a truncated/timed-out
     // run be reported as success.
-    let marker = String::from_utf8_lossy(&out).contains("SKIFF_KEY_OK");
+    let marker = String::from_utf8_lossy(&out).contains("HAWSER_KEY_OK");
     let exit_ok = exit_status.map_or(true, |code| code == 0);
     if completed && exit_ok && marker {
         Ok(())
@@ -2658,12 +2658,12 @@ fn local_mode(meta: Option<&std::fs::Metadata>) -> Option<u32> {
     }
 }
 
-/// A unique sibling path for atomic writes: `<name>.<n>.skiffpart`. The counter
+/// A unique sibling path for atomic writes: `<name>.<n>.hawserpart`. The counter
 /// makes concurrent transfers to the same directory collision-free.
 fn temp_sibling(path: &str) -> String {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{path}.{n}.skiffpart")
+    format!("{path}.{n}.hawserpart")
 }
 
 /// Copy one local file to a remote path, streaming with progress.
@@ -3012,7 +3012,7 @@ async fn socks5_serve(
 /// Streaming UTF-8 decode: append `data` to `pending`, return every complete
 /// character, and keep an incomplete trailing sequence (at most 3 bytes) in
 /// `pending` for the next chunk. Only genuinely invalid bytes become U+FFFD.
-fn decode_utf8_stream(pending: &mut Vec<u8>, data: &[u8]) -> String {
+pub(crate) fn decode_utf8_stream(pending: &mut Vec<u8>, data: &[u8]) -> String {
     pending.extend_from_slice(data);
     let mut out = String::new();
     loop {
@@ -3223,7 +3223,7 @@ mod tests {
     #[test]
     fn rejects_symlinked_ancestor_in_subtree() {
         use std::fs;
-        let base = std::env::temp_dir().join(format!("skiff-symtest-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hawser-symtest-{}", std::process::id()));
         let root = base.join("root");
         let outside = base.join("outside");
         fs::create_dir_all(&root).unwrap();

@@ -93,7 +93,12 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
   const confirmRef = useRef(confirm)
   confirmRef.current = confirm
 
+  /** Bumped on every mount of the terminal effect; lets a teardown tell "gone
+   *  for good" from "remounted immediately" (see the deferred disconnect). */
+  const mountGen = useRef(0)
+
   useEffect(() => {
+    mountGen.current += 1
     const host = hostRef.current
     if (!host) return
 
@@ -460,7 +465,15 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
       fitRef.current = null
       pushResizeRef.current = null
       sendResizeRef.current = null
-      void safeInvoke('ssh_disconnect', { sessionId: session.id })
+      // Safety-net disconnect for a pane that goes away for good (tab and pane
+      // closes already disconnect explicitly). Deferred, and skipped if this
+      // same pane mounts again at once — React StrictMode's dev double-mount —
+      // because that disconnect would race the new pane's connect over IPC and
+      // could kill the session it just started (seen with local shells).
+      const gen = mountGen.current
+      window.setTimeout(() => {
+        if (mountGen.current === gen) void safeInvoke('ssh_disconnect', { sessionId: session.id })
+      }, 0)
     }
   }, [session.id])
 

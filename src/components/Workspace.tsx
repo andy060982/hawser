@@ -38,9 +38,12 @@ interface Props {
   broadcast: boolean
   broadcastExcluded?: Set<string>
   onToggleBroadcast: () => void
+  /** False for local terminals, which have no SFTP side. */
+  filesAvailable?: boolean
 }
 
 export function Workspace({
+  filesAvailable = true,
   sessions, session, onChangeView, onSize, groupSessions, onFocusSession, onSplit, onSeparate,
   onClosePane, layout, onResizeSplit, onResetSplit,
   onStartTransfer, sftpPaths, onSftpPathsChange, transferTick, accentHex, broadcast, broadcastExcluded, onToggleBroadcast,
@@ -71,12 +74,14 @@ export function Workspace({
             icon={<SquareTerminal size={12} />}
             label="Terminal"
           />
-          <ViewTab
-            active={session.view === 'sftp'}
-            onClick={() => onChangeView('sftp')}
-            icon={<FolderTree size={12} />}
-            label="Files"
-          />
+          {filesAvailable && (
+            <ViewTab
+              active={session.view === 'sftp'}
+              onClick={() => onChangeView('sftp')}
+              icon={<FolderTree size={12} />}
+              label="Files"
+            />
+          )}
         </div>
         <div className="ml-auto flex items-center gap-1">
           {session.view === 'terminal' && (

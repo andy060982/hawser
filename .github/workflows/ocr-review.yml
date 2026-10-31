@@ -1,7 +1,7 @@
 # Automated AI PR review (Alibaba open-code-review) using your Anthropic key.
 #
 # One-time setup (repo Settings -> Secrets and variables -> Actions), or run
-# the gh commands Skiff's maintainer was given:
+# the gh commands Hawser's maintainer was given:
 #   secret    OCR_LLM_URL            https://api.anthropic.com
 #   secret    OCR_LLM_AUTH_TOKEN     your Anthropic API key (sk-ant-...)
 #   variable  OCR_LLM_MODEL          claude-sonnet-5

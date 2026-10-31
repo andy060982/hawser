@@ -1,6 +1,6 @@
 /** App-wide settings: host-color policies and a couple of safety toggles.
  *
- *  Persisted to %APPDATA%\skiff\settings.json via the settings_load/save IPC
+ *  Persisted to %APPDATA%\hawser\settings.json via the settings_load/save IPC
  *  commands (same corrupt-tolerant contract as the host catalogue). Exposed
  *  through a context so the cross-cutting consumers — connect flow, AI panel,
  *  broadcast, close guard — read one source of truth instead of threading
@@ -36,6 +36,15 @@ export interface Settings {
   copyOnSelect: boolean
   /** Middle-click (mouse wheel button) pastes the clipboard, X11 / PuTTY style. */
   middleClickPaste: boolean
+  /** Open a local terminal tab when Hawser starts — "use it as my terminal". */
+  localShellOnStartup: boolean
+  /** Profile id for new local terminals (Ctrl+Shift+T, startup). Unset means
+   *  the first one the backend lists (PowerShell 7 / Windows PowerShell on
+   *  Windows, the login shell elsewhere). */
+  defaultLocalShell?: string
+  /** Keep a transcript of local terminals, like SSH sessions, so session
+   *  search covers them. Everything shown on screen is written to disk. */
+  recordLocalTranscripts: boolean
 }
 
 const PERMISSIVE: ColorPolicy = { ai: 'on', confirmConnect: false, excludeFromBroadcast: false }
@@ -65,6 +74,8 @@ export function defaultSettings(): Settings {
     confirmCloseActive: true,
     copyOnSelect: true,
     middleClickPaste: true,
+    localShellOnStartup: false,
+    recordLocalTranscripts: true,
   }
 }
 
@@ -83,6 +94,9 @@ function hydrate(raw: unknown): Settings {
   if (typeof r.confirmCloseActive === 'boolean') base.confirmCloseActive = r.confirmCloseActive
   if (typeof r.copyOnSelect === 'boolean') base.copyOnSelect = r.copyOnSelect
   if (typeof r.middleClickPaste === 'boolean') base.middleClickPaste = r.middleClickPaste
+  if (typeof r.localShellOnStartup === 'boolean') base.localShellOnStartup = r.localShellOnStartup
+  if (typeof r.defaultLocalShell === 'string') base.defaultLocalShell = r.defaultLocalShell
+  if (typeof r.recordLocalTranscripts === 'boolean') base.recordLocalTranscripts = r.recordLocalTranscripts
   return base
 }
 
@@ -93,6 +107,8 @@ export function policyFor(settings: Settings, color: HostColor | undefined): Col
 
 interface SettingsCtx {
   settings: Settings
+  /** True once the saved settings have been read (startup actions wait for it). */
+  ready: boolean
   update: (patch: Partial<Settings>) => void
   setColorPolicy: (color: HostColor, patch: Partial<ColorPolicy>) => void
 }
@@ -107,12 +123,15 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   // Don't persist the first load (that would just rewrite defaults before the
   // real file is read); only persist genuine user changes.
   const loaded = useRef(false)
+  const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    void safeInvoke<unknown>('settings_load').then((raw) => {
-      setSettings(hydrate(raw))
-      loaded.current = true
-    })
+    void safeInvoke<unknown>('settings_load')
+      .then((raw) => {
+        setSettings(hydrate(raw))
+        loaded.current = true
+      })
+      .finally(() => setReady(true))
   }, [])
 
   const persist = useCallback((next: Settings) => {
@@ -138,7 +157,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [persist],
   )
 
-  return <Ctx.Provider value={{ settings, update, setColorPolicy }}>{children}</Ctx.Provider>
+  return <Ctx.Provider value={{ settings, ready, update, setColorPolicy }}>{children}</Ctx.Provider>
 }
 
 export function useSettings(): SettingsCtx {

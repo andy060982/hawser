@@ -148,7 +148,7 @@ export function HostKeyDialog() {
               Unrecognised host key
             </h2>
             <p id="hk-desc" className="mt-0.5 text-[12.5px] text-ink-dim">
-              Skiff has not connected to this server before.
+              Hawser has not connected to this server before.
               {queue.length > 1 && (
                 <span className="ml-1 text-ink-faint">
                   ({queue.length - 1} more {queue.length - 1 === 1 ? 'prompt' : 'prompts'} waiting)

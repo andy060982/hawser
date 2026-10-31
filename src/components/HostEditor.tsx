@@ -15,7 +15,7 @@ import { safeInvoke } from '../lib/tauri'
    Add / edit a saved host.
 
    The password field is the reason this component matters. Before it existed
-   the only way to store a credential was `cmdkey /generic:skiff:host:<id>`,
+   the only way to store a credential was `cmdkey /generic:hawser:host:<id>`,
    which is an unreasonable thing to ask of anyone.
 
    The secret goes straight to `credential_save`, which writes it to the Windows
@@ -287,6 +287,26 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
               placeholder="show running-config"
               className={`${inputCls} font-mono`}
             />
+            <label
+              className={`mt-1.5 flex items-start gap-2 text-[12px] ${
+                draft.configCommand?.trim() ? 'cursor-pointer text-ink-dim' : 'text-ink-faint'
+              }`}
+            >
+              <input
+                type="checkbox"
+                disabled={!draft.configCommand?.trim()}
+                checked={!!draft.checkConfigOnConnect && !!draft.configCommand?.trim()}
+                onChange={(e) => set('checkConfigOnConnect', e.target.checked || undefined)}
+                className="mt-[2px] h-3 w-3 accent-[var(--color-accent)]"
+              />
+              <span>
+                Check for config changes on connect
+                <span className="block text-[10.5px] text-ink-faint">
+                  Runs the command above on each connect and tells you if anything
+                  changed since your last visit. A snapshot is saved only when it did.
+                </span>
+              </span>
+            </label>
           </Field>
 
           <Field
@@ -631,7 +651,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                   title="Generate a new Ed25519 keypair in ~/.ssh and use it here"
                   onClick={() =>
                     void safeInvoke<{ privatePath: string; publicKey: string }>('ssh_keygen', {
-                      comment: `skiff ${draft.username || 'user'}@${draft.hostname || draft.name}`,
+                      comment: `hawser ${draft.username || 'user'}@${draft.hostname || draft.name}`,
                     })
                       .then((r) => {
                         if (!r) return

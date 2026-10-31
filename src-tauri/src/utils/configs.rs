@@ -3,11 +3,11 @@
 //! The most-asked question in network operations is "what changed on this box
 //! since it last worked". Snapshots answer it: run the device's config-dump
 //! command, store the output timestamped under
-//! `%APPDATA%\skiff\configs\<host>\`, and diff any two.
+//! `%APPDATA%\hawser\configs\<host>\`, and diff any two.
 //!
 //! Storage is one plain text file per snapshot — no database, no custom
 //! format — so the archive stays greppable and usable by other tools (or by
-//! the user in a panic at 2 AM) without Skiff involved.
+//! the user in a panic at 2 AM) without Hawser involved.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -84,16 +84,7 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
 
     let (added, removed) = match previous {
         Some(old) => {
-            let diff = similar::TextDiff::from_lines(old.as_str(), content);
-            let mut a = 0usize;
-            let mut r = 0usize;
-            for change in diff.iter_all_changes() {
-                match change.tag() {
-                    similar::ChangeTag::Insert => a += 1,
-                    similar::ChangeTag::Delete => r += 1,
-                    similar::ChangeTag::Equal => {}
-                }
-            }
+            let (a, r) = line_delta(&old, content);
             (Some(a), Some(r))
         }
         None => (None, None),
@@ -102,6 +93,98 @@ pub fn save_snapshot(host: &str, content: &str) -> Result<SnapshotResult, KnownH
     Ok(SnapshotResult {
         name,
         lines: content.lines().count(),
+        added,
+        removed,
+    })
+}
+
+/// (lines added, lines removed) going from `old` to `new`.
+fn line_delta(old: &str, new: &str) -> (usize, usize) {
+    let diff = similar::TextDiff::from_lines(old, new);
+    let (mut a, mut r) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => a += 1,
+            similar::ChangeTag::Delete => r += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (a, r)
+}
+
+/// Outcome of a "has this box changed since I last looked?" check.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigCheck {
+    /// "first" (no earlier snapshot: this one is the baseline), "unchanged"
+    /// (identical to the newest snapshot: nothing saved), or "changed".
+    pub status: &'static str,
+    /// The snapshot saved by this check; None when unchanged.
+    pub name: Option<String>,
+    /// The newest snapshot before this check, and when it was taken.
+    pub previous: Option<String>,
+    pub previous_modified: Option<u64>,
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Compare a fresh capture with the newest stored snapshot, saving it only if
+/// it differs. Unlike `save_snapshot` this never stores a duplicate, so it is
+/// safe to run on every connect without piling up identical files.
+pub fn check_snapshot(host: &str, content: &str) -> Result<ConfigCheck, KnownHostsError> {
+    let dir = configs_dir(host)?;
+    std::fs::create_dir_all(&dir).map_err(|source| KnownHostsError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    super::platform::restrict_perms(&dir, 0o700);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    check_in(&dir, content, &super::session_log::timestamp_for(now))
+}
+
+fn check_in(dir: &PathBuf, content: &str, stamp: &str) -> Result<ConfigCheck, KnownHostsError> {
+    let prev = newest(dir).map(|p| {
+        let modified = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+        (name, modified, std::fs::read_to_string(&p).unwrap_or_default())
+    });
+    let (previous, previous_modified) = match &prev {
+        Some((n, m, _)) => (n.clone(), *m),
+        None => (None, None),
+    };
+    // Line endings and trailing blank lines vary between captures of the same
+    // config (exec channels, pagers); they are not a change.
+    let norm = |t: &str| t.replace("\r\n", "\n").trim_end().to_string();
+    let (status, added, removed) = match &prev {
+        None => ("first", 0, 0),
+        Some((_, _, old)) if norm(old) == norm(content) => {
+            return Ok(ConfigCheck {
+                status: "unchanged",
+                name: None,
+                previous,
+                previous_modified,
+                added: 0,
+                removed: 0,
+            })
+        }
+        Some((_, _, old)) => {
+            let (a, r) = line_delta(old, content);
+            ("changed", a, r)
+        }
+    };
+    let name = write_new_snapshot(dir, stamp, content)?;
+    Ok(ConfigCheck {
+        status,
+        name: Some(name),
+        previous,
+        previous_modified,
         added,
         removed,
     })
@@ -142,12 +225,32 @@ fn write_new_snapshot(dir: &Path, base: &str, content: &str) -> Result<String, K
     Ok(name)
 }
 
+/// Chronological key of a snapshot name "YYYYMMDD-HHMMSS[.n].txt": the stamp,
+/// then the numeric same-second suffix (absent = 0). Plain string order would
+/// put ".1.txt" before ".txt".
+fn name_order(name: &str) -> (String, u32) {
+    let stem = name.strip_suffix(".txt").unwrap_or(name);
+    match stem.rsplit_once('.') {
+        Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (base.to_string(), n.parse().unwrap_or(u32::MAX))
+        }
+        _ => (stem.to_string(), 0),
+    }
+}
+
+/// Newest snapshot by modified time, ties (same-second writes, coarse mtime
+/// filesystems) broken by the name's own chronological order.
 fn newest(dir: &PathBuf) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".txt"))
-        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .max_by_key(|e| {
+            (
+                e.metadata().and_then(|m| m.modified()).ok(),
+                name_order(&e.file_name().to_string_lossy()),
+            )
+        })
         .map(|e| e.path())
 }
 
@@ -225,6 +328,75 @@ pub fn read_snapshot(host: &str, name: &str) -> Result<String, KnownHostsError> 
 mod tests {
     use super::*;
 
+    fn tmp_dir() -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("hawser-cfg-test-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn same_second_suffixes_order_after_the_base_name() {
+        let mut names = vec![
+            "20261031-090000.1.txt",
+            "20261031-090000.txt",
+            "20261031-085959.txt",
+            "20261031-090000.10.txt",
+            "20261031-090000.2.txt",
+        ];
+        names.sort_by_key(|n| name_order(n));
+        assert_eq!(
+            names,
+            [
+                "20261031-085959.txt",
+                "20261031-090000.txt",
+                "20261031-090000.1.txt",
+                "20261031-090000.2.txt",
+                "20261031-090000.10.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_compares_against_the_latest_same_second_snapshot() {
+        let d = tmp_dir();
+        check_in(&d, "a\n", "20261031-090000").unwrap();
+        let second = check_in(&d, "b\n", "20261031-090000").unwrap(); // -> .1.txt
+        assert_eq!(second.name.as_deref(), Some("20261031-090000.1.txt"));
+        // Force identical mtimes, with the older name made to look newer by
+        // nothing but the tie-break: name order must decide.
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        for n in ["20261031-090000.txt", "20261031-090000.1.txt"] {
+            std::fs::File::options().write(true).open(d.join(n)).unwrap().set_modified(t).unwrap();
+        }
+        // Same mtime second: the tie-break must pick .1.txt as newest.
+        let third = check_in(&d, "b\n", "20261031-090000").unwrap();
+        assert_eq!(third.status, "unchanged");
+        assert_eq!(third.previous.as_deref(), Some("20261031-090000.1.txt"));
+    }
+
+    #[test]
+    fn check_saves_baseline_then_only_real_changes() {
+        let d = tmp_dir();
+        let first = check_in(&d, "hostname fw1\nntp server 1.1.1.1\n", "20261031-090000").unwrap();
+        assert_eq!((first.status, first.previous.as_deref()), ("first", None));
+        assert!(first.name.is_some());
+
+        // Same config, different line endings / trailing newline: no new file.
+        let same = check_in(&d, "hostname fw1\r\nntp server 1.1.1.1\r\n\r\n", "20261031-100000").unwrap();
+        assert_eq!(same.status, "unchanged");
+        assert_eq!(same.name, None);
+        assert_eq!(same.previous, first.name);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+
+        let changed = check_in(&d, "hostname fw1\nntp server 9.9.9.9\nlogging host 10.0.0.5\n", "20261031-110000").unwrap();
+        assert_eq!((changed.status, changed.added, changed.removed), ("changed", 2, 1));
+        assert_eq!(changed.previous, first.name);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+    }
+
     #[test]
     fn checked_accepts_plain_snapshot_names() {
         let dir = PathBuf::from("configs");
@@ -256,7 +428,7 @@ mod tests {
     #[test]
     fn same_second_snapshots_do_not_overwrite() {
         let dir = std::env::temp_dir().join(format!(
-            "skiff-configs-test-{}-{}",
+            "hawser-configs-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

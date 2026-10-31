@@ -1,10 +1,43 @@
 # Changelog
 
-All notable changes to Skiff are documented here. Format follows
+All notable changes to Hawser are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+### Changed
+
+- **Renamed Skiff → Hawser.** New app name, bundle id, data folder, and
+  keychain namespace. Hosts and saved passwords from Skiff builds are not
+  migrated; export hosts from Skiff and import them into Hawser.
+
+### Added
+
+- **Tamper-evident audit log** (menu → Audit log…). Connects, logins, file
+  transfers, deletes, key generation/installs, credential changes, and host
+  exports are recorded as a hash chain whose head is sealed in the OS keychain.
+  "Verify integrity" reports verified / not fully verified / failed, and where
+  the chain broke. Records hold metadata only: no passwords, keys, command
+  text, or command output. "Archive and start new" sets a failed log aside
+  (kept, and pinned by fingerprint in the new log).
+- **"What changed since my last visit."** Opt-in per host (Host editor →
+  "Check for config changes on connect"): on each connect Hawser runs the host's
+  config command on a side channel and compares it with the newest snapshot. You
+  get a one-line note in the terminal ("config unchanged since …" or "config
+  changed since …: +12 −3 lines") and a status-bar chip that opens the diff. A
+  snapshot is saved only when the config actually changed.
+- **Local terminals: use Hawser as your everyday terminal.** Ctrl+Shift+T (or
+  the app menu) opens PowerShell 7 / Windows PowerShell / Command Prompt / WSL /
+  Git Bash on Windows, or your login shell (zsh, bash, fish) on macOS and Linux,
+  in a real PTY (ConPTY on Windows). Local tabs get splits, find, copy-on-select,
+  themes, transcripts, and session search like SSH tabs. Settings → Local
+  terminal: default shell, open one at startup, and whether to record local
+  transcripts. The AI assistant can't see local terminals by default; opening
+  one is recorded in the audit log (what you type is not).
+- **Search inside sessions** in Session history: full-text search across every
+  recorded transcript, grouped by session, newest first; click a match to open
+  the transcript at that line.
 
 ## [0.5.0-beta.1] - 2026-10-30
 
