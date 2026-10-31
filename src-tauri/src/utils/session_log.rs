@@ -359,6 +359,17 @@ mod tests {
     }
 
     #[test]
+    fn match_offset_survives_case_expansion() {
+        // Each 'İ' lowercases to two chars; 300 of them would push a naive
+        // lowercase-offset window right past the match.
+        let line = format!("{}needle{}", "İ".repeat(300), "x".repeat(300));
+        let lower = line.to_lowercase();
+        let at = lower.find("needle").unwrap();
+        assert_eq!(orig_char_index(&line, at), 300);
+        assert!(snippet(&line, orig_char_index(&line, at)).contains("needle"));
+    }
+
+    #[test]
     fn long_lines_are_windowed_around_the_match() {
         let line = format!("{}NEEDLE{}", "é".repeat(1000), "x".repeat(1000));
         let s = snippet(&line, 1000);
@@ -750,11 +761,26 @@ fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Result<SearchR
                 host: log.host.clone(),
                 started: log.started,
                 line: (i + 1) as u64,
-                text: snippet(line, lower[..at].chars().count()),
+                text: snippet(line, orig_char_index(line, at)),
             });
         }
     }
     Ok(res)
+}
+
+/// Char index in `line` of the character whose lowercase form starts at byte
+/// `lower_at` of `line.to_lowercase()`. Lowercasing can change length (`İ` → `i̇`
+/// is one char to two), so an offset in the lowercased text cannot be reused
+/// against the original directly.
+fn orig_char_index(line: &str, lower_at: usize) -> usize {
+    let mut consumed = 0;
+    for (i, c) in line.chars().enumerate() {
+        if consumed >= lower_at {
+            return i;
+        }
+        consumed += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    line.chars().count()
 }
 
 /// `line`, or a window of it around char index `at` when it is long, with an

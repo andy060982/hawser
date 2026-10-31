@@ -32,23 +32,49 @@ interface SearchResult {
   truncated: boolean
 }
 
+/* `text` lowercased, plus where each lowercased UTF-16 unit came from in the
+   original. Lowercasing can change length ('İ' becomes two units), so matching
+   on the lowercase string and slicing the original at the same offsets would
+   drift; this map turns lowercase offsets back into original ones. */
+function fold(text: string): { lower: string; origin: number[] } {
+  let lower = ''
+  const origin: number[] = []
+  let i = 0
+  for (const ch of text) {
+    const l = ch.toLowerCase()
+    lower += l
+    for (let k = 0; k < l.length; k++) origin.push(i)
+    i += ch.length
+  }
+  origin.push(i) // sentinel: end of text
+  return { lower, origin }
+}
+
 /* `text` with every case-insensitive occurrence of `q` wrapped in <mark>. */
 function Highlight({ text, q }: { text: string; q: string }) {
   const needle = q.trim().toLowerCase()
   if (!needle) return <>{text}</>
-  const lower = text.toLowerCase()
+  const { lower, origin } = fold(text)
   const parts: React.ReactNode[] = []
-  let i = 0
-  for (let at = lower.indexOf(needle); at !== -1; at = lower.indexOf(needle, i)) {
-    parts.push(text.slice(i, at))
-    parts.push(
-      <mark key={at} className="rounded-sm bg-accent-soft text-ink">
-        {text.slice(at, at + needle.length)}
-      </mark>,
-    )
-    i = at + needle.length
+  let from = 0 // in lowercase units
+  let shown = 0 // in original units
+  for (let at = lower.indexOf(needle); at !== -1; at = lower.indexOf(needle, from)) {
+    const start = origin[at]
+    const end = origin[at + needle.length]
+    // A match that starts inside one expanded char can map back to a start
+    // already shown; skip rather than duplicate text.
+    if (start >= shown) {
+      parts.push(text.slice(shown, start))
+      parts.push(
+        <mark key={at} className="rounded-sm bg-accent-soft text-ink">
+          {text.slice(start, end)}
+        </mark>,
+      )
+      shown = end
+    }
+    from = at + needle.length
   }
-  parts.push(text.slice(i))
+  parts.push(text.slice(shown))
   return <>{parts}</>
 }
 
