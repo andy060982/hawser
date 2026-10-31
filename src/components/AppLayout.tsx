@@ -202,8 +202,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // kept on purpose: a dropped link or a dormant-restored tab should come
     // back next launch too, not just live ones. Only 'error' (auth failed, bad
     // host key) is dropped, since re-restoring a doomed connection is noise.
+    // Local terminals are left out too: they are not catalogue hosts, so they
+    // could never be restored (the "open at startup" setting covers them).
     const open = sessions
-      .filter((s) => s.status !== 'error')
+      .filter((s) => s.status !== 'error' && !s.hostId.startsWith('local-'))
       .map((s) => ({ hostId: s.hostId, view: s.view, paneIndex: s.paneIndex }))
     void safeInvoke('sessions_save', { list: open })
   }, [sessions])
@@ -950,6 +952,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         username,
         // With no password given, the agent is the only thing worth trying.
         auth: password ? 'password' : 'agent',
+        // Ad-hoc hosts carry no colour or per-host choice, so the AI assistant
+        // stays off for them (as it always effectively was), rather than
+        // inheriting the permissive default policy.
+        aiAllowed: false,
       }
       const sid = `s-${host.id}`
       const session: Session = {
@@ -1094,7 +1100,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       },
       {
         label: 'Port forwarding…',
-        disabled: dead,
+        disabled: dead || !!host?.local,
         onSelect: () => {
           const cur = sessionsRef.current.find((t) => t.id === sessionId)
           if (cur) setTunnelFor(cur)
@@ -1102,7 +1108,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       },
       {
         label: 'Capture command output…',
-        disabled: dead || !host,
+        disabled: dead || !host || !!host.local,
         onSelect: async () => {
           const command = (
             await prompt('Command to run — its full output is saved to a file (e.g. show tech-support):', {
@@ -1521,8 +1527,9 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
               // With no quick-connect UI yet, the most useful meaning of "+" is
               // a second session to the host you are already on. With nothing
               // open there is no host to duplicate, so offer to define one.
-              const current = active && findHost(hosts, active.hostId)
-              if (current) openHost(current, true)
+              const current = active && lookupHost(active.hostId)
+              if (current?.local) openLocal(current.local.profile)
+              else if (current && findHost(hosts, current.id)) openHost(current, true)
               else setEditing({ host: null })
             }}
           />

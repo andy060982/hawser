@@ -202,7 +202,13 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             <label className="flex items-center gap-2 px-1 py-1 text-[12.5px] text-ink">
               <span className="w-32 shrink-0">Default shell</span>
               <select
-                value={settings.defaultLocalShell ?? shells[0]?.id ?? ''}
+                // A saved shell that is no longer installed shows (and acts) as
+                // the first available one, which is what openLocal falls back to.
+                value={
+                  shells.some((p) => p.id === settings.defaultLocalShell)
+                    ? settings.defaultLocalShell
+                    : (shells[0]?.id ?? '')
+                }
                 onChange={(e) => update({ defaultLocalShell: e.target.value || undefined })}
                 className="h-7 min-w-0 flex-1 rounded border border-line bg-surface-1 px-1.5 text-[12px] text-ink focus:border-accent focus:outline-none"
               >

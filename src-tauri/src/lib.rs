@@ -160,7 +160,12 @@ async fn ssh_resize(
     rows: u32,
 ) -> CmdResult<()> {
     if local.owns(&session_id) {
-        return local.resize(&session_id, cols, rows);
+        // Off the async runtime: the master lock can briefly wait on the exit
+        // watcher closing the console.
+        let local = Arc::clone(&local);
+        return tauri::async_runtime::spawn_blocking(move || local.resize(&session_id, cols, rows))
+            .await
+            .map_err(|e| e.to_string())?;
     }
     registry
         .resize(&session_id, cols, rows)
