@@ -1,4 +1,5 @@
 mod credentials;
+mod local_shell;
 mod utils;
 mod ssh;
 
@@ -128,9 +129,19 @@ async fn auth_prompt_cancel(
 #[tauri::command]
 async fn ssh_write(
     registry: State<'_, Registry>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
     data: Vec<u8>,
 ) -> CmdResult<()> {
+    // Local terminals share the session commands (see local_shell). A PTY
+    // write can block while the shell isn't reading, so it runs off the
+    // async runtime.
+    if local.owns(&session_id) {
+        let local = Arc::clone(&local);
+        return tauri::async_runtime::spawn_blocking(move || local.write(&session_id, &data))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     registry
         .write(&session_id, &data)
         .await
@@ -143,10 +154,14 @@ async fn ssh_write(
 #[tauri::command]
 async fn ssh_resize(
     registry: State<'_, Registry>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
     cols: u32,
     rows: u32,
 ) -> CmdResult<()> {
+    if local.owns(&session_id) {
+        return local.resize(&session_id, cols, rows);
+    }
     registry
         .resize(&session_id, cols, rows)
         .await
@@ -159,8 +174,11 @@ async fn ssh_disconnect(
     registry: State<'_, Registry>,
     prompts: State<'_, Arc<HostKeyPrompts>>,
     auth_prompts: State<'_, Arc<AuthPrompts>>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
 ) -> CmdResult<()> {
+    // A local terminal closes its shell; no-op for any other id.
+    local.close(&session_id);
     // Cancel an in-flight connect FIRST: once it is cancelled it cannot raise
     // a new prompt, so the sweep below cannot miss one registered behind it.
     registry.remove(&session_id).await;
@@ -175,6 +193,52 @@ async fn ssh_disconnect(
         ssh::emit_prompt_closed(&app, &request_id);
     }
     Ok(())
+}
+
+/* ------------------------------------------------------------ local shells */
+
+/// Shells available on this machine for "New local terminal".
+#[tauri::command]
+async fn local_shell_profiles() -> CmdResult<Vec<local_shell::ShellProfile>> {
+    Ok(local_shell::profiles())
+}
+
+/// Start a local shell in a PTY for `session_id`. `profile` is a profile id
+/// from `local_shell_profiles`, never a program path. `record` keeps a
+/// transcript like an SSH session does (Settings → Terminal).
+#[tauri::command]
+async fn local_shell_start(
+    app: AppHandle,
+    local: State<'_, Arc<local_shell::LocalShells>>,
+    session_id: String,
+    profile: String,
+    cols: u32,
+    rows: u32,
+    record: bool,
+) -> CmdResult<()> {
+    let local = Arc::clone(&local);
+    let started = tauri::async_runtime::spawn_blocking(move || {
+        local.start(&app, &session_id, &profile, cols, rows, record)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // Audited like a connect (which shell, never what is typed), but off the
+    // command's path: sealing writes the keychain, which can show a prompt, and
+    // the terminal must not wait on it.
+    let (event, summary, detail) = match &started {
+        Ok(p) => (
+            "local.open",
+            format!("opened a local terminal ({})", p.label),
+            serde_json::json!({ "profile": p.id, "ok": true }),
+        ),
+        Err(e) => (
+            "local.open.fail",
+            "a local terminal failed to start".to_string(),
+            serde_json::json!({ "error": e, "ok": false }),
+        ),
+    };
+    tauri::async_runtime::spawn_blocking(move || utils::audit::record(event, summary, detail));
+    started.map(|_| ())
 }
 
 /* --------------------------------------------------------------------- sftp */
@@ -1016,6 +1080,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             app.manage(Registry::default());
+            app.manage(Arc::new(local_shell::LocalShells::default()));
             app.manage(Arc::new(HostKeyPrompts::default()));
             app.manage(Arc::new(AuthPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
@@ -1104,6 +1169,8 @@ pub fn run() {
             audit_list,
             audit_verify,
             audit_archive,
+            local_shell_profiles,
+            local_shell_start,
             credential_save,
             credential_status,
             credential_delete,

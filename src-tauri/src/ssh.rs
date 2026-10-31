@@ -3012,7 +3012,7 @@ async fn socks5_serve(
 /// Streaming UTF-8 decode: append `data` to `pending`, return every complete
 /// character, and keep an incomplete trailing sequence (at most 3 bytes) in
 /// `pending` for the next chunk. Only genuinely invalid bytes become U+FFFD.
-fn decode_utf8_stream(pending: &mut Vec<u8>, data: &[u8]) -> String {
+pub(crate) fn decode_utf8_stream(pending: &mut Vec<u8>, data: &[u8]) -> String {
     pending.extend_from_slice(data);
     let mut out = String::new();
     loop {

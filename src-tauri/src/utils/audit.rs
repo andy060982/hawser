@@ -255,7 +255,6 @@ trait Anchor: Send + Sync {
     fn write(&self, seq: u64, hash: &str) -> Result<(), String>;
     /// Replace the head with a permanent "integrity failed" marker.
     fn freeze(&self, reason: &str) -> Result<(), String>;
-    fn clear(&self) -> Result<(), String>;
 }
 
 fn seal_payload(seq: u64, hash: &str) -> String {
@@ -302,13 +301,6 @@ impl Anchor for Keychain {
     fn freeze(&self, reason: &str) -> Result<(), String> {
         crate::credentials::write_secret(SEAL_ID, "audit", &frozen_payload(reason))
             .map_err(|e| e.to_string())
-    }
-    fn clear(&self) -> Result<(), String> {
-        use crate::credentials::{delete_secret, CredError};
-        match delete_secret(SEAL_ID) {
-            Ok(()) | Err(CredError::NotFound(_)) => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
     }
 }
 
@@ -1210,6 +1202,10 @@ mod tests {
     }
 
     impl Mem {
+        fn clear(&self) -> Result<(), String> {
+            *self.seal.lock().unwrap() = None;
+            Ok(())
+        }
         fn frozen(&self) -> bool {
             matches!(self.read(), SealRead::Frozen(_))
         }
@@ -1245,10 +1241,7 @@ mod tests {
             *self.seal.lock().unwrap() = Some(frozen_payload(reason));
             Ok(())
         }
-        fn clear(&self) -> Result<(), String> {
-            *self.seal.lock().unwrap() = None;
-            Ok(())
-        }
+
     }
 
     static DIRS: AtomicUsize = AtomicUsize::new(0);

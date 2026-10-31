@@ -39,6 +39,7 @@ similar = "2.7.0"
 futures-util = "0.3.34"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "rustls"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+portable-pty = "0.9"
 
 # --- Platform credential vaults -------------------------------------------
 # Windows: hand-rolled Credential Manager access (see src/credentials.rs).
@@ -85,3 +86,6 @@ panic = "abort"     # no unwinding tables, no landing pads
 inherits = "release"
 strip = false
 debug = 1
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }

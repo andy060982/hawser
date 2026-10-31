@@ -1,7 +1,8 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Settings2, X } from 'lucide-react'
 import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { policyFor, useSettings } from '../lib/settings'
+import { safeInvoke } from '../lib/tauri'
 
 /* ---------------------------------------------------------------------------
    App settings: host-colour policies + safety toggles.
@@ -12,6 +13,12 @@ import { policyFor, useSettings } from '../lib/settings'
 --------------------------------------------------------------------------- */
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const { settings, update, setColorPolicy } = useSettings()
+  const [shells, setShells] = useState<{ id: string; label: string; program: string }[]>([])
+  useEffect(() => {
+    void safeInvoke<{ id: string; label: string; program: string }[]>('local_shell_profiles').then(
+      (p) => setShells(p ?? []),
+    )
+  }, [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
@@ -182,6 +189,59 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 <span className="block text-[11px] text-ink-faint">
                   Pressing the mouse wheel button pastes the clipboard. Right-click also pastes
                   (or copies the selection if one is active).
+                </span>
+              </span>
+            </label>
+          </section>
+
+          {/* --- Local terminal --- */}
+          <section className="mt-4">
+            <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">
+              Local terminal
+            </h3>
+            <label className="flex items-center gap-2 px-1 py-1 text-[12.5px] text-ink">
+              <span className="w-32 shrink-0">Default shell</span>
+              <select
+                value={settings.defaultLocalShell ?? shells[0]?.id ?? ''}
+                onChange={(e) => update({ defaultLocalShell: e.target.value || undefined })}
+                className="h-7 min-w-0 flex-1 rounded border border-line bg-surface-1 px-1.5 text-[12px] text-ink focus:border-accent focus:outline-none"
+              >
+                {shells.map((p) => (
+                  <option key={p.id} value={p.id} title={p.program}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="px-1 pb-1 text-[11px] text-ink-faint">
+              New local terminal: Ctrl+Shift+T, or the app menu for a specific shell.
+            </p>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.localShellOnStartup}
+                onChange={(e) => update({ localShellOnStartup: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Open a local terminal at startup</span>
+                <span className="block text-[11px] text-ink-faint">
+                  Use Hawser as your everyday terminal: it opens with your default shell ready.
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.recordLocalTranscripts}
+                onChange={(e) => update({ recordLocalTranscripts: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Record local terminal transcripts</span>
+                <span className="block text-[11px] text-ink-faint">
+                  Saves what local terminals show, like SSH sessions, so Session history can search
+                  it. Everything on screen is written to disk. Applies to newly opened terminals.
                 </span>
               </span>
             </label>

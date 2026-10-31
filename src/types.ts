@@ -68,6 +68,9 @@ export interface Host {
    *  a Palo Alto, `df -h` on a Linux box. Slot digits are chosen by the user so
    *  the same finger memory can mean the same *kind* of thing across hosts. */
   snippets?: Snippet[]
+  /** Set on the synthetic hosts behind local terminal tabs (never saved to the
+   *  catalogue): the shell profile id to start instead of dialling SSH. */
+  local?: { profile: string }
 }
 
 export interface Snippet {

@@ -153,7 +153,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   sessionsRef.current = sessions
   const hostsRef = useRef<HostNode[]>(seedHosts)
   hostsRef.current = hosts
-  const { settings } = useSettings()
+  const { settings, ready: settingsReady } = useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
   const { confirm, alert, prompt } = useDialogs()
@@ -453,10 +453,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // On a device that cannot run tmux — which is most network gear — this is
     // the only continuity available: the box kept nothing, but we did. Dimmed
     // and fenced so it can never be mistaken for live output.
-    void safeInvoke<string | null>('session_history', {
-      host: host.hostname,
-      maxBytes: 12_000,
-    }).then((history) => {
+    // Not for local terminals: a shell on this machine starts fresh, like any
+    // other terminal app.
+    void (host.local
+      ? Promise.resolve(null)
+      : safeInvoke<string | null>('session_history', { host: host.hostname, maxBytes: 12_000 })
+    ).then((history) => {
       if (!history) return
       emitLocal(
         session.id,
@@ -570,7 +572,15 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // stale, even if this connect ends up throttled and runs no check of its own.
     configReplies.current.invalidate(sessionId)
 
-    void safeInvoke('ssh_connect', {
+    const dial = host.local
+      ? safeInvoke('local_shell_start', {
+          sessionId,
+          profile: host.local.profile,
+          cols,
+          rows,
+          record: settingsRef.current.recordLocalTranscripts,
+        })
+      : safeInvoke('ssh_connect', {
       sessionId,
       // Credential sharing: the vault is keyed by this id, so pointing it at
       // another host's id is the whole feature — one entry, many hosts.
@@ -603,6 +613,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         }
       })(),
     })
+    void dial
       .then(() => {
         // The tab was closed while the connect was in flight: the backend has
         // just registered a session nothing owns, so tear it down.
@@ -728,9 +739,14 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const setView = useCallback(
     (view: WorkspaceView) =>
       setSessions((prev) =>
-        prev.map((s) => (s.id === activeId ? { ...s, view } : s)),
+        prev.map((s) =>
+          // Local terminals have no SFTP side; stay on the terminal.
+          s.id === activeId && !(view === 'sftp' && lookupHost(s.hostId)?.local)
+            ? { ...s, view }
+            : s,
+        ),
       ),
-    [activeId],
+    [activeId, lookupHost],
   )
 
   /* Connection lifecycle from the backend. This is the only way the UI learns a
@@ -879,6 +895,50 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
 
   /** Quick connect: an ephemeral host, never saved, password (if any) used
    *  once. The session looks like any other; the catalogue never learns. */
+  /** Shells this machine offers (PowerShell, cmd, WSL, Git Bash / login shell…). */
+  const [shellProfiles, setShellProfiles] = useState<{ id: string; label: string }[]>([])
+  useEffect(() => {
+    void safeInvoke<{ id: string; label: string }[]>('local_shell_profiles').then((p) =>
+      setShellProfiles(p ?? []),
+    )
+  }, [])
+
+  /** Open a local terminal tab. The tab rides on a synthetic host (one per
+   *  shell profile, never saved to the catalogue), so splitting, restart,
+   *  find, and transcripts all work as for SSH. AI access is off by default:
+   *  a local shell sees the whole machine. */
+  const openLocal = useCallback(
+    (profileId?: string) => {
+      const prof =
+        shellProfiles.find((p) => p.id === (profileId ?? settingsRef.current.defaultLocalShell)) ??
+        shellProfiles[0]
+      if (!prof) return
+      const host: Host = {
+        kind: 'host',
+        id: `local-${prof.id}`,
+        name: prof.label,
+        hostname: 'localhost',
+        port: 0,
+        username: '',
+        auth: 'agent',
+        aiAllowed: false,
+        local: { profile: prof.id },
+      }
+      ephemeralHostsRef.current.set(host.id, host)
+      void openHost(host, true)
+    },
+    [shellProfiles, openHost],
+  )
+
+  /* "Open a local terminal at startup": once, after settings and the shell
+     list have loaded. */
+  const startupLocalDone = useRef(false)
+  useEffect(() => {
+    if (startupLocalDone.current || !settingsReady || shellProfiles.length === 0) return
+    startupLocalDone.current = true
+    if (settingsRef.current.localShellOnStartup) openLocal()
+  }, [settingsReady, shellProfiles, openLocal])
+
   const quickConnect = useCallback(
     (username: string, hostname: string, port: number, password: string | null) => {
       const host: Host = {
@@ -1110,7 +1170,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  was previously only reachable by knowing where to click. */
   const openAppMenu = useCallback((x: number, y: number) => {
     const items: MenuItem[] = [
-      { label: 'Quick connect… Ctrl+Shift+P', onSelect: () => setShowQuickConnect(true) },
+      { label: 'New local terminal  Ctrl+Shift+T', onSelect: () => openLocal() },
+      ...shellProfiles.map((p) => ({ label: `    ${p.label}`, onSelect: () => openLocal(p.id) })),
+      { label: 'Quick connect… Ctrl+Shift+P', dividerBefore: true, onSelect: () => setShowQuickConnect(true) },
       { label: 'Network tools…', onSelect: () => setNetTools({ target: '', port: 22 }) },
       { label: 'AI assistant… Ctrl+Shift+A', onSelect: () => setShowAi(true) },
       { label: 'Settings…', onSelect: () => setShowSettings(true) },
@@ -1155,7 +1217,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       },
     ]
     setMenu({ x, y, items })
-  }, [activeId, closeSession, persistHosts])
+  }, [activeId, closeSession, persistHosts, openLocal, shellProfiles])
 
   /** Right-click on the host sidebar's empty area: the fast path to a new
    *  connection without hunting for the "+" button. */
@@ -1385,6 +1447,10 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
           e.preventDefault()
           setShowQuickConnect(true)
           break
+        case 'KeyT': // new local terminal (default shell)
+          e.preventDefault()
+          openLocal()
+          break
         case 'KeyF': // find in the focused terminal
           if (!activeId) break
           e.preventDefault()
@@ -1405,7 +1471,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [active?.view, activeId, groups, paneForGroup, setView, closeSession, cycleTab, sendSnippet])
+  }, [active?.view, activeId, groups, paneForGroup, setView, closeSession, cycleTab, sendSnippet, openLocal])
 
   /* ---------------------------------------------------------------- render */
 
@@ -1481,13 +1547,14 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
             broadcast={broadcast}
             broadcastExcluded={broadcastExcluded}
             onToggleBroadcast={toggleBroadcast}
+            filesAvailable={!(active && lookupHost(active.hostId)?.local)}
           />
         </main>
 
         {showAi && (
           <AiPanel
             session={active}
-            host={active ? findHost(hosts, active.hostId) : undefined}
+            host={active ? lookupHost(active.hostId) : undefined}
             effectiveColor={activeColor}
             onClose={() => setShowAi(false)}
           />
@@ -1502,6 +1569,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
         size={activeId ? sizes[activeId] : undefined}
         onReconnect={activeId ? () => reconnectSession(activeId) : undefined}
         configChange={activeId ? configChanges[activeId] : undefined}
+        local={!!(active && lookupHost(active.hostId)?.local)}
         onViewConfigChange={(() => {
           const c = activeId ? configChanges[activeId] : undefined
           const h = c && lookupHost(c.hostId)

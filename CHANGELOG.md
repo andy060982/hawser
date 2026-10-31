@@ -27,6 +27,14 @@ All notable changes to Hawser are documented here. Format follows
   get a one-line note in the terminal ("config unchanged since …" or "config
   changed since …: +12 −3 lines") and a status-bar chip that opens the diff. A
   snapshot is saved only when the config actually changed.
+- **Local terminals: use Hawser as your everyday terminal.** Ctrl+Shift+T (or
+  the app menu) opens PowerShell 7 / Windows PowerShell / Command Prompt / WSL /
+  Git Bash on Windows, or your login shell (zsh, bash, fish) on macOS and Linux,
+  in a real PTY (ConPTY on Windows). Local tabs get splits, find, copy-on-select,
+  themes, transcripts, and session search like SSH tabs. Settings → Local
+  terminal: default shell, open one at startup, and whether to record local
+  transcripts. The AI assistant can't see local terminals by default; opening
+  one is recorded in the audit log (what you type is not).
 - **Search inside sessions** in Session history: full-text search across every
   recorded transcript, grouped by session, newest first; click a match to open
   the transcript at that line.
