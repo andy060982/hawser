@@ -834,8 +834,10 @@ mod tests {
 
     /// A signal interrupting the readiness wait (EINTR) must not count as
     /// readable: the reader would fall into a blocking read with no data and
-    /// could stay there past the finish. Deterministic: a thread waits on an
-    /// empty pipe, and SIGUSR1 (no-op handler, no SA_RESTART) interrupts it.
+    /// could stay there past the finish. A thread waits on an empty pipe and
+    /// SIGUSR1 (no-op handler, no SA_RESTART) is re-sent every 50 ms until the
+    /// wait returns, so it doesn't matter when the thread actually entered
+    /// poll/select. The previous SIGUSR1 disposition is restored afterwards.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_wait_is_not_readiness() {
@@ -843,33 +845,39 @@ mod tests {
         extern "C" fn noop(_: libc::c_int) {}
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: pipe() fills two fds we then own; sigaction installs a
-        // no-op handler without SA_RESTART so the wait returns EINTR.
-        let (rd, _wr) = unsafe {
+        // no-op handler without SA_RESTART (so the wait returns EINTR) and
+        // saves the previous one for restoring.
+        let (rd, _wr, previous) = unsafe {
             assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = noop as extern "C" fn(libc::c_int) as *const () as usize;
             sa.sa_flags = 0;
             libc::sigemptyset(&mut sa.sa_mask);
-            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()), 0);
-            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, &mut previous), 0);
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]), previous)
         };
         let wake = ReadyFd(rd);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             // SAFETY: pthread_self has no preconditions.
-            tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
-            let start = std::time::Instant::now();
+            tid_tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
             let outcome = wake.ready(Duration::from_secs(10));
-            (outcome, start.elapsed())
+            done_tx.send(()).unwrap();
+            outcome
         });
-        let tid = rx.recv().unwrap() as libc::pthread_t;
-        std::thread::sleep(Duration::from_millis(200));
-        // SAFETY: the target thread is alive (blocked in the wait).
-        assert_eq!(unsafe { libc::pthread_kill(tid, libc::SIGUSR1) }, 0);
-        let (outcome, took) = waiter.join().unwrap();
-        assert!(took < Duration::from_secs(5), "the signal did not interrupt the wait");
+        let tid = tid_rx.recv().unwrap() as libc::pthread_t;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while done_rx.recv_timeout(Duration::from_millis(50)).is_err() {
+            assert!(std::time::Instant::now() < deadline, "the wait was never interrupted");
+            // SAFETY: the waiter hasn't signalled completion, so it is alive.
+            unsafe { libc::pthread_kill(tid, libc::SIGUSR1) };
+        }
+        let outcome = waiter.join().unwrap();
+        // SAFETY: restoring the disposition saved above.
+        unsafe { libc::sigaction(libc::SIGUSR1, &previous, std::ptr::null_mut()) };
         assert_eq!(outcome, Wait::Again);
-        // And the pure classification for the other cases.
         assert_eq!(Wait::classify(1), Wait::Ready);
         assert_eq!(Wait::classify(0), Wait::Again);
     }
