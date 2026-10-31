@@ -225,12 +225,32 @@ fn write_new_snapshot(dir: &Path, base: &str, content: &str) -> Result<String, K
     Ok(name)
 }
 
+/// Chronological key of a snapshot name "YYYYMMDD-HHMMSS[.n].txt": the stamp,
+/// then the numeric same-second suffix (absent = 0). Plain string order would
+/// put ".1.txt" before ".txt".
+fn name_order(name: &str) -> (String, u32) {
+    let stem = name.strip_suffix(".txt").unwrap_or(name);
+    match stem.rsplit_once('.') {
+        Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (base.to_string(), n.parse().unwrap_or(u32::MAX))
+        }
+        _ => (stem.to_string(), 0),
+    }
+}
+
+/// Newest snapshot by modified time, ties (same-second writes, coarse mtime
+/// filesystems) broken by the name's own chronological order.
 fn newest(dir: &PathBuf) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".txt"))
-        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .max_by_key(|e| {
+            (
+                e.metadata().and_then(|m| m.modified()).ok(),
+                name_order(&e.file_name().to_string_lossy()),
+            )
+        })
         .map(|e| e.path())
 }
 
@@ -315,6 +335,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn same_second_suffixes_order_after_the_base_name() {
+        let mut names = vec![
+            "20261031-090000.1.txt",
+            "20261031-090000.txt",
+            "20261031-085959.txt",
+            "20261031-090000.10.txt",
+            "20261031-090000.2.txt",
+        ];
+        names.sort_by_key(|n| name_order(n));
+        assert_eq!(
+            names,
+            [
+                "20261031-085959.txt",
+                "20261031-090000.txt",
+                "20261031-090000.1.txt",
+                "20261031-090000.2.txt",
+                "20261031-090000.10.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_compares_against_the_latest_same_second_snapshot() {
+        let d = tmp_dir();
+        check_in(&d, "a\n", "20261031-090000").unwrap();
+        let second = check_in(&d, "b\n", "20261031-090000").unwrap(); // -> .1.txt
+        assert_eq!(second.name.as_deref(), Some("20261031-090000.1.txt"));
+        // Same mtime second: the tie-break must pick .1.txt as newest.
+        let third = check_in(&d, "b\n", "20261031-090000").unwrap();
+        assert_eq!(third.status, "unchanged");
+        assert_eq!(third.previous.as_deref(), Some("20261031-090000.1.txt"));
     }
 
     #[test]

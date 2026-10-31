@@ -110,6 +110,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   /** hostId → when its config was last checked, so split panes and quick
    *  reconnects to one box don't each run the capture command again. */
   const configCheckedRef = useRef(new Map<string, number>())
+  /** sessionId → token of its latest config check. A reply from an older check
+   *  (the tab reconnected, or closed and the id was reused) is ignored. */
+  const configGenRef = useRef(new Map<string, number>())
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -491,6 +494,19 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     const last = configCheckedRef.current.get(host.id)
     if (last !== undefined && Date.now() - last < 120_000) return
     configCheckedRef.current.set(host.id, Date.now())
+    const gen = (configGenRef.current.get(sessionId) ?? 0) + 1
+    configGenRef.current.set(sessionId, gen)
+    /* Only the latest check for a tab that still exists may write anything:
+       a late reply must not print into (or badge) a closed or redialled tab. */
+    const current = () =>
+      configGenRef.current.get(sessionId) === gen &&
+      sessionsRef.current.some((s) => s.id === sessionId)
+    const dropChip = () =>
+      setConfigChanges((m) => {
+        if (!(sessionId in m)) return m
+        const { [sessionId]: _gone, ...rest } = m
+        return rest
+      })
 
     const note = (text: string) => emitLocal(sessionId, `\x1b[38;5;244m● ${text}\x1b[0m\r\n`)
     const when = (epoch: number | null) => {
@@ -507,10 +523,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       removed: number
     }>('config_check', { sessionId, host: host.hostname, command })
       .then((r) => {
-        if (!r) return
+        if (!r || !current()) return
         if (r.status === 'first') {
+          dropChip()
           note('config baseline saved; future connects will report changes against it')
         } else if (r.status === 'unchanged') {
+          dropChip()
           note(`config unchanged since ${when(r.previousModified)}`)
         } else if (r.name && r.previous) {
           emitLocal(
@@ -526,9 +544,25 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         }
       })
       .catch((e: unknown) => {
+        if (!current()) return
         note(`config check failed: ${e instanceof Error ? e.message : String(e)}`)
       })
   }, [])
+
+  /* Closed tabs take their config-change chip and check token with them. */
+  useEffect(() => {
+    const live = new Set(sessions.map((s) => s.id))
+    for (const id of configGenRef.current.keys()) {
+      if (!live.has(id)) configGenRef.current.delete(id)
+    }
+    setConfigChanges((m) => {
+      const stale = Object.keys(m).filter((id) => !live.has(id))
+      if (stale.length === 0) return m
+      const next = { ...m }
+      for (const id of stale) delete next[id]
+      return next
+    })
+  }, [sessions])
 
   /** Performs the deferred connect once a real terminal size is known. */
   const connectPending = useCallback((sessionId: string, cols: number, rows: number) => {

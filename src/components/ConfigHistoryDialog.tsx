@@ -16,6 +16,19 @@ interface SnapshotResult {
   removed: number | null
 }
 
+/* Chronological order of snapshot names "YYYYMMDD-HHMMSS[.n].txt". Plain string
+   sort is wrong for same-second snapshots: "…00.1.txt" sorts before "…00.txt"
+   ('.1' < '.t'), which would reverse a diff. */
+export const snapshotOrder = (a: string, b: string): number => {
+  const key = (n: string): [string, number] => {
+    const m = /^(.*?)(?:\.(\d+))?\.txt$/.exec(n)
+    return m ? [m[1], m[2] ? Number(m[2]) : 0] : [n, 0]
+  }
+  const [sa, na] = key(a)
+  const [sb, nb] = key(b)
+  return sa < sb ? -1 : sa > sb ? 1 : na - nb
+}
+
 const fmtWhen = (epoch: number | null) => {
   if (!epoch) return '—'
   const d = new Date(epoch * 1000)
@@ -85,7 +98,7 @@ export function ConfigHistoryDialog({
         .then((c) => show(c ?? ''))
         .catch((e) => show(String(e)))
     } else if (selected.length === 2) {
-      const [a, b] = [...selected].sort() // timestamp names sort chronologically
+      const [a, b] = [...selected].sort(snapshotOrder) // oldest first
       void safeInvoke<string>('config_diff', { host: host.hostname, older: a, newer: b })
         .then((c) => show(c || '(no differences)'))
         .catch((e) => show(String(e)))
