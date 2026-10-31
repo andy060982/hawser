@@ -528,6 +528,16 @@ async fn log_read(name: String) -> CmdResult<String> {
     utils::session_log::read_log(&name).map_err(|e| e.to_string())
 }
 
+/// Search every transcript for a line containing `query` (case-insensitive),
+/// newest session first. Runs on the blocking pool: it reads every log file.
+#[tauri::command]
+async fn logs_search(query: String, limit: usize) -> CmdResult<utils::session_log::SearchResult> {
+    tauri::async_runtime::spawn_blocking(move || utils::session_log::search(&query, limit))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 /// Most recent audit-log entries, newest first, for the Audit panel.
 #[tauri::command]
 async fn audit_list(limit: usize) -> CmdResult<Vec<utils::audit::AuditView>> {
@@ -1053,6 +1063,7 @@ pub fn run() {
             logs_list,
             open_logs_folder,
             log_read,
+            logs_search,
             audit_list,
             audit_verify,
             audit_archive,

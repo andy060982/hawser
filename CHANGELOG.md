@@ -6,6 +6,25 @@ All notable changes to Hawser are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Renamed Skiff → Hawser.** New app name, bundle id, data folder, and
+  keychain namespace. Hosts and saved passwords from Skiff builds are not
+  migrated; export hosts from Skiff and import them into Hawser.
+
+### Added
+
+- **Tamper-evident audit log** (menu → Audit log…). Connects, logins, file
+  transfers, deletes, key generation/installs, credential changes, and host
+  exports are recorded as a hash chain whose head is sealed in the OS keychain.
+  "Verify integrity" reports verified / not fully verified / failed, and where
+  the chain broke. Records hold metadata only: no passwords, keys, command
+  text, or command output. "Archive and start new" sets a failed log aside
+  (kept, and pinned by fingerprint in the new log).
+- **Search inside sessions** in Session history: full-text search across every
+  recorded transcript, grouped by session, newest first; click a match to open
+  the transcript at that line.
+
 ## [0.5.0-beta.1] - 2026-10-30
 
 First public beta. Includes the full bug-sprint hardening pass and a security

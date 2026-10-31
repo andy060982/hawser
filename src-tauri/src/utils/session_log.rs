@@ -306,6 +306,67 @@ pub(crate) fn strip_ansi(input: &[u8]) -> (Vec<u8>, Vec<u8>) {
 mod tests {
     use super::*;
 
+    fn search_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("hawser-search-test-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for (name, body) in files {
+            std::fs::write(d.join(name), body).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn search_finds_lines_case_insensitively_newest_first() {
+        let d = search_dir(&[
+            ("fw1_20260901-100000.log", "fw1# show run\nfw1# Show Interfaces\n"),
+            ("core_20261001-100000.log", "core# show interfaces status\n"),
+            ("notes.txt", "show interfaces"),
+        ]);
+        let r = search_in(&d, "SHOW INTERFACES", 50).unwrap();
+        assert_eq!(r.scanned, 2);
+        assert!(!r.truncated);
+        let got: Vec<_> = r.hits.iter().map(|h| (h.host.as_str(), h.line)).collect();
+        assert_eq!(got, [("core", 1), ("fw1", 2)]);
+        assert_eq!(r.hits[1].text, "fw1# Show Interfaces");
+    }
+
+    #[test]
+    fn search_ignores_tiny_queries_and_caps_results() {
+        let body = "match\n".repeat(100);
+        let d = search_dir(&[
+            ("a_20261001-100000.log", body.as_str()),
+            ("b_20261002-100000.log", body.as_str()),
+        ]);
+        assert!(search_in(&d, " m ", 50).unwrap().hits.is_empty());
+        let r = search_in(&d, "match", 1000).unwrap();
+        assert_eq!(r.hits.len(), 2 * HITS_PER_LOG);
+        assert!(r.truncated);
+        let r = search_in(&d, "match", 10).unwrap();
+        assert_eq!(r.hits.len(), 10);
+        assert!(r.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_does_not_follow_symlinks() {
+        let secret = search_dir(&[("x.txt", "needle in a private file\n")]);
+        let d = search_dir(&[]);
+        std::os::unix::fs::symlink(secret.join("x.txt"), d.join("evil_20261001-100000.log")).unwrap();
+        assert!(search_in(&d, "needle", 50).unwrap().hits.is_empty());
+    }
+
+    #[test]
+    fn long_lines_are_windowed_around_the_match() {
+        let line = format!("{}NEEDLE{}", "é".repeat(1000), "x".repeat(1000));
+        let s = snippet(&line, 1000);
+        assert!(s.starts_with('…') && s.ends_with('…'));
+        assert!(s.contains("NEEDLE"));
+        assert!(s.chars().count() <= SNIPPET_CHARS + 2);
+    }
+
     #[test]
     fn strips_colour_and_keeps_text() {
         let (out, rest) = strip_ansi(b"\x1b[1;32mhello\x1b[0m world\r\n");
@@ -516,11 +577,14 @@ pub struct LogEntry {
 
 /// List transcripts, newest first. Empty when there are none.
 pub fn list() -> Result<Vec<LogEntry>, KnownHostsError> {
-    let dir = match logs_dir() {
-        Ok(d) if d.exists() => d,
-        _ => return Ok(Vec::new()),
-    };
+    match logs_dir() {
+        Ok(d) if d.exists() => list_in(&d),
+        _ => Ok(Vec::new()),
+    }
+}
 
+fn list_in(dir: &std::path::Path) -> Result<Vec<LogEntry>, KnownHostsError> {
+    let dir = dir.to_path_buf();
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|source| KnownHostsError::Io {
         path: dir.clone(),
@@ -591,6 +655,124 @@ pub fn read_log(name: &str) -> Result<String, KnownHostsError> {
     // so a strict UTF-8 read would make the whole transcript unviewable.
     let bytes = std::fs::read(&path).map_err(|source| KnownHostsError::Io { path, source })?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/* ------------------------------------------------------------------ search */
+
+/// One matching line in one transcript.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    /// Transcript filename (the `read_log` id).
+    pub name: String,
+    pub host: String,
+    pub started: Option<u64>,
+    /// 1-based line number within the transcript, for jumping to it.
+    pub line: u64,
+    /// The matching line, trimmed to a window around the match if very long.
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+    /// Transcripts that were read.
+    pub scanned: usize,
+    /// True when a cap cut the results short (total hits, hits per session, or
+    /// an oversized transcript read only in part).
+    pub truncated: bool,
+}
+
+/// Most matches reported from any one transcript, so one chatty session (a
+/// `show log` dump) cannot crowd every other session out of the results.
+const HITS_PER_LOG: usize = 25;
+/// Bytes read from any one transcript.
+const SEARCH_READ_CAP: u64 = 32 * 1024 * 1024;
+/// Characters of context kept around a match on a very long line.
+const SNIPPET_CHARS: usize = 240;
+
+/// Case-insensitive substring search across every transcript, newest session
+/// first. This is the "memory" view: "when did I last run X, and on which box?"
+///
+/// Reads only regular `.log` files in the logs directory (never through a
+/// symlink, same rule as `read_log`). A query shorter than 2 characters returns
+/// nothing rather than every line ever recorded.
+pub fn search(query: &str, limit: usize) -> Result<SearchResult, KnownHostsError> {
+    match logs_dir() {
+        Ok(d) if d.exists() => search_in(&d, query, limit),
+        _ => Ok(SearchResult { hits: Vec::new(), scanned: 0, truncated: false }),
+    }
+}
+
+fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Result<SearchResult, KnownHostsError> {
+    use std::io::Read;
+
+    let needle = query.trim().to_lowercase();
+    let mut res = SearchResult { hits: Vec::new(), scanned: 0, truncated: false };
+    if needle.chars().count() < 2 {
+        return Ok(res);
+    }
+    let limit = limit.clamp(1, 1000);
+
+    for log in list_in(dir)? {
+        if res.hits.len() >= limit {
+            res.truncated = true;
+            break;
+        }
+        let path = dir.join(&log.name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            _ => continue,
+        }
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        let mut bytes = Vec::new();
+        if file.take(SEARCH_READ_CAP).read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        if log.bytes > SEARCH_READ_CAP {
+            res.truncated = true;
+        }
+        res.scanned += 1;
+
+        let text = String::from_utf8_lossy(&bytes);
+        let mut in_log = 0;
+        for (i, line) in text.lines().enumerate() {
+            let lower = line.to_lowercase();
+            let Some(at) = lower.find(&needle) else { continue };
+            if in_log == HITS_PER_LOG || res.hits.len() >= limit {
+                res.truncated = true;
+                break;
+            }
+            in_log += 1;
+            res.hits.push(SearchHit {
+                name: log.name.clone(),
+                host: log.host.clone(),
+                started: log.started,
+                line: (i + 1) as u64,
+                text: snippet(line, lower[..at].chars().count()),
+            });
+        }
+    }
+    Ok(res)
+}
+
+/// `line`, or a window of it around char index `at` when it is long, with an
+/// ellipsis marking each cut side. Char-based so it never splits a code point.
+fn snippet(line: &str, at: usize) -> String {
+    let n = line.chars().count();
+    if n <= SNIPPET_CHARS {
+        return line.to_string();
+    }
+    let start = at.saturating_sub(SNIPPET_CHARS / 3).min(n - SNIPPET_CHARS);
+    let mut out: String = line.chars().skip(start).take(SNIPPET_CHARS).collect();
+    if start > 0 {
+        out.insert(0, '…');
+    }
+    if start + SNIPPET_CHARS < n {
+        out.push('…');
+    }
+    out
 }
 
 /// Split "<host>_<YYYYMMDD-HHMMSS>[.<n>].log" into (host slug, stamp), where
