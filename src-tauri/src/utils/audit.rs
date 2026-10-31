@@ -47,6 +47,9 @@
 //! - Records written while the seal cannot be updated (keychain locked, or just
 //!   before a crash) can be cut off the end without a failure; verify reports
 //!   them as not vouched for while they exist, but cannot miss what is gone.
+//! - If an archive was interrupted after its commit and the keychain is then
+//!   unreadable, records are refused (and lost, with a stderr line) until the
+//!   keychain can be read, because it is unknown which file is live.
 //! - The app assumes a single running instance. Two instances writing the same
 //!   log would race on `seq` and produce a (false) failed verify.
 //! - Each append writes the keychain synchronously; a keychain that prompts
@@ -731,7 +734,9 @@ impl<A: Anchor> Log<A> {
         let mut guard = self.session.lock().map_err(|_| "audit lock poisoned".to_string())?;
         let res = (|| {
             if guard.is_none() {
-                self.recover_rotation()?;
+                if self.recover_rotation()? == Rotation::Pending {
+                    return Err(KnownHostsError::Parse(ROTATION_PENDING.to_string()));
+                }
                 *guard = Some(self.open_session()?);
             }
             let s = guard.as_mut().expect("session set above");
@@ -774,7 +779,16 @@ impl<A: Anchor> Log<A> {
             path: self.path.clone(),
             source: std::io::Error::other("audit lock poisoned"),
         })?;
-        self.recover_rotation()?;
+        if self.recover_rotation()? == Rotation::Pending {
+            return Ok(VerifyReport {
+                ok: false,
+                status: Status::Warning,
+                count: 0,
+                message: format!("Cannot verify yet: {ROTATION_PENDING}."),
+                broken_at: None,
+                seal_status: "unavailable".to_string(),
+            });
+        }
         self.verify_locked()
     }
 
@@ -922,11 +936,15 @@ impl<A: Anchor> Log<A> {
     /// file is discarded and the old log, still sealed, carries on unchanged.
     /// A forged `.rotating` cannot commit itself, because only the app can
     /// write the seal.
-    fn recover_rotation(&self) -> Result<(), KnownHostsError> {
+    ///
+    /// Returns [`Rotation::Pending`] while that cannot be decided (the seal is
+    /// unreadable). Nothing may open or append to the log in that state: it is
+    /// unknown whether the old or the staged file is the live one.
+    fn recover_rotation(&self) -> Result<Rotation, KnownHostsError> {
         let staged = self.rotating_path();
         let text = match std::fs::read_to_string(&staged) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Rotation::Clear),
             Err(e) => return Err(io_err(&staged)(e)),
         };
         let rows = parse_text(&text);
@@ -936,11 +954,12 @@ impl<A: Anchor> Log<A> {
         };
         let committed = match (opening, self.anchor.read()) {
             (Some(e), SealRead::Present(1, h)) => h == e.hash,
-            (_, SealRead::Unavailable) => return Ok(()), // decide once readable
+            (_, SealRead::Unavailable) => return Ok(Rotation::Pending),
             _ => false,
         };
         if !committed {
-            return std::fs::remove_file(&staged).map_err(io_err(&staged));
+            std::fs::remove_file(&staged).map_err(io_err(&staged))?;
+            return Ok(Rotation::Clear);
         }
         let e = opening.expect("committed implies a valid opening record");
         if let Some(name) = e.detail.get("archivedAs").and_then(Value::as_str) {
@@ -950,8 +969,8 @@ impl<A: Anchor> Log<A> {
             }
         }
         std::fs::rename(&staged, &self.path).map_err(io_err(&self.path))?;
-        sync_dir(&self.path);
-        Ok(())
+        sync_dir(&self.path).map_err(io_err(&self.path))?;
+        Ok(Rotation::Clear)
     }
 
     #[cfg(test)]
@@ -973,7 +992,9 @@ impl<A: Anchor> Log<A> {
         let mut guard = self.session.lock().map_err(|_| "audit lock poisoned".to_string())?;
         // Whatever happens below, the next append re-reads the disk.
         *guard = None;
-        self.recover_rotation().map_err(|e| e.to_string())?;
+        if self.recover_rotation().map_err(|e| e.to_string())? == Rotation::Pending {
+            return Err(ROTATION_PENDING.to_string());
+        }
         if matches!(self.anchor.read(), SealRead::Unavailable) {
             return Err("the keychain is unavailable; cannot archive without moving the anchor".into());
         }
@@ -1042,7 +1063,9 @@ impl<A: Anchor> Log<A> {
             f.write_all(line.as_bytes())?;
             f.sync_all()
         };
-        stage().map_err(|err| {
+        // The staged file's directory entry must be durable before the commit:
+        // a seal pointing at a file that power loss erased could never recover.
+        stage().and_then(|_| sync_dir(&staged)).map_err(|err| {
             let _ = std::fs::remove_file(&staged);
             format!("could not stage the new audit log: {err}")
         })?;
@@ -1066,22 +1089,33 @@ impl<A: Anchor> Log<A> {
         self.crash_point(3)?;
         std::fs::rename(&staged, &self.path)
             .map_err(|err| format!("could not activate the new audit log: {err}"))?;
-        sync_dir(&self.path);
+        // Committed already; a failure here is reported, and recovery (or the
+        // journal) completes what the renames did not make durable.
+        sync_dir(&self.path).map_err(|err| format!("archived, but syncing the directory failed: {err}"))?;
         Ok(name)
     }
 }
 
-/// fsync the directory holding `path`, so renames in it survive a crash.
-/// Best effort, and a no-op where directories cannot be opened (Windows).
-fn sync_dir(path: &Path) {
+/// Whether an interrupted archive still blocks the log (see `recover_rotation`).
+#[derive(Debug, PartialEq)]
+enum Rotation {
+    Clear,
+    Pending,
+}
+
+const ROTATION_PENDING: &str = "an interrupted archive is waiting for the keychain to become readable; nothing can be recorded or verified until then";
+
+/// fsync the directory holding `path`, so a file created or renamed in it
+/// survives power loss. Errors propagate on Unix. Windows has no directory
+/// handle to sync; NTFS journals the metadata itself.
+fn sync_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        std::fs::File::open(dir)?.sync_all()?;
     }
     #[cfg(not(unix))]
     let _ = path;
+    Ok(())
 }
 
 /* ------------------------------------------------------------------ public */
@@ -1606,6 +1640,42 @@ mod tests {
                 let name = first.detail["archivedAs"].as_str().unwrap();
                 assert!(p.with_file_name(name).exists(), "step {step}");
             }
+        }
+    }
+
+    #[test]
+    fn interrupted_archive_blocks_appends_while_the_keychain_is_locked() {
+        for step in 2..=3u8 {
+            let (p, m) = (tmp(), Mem::default());
+            let log = restart(&p, &m);
+            rec(&log, 3);
+            log.faults.crash_archive_after.store(step, Ordering::SeqCst);
+            assert!(log.archive().is_err());
+            let snapshot = |p: &Path| {
+                let mut v: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+                    .unwrap()
+                    .flatten()
+                    .map(|e| (e.file_name(), std::fs::read(e.path()).unwrap()))
+                    .collect();
+                v.sort();
+                v
+            };
+            let before = snapshot(&p);
+
+            // Restart with the keychain locked: nothing may be written anywhere.
+            m.unavailable.store(true, Ordering::SeqCst);
+            let log = restart(&p, &m);
+            assert!(log.record("connect", "x", json!({})).is_err(), "step {step}");
+            assert!(log.record("connect", "y", json!({})).is_err(), "step {step}");
+            assert_eq!(status(&log), Status::Warning, "step {step}");
+            assert_eq!(snapshot(&p), before, "step {step}: files changed while pending");
+
+            // Keychain back: the rotation completes and the log verifies.
+            m.unavailable.store(false, Ordering::SeqCst);
+            rec(&log, 1);
+            let r = log.verify().unwrap();
+            assert_eq!((r.status, r.count), (Status::Verified, 2), "step {step}: {}", r.message);
+            assert!(lines(&p)[0].contains(EV_ARCHIVED));
         }
     }
 
