@@ -470,6 +470,17 @@ struct Log<A: Anchor> {
     path: PathBuf,
     anchor: A,
     session: Mutex<Option<Session>>,
+    /// Test-only fault injection: fail the next fsync / stop an archive after
+    /// step N, to prove the failure paths leave a recoverable state.
+    #[cfg(test)]
+    faults: Faults,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Faults {
+    fail_sync: std::sync::atomic::AtomicBool,
+    crash_archive_after: std::sync::atomic::AtomicU8,
 }
 
 /// Read and parse every line. Missing file → empty. A line that does not parse,
@@ -503,6 +514,8 @@ impl<A: Anchor> Log<A> {
             path,
             anchor,
             session: Mutex::new(None),
+            #[cfg(test)]
+            faults: Faults::default(),
         }
     }
 
@@ -549,13 +562,23 @@ impl<A: Anchor> Log<A> {
         let mut buf = String::with_capacity(line.len() + 1);
         buf.push_str(line);
         buf.push('\n');
-        if let Err(e) = file.write_all(buf.as_bytes()) {
+        let res = file.write_all(buf.as_bytes()).and_then(|_| {
+            #[cfg(test)]
+            if self.faults.fail_sync.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected fsync failure"));
+            }
+            file.sync_data()
+        });
+        if let Err(e) = res {
+            // Undo the line so the file matches the head we still hold. If even
+            // that fails, the caller drops its cached head and the next append
+            // re-reads the file, where an unsealed tail is noted, not reused.
             if let Some(len) = before {
-                let _ = file.set_len(len);
+                let _ = file.set_len(len).and_then(|_| file.sync_data());
             }
             return Err(io_err(&self.path)(e));
         }
-        file.sync_data().map_err(io_err(&self.path))
+        Ok(())
     }
 
     /// Replace the log's contents via a synced temp file + rename, so a crash
@@ -706,15 +729,24 @@ impl<A: Anchor> Log<A> {
 
     fn record(&self, event: &str, summary: &str, detail: Value) -> Result<(), String> {
         let mut guard = self.session.lock().map_err(|_| "audit lock poisoned".to_string())?;
-        if guard.is_none() {
-            *guard = Some(self.open_session().map_err(|e| e.to_string())?);
+        let res = (|| {
+            if guard.is_none() {
+                self.recover_rotation()?;
+                *guard = Some(self.open_session()?);
+            }
+            let s = guard.as_mut().expect("session set above");
+            if s.mode == Mode::Pending {
+                self.resolve(s)?;
+            }
+            self.write_record(s, event, summary, sanitize(detail))
+        })();
+        if res.is_err() {
+            // The file may no longer match the cached head (a write whose
+            // rollback failed, a half-applied note). Never chain from a head the
+            // disk might disagree with: re-read and reconcile on the next append.
+            *guard = None;
         }
-        let s = guard.as_mut().expect("session set above");
-        if s.mode == Mode::Pending {
-            self.resolve(s).map_err(|e| e.to_string())?;
-        }
-        self.write_record(s, event, summary, sanitize(detail))
-            .map_err(|e| e.to_string())
+        res.map_err(|e| e.to_string())
     }
 
     fn list(&self, limit: usize) -> Result<Vec<AuditView>, KnownHostsError> {
@@ -742,28 +774,49 @@ impl<A: Anchor> Log<A> {
             path: self.path.clone(),
             source: std::io::Error::other("audit lock poisoned"),
         })?;
+        self.recover_rotation()?;
         self.verify_locked()
     }
 
-    /// The previous log this one was archived from, if its fingerprint no longer
-    /// matches what the (anchored) opening `audit.archived` record pinned.
+    /// Walk the archive pins back through every generation: the current log's
+    /// opening `audit.archived` record pins its predecessor by SHA-256, whose own
+    /// opening record pins the one before, and so on. Returns the first archive
+    /// that is missing or no longer matches its pin.
     fn archived_log_problem(&self, rows: &[Result<AuditEntry, usize>]) -> Option<String> {
-        let Some(Ok(first)) = rows.first() else { return None };
-        if first.event != EV_ARCHIVED {
-            return None;
+        let mut first = match rows.first() {
+            Some(Ok(e)) => e.clone(),
+            _ => return None,
+        };
+        let mut seen = std::collections::HashSet::new();
+        while first.event == EV_ARCHIVED {
+            let (Some(name), Some(want)) = (
+                first.detail.get("archivedAs").and_then(Value::as_str),
+                first.detail.get("archivedSha256").and_then(Value::as_str),
+            ) else {
+                return None; // the log before this one was empty: nothing pinned
+            };
+            // Only a bare file name beside the log: a crafted record cannot point
+            // the check elsewhere (it is hashed and anchored, but be strict anyway).
+            if name.contains(['/', '\\', ':']) || name.starts_with('.') {
+                return Some(format!("the archive name {name:?} is not a plain file name"));
+            }
+            if !seen.insert(name.to_string()) {
+                return Some(format!("the archive chain loops back to {name}"));
+            }
+            let bytes = match std::fs::read(self.path.with_file_name(name)) {
+                Ok(b) => b,
+                Err(_) => return Some(format!("the archived log {name} is missing or unreadable")),
+            };
+            if hex(&Sha256::digest(&bytes)) != want {
+                return Some(format!("the archived log {name} was modified after it was archived"));
+            }
+            // Pinned and intact: its own first record is now trusted, so follow it.
+            match parse_text(&String::from_utf8_lossy(&bytes)).into_iter().next() {
+                Some(Ok(e)) => first = e,
+                _ => return None,
+            }
         }
-        let name = first.detail.get("archivedAs")?.as_str()?;
-        let want = first.detail.get("archivedSha256")?.as_str()?;
-        // Only a bare file name beside the log: a crafted record cannot point
-        // the check elsewhere (it is hashed and anchored, but be strict anyway).
-        if name.contains(['/', '\\', ':']) || name.starts_with('.') {
-            return Some(format!("the archive name {name:?} is not a plain file name"));
-        }
-        match std::fs::read(self.path.with_file_name(name)) {
-            Ok(bytes) if hex(&Sha256::digest(&bytes)) == want => None,
-            Ok(_) => Some(format!("the archived previous log {name} was modified after it was archived")),
-            Err(_) => Some(format!("the archived previous log {name} is missing or unreadable")),
-        }
+        None
     }
 
     fn verify_locked(&self) -> Result<VerifyReport, KnownHostsError> {
@@ -852,13 +905,78 @@ impl<A: Anchor> Log<A> {
         })
     }
 
+    /// Where an archive's replacement log is staged until the rotation commits.
+    fn rotating_path(&self) -> PathBuf {
+        self.path.with_extension("jsonl.rotating")
+    }
+
+    /// Finish or discard an archive interrupted by a crash or an I/O error.
+    ///
+    /// Rotation is a small transaction whose commit point is the seal:
+    ///   1. the new log's opening record is written, synced, to `.rotating`;
+    ///   2. the seal is moved to that record (commit);
+    ///   3. the old log is renamed to its archive name;
+    ///   4. `.rotating` becomes the live log.
+    /// If the seal already names the staged record, the rotation committed and
+    /// steps 3–4 are completed here. Otherwise it never committed: the staged
+    /// file is discarded and the old log, still sealed, carries on unchanged.
+    /// A forged `.rotating` cannot commit itself, because only the app can
+    /// write the seal.
+    fn recover_rotation(&self) -> Result<(), KnownHostsError> {
+        let staged = self.rotating_path();
+        let text = match std::fs::read_to_string(&staged) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err(&staged)(e)),
+        };
+        let rows = parse_text(&text);
+        let opening = match rows.as_slice() {
+            [Ok(e)] if e.seq == 1 && e.event == EV_ARCHIVED && hash_entry(e) == e.hash => Some(e),
+            _ => None,
+        };
+        let committed = match (opening, self.anchor.read()) {
+            (Some(e), SealRead::Present(1, h)) => h == e.hash,
+            (_, SealRead::Unavailable) => return Ok(()), // decide once readable
+            _ => false,
+        };
+        if !committed {
+            return std::fs::remove_file(&staged).map_err(io_err(&staged));
+        }
+        let e = opening.expect("committed implies a valid opening record");
+        if let Some(name) = e.detail.get("archivedAs").and_then(Value::as_str) {
+            let dest = self.path.with_file_name(name);
+            if self.path.exists() && std::fs::symlink_metadata(&dest).is_err() {
+                std::fs::rename(&self.path, &dest).map_err(io_err(&dest))?;
+            }
+        }
+        std::fs::rename(&staged, &self.path).map_err(io_err(&self.path))?;
+        sync_dir(&self.path);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn crash_point(&self, step: u8) -> Result<(), String> {
+        let at = self.faults.crash_archive_after.load(std::sync::atomic::Ordering::SeqCst);
+        if at == step {
+            return Err(format!("injected crash after archive step {step}"));
+        }
+        Ok(())
+    }
+
     /// Move the current log aside (kept, never deleted) and start a fresh one.
-    /// The new log's first record — anchored like any other — pins the archived
+    /// The new log's first record, anchored like any other, pins the archived
     /// file by SHA-256 together with its last head and the verdict it had, so
-    /// the archive stays tamper-evident after its own anchor is gone. Returns
-    /// the archive's file name.
+    /// the archive stays tamper-evident after the seal moves on. See
+    /// [`Self::recover_rotation`] for the crash-safe ordering. Returns the
+    /// archive's file name.
     fn archive(&self) -> Result<String, String> {
         let mut guard = self.session.lock().map_err(|_| "audit lock poisoned".to_string())?;
+        // Whatever happens below, the next append re-reads the disk.
+        *guard = None;
+        self.recover_rotation().map_err(|e| e.to_string())?;
+        if matches!(self.anchor.read(), SealRead::Unavailable) {
+            return Err("the keychain is unavailable; cannot archive without moving the anchor".into());
+        }
         let prior = self.verify_locked().map_err(|e| e.to_string())?;
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
@@ -873,33 +991,14 @@ impl<A: Anchor> Log<A> {
         // A name that is not already taken: two archives in the same second (or
         // after a clock change) must never overwrite an earlier one.
         let ts = now_secs();
-        let (name, dest) = (0u32..)
-            .map(|n| {
-                let name = if n == 0 {
-                    format!("audit-{ts}.archived.jsonl")
-                } else {
-                    format!("audit-{ts}-{n}.archived.jsonl")
-                };
-                let dest = self.path.with_file_name(&name);
-                (name, dest)
+        let name = (0u32..)
+            .map(|n| match n {
+                0 => format!("audit-{ts}.archived.jsonl"),
+                n => format!("audit-{ts}-{n}.archived.jsonl"),
             })
-            .find(|(_, d)| std::fs::symlink_metadata(d).is_err())
+            .find(|name| std::fs::symlink_metadata(self.path.with_file_name(name)).is_err())
             .expect("an unused archive name exists");
-        if !bytes.is_empty() {
-            std::fs::rename(&self.path, &dest)
-                .map_err(|e| format!("could not archive the audit log: {e}"))?;
-        }
-        // Best effort: the first seal of the new log overwrites it anyway.
-        let _ = self.anchor.clear();
 
-        let mut s = Session {
-            seq: 0,
-            hash: GENESIS.to_string(),
-            mode: Mode::Trusted,
-            loaded: None,
-            last_warn: None,
-            freeze_pending: None,
-        };
         let mut d = BTreeMap::new();
         let status = serde_json::to_value(prior.status).unwrap_or(Value::Null);
         d.insert("priorStatus".to_string(), status);
@@ -917,11 +1016,72 @@ impl<A: Anchor> Log<A> {
             }
             format!("started a new log; the previous one was kept as {name}")
         };
-        self.write_record(&mut s, EV_ARCHIVED, &summary, d)
-            .map_err(|e| e.to_string())?;
-        *guard = Some(s);
+        let mut e = AuditEntry {
+            seq: 1,
+            ts: now_secs(),
+            event: EV_ARCHIVED.to_string(),
+            summary: cap(summary),
+            detail: d,
+            prev: GENESIS.to_string(),
+            hash: String::new(),
+        };
+        e.hash = hash_entry(&e);
+        let line = serde_json::to_string(&e).unwrap_or_default() + "\n";
+
+        // 1. Stage the opening record durably.
+        let staged = self.rotating_path();
+        let stage = || -> std::io::Result<()> {
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&staged)?;
+            f.write_all(line.as_bytes())?;
+            f.sync_all()
+        };
+        stage().map_err(|err| {
+            let _ = std::fs::remove_file(&staged);
+            format!("could not stage the new audit log: {err}")
+        })?;
+        #[cfg(test)]
+        self.crash_point(1)?;
+
+        // 2. Commit: move the seal to the staged record.
+        if let Err(err) = self.anchor.write(1, &e.hash) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("could not move the keychain anchor: {err}"));
+        }
+        #[cfg(test)]
+        self.crash_point(2)?;
+
+        // 3–4. Committed: finish the renames (also what recovery would do).
+        if !bytes.is_empty() {
+            std::fs::rename(&self.path, self.path.with_file_name(&name))
+                .map_err(|err| format!("could not archive the audit log: {err}"))?;
+        }
+        #[cfg(test)]
+        self.crash_point(3)?;
+        std::fs::rename(&staged, &self.path)
+            .map_err(|err| format!("could not activate the new audit log: {err}"))?;
+        sync_dir(&self.path);
         Ok(name)
     }
+}
+
+/// fsync the directory holding `path`, so renames in it survive a crash.
+/// Best effort, and a no-op where directories cannot be opened (Windows).
+fn sync_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /* ------------------------------------------------------------------ public */
@@ -1381,6 +1541,94 @@ mod tests {
         ls[0] = ls[0].replacen("\"detail\":{", "\"detail\":{\"host\":\"evil.example\",", 1);
         std::fs::write(&p, ls.join("\n") + "\n").unwrap();
         assert_eq!(status(&restart(&p, &m)), Status::Failed);
+    }
+
+    #[test]
+    fn fsync_failure_never_reuses_a_sequence_number() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        rec(&log, 2);
+        log.faults.fail_sync.store(true, Ordering::SeqCst);
+        assert!(log.record("connect", "lost", json!({})).is_err());
+        rec(&log, 2);
+        let r = log.verify().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 4), "{}", r.message);
+        let seqs: Vec<u64> = lines(&p)
+            .iter()
+            .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap().seq)
+            .collect();
+        assert_eq!(seqs, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn every_archive_generation_stays_pinned() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        rec(&log, 2);
+        let a = log.archive().unwrap();
+        rec(&log, 2);
+        let b = log.archive().unwrap();
+        rec(&log, 1);
+        assert_eq!(status(&log), Status::Verified);
+        // Tamper with the OLDER archive only; B (its pin holder) is untouched.
+        let pa = p.with_file_name(&a);
+        let t = std::fs::read_to_string(&pa).unwrap().replace("event 1", "event 8");
+        std::fs::write(&pa, t).unwrap();
+        let r = log.verify().unwrap();
+        assert_eq!(r.status, Status::Failed, "{}", r.message);
+        assert!(r.message.contains(&a), "{}", r.message);
+        std::fs::remove_file(&pa).unwrap();
+        assert_eq!(status(&log), Status::Failed);
+        let _ = b;
+    }
+
+    #[test]
+    fn archive_interrupted_at_any_step_recovers() {
+        for step in 1..=3u8 {
+            let (p, m) = (tmp(), Mem::default());
+            let log = restart(&p, &m);
+            rec(&log, 3);
+            log.faults.crash_archive_after.store(step, Ordering::SeqCst);
+            assert!(log.archive().is_err(), "step {step}");
+            // "Restart" and carry on.
+            let log = restart(&p, &m);
+            rec(&log, 1);
+            let r = log.verify().unwrap();
+            assert_eq!(r.status, Status::Verified, "step {step}: {}", r.message);
+            assert!(!log.rotating_path().exists(), "step {step}");
+            let first: AuditEntry = serde_json::from_str(&lines(&p)[0]).unwrap();
+            if step == 1 {
+                // Never committed: the old log carries on, nothing archived.
+                assert_eq!((first.event.as_str(), r.count), ("connect", 4), "step {step}");
+            } else {
+                // Committed: rotation completed, the old log is pinned.
+                assert_eq!((first.event.as_str(), r.count), (EV_ARCHIVED, 2), "step {step}");
+                let name = first.detail["archivedAs"].as_str().unwrap();
+                assert!(p.with_file_name(name).exists(), "step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_forged_staged_rotation_cannot_commit() {
+        let (p, m) = (tmp(), Mem::default());
+        rec(&restart(&p, &m), 2);
+        // A file-only attacker stages an "archived" opening record of their own.
+        let mut e = AuditEntry {
+            seq: 1,
+            ts: 1,
+            event: EV_ARCHIVED.into(),
+            summary: "started a new log".into(),
+            detail: BTreeMap::new(),
+            prev: GENESIS.into(),
+            hash: String::new(),
+        };
+        e.hash = hash_entry(&e);
+        let log = restart(&p, &m);
+        std::fs::write(log.rotating_path(), serde_json::to_string(&e).unwrap() + "\n").unwrap();
+        assert_eq!(status(&log), Status::Verified);
+        assert!(!log.rotating_path().exists());
+        assert_eq!(lines(&p).len(), 2);
     }
 
     #[test]
