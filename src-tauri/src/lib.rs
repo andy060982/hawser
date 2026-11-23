@@ -221,6 +221,9 @@ async fn ssh_disconnect(
     // Cancel an in-flight connect FIRST: once it is cancelled it cannot raise
     // a new prompt, so the sweep below cannot miss one registered behind it.
     registry.remove(&session_id).await;
+    // Its remote edits end with it: clean copies are deleted, unsynced ones
+    // kept and reported (utils::remote_edit::close_session).
+    utils::remote_edit::close_session(&app, &session_id).await;
     // A tab closed mid-connect may still have a host-key or password dialog up.
     // Drop those prompts and tell the UI to close them, rather than leave a
     // question nobody owns on screen.
@@ -370,6 +373,101 @@ async fn sftp_put(
 async fn sftp_cancel(registry: State<'_, Registry>, transfer_id: String) -> CmdResult<()> {
     registry.transfer_cancel(&transfer_id);
     Ok(())
+}
+
+/* ------------------------------------------------------- remote editing */
+
+/// Open a remote file in a local editor (see utils::remote_edit): download it
+/// to a private folder, open it, and upload each save after checking the
+/// remote file did not change meanwhile. Takes no editor or local path from
+/// the webview: the editor command is the validated one `edit_editor_save`
+/// stored.
+#[tauri::command]
+async fn edit_open(app: AppHandle, session_id: String, remote_path: String) -> CmdResult<utils::remote_edit::EditInfo> {
+    let result = utils::remote_edit::open(&app, &session_id, &remote_path).await;
+    match &result {
+        Ok(info) => utils::audit::record(
+            "sftp.edit.open",
+            format!("opened {remote_path} for editing ({} bytes)", info.bytes),
+            serde_json::json!({ "remote": remote_path, "sessionId": session_id, "bytes": info.bytes, "opener": info.opener, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.edit.open",
+            format!("opening {remote_path} for editing failed"),
+            serde_json::json!({ "remote": remote_path, "sessionId": session_id, "ok": false, "error": e }),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+fn edit_list(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>) -> Vec<utils::remote_edit::EditInfo> {
+    edits.list()
+}
+
+/// Push an edit now: `mode` is "now" (checked like a save), "overwrite" (a
+/// conflict's Overwrite remote) or "copy" (Save a copy as name.conflict).
+/// The push records `sftp.edit.upload` itself, as a watcher-driven save does.
+#[tauri::command]
+async fn edit_upload(app: AppHandle, edit_id: String, mode: String) -> CmdResult<utils::remote_edit::EditInfo> {
+    let mode = utils::remote_edit::PushMode::parse(&mode)?;
+    utils::remote_edit::upload(&app, &edit_id, mode).await
+}
+
+/// Stop editing: `mode` "ask" (the default: does nothing while there are
+/// unsynced changes, so the UI can ask), "discard" or "keep".
+#[tauri::command]
+async fn edit_stop(app: AppHandle, edit_id: String, mode: Option<String>) -> CmdResult<utils::remote_edit::StopOutcome> {
+    let mode = utils::remote_edit::StopMode::parse(mode.as_deref())?;
+    utils::remote_edit::stop(&app, &edit_id, mode).await
+}
+
+/// Reveal an edit's local copy. By id, never by path (see open_logs_folder).
+#[tauri::command]
+async fn edit_reveal(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>, edit_id: String) -> CmdResult<()> {
+    let edits = Arc::clone(&edits);
+    off(move || edits.reveal(&edit_id)).await
+}
+
+/// Copies kept because they had unsynced changes (this run or an earlier one).
+#[tauri::command]
+fn edit_leftovers(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>) -> Vec<utils::remote_edit::Leftover> {
+    edits.leftovers()
+}
+
+#[tauri::command]
+async fn edit_leftover_reveal(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>, id: String) -> CmdResult<()> {
+    let edits = Arc::clone(&edits);
+    off(move || edits.leftover_reveal(&id)).await
+}
+
+#[tauri::command]
+async fn edit_leftover_discard(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>, id: String) -> CmdResult<()> {
+    let edits = Arc::clone(&edits);
+    off(move || edits.leftover_discard(&id)).await
+}
+
+#[tauri::command]
+async fn edit_editor_load() -> CmdResult<utils::remote_edit::EditorView> {
+    off(utils::remote_edit::editor_view).await
+}
+
+/// Save the editor command ("" = the OS default app), validated first.
+#[tauri::command]
+async fn edit_editor_save(command: String) -> CmdResult<utils::remote_edit::EditorView> {
+    let result = off(move || utils::remote_edit::editor_save(&command)).await;
+    if let Ok(view) = &result {
+        utils::audit::record(
+            "sftp.edit.editor",
+            if view.command.is_empty() {
+                "remote editing uses the default app".to_string()
+            } else {
+                format!("remote editing uses {}", view.command)
+            },
+            serde_json::json!({ "command": view.command, "program": view.resolved, "ok": true }),
+        );
+    }
+    result
 }
 
 /* ----------------------------------------------------------------- tunnels */
@@ -1521,6 +1619,7 @@ pub fn run() {
             app.manage(Arc::new(HostKeyPrompts::default()));
             app.manage(Arc::new(AuthPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
+            app.manage(Arc::new(utils::remote_edit::RemoteEdits::default()));
 
             // The audit writer thread, before anything can be recorded. It
             // also ingests records an earlier exit had to spill.
@@ -1533,46 +1632,19 @@ pub fn run() {
                 }
             }
 
-            // Backfill credential→destination and AI-origin bindings for
-            // already-saved secrets, from the on-disk catalogue. This MUST run
-            // synchronously here, before setup returns and the webview can
-            // invoke any command: if it were spawned, a compromised frontend
-            // could race it — poisoning hosts.json via hosts_save before the
-            // migration reads it — and reintroduce the frontend-writable-source
-            // bug. Run inline (small catalogue + a few vault reads); a panic is
-            // contained so a migration hiccup never blocks startup.
-            // A W4b build journaled each password / AI key save; one left
-            // behind by a crash is settled fail-closed, without deleting a
-            // secret (its legacy authorization is withdrawn). This build
-            // stores a secret and its destinations as one vault item, so it
-            // writes no journals.
-            if let Ok(Some(id)) = std::panic::catch_unwind(utils::hosts::retire_legacy_journal) {
-                let summary = "a password save was interrupted by an earlier build; it will not be sent until it is saved again";
-                eprintln!("hawser: {summary} ('{id}')");
-                utils::audit::record("credential.repair", summary, serde_json::json!({ "hostId": id, "ok": true }));
-            }
-            if let Ok(true) = std::panic::catch_unwind(utils::ai::retire_legacy_journal) {
-                let summary = "an AI key save was interrupted by an earlier build; save the key again to use it";
-                eprintln!("hawser: {summary}");
-                utils::audit::record("ai.key_repair", summary, serde_json::json!({ "profile": "default", "ok": true }));
-            }
-            let _ = std::panic::catch_unwind(utils::hosts::migrate_bindings);
-            let _ = std::panic::catch_unwind(utils::ai::migrate_ai_origins);
+            // No credential upgrade runs here: no Hawser build has been
+            // released, so there is no earlier vault or binding format to
+            // migrate (see utils::vault_item). An item this build cannot read
+            // fails closed and is entered again.
+
+            // Remote-edit copies an earlier run left: clean ones are deleted,
+            // unsynced ones listed in the Editing panel (off-thread: hashing).
+            utils::remote_edit::startup_sweep(app.handle().clone());
 
             // Prune old transcripts on launch. Defaults chosen to keep a useful
             // window of history without letting plaintext firewall logs pile up
             // indefinitely: 30 days, and at most 500 files. Runs off-thread so a
             // large logs directory never delays the window appearing.
-            // Quick-connect hosts are never saved, so a password an older build
-            // saved for one could never be deleted from the UI: remove them.
-            // Off-thread: each removal is a keychain call.
-            std::thread::spawn(|| {
-                match std::panic::catch_unwind(utils::hosts::purge_quick_connect_secrets) {
-                    Ok(n) if n > 0 => eprintln!("hawser: removed {n} saved quick-connect password(s)"),
-                    Ok(_) => {}
-                    Err(_) => eprintln!("hawser: quick-connect cleanup panicked"),
-                }
-            });
             std::thread::spawn(|| {
                 // catch_unwind so a panic in pruning (e.g. the logs directory
                 // vanishing mid-scan) is reported rather than silently swallowed
@@ -1598,6 +1670,16 @@ pub fn run() {
             sftp_get,
             sftp_put,
             sftp_cancel,
+            edit_open,
+            edit_list,
+            edit_upload,
+            edit_stop,
+            edit_reveal,
+            edit_leftovers,
+            edit_leftover_reveal,
+            edit_leftover_discard,
+            edit_editor_load,
+            edit_editor_save,
             local_list,
             local_root,
             path_exists,
@@ -1660,11 +1742,16 @@ pub fn run() {
         ])
         .build(context)
         .expect("error while running tauri application");
-    app.run(|_app, event| {
+    app.run(|app, event| {
         // Audit records are written by a background thread: give the queue
         // up to 10 s to drain, then spill whatever is still pending to
         // audit.pending-<ts>.jsonl, recorded at the next start.
         if let tauri::RunEvent::Exit = event {
+            // Remote edits stop watching; clean copies are deleted, unsynced
+            // ones kept for the next launch to list.
+            if let Some(edits) = app.try_state::<Arc<utils::remote_edit::RemoteEdits>>() {
+                edits.shutdown();
+            }
             utils::audit::shutdown(std::time::Duration::from_secs(10));
         }
     });

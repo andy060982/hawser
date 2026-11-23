@@ -1929,3 +1929,160 @@ async fn mux_stops_when_both_sessions_leave_while_its_writer_is_parked() {
     );
     drop(mux);
 }
+
+/* ---------------------------------------------------------- remote editing */
+
+/// Set a file's mtime (whole seconds, as SFTP v3 reports it).
+fn set_mtime(p: &Path, secs: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+}
+
+impl Harness {
+    fn local_str(&self, name: &str) -> String {
+        self.local.join(name).to_string_lossy().to_string()
+    }
+}
+
+/// Edit round trip: download records the baseline, a local save is uploaded
+/// over the original (keeping its mode) and becomes the new baseline, and a
+/// second save is checked against that one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_download_modify_upload_round_trip() {
+    for opts in extension_sets() {
+        let which = label(&opts);
+        let h = harness_with(opts).await;
+        h.put_remote("app.conf", b"listen 80;\n", 0o640);
+        set_mtime(&h.remote.join("app.conf"), 1_700_000_000);
+        let local = h.local_str("app.conf");
+        let (probe, bytes) = edit_fetch_with(&h.conn, "/app.conf", &local).await.unwrap();
+        assert_eq!(bytes, 11);
+        assert_eq!(probe.stamp, RemoteStamp { size: 11, mtime: Some(1_700_000_000) }, "{which}");
+        assert_eq!(probe.mode.map(|m| m & 0o777), Some(0o640));
+        assert_eq!(std::fs::read(&local).unwrap(), b"listen 80;\n");
+
+        std::fs::write(&local, b"listen 8080;\n").unwrap();
+        let pushed = edit_push_with(&h.conn, &local, "/app.conf", Some(probe.stamp)).await.unwrap();
+        let EditPushed::Uploaded { stamp, bytes, notes } = pushed else { panic!("{which}: {pushed:?}") };
+        assert_eq!(bytes, 13);
+        assert!(notes.is_empty(), "{which}: {notes:?}");
+        assert_eq!(h.remote_body("app.conf"), b"listen 8080;\n", "{which}");
+        assert_eq!(Harness::mode(&h.remote.join("app.conf")), 0o640, "{which}: mode kept");
+        let m = std::fs::metadata(h.remote.join("app.conf")).unwrap();
+        assert_eq!(stamp, RemoteStamp { size: 13, mtime: Some(filetime_secs(&m)) }, "{which}: new baseline");
+
+        // The next save is checked against the NEW baseline, and goes through.
+        std::fs::write(&local, b"listen 443;\n").unwrap();
+        let again = edit_push_with(&h.conn, &local, "/app.conf", Some(stamp)).await.unwrap();
+        assert!(matches!(again, EditPushed::Uploaded { .. }), "{which}: {again:?}");
+        assert_eq!(h.remote_body("app.conf"), b"listen 443;\n");
+        Harness::assert_clean(&h.remote);
+    }
+}
+
+fn filetime_secs(m: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    m.mtime() as u32
+}
+
+/// Someone else changed the remote file after it was downloaded: the save is
+/// NOT uploaded — a different size, and also the same size with a new mtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_a_remote_change_is_a_conflict_and_nothing_is_uploaded() {
+    for same_size in [false, true] {
+        let h = harness(true).await;
+        h.put_remote("motd", b"hello", 0o644);
+        set_mtime(&h.remote.join("motd"), 1_700_000_000);
+        let local = h.local_str("motd");
+        let (probe, _) = edit_fetch_with(&h.conn, "/motd", &local).await.unwrap();
+
+        let theirs: &[u8] = if same_size { b"HELLO" } else { b"their change" };
+        std::fs::write(h.remote.join("motd"), theirs).unwrap();
+        set_mtime(&h.remote.join("motd"), 1_700_000_100);
+        std::fs::write(&local, b"my change").unwrap();
+
+        let pushed = edit_push_with(&h.conn, &local, "/motd", Some(probe.stamp)).await.unwrap();
+        let EditPushed::Conflict { now: Some(now) } = pushed else { panic!("same_size={same_size}: {pushed:?}") };
+        assert_eq!(now.mtime, Some(1_700_000_100));
+        assert_eq!(h.remote_body("motd"), theirs, "same_size={same_size}: their change survives");
+        Harness::assert_clean(&h.remote);
+        assert!(h.remote_named(".conflict").is_empty());
+
+        // "Overwrite remote": no baseline check, the local version wins.
+        let forced = edit_push_with(&h.conn, &local, "/motd", None).await.unwrap();
+        assert!(matches!(forced, EditPushed::Uploaded { .. }), "{forced:?}");
+        assert_eq!(h.remote_body("motd"), b"my change");
+    }
+}
+
+/// The remote file was deleted (or moved away) meanwhile: a conflict too, and
+/// the save does not recreate it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_a_deleted_remote_is_a_conflict() {
+    let h = harness(false).await;
+    h.put_remote("gone.txt", b"v1", 0o644);
+    let local = h.local_str("gone.txt");
+    let (probe, _) = edit_fetch_with(&h.conn, "/gone.txt", &local).await.unwrap();
+    std::fs::remove_file(h.remote.join("gone.txt")).unwrap();
+    std::fs::write(&local, b"v2").unwrap();
+    let pushed = edit_push_with(&h.conn, &local, "/gone.txt", Some(probe.stamp)).await.unwrap();
+    assert!(matches!(pushed, EditPushed::Conflict { now: None }), "{pushed:?}");
+    assert!(!h.remote.join("gone.txt").exists());
+}
+
+/// "Save a copy as name.conflict": a new file beside the original, the next
+/// free name when that is taken, and the original left as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_save_copy_never_replaces_anything() {
+    let h = harness(true).await;
+    h.put_remote("site.conf", b"theirs", 0o644);
+    h.put_local("site.conf", b"mine", 0o600);
+    let local = h.local_str("site.conf");
+    let (first, n) = edit_save_copy_with(&h.conn, &local, "/site.conf").await.unwrap();
+    assert_eq!((first.as_str(), n), ("/site.conf.conflict", 4));
+    let (second, _) = edit_save_copy_with(&h.conn, &local, "/site.conf").await.unwrap();
+    assert_eq!(second, "/site.conf.conflict.2");
+    assert_eq!(h.remote_body("site.conf"), b"theirs");
+    assert_eq!(h.remote_body("site.conf.conflict"), b"mine");
+    assert_eq!(h.remote_body("site.conf.conflict.2"), b"mine");
+    Harness::assert_clean(&h.remote);
+}
+
+/// Only regular files (a link to one is fine) up to the size cap are opened;
+/// a file that changes while it downloads is refused, not given a baseline
+/// that does not describe the bytes on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_fetch_refuses_what_it_cannot_baseline() {
+    let h = harness(true).await;
+    std::fs::create_dir(h.remote.join("dir")).unwrap();
+    let e = edit_probe_with(&h.conn, "/dir").await.unwrap_err();
+    assert!(e.to_string().contains("only regular files"), "{e}");
+
+    let big = std::fs::File::create(h.remote.join("big.log")).unwrap();
+    big.set_len(crate::utils::remote_edit::MAX_EDIT_BYTES + 1).unwrap();
+    let e = edit_probe_with(&h.conn, "/big.log").await.unwrap_err();
+    assert!(e.to_string().contains("over 20 MB"), "{e}");
+
+    let e = edit_probe_with(&h.conn, "/nope").await.unwrap_err();
+    assert!(e.to_string().contains("no longer exists"), "{e}");
+
+    h.put_remote("real.conf", b"x", 0o644);
+    std::os::unix::fs::symlink(h.remote.join("real.conf"), h.remote.join("link.conf")).unwrap();
+    assert_eq!(edit_probe_with(&h.conn, "/link.conf").await.unwrap().stamp.size, 1);
+
+    // Changed mid-download (on the first READ): refused, and no copy kept.
+    h.put_remote("busy.log", b"line 1\n", 0o644);
+    let path = h.remote.join("busy.log");
+    h.fault("read", "busy.log", 1, vec![hook(move || std::fs::write(&path, b"line 1\nline 2\n").unwrap())]);
+    let local = h.local_str("busy.log");
+    let e = edit_fetch_with(&h.conn, "/busy.log", &local).await.unwrap_err();
+    assert!(e.to_string().contains("changed on the server while it was downloading"), "{e}");
+    assert!(!Path::new(&local).exists());
+
+    // Never over an existing local file (the edit folder is always fresh).
+    h.put_remote("a.txt", b"remote", 0o644);
+    h.put_local("a.txt", b"local", 0o600);
+    assert!(edit_fetch_with(&h.conn, "/a.txt", &h.local_str("a.txt")).await.is_err());
+    assert_eq!(std::fs::read(h.local.join("a.txt")).unwrap(), b"local");
+    Harness::assert_clean(&h.local);
+}

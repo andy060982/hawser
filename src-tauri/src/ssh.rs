@@ -2957,9 +2957,11 @@ async fn authorize_stored_password(
             "refusing to send the saved credential '{host_id}' to {host}:{port} as {username}: \
              it is not an authorized saved destination for that credential"
         ))),
+        // Covers a save that failed half-way, a destination digest that does
+        // not match the binding list, and a vault item that cannot be read.
         StoredSecret::Poisoned => Err(SshError::AuthFailed(format!(
-            "the saved credential '{host_id}' is not used: an earlier save of it failed half-way, \
-             so it may not match where it is allowed to go. Save the password again."
+            "the saved credential '{host_id}' is not used: Hawser could not confirm where this \
+             saved password may be sent. Save the password again."
         ))),
     }
 }
@@ -3122,7 +3124,10 @@ async fn authenticate(
             if matches!(result, russh::client::AuthResult::Success) {
                 if let Some(secret) = &save_typed {
                     // Secret and binding as one unit (utils::hosts::save_credential):
-                    // a failed binding write restores the previous secret. On the
+                    // the vault item is a `hawser-vault:2` envelope holding
+                    // {user, secret, dest_digest}, where dest_digest pins the
+                    // destination list kept in credential_bindings.json, so a
+                    // secret is only ever sent where that list allows. On the
                     // blocking pool: keychain calls can show a prompt.
                     let (id, user, secret) = (host_id.to_string(), username.to_string(), secret.clone());
                     let owner = crate::utils::hosts::Dest { host: host.to_string(), port, username: username.to_string() };
@@ -4646,8 +4651,9 @@ impl<'a> Progress<'a> {
         *self.cancel.borrow()
     }
 
-    /// A transfer with nobody to report to (the SFTP harness tests).
-    #[cfg(test)]
+    /// A transfer with nobody to report to: the SFTP harness tests, and the
+    /// remote-edit sync (`edit_fetch_with` / `edit_push_with`), which reports
+    /// through its own `sftp://edit` events rather than a transfer row.
     fn detached(cancel: watch::Receiver<bool>) -> Progress<'static> {
         Progress {
             app: None,
@@ -4669,6 +4675,7 @@ impl<'a> Progress<'a> {
             cancel,
             notes: Vec::new(),
             notes_dropped: 0,
+            #[cfg(test)]
             sent: None,
         }
     }
@@ -5074,7 +5081,7 @@ async fn upload_tree(
 ///
 /// The Windows-only hazards are checked on Windows only: on macOS and Linux
 /// `aux.c`, `con.h` or `report.` are ordinary, legal names.
-fn safe_local_component(name: &str) -> bool {
+pub(crate) fn safe_local_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
@@ -6454,6 +6461,199 @@ async fn write_in_place(
         remove_remote_quietly(sftp, target).await;
     }
     r
+}
+
+/* --------------------------------------------------------- remote editing */
+
+// The SFTP half of "edit a remote file in a local editor" (the local half —
+// temp folders, the watcher, opening the editor — is utils::remote_edit).
+// Everything here goes through the same hardened paths as a transfer:
+// `copy_remote_file` stages and commits the download, `copy_local_file` the
+// upload (staged, posix-rename where offered, mode kept), under `Replace`.
+
+use crate::utils::remote_edit::{RemoteStamp, MAX_EDIT_BYTES};
+
+/// What the remote file looked like when it was (re)checked.
+fn stamp_of(m: &russh_sftp::protocol::FileAttributes) -> RemoteStamp {
+    RemoteStamp { size: m.size.unwrap_or(0), mtime: m.mtime }
+}
+
+/// What a remote file opened for editing looks like on the server.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EditProbe {
+    pub stamp: RemoteStamp,
+    /// Permission bits as the server reports them (type bits included).
+    pub mode: Option<u32>,
+}
+
+/// How a save was pushed to the server.
+#[derive(Debug)]
+pub(crate) enum EditPushed {
+    /// Uploaded; `stamp` is the remote file as it is now, the new baseline.
+    Uploaded { stamp: RemoteStamp, bytes: u64, notes: Vec<String> },
+    /// The remote file is not what was downloaded (someone else changed or
+    /// removed it): NOTHING was uploaded. `now` is None when it is gone.
+    Conflict { now: Option<RemoteStamp> },
+}
+
+/// STAT (following a link, as an editor of `/etc/foo` -> `foo.real` would
+/// expect). `None` only for a definite "no such file".
+async fn edit_stat(sftp: &SftpConn, remote: &str) -> Result<Option<russh_sftp::protocol::FileAttributes>, SshError> {
+    match step(&uncancellable(), sftp.hi.metadata(remote)).await {
+        Ok(m) => Ok(Some(m)),
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The remote file, checked as editable: it exists, is a regular file (after
+/// following a link) and is no bigger than `MAX_EDIT_BYTES`.
+pub(crate) async fn edit_probe_with(sftp: &SftpConn, remote: &str) -> Result<EditProbe, SshError> {
+    let m = edit_stat(sftp, remote)
+        .await?
+        .ok_or_else(|| SshError::PartialTransfer(format!("{remote} no longer exists on the server")))?;
+    if !m.file_type().is_file() {
+        return Err(SshError::PartialTransfer(format!(
+            "{remote} is {}; only regular files can be edited",
+            remote_kind(&m)
+        )));
+    }
+    let size = m.size.unwrap_or(0);
+    if size > MAX_EDIT_BYTES {
+        return Err(SshError::PartialTransfer(format!(
+            "{remote} is {} MB; files over {} MB are not opened for editing — download it instead",
+            size.div_ceil(1024 * 1024),
+            MAX_EDIT_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(EditProbe { stamp: stamp_of(&m), mode: m.permissions })
+}
+
+/// Download `remote` to `local` (a path that must not exist yet) and return
+/// the baseline: the remote size and mtime as they were downloaded. A file
+/// that changed WHILE it was being read is refused (the copy is removed), so
+/// the baseline always describes the bytes on disk.
+pub(crate) async fn edit_fetch_with(sftp: &Arc<SftpConn>, remote: &str, local: &str) -> Result<(EditProbe, u64), SshError> {
+    let before = edit_probe_with(sftp, remote).await?;
+    let mut p = Progress::detached(uncancellable());
+    let bytes = copy_remote_file(sftp, &mut p, remote, local, Overwrite::Never).await?;
+    let after = edit_stat(sftp, remote).await;
+    let steady = matches!(&after, Ok(Some(m)) if !before.stamp.differs(&stamp_of(m)) && bytes == before.stamp.size);
+    if !steady {
+        let _ = tokio::fs::remove_file(local).await;
+        return Err(match after {
+            Err(e) => e,
+            _ => SshError::PartialTransfer(format!(
+                "{remote} changed on the server while it was downloading; try again"
+            )),
+        });
+    }
+    Ok((before, bytes))
+}
+
+/// Push a saved local copy back over `remote`.
+///
+/// With `expect` (a normal save), the remote file is STATed first and must
+/// still match that baseline: if its size or mtime differ, someone else
+/// changed it and NOTHING is uploaded (`Conflict`). Without (the user chose
+/// "Overwrite remote"), it is replaced regardless. The upload itself is
+/// `copy_local_file` under `Replace`, and the result is STATed again for the
+/// next baseline.
+///
+/// There is no lock on the server: a write by someone else between the check
+/// and the commit, or within the same second at the same size, is not seen.
+pub(crate) async fn edit_push_with(
+    sftp: &Arc<SftpConn>,
+    local: &str,
+    remote: &str,
+    expect: Option<RemoteStamp>,
+) -> Result<EditPushed, SshError> {
+    if let Some(base) = expect {
+        match edit_stat(sftp, remote).await? {
+            None => return Ok(EditPushed::Conflict { now: None }),
+            Some(m) if !m.file_type().is_file() => {
+                return Err(SshError::PartialTransfer(format!(
+                    "{remote} is now {}; not uploading over it",
+                    remote_kind(&m)
+                )))
+            }
+            Some(m) if base.differs(&stamp_of(&m)) => {
+                return Ok(EditPushed::Conflict { now: Some(stamp_of(&m)) })
+            }
+            Some(_) => {}
+        }
+    }
+    let mut p = Progress::detached(uncancellable());
+    let bytes = copy_local_file(sftp, &mut p, local, remote, Overwrite::Replace).await?;
+    let notes = p.take_notes();
+    let stamp = match edit_stat(sftp, remote).await? {
+        Some(m) => stamp_of(&m),
+        None => {
+            return Err(SshError::PartialTransfer(format!(
+                "uploaded {remote}, but it was gone right after; check it on the server"
+            )))
+        }
+    };
+    Ok(EditPushed::Uploaded { stamp, bytes, notes })
+}
+
+/// "Save a copy as name.conflict": upload the local copy to a NEW name next to
+/// `remote` — `<remote>.conflict`, or `.conflict.2` … when taken — never
+/// replacing anything (`Overwrite::Never`, enforced at commit). Returns the
+/// remote path used and the bytes written.
+pub(crate) async fn edit_save_copy_with(sftp: &Arc<SftpConn>, local: &str, remote: &str) -> Result<(String, u64), SshError> {
+    for n in 1..=20u32 {
+        let target = if n == 1 { format!("{remote}.conflict") } else { format!("{remote}.conflict.{n}") };
+        if remote_present(sftp, &target).await? {
+            continue;
+        }
+        let mut p = Progress::detached(uncancellable());
+        match copy_local_file(sftp, &mut p, local, &target, Overwrite::Never).await {
+            Ok(bytes) => return Ok((target, bytes)),
+            // Taken in the meantime: the next name.
+            Err(SshError::PartialTransfer(t)) if t.contains("already exists") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SshError::PartialTransfer(format!(
+        "{remote}.conflict through .conflict.20 all exist; tidy them up first"
+    )))
+}
+
+impl Registry {
+    /// `edit_probe_with` on a session's SFTP channel.
+    pub(crate) async fn edit_probe(&self, session_id: &str, remote: &str) -> Result<EditProbe, SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_probe_with(&sftp, remote).await;
+        self.check_sftp(session_id, &sftp, r).await
+    }
+
+    /// `edit_fetch_with` on a session's SFTP channel.
+    pub(crate) async fn edit_fetch(&self, session_id: &str, remote: &str, local: &str) -> Result<(EditProbe, u64), SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_fetch_with(&sftp, remote, local).await;
+        self.check_sftp(session_id, &sftp, r).await
+    }
+
+    /// `edit_push_with` on a session's SFTP channel.
+    pub(crate) async fn edit_push(
+        &self,
+        session_id: &str,
+        local: &str,
+        remote: &str,
+        expect: Option<RemoteStamp>,
+    ) -> Result<EditPushed, SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_push_with(&sftp, local, remote, expect).await;
+        self.check_sftp(session_id, &sftp, r).await
+    }
+
+    /// `edit_save_copy_with` on a session's SFTP channel.
+    pub(crate) async fn edit_save_copy(&self, session_id: &str, local: &str, remote: &str) -> Result<(String, u64), SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_save_copy_with(&sftp, local, remote).await;
+        self.check_sftp(session_id, &sftp, r).await
+    }
 }
 
 /// One SOCKS5 CONNECT conversation, then a bidirectional pump.

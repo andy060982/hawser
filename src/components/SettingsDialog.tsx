@@ -4,6 +4,7 @@ import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { policyFor, useSettings } from '../lib/settings'
 import { safeInvoke } from '../lib/tauri'
 import { useModalLayer } from '../lib/useModalLayer'
+import type { EditorView } from '../types'
 
 /* ---------------------------------------------------------------------------
    App settings: host-colour policies + safety toggles.
@@ -20,6 +21,32 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       (p) => setShells(p ?? []),
     )
   }, [])
+
+  // Remote editing: the editor command lives in the backend (editor.json),
+  // which validates it on save and again before each use.
+  const [editor, setEditor] = useState('')
+  const [editorSaved, setEditorSaved] = useState<EditorView | null>(null)
+  const [editorError, setEditorError] = useState<string | null>(null)
+  useEffect(() => {
+    void safeInvoke<EditorView>('edit_editor_load')
+      .then((v) => {
+        if (!v) return
+        setEditor(v.command)
+        setEditorSaved(v)
+      })
+      .catch((e) => setEditorError(String(e)))
+  }, [])
+  const saveEditor = () => {
+    setEditorError(null)
+    void safeInvoke<EditorView>('edit_editor_save', { command: editor })
+      .then((v) => {
+        if (!v) return
+        setEditor(v.command)
+        setEditorSaved(v)
+      })
+      .catch((e) => setEditorError(e instanceof Error ? e.message : String(e)))
+  }
+  const editorDirty = editor.trim() !== (editorSaved?.command ?? '')
 
   // Escape closes this dialog only while it is the top modal.
   useModalLayer(true, onClose)
@@ -209,6 +236,51 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 </span>
               </span>
             </label>
+          </section>
+
+          {/* --- Remote editing --- */}
+          <section className="mt-4">
+            <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">
+              Remote editing
+            </h3>
+            <label className="flex items-center gap-2 px-1 py-1 text-[12.5px] text-ink">
+              <span className="w-32 shrink-0">Editor command</span>
+              <input
+                type="text"
+                value={editor}
+                onChange={(e) => setEditor(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveEditor()
+                }}
+                placeholder="Empty: the system's default app"
+                spellCheck={false}
+                className="h-7 min-w-0 flex-1 rounded border border-line bg-surface-1 px-1.5 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={saveEditor}
+                disabled={!editorDirty}
+                className="h-7 shrink-0 rounded border border-line-strong px-2 text-[11.5px] text-ink hover:bg-surface-3 disabled:opacity-40"
+              >
+                Save
+              </button>
+            </label>
+            {editorError && (
+              <p className="selectable px-1 pb-1 text-[11px] text-alert">{editorError}</p>
+            )}
+            {!editorError && editorSaved?.resolved && !editorDirty && (
+              <p className="selectable px-1 pb-1 font-mono text-[11px] text-ink-faint">
+                Runs {editorSaved.resolved}
+              </p>
+            )}
+            <p className="px-1 pb-1 text-[11px] text-ink-faint">
+              &quot;Edit in local editor&quot; on a remote file opens it with this command, with the file
+              added as the last argument — never through a shell. For example{' '}
+              <code className="font-mono">code --wait</code>, <code className="font-mono">subl -w</code> or{' '}
+              <code className="font-mono">open -a TextEdit</code>. Left empty, the system&apos;s default app
+              is used, except for executable and launcher files (.sh, .command, .exe, .desktop…), which it
+              could run instead of opening.
+            </p>
           </section>
 
           {/* --- Local terminal --- */}

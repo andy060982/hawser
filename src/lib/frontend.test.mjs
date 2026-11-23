@@ -620,6 +620,38 @@ test('an import remaps a credential reference spelled in another case where the 
   }
 })
 
+/* W4d: jump-host references are exact ids, whatever the vault's case rule. */
+test('an import keeps a client on the exact jump host it names when h-jump and H-JUMP both exist', () => {
+  try {
+    for (const folds of [true, false]) {
+      setVaultFoldsCase(folds)
+      const [lower, upper, client, lowerClient] = reidentify(
+        [
+          mkHost({ id: 'h-jump', hostname: 'lower-bastion' }),
+          mkHost({ id: 'H-JUMP', hostname: 'upper-bastion' }),
+          mkHost({ id: 'h-client', hostname: 'target', jumpHostId: 'H-JUMP' }),
+          mkHost({ id: 'h-client2', hostname: 'target2', jumpHostId: 'h-jump' }),
+        ],
+        [],
+      )
+      assert.equal(lower.id, 'h-jump')
+      if (folds) assert.notEqual(vaultIdKey(upper.id), vaultIdKey('h-jump'), 'H-JUMP is re-id\'d where the vault folds')
+      else assert.equal(upper.id, 'H-JUMP')
+      assert.equal(client.jumpHostId, upper.id, `folds=${folds}: the client stays on H-JUMP`)
+      assert.notEqual(client.jumpHostId, lower.id)
+      assert.equal(lowerClient.jumpHostId, lower.id)
+      // A credential reference spelled exactly follows its exact host too.
+      const [, u2, borrower] = reidentify(
+        [mkHost({ id: 'h-jump' }), mkHost({ id: 'H-JUMP' }), mkHost({ id: 'h-b', credentialId: 'H-JUMP' })],
+        [],
+      )
+      assert.equal(borrower.credentialId, u2.id)
+    }
+  } finally {
+    setVaultFoldsCase(true)
+  }
+})
+
 /* ------------------------------------------------------------------ W5 */
 
 const key = (code, mods = {}, k) => ({
@@ -945,4 +977,65 @@ test('the passphrase guard judges the effective vault slot', () => {
   } finally {
     setVaultFoldsCase(true)
   }
+})
+
+/* ---------------------------------------------------------- remote editing */
+import {
+  MAX_EDIT_BYTES, applyClosed, applyEdit, applyList, conflictCopyName, conflictPromptDue, discardPrompt,
+  editBlockReason, editOffered, editStatusLabel, emptyEdits, mergeLeftovers,
+} from './remoteEdit.ts'
+
+const editInfo = (over = {}) => ({
+  editId: 'e-1', sessionId: 's1', remotePath: '/etc/app.conf', localPath: '/x/app.conf', name: 'app.conf',
+  status: 'synced', message: null, dirty: false, bytes: 3, lastSync: 1, conflictSeq: 0, opener: 'default', ...over,
+})
+
+test('edit is offered for files and links, and capped at 20 MB', () => {
+  assert.equal(MAX_EDIT_BYTES, 20 * 1024 * 1024)
+  assert.ok(editOffered({ kind: 'file' }))
+  assert.ok(editOffered({ kind: 'symlink' }))
+  assert.ok(!editOffered({ kind: 'directory' }))
+  assert.equal(editBlockReason({ kind: 'file', size: MAX_EDIT_BYTES, name: 'a' }), null)
+  assert.match(editBlockReason({ kind: 'file', size: MAX_EDIT_BYTES + 1, name: 'big.log' }), /big\.log is 21 MB.*over 20 MB/)
+  // A link's listed size is its own; the backend checks what it points at.
+  assert.equal(editBlockReason({ kind: 'symlink', size: MAX_EDIT_BYTES * 4, name: 'l' }), null)
+  assert.ok(editBlockReason({ kind: 'directory', size: 0, name: 'd' }))
+})
+
+test('edit events update rows in place and never revive an ended edit', () => {
+  let s = applyEdit(emptyEdits(), editInfo())
+  s = applyEdit(s, editInfo({ editId: 'e-2', name: 'b' }))
+  s = applyEdit(s, editInfo({ status: 'uploading' }))
+  assert.deepEqual(s.edits.map((e) => [e.editId, e.status]), [['e-1', 'uploading'], ['e-2', 'synced']])
+  s = applyClosed(s, { editId: 'e-1' })
+  assert.deepEqual(s.edits.map((e) => e.editId), ['e-2'])
+  // A status event already in flight when it ended, and a stale list.
+  s = applyEdit(s, editInfo({ status: 'synced' }))
+  s = applyList(s, [editInfo(), editInfo({ editId: 'e-2' })])
+  assert.deepEqual(s.edits.map((e) => e.editId), ['e-2'])
+})
+
+test('Keep editing dismisses one conflict; the next one prompts again', () => {
+  const c1 = editInfo({ status: 'conflict', conflictSeq: 1 })
+  assert.ok(conflictPromptDue(c1, {}))
+  const dismissed = { 'e-1': 1 }
+  assert.ok(!conflictPromptDue(c1, dismissed))
+  assert.ok(conflictPromptDue({ ...c1, conflictSeq: 2 }, dismissed))
+  assert.ok(!conflictPromptDue(editInfo({ conflictSeq: 2 }), {}), 'not in conflict')
+})
+
+test('edit rows name their state, and the prompts name the file', () => {
+  assert.equal(editStatusLabel({ status: 'synced', dirty: false }), 'synced')
+  assert.equal(editStatusLabel({ status: 'synced', dirty: true }), 'changed')
+  assert.equal(editStatusLabel({ status: 'uploading', dirty: true }), 'uploading…')
+  assert.equal(editStatusLabel({ status: 'conflict', dirty: true }), 'conflict')
+  assert.equal(editStatusLabel({ status: 'error', dirty: true }), 'error')
+  assert.equal(conflictCopyName('nginx.conf'), 'nginx.conf.conflict')
+  assert.match(discardPrompt(editInfo()), /app\.conf has changes that were not uploaded to \/etc\/app\.conf/)
+})
+
+test('kept copies merge by id, the backend list first', () => {
+  const a = { id: 's/a', remotePath: '/a', localPath: '/l/a', name: 'a' }
+  const b = { id: 's/b', remotePath: '/b', localPath: '/l/b', name: 'b' }
+  assert.deepEqual(mergeLeftovers([a], [b, { ...a, name: 'A' }]).map((l) => [l.id, l.name]), [['s/b', 'b'], ['s/a', 'A']])
 })

@@ -11,6 +11,7 @@ import { ContextMenu, type MenuState } from './ContextMenu'
 import { X } from 'lucide-react'
 import { sep } from '@tauri-apps/api/path'
 import { defaultLocalRoot, localBaseName, unsafeTransferName } from '../lib/localPath'
+import { editBlockReason, editOffered } from '../lib/remoteEdit'
 
 /** A valid, listable local starting directory for the current OS: the
  *  filesystem root, which on Windows is the system drive's (the backend's
@@ -132,6 +133,20 @@ export function SftpView({
       side === 'local' ? { path: target } : { sessionId: session.id, path: target }))
   }
 
+  /** "Edit in local editor": the backend downloads the file to a private
+   *  folder, opens it, and uploads each save (see lib/remoteEdit). The row
+   *  appears in the Editing section of the transfer bar. */
+  const editRemote = (entry: FileEntry, full: string) => {
+    const blocked = editBlockReason(entry)
+    if (blocked) {
+      void alert(blocked, { title: 'Edit in local editor' })
+      return
+    }
+    void safeInvoke('edit_open', { sessionId: session.id, remotePath: full }).catch(
+      (e) => void alert(e instanceof Error ? e.message : String(e), { title: 'Edit in local editor' }),
+    )
+  }
+
   const openRowMenu = (side: PaneSide) => (entry: FileEntry, x: number, y: number) => {
     const base = side === 'local' ? localPath : remotePath
     const full = joinPath(side, base, entry.name)
@@ -144,6 +159,9 @@ export function SftpView({
           label: side === 'local' ? 'Upload' : 'Download',
           onSelect: () => start(side, [entry.name]),
         },
+        ...(side === 'remote' && editOffered(entry)
+          ? [{ label: 'Edit in local editor', onSelect: () => editRemote(entry, full) }]
+          : []),
         {
           label: 'Rename…',
           dividerBefore: true,

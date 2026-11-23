@@ -50,6 +50,57 @@ pub fn open_dir(path: &Path) -> std::io::Result<()> {
     spawn_reaped(Command::new(FILE_MANAGER).arg(path))
 }
 
+/// Open a file with the platform's default app for its type (remote editing:
+/// utils::remote_edit, which refuses executable and launcher types before it
+/// gets here). The path is passed as one argument — never through a shell
+/// string — and is absolute, so it cannot read as an option.
+///
+/// Windows uses ShellExecuteW directly: `cmd /c start` would re-parse a
+/// server-chosen file name (`a&calc.txt`) as shell syntax.
+pub fn open_file_default(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        // SAFETY: NUL-terminated wide strings that outlive the call; no
+        // parameters or directory (NULL is allowed for both), no owner window.
+        let h = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // Documented: a value above 32 is success, anything else an error code.
+        let code = h as isize;
+        if code > 32 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("Windows could not open the file (ShellExecute error {code})")))
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        spawn_reaped(Command::new(FILE_MANAGER).arg(path))
+    }
+}
+
+/// Start a user-configured program (an editor command, already validated by
+/// utils::remote_edit) and reap it in the background. No shell is involved:
+/// `cmd` carries its program and arguments as separate argv entries.
+pub fn spawn_program(cmd: &mut Command) -> std::io::Result<()> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    spawn_reaped(cmd)
+}
+
 /// Reveal (and, where supported, select) a single file in the file manager.
 ///
 /// Windows and macOS can select the file itself; Linux has no portable

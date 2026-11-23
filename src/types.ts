@@ -248,3 +248,60 @@ export interface TransferFailureEvent {
   reason: string
   direction: TransferDirection
 }
+
+/* ------------------------------------------------------- remote editing */
+
+/** Mirrors EditStatus in src-tauri/src/utils/remote_edit.rs. */
+export type EditStatus = 'synced' | 'uploading' | 'conflict' | 'error'
+
+/** One remote file open in a local editor: the `edit_open` / `edit_list`
+ *  result and the `sftp://edit` event. Mirrors EditInfo in
+ *  src-tauri/src/utils/remote_edit.rs — change the two together. */
+export interface EditInfo {
+  editId: string
+  sessionId: string
+  remotePath: string
+  /** The private local copy the editor has open. */
+  localPath: string
+  name: string
+  status: EditStatus
+  message: string | null
+  /** The local copy has (or may have) changes the server does not. */
+  dirty: boolean
+  bytes: number
+  /** Unix seconds the server last matched the local copy. */
+  lastSync: number | null
+  /** Bumped on every conflict found (see lib/remoteEdit conflictPromptDue). */
+  conflictSeq: number
+  /** 'default': the OS default app; 'command': the editor command. */
+  opener: 'default' | 'command'
+}
+
+/** `sftp://edit-closed`. `keptAt`: unsynced changes were kept there. */
+export interface EditClosed {
+  editId: string
+  keptAt: string | null
+}
+
+/** A local copy kept because it had unsynced changes (`edit_leftovers`,
+ *  `sftp://edit-leftovers`). Mirrors Leftover in remote_edit.rs. */
+export interface EditLeftover {
+  id: string
+  remotePath: string
+  localPath: string
+  name: string
+}
+
+/** `edit_stop`'s result. `stopped` false: unsynced changes, ask the user. */
+export interface EditStopOutcome {
+  stopped: boolean
+  dirty: boolean
+  keptAt: string | null
+}
+
+/** `edit_editor_load` / `edit_editor_save`. */
+export interface EditorView {
+  command: string
+  /** The program it runs, as a full path; null for the default app. */
+  resolved: string | null
+}

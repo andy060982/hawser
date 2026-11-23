@@ -316,11 +316,18 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
   }
 
   const existingIds = new Set(taken)
-  /** Imported id, by its vault key -> the id it ends up with (itself when it
-   *  did not collide). Keyed like the collision check, so a reference spelled
-   *  in another case (`H-LENDER` borrowing `h-lender`, one entry where the
-   *  vault folds case) follows the rename too. */
-  const remap = new Map<string, string>()
+  /** Imported id, EXACTLY as spelled -> the id it ends up with (itself when
+   *  it did not collide). Host references (`jumpHostId`) resolve through this
+   *  map only: the app looks hosts up by exact id, so a file holding distinct
+   *  `h-jump` and `H-JUMP` hosts (exported where the vault is case-sensitive)
+   *  keeps each client on the bastion it named, even when one of the two is
+   *  re-id'd here. */
+  const exact = new Map<string, string>()
+  /** The same, keyed by vault key (first spelling wins). Credential
+   *  references (`credentialId`, a vault slot) fall back to it, so a borrower
+   *  spelled in another case (`H-LENDER` borrowing `h-lender`, one entry where
+   *  the vault folds case) follows the lender's rename too. */
+  const byVaultKey = new Map<string, string>()
 
   const walk = (list: HostNode[]): HostNode[] =>
     list.map((n) => {
@@ -328,7 +335,8 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
         taken.has(key(n.id)) || !usableImportedId(n.id)
           ? freshId(isFolder(n) ? 'f' : 'h')
           : (taken.add(key(n.id)), n.id)
-      if (!remap.has(key(n.id))) remap.set(key(n.id), id)
+      if (!exact.has(n.id)) exact.set(n.id, id)
+      if (!byVaultKey.has(key(n.id))) byVaultKey.set(key(n.id), id)
       return isFolder(n)
         ? { ...n, id, children: walk(n.children) }
         : { ...n, id }
@@ -339,16 +347,22 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
   // to whatever LOCAL host owns it — tunnelling through the wrong bastion. A
   // reference that points outside the import at an id this machine already
   // uses is dropped rather than bound to an unrelated local host.
-  const fix = (ref: string | undefined): string | undefined => {
+  const outside = (ref: string): string | undefined =>
+    existingIds.has(key(ref)) || !usableImportedId(ref) ? undefined : ref
+  const fixHost = (ref: string | undefined): string | undefined => {
     if (ref === undefined) return undefined
-    if (remap.has(key(ref))) return remap.get(key(ref))
-    return existingIds.has(key(ref)) || !usableImportedId(ref) ? undefined : ref
+    return exact.has(ref) ? exact.get(ref) : outside(ref)
+  }
+  const fixCredential = (ref: string | undefined): string | undefined => {
+    if (ref === undefined) return undefined
+    if (exact.has(ref)) return exact.get(ref)
+    return byVaultKey.has(key(ref)) ? byVaultKey.get(key(ref)) : outside(ref)
   }
   const relink = (list: HostNode[]): HostNode[] =>
     list.map((n) =>
       isFolder(n)
         ? { ...n, children: relink(n.children) }
-        : { ...n, jumpHostId: fix(n.jumpHostId), credentialId: fix(n.credentialId) },
+        : { ...n, jumpHostId: fixHost(n.jumpHostId), credentialId: fixCredential(n.credentialId) },
     )
 
   return relink(walk(imported))

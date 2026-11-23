@@ -2265,8 +2265,11 @@ fn ingest_pending<A: Anchor>(log: &Log<A>) {
 /// Where the live log is. Beside hosts.json, except on Windows, where that is
 /// the ROAMING profile while the keychain seal (CRED_PERSIST_LOCAL_MACHINE)
 /// is per machine: a roaming log would be checked against another machine's
-/// seal. There it lives under %LOCALAPPDATA%, copied once from the roaming
-/// folder (archives included, so their pins still resolve).
+/// seal. There it lives under %LOCALAPPDATA%\hawser.
+///
+/// Nothing is copied from the roaming folder: no Hawser build has been
+/// released, so no user has a roaming audit log (or spill files beside one)
+/// to bring along. Development builds' roaming files are left where they are.
 fn audit_path() -> Result<PathBuf, String> {
     static PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     PATH.get_or_init(resolve_audit_path).clone()
@@ -2279,113 +2282,16 @@ fn resolve_audit_path() -> Result<PathBuf, String> {
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
             let local = PathBuf::from(local).join("hawser");
-            if local != roaming {
-                if let Err(e) = migrate_audit_files(&roaming, &local) {
-                    eprintln!("hawser: could not move the audit log to the local profile: {e}");
-                    return Ok(roaming.join(AUDIT_FILE));
+            match std::fs::create_dir_all(&local) {
+                Ok(()) => {
+                    super::platform::restrict_perms(&local, 0o700);
+                    return Ok(local.join(AUDIT_FILE));
                 }
+                Err(e) => eprintln!("hawser: could not create the local audit folder, using the roaming one: {e}"),
             }
-            return Ok(local.join(AUDIT_FILE));
         }
     }
     Ok(roaming.join(AUDIT_FILE))
-}
-
-/// Copy the audit files (`audit.jsonl`, its archives, torn evidence and a
-/// staged rotation) from `from` into `to`. The originals are left in place,
-/// since a roaming profile shares them with other machines.
-///
-/// Crash-safe and retried until it completes: each file is copied to a temp
-/// name, synced, and only then renamed into place, and `audit.migrated` is
-/// written LAST. Without the marker the migration runs again; a destination
-/// that is a strict prefix of its source (a copy an older build cut short) is
-/// replaced, while one that is complete or has grown past its source (this
-/// machine appended to it) is kept.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn migrate_audit_files(from: &Path, to: &Path) -> std::io::Result<()> {
-    let marker = to.join("audit.migrated");
-    if marker.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(to)?;
-    super::platform::restrict_perms(to, 0o700);
-    // Every error below propagates, so the marker is written only once every
-    // source file was read and copied. A missing source folder has nothing to
-    // copy; any other failure to list it is an error, never "nothing there".
-    match std::fs::read_dir(from) {
-        Ok(dir) => {
-            for entry in dir {
-                let entry = entry?;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                let ours = name == AUDIT_FILE
-                    || (name.starts_with("audit-") && name.ends_with(".archived.jsonl"))
-                    || name.starts_with("audit.jsonl.");
-                if !ours || name.ends_with(".lock") || !entry.file_type()?.is_file() {
-                    continue;
-                }
-                let dest = to.join(&*name);
-                if !migration_needs_copy(&entry.path(), &dest)? {
-                    continue;
-                }
-                let tmp = to.join(format!(".migrating-{name}"));
-                let _ = std::fs::remove_file(&tmp);
-                copy_synced(&mut File::open(entry.path())?, &tmp)?;
-                std::fs::rename(&tmp, &dest)?;
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    sync_dir(&marker)?;
-    let tmp = to.join(".migrating-audit.migrated");
-    let _ = std::fs::remove_file(&tmp);
-    copy_synced(&mut &b"1\n"[..], &tmp)?;
-    std::fs::rename(&tmp, &marker)?;
-    sync_dir(&marker)
-}
-
-/// Copy `src` into a new file at `dest` and sync it through the SAME write
-/// handle before closing it. (Windows FlushFileBuffers needs write access: a
-/// sync through a handle reopened read-only fails with access denied.)
-fn copy_synced(src: &mut impl Read, dest: &Path) -> std::io::Result<()> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut out = opts.open(dest)?;
-    std::io::copy(src, &mut out)?;
-    out.sync_all()
-}
-
-/// Whether `dest` still needs `src` copied over it: missing, or a strict
-/// prefix of `src` (an interrupted copy). Anything else is kept.
-fn migration_needs_copy(src: &Path, dest: &Path) -> std::io::Result<bool> {
-    let dlen = match std::fs::metadata(dest) {
-        Ok(m) => m.len(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(e),
-    };
-    let slen = std::fs::metadata(src)?.len();
-    if dlen >= slen {
-        return Ok(false);
-    }
-    let (mut a, mut b) = (BufReader::new(File::open(src)?), BufReader::new(File::open(dest)?));
-    let (mut x, mut y) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
-    let mut left = dlen;
-    while left > 0 {
-        let n = (left.min(x.len() as u64)) as usize;
-        a.read_exact(&mut x[..n])?;
-        b.read_exact(&mut y[..n])?;
-        if x[..n] != y[..n] {
-            return Ok(false);
-        }
-        left -= n as u64;
-    }
-    Ok(true)
 }
 
 fn writer() -> Option<&'static Writer> {
@@ -3297,25 +3203,6 @@ mod tests {
         assert_eq!(m.get().unwrap().0, 5);
     }
 
-    #[test]
-    fn audit_files_migrate_once_and_originals_stay() {
-        let from = tmp().parent().unwrap().to_path_buf();
-        let to = tmp().parent().unwrap().join("local");
-        std::fs::write(from.join(AUDIT_FILE), b"log\n").unwrap();
-        std::fs::write(from.join("audit-1-abc.archived.jsonl"), b"old\n").unwrap();
-        std::fs::write(from.join("hosts.json"), b"[]").unwrap();
-        migrate_audit_files(&from, &to).unwrap();
-        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"log\n");
-        assert!(to.join("audit-1-abc.archived.jsonl").exists());
-        assert!(!to.join("hosts.json").exists());
-        assert!(from.join(AUDIT_FILE).exists());
-        // Once: a later run never overwrites the local log.
-        std::fs::write(to.join(AUDIT_FILE), b"newer\n").unwrap();
-        std::fs::write(from.join(AUDIT_FILE), b"roamed\n").unwrap();
-        migrate_audit_files(&from, &to).unwrap();
-        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"newer\n");
-    }
-
     /// W4b: process B stages a rotation, moves the seal (commit) and dies
     /// before the renames. Process A, holding a cached head whose file length
     /// still matches, must complete B's committed rotation, not append to the
@@ -3534,21 +3421,6 @@ mod tests {
         assert!(!p.exists() || lines(&p).is_empty(), "nothing spilled was also written");
     }
 
-    /// W4c (item 5): a source folder that cannot be listed is an error, and
-    /// no completion marker is written.
-    #[cfg(unix)]
-    #[test]
-    fn a_migration_source_that_cannot_be_read_never_writes_the_marker() {
-        let root = tmp().parent().unwrap().to_path_buf();
-        let (from, to) = (root.join("roaming-file"), root.join("local"));
-        std::fs::write(&from, b"not a folder").unwrap();
-        assert!(migrate_audit_files(&from, &to).is_err());
-        assert!(!to.join("audit.migrated").exists());
-        // A missing source folder simply has nothing to copy.
-        migrate_audit_files(&root.join("absent"), &to).unwrap();
-        assert!(to.join("audit.migrated").exists());
-    }
-
     /// W4b: an archive verified and hashed outside the locks is used only if
     /// the file is still the one it saw; appends since then are redone under
     /// the lock, so the pin always covers every archived record.
@@ -3570,37 +3442,6 @@ mod tests {
         let fresh = log.prepare_archive().unwrap();
         log.archive_with(Some(fresh)).unwrap();
         assert_eq!(log.verify().unwrap().status, Status::Verified);
-    }
-
-    /// W4b: a migration cut short is retried (no marker yet), completing a
-    /// partial copy; a local log that grew past its source is never replaced.
-    #[test]
-    fn an_interrupted_migration_is_retried_until_its_marker_is_written() {
-        let from = tmp().parent().unwrap().to_path_buf();
-        let to = tmp().parent().unwrap().join("local");
-        std::fs::write(from.join(AUDIT_FILE), b"line one\nline two\n").unwrap();
-        std::fs::write(from.join("audit-1-abc.archived.jsonl"), b"old\n").unwrap();
-        // An older build copied half the live log and died: no archive, no marker.
-        std::fs::create_dir_all(&to).unwrap();
-        std::fs::write(to.join(AUDIT_FILE), b"line one\n").unwrap();
-        migrate_audit_files(&from, &to).unwrap();
-        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"line one\nline two\n");
-        assert!(to.join("audit-1-abc.archived.jsonl").exists());
-        assert!(to.join("audit.migrated").exists());
-        let temps = std::fs::read_dir(&to).unwrap().flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".migrating-"))
-            .count();
-        assert_eq!(temps, 0);
-        // Without a marker, a local log that has grown past its source is kept.
-        std::fs::remove_file(to.join("audit.migrated")).unwrap();
-        std::fs::write(to.join(AUDIT_FILE), b"line one\nline two\nlocal three\n").unwrap();
-        migrate_audit_files(&from, &to).unwrap();
-        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"line one\nline two\nlocal three\n");
-        // A divergent shorter one is kept too (not a prefix: not ours to replace).
-        std::fs::remove_file(to.join("audit.migrated")).unwrap();
-        std::fs::write(to.join(AUDIT_FILE), b"other\n").unwrap();
-        migrate_audit_files(&from, &to).unwrap();
-        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"other\n");
     }
 
     #[test]

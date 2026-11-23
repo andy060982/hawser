@@ -10,5 +10,6 @@ pub mod instance;
 pub mod known_hosts;
 pub mod nettools;
 pub mod platform;
+pub mod remote_edit;
 pub mod vault_item;
 pub mod session_log;
