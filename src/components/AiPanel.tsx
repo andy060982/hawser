@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Bot, Check, Copy, CornerDownLeft, Loader2, Settings2, ShieldOff, Sparkles,
-  TextSearch, X,
+  Square, TextSearch, X,
 } from 'lucide-react'
 import type { Host, Session } from '../types'
 import type { HostColor } from '../lib/hostColors'
@@ -9,6 +9,8 @@ import { type ColorPolicy, policyFor, useSettings } from '../lib/settings'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { getTerm } from '../lib/termRegistry'
 import { scanForSecrets, type SecretHit } from '../lib/secretScan'
+import { checkInsert, isDangerousCommand } from '../lib/dangerous'
+import { useDialogs } from '../lib/dialogs'
 import { ShieldAlert } from 'lucide-react'
 
 interface AiConfig {
@@ -32,16 +34,22 @@ interface AiEvent {
   error: string | null
 }
 
+/* The first preset is the starting point when nothing is saved. A plain HTTP
+   API is the default: the CLI is a local agent (run here with every tool
+   disabled, but still the larger surface), so it is opt-in. A config saved
+   with the CLI keeps working; only the unconfigured default changed. */
 const PRESETS: { label: string; cfg: AiConfig }[] = [
-  {
-    label: 'Claude Code CLI (uses your Claude subscription)',
-    cfg: { kind: 'claude-code', baseUrl: '', model: 'managed by Claude Code' },
-  },
   { label: 'Anthropic (Claude)', cfg: { kind: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'claude-sonnet-4-5' } },
   { label: 'OpenAI', cfg: { kind: 'openai', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' } },
   { label: 'Ollama (local)', cfg: { kind: 'openai', baseUrl: 'http://localhost:11434/v1', model: 'llama3.1' } },
   { label: 'LM Studio (local)', cfg: { kind: 'openai', baseUrl: 'http://localhost:1234/v1', model: 'local-model' } },
+  {
+    label: 'Claude Code CLI (uses your Claude subscription; tools disabled)',
+    cfg: { kind: 'claude-code', baseUrl: '', model: 'managed by Claude Code' },
+  },
 ]
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 /** Whether the assistant may see this host's terminal output. Red-accented
  *  hosts (production, by this app's own convention) default to NO — sending a
@@ -60,20 +68,26 @@ export function aiAllowedFor(
    AI assistant panel (Ctrl+Shift+A).
 
    Advisor only, by architecture rather than by policy:
-   - Suggestions render as chips; Insert TYPES the command into the terminal
-     with no newline. The human pressing Enter is the approval step.
-   - Context is the visible tail of THIS session's transcript (~4 KB), shown
-     as a labelled line so what leaves the machine is never a surprise.
-   - The provider sees one session, never other tabs.
+   - Suggestions render as chips; Insert pastes the command through the
+     terminal's own paste path (bracketed when the remote enabled it) with no
+     newline. Control characters are refused, multi-line text and destructive
+     commands need a confirm. The human pressing Enter is the approval step.
+   - Context is the tail of THIS endpoint's transcript (~4 KB), looked up by
+     endpoint identity rather than hostname, so another entry sharing the
+     address (with its own AI policy) can never supply it.
+   - The provider sees one endpoint, never other tabs.
 --------------------------------------------------------------------------- */
 export function AiPanel({
   session,
   host,
+  endpoint,
   effectiveColor,
   onClose,
 }: {
   session: Session | undefined
   host: Host | undefined
+  /** Endpoint identity of `host` (lib/endpoint); keys the transcript lookup. */
+  endpoint: string | undefined
   effectiveColor?: HostColor
   onClose: () => void
 }) {
@@ -81,6 +95,7 @@ export function AiPanel({
   const [showSettings, setShowSettings] = useState(false)
   const [keySaved, setKeySaved] = useState(false)
   const [keyDraft, setKeyDraft] = useState('')
+  const [settingsError, setSettingsError] = useState<string | null>(null)
   // One conversation per session id, so switching panes/sessions and coming
   // back restores that session's thread instead of wiping it — while still
   // never showing one session's history under another (no cross-host bleed).
@@ -118,23 +133,30 @@ export function AiPanel({
   } | null>(null)
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
+  /** The run in flight, for the Stop button. */
+  const runRef = useRef<string | null>(null)
 
   const { settings } = useSettings()
   const allowed = aiAllowedFor(host, policyFor(settings, effectiveColor))
 
   /* Provider config: load once; missing config opens settings. */
   useEffect(() => {
-    void safeInvoke<AiConfig | null>('ai_config_load').then((c) => {
-      // kind, not baseUrl: the Claude Code CLI provider has no URL at all.
-      if (c && c.kind) setCfg(c)
-      else setShowSettings(true)
-    })
+    void safeInvoke<AiConfig | null>('ai_config_load')
+      .then((c) => {
+        // kind, not baseUrl: the Claude Code CLI provider has no URL at all.
+        if (c && c.kind) setCfg(c)
+        else setShowSettings(true)
+      })
+      .catch((e: unknown) => {
+        setSettingsError(`Could not load the saved provider settings: ${errText(e)}`)
+        setShowSettings(true)
+      })
   }, [])
 
   useEffect(() => {
-    void safeInvoke<boolean>('ai_key_status', { profile: 'default' }).then((v) =>
-      setKeySaved(Boolean(v)),
-    )
+    void safeInvoke<boolean>('ai_key_status', { profile: 'default' })
+      .then((v) => setKeySaved(Boolean(v)))
+      .catch(() => setKeySaved(false))
   }, [showSettings])
 
   useEffect(() => {
@@ -143,30 +165,54 @@ export function AiPanel({
 
   useEffect(() => () => unlistenRef.current?.(), [])
 
+  /* The key is saved (and bound) before the provider switch is persisted, and
+     the in-memory config changes only once both succeeded: a failed key save
+     no longer leaves the provider switched with its key unbound. The typed key
+     is cleared from state whatever happens, so a failure cannot leave it
+     sitting in React state for the life of the panel. */
   const saveSettings = async (next: AiConfig) => {
-    setCfg(next)
-    await safeInvoke('ai_config_save', { config: next })
-    if (keyDraft.trim()) {
-      // Pass the origin so the backend can bind the key to it (see save_key):
-      // the key may then only be sent to this kind/base_url, regardless of any
-      // later edit to ai.json.
-      await safeInvoke('ai_key_save', {
-        profile: 'default',
-        key: keyDraft.trim(),
-        kind: next.kind,
-        baseUrl: next.baseUrl,
-      })
+    setSettingsError(null)
+    const key = keyDraft.trim()
+    try {
+      if (key) {
+        // Pass the origin so the backend can bind the key to it (see save_key):
+        // the key may then only be sent to this kind/base_url, regardless of any
+        // later edit to ai.json.
+        await safeInvoke('ai_key_save', {
+          profile: 'default',
+          key,
+          kind: next.kind,
+          baseUrl: next.baseUrl,
+        })
+        setKeySaved(true)
+      }
+      await safeInvoke('ai_config_save', { config: next })
+      setCfg(next)
+      setShowSettings(false)
+    } catch (e) {
+      setSettingsError(`Not saved: ${errText(e)}`)
+    } finally {
       setKeyDraft('')
-      setKeySaved(true)
     }
-    setShowSettings(false)
   }
 
   /** Forget the saved key (and the origin it is bound to). The way out after
    *  moving to a provider that needs none, e.g. local Ollama. */
   const removeKey = async () => {
-    await safeInvoke('ai_key_delete', { profile: 'default' })
-    setKeySaved(false)
+    setSettingsError(null)
+    try {
+      await safeInvoke('ai_key_delete', { profile: 'default' })
+      setKeySaved(false)
+    } catch (e) {
+      setSettingsError(`The key was not removed: ${errText(e)}`)
+    }
+  }
+
+  /** Stop the request in flight. The backend kills the CLI or drops the HTTP
+   *  request and sends the run's final event, which unlocks the composer. */
+  const stop = () => {
+    const runId = runRef.current
+    if (runId) void safeInvoke('ai_cancel', { runId }).catch(() => {})
   }
 
   /** Actually fire the request — reached either directly, or after the user
@@ -184,7 +230,8 @@ export function AiPanel({
       unlistenRef.current = null
       setThreadMsgs(target, [...thread, { role: 'assistant', content: '' }])
       setStreaming(true)
-      const runId = `ai-${Date.now()}`
+      const runId = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      runRef.current = runId
       unlistenRef.current = await safeListen<AiEvent>(`ai://${runId}`, (ev) => {
         if (ev.error) {
           setThreadMsgs(target, (m) => {
@@ -208,6 +255,7 @@ export function AiPanel({
         }
         if (ev.done) {
           setStreaming(false)
+          if (runRef.current === runId) runRef.current = null
           unlistenRef.current?.()
           unlistenRef.current = null
         }
@@ -223,6 +271,7 @@ export function AiPanel({
         })
       } catch (e) {
         setStreaming(false)
+        if (runRef.current === runId) runRef.current = null
         unlistenRef.current?.()
         unlistenRef.current = null
         setThreadMsgs(target, (m) => [
@@ -252,13 +301,18 @@ export function AiPanel({
       const thread = [...sendable, userMsg]
       setInput('')
 
-      // Context: the transcript tail for THIS host. Labelled in the thread
-      // header below so the user always knows what was shared.
-      const tail =
-        (await safeInvoke<string | null>('session_history', {
-          host: host.hostname,
-          maxBytes: 4000,
-        })) ?? ''
+      // Context: the transcript tail for THIS endpoint — never a hostname
+      // lookup, which could return another entry's output under this host's
+      // AI policy. Labelled in the thread header so the user always knows what
+      // was shared.
+      let tail = ''
+      if (endpoint) {
+        try {
+          tail = (await safeInvoke<string | null>('session_history', { endpoint, maxBytes: 4000 })) ?? ''
+        } catch {
+          tail = ''
+        }
+      }
 
       const systemContext =
         `Host: ${host.name} (${host.hostname}:${host.port}, user ${host.username}).\n` +
@@ -278,7 +332,7 @@ export function AiPanel({
       }
       void dispatch(targetSid, thread, systemContext)
     },
-    [cfg, session, host, allowed, streaming, messages, dispatch],
+    [cfg, session, host, endpoint, allowed, streaming, messages, dispatch],
   )
 
   const explainSelection = () => {
@@ -313,6 +367,7 @@ export function AiPanel({
       {showSettings ? (
         <SettingsForm
           cfg={cfg}
+          error={settingsError}
           keySaved={keySaved}
           keyDraft={keyDraft}
           setKeyDraft={setKeyDraft}
@@ -380,15 +435,27 @@ export function AiPanel({
                 placeholder="Ask about this session…"
                 className="min-w-0 flex-1 resize-none rounded border border-line bg-surface-0 px-2 py-1.5 text-[12.5px] text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
               />
-              <button
-                type="button"
-                disabled={streaming || !input.trim()}
-                onClick={() => void send(input)}
-                aria-label="Send"
-                className="grid w-9 shrink-0 place-items-center rounded border border-accent/60 bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40"
-              >
-                <CornerDownLeft size={14} />
-              </button>
+              {streaming ? (
+                <button
+                  type="button"
+                  onClick={stop}
+                  aria-label="Stop"
+                  title="Stop this request"
+                  className="grid w-9 shrink-0 place-items-center rounded border border-line text-ink-dim hover:bg-surface-3 hover:text-ink"
+                >
+                  <Square size={12} />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={!input.trim()}
+                  onClick={() => void send(input)}
+                  aria-label="Send"
+                  className="grid w-9 shrink-0 place-items-center rounded border border-accent/60 bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40"
+                >
+                  <CornerDownLeft size={14} />
+                </button>
+              )}
             </div>
           </div>
         </>
@@ -494,6 +561,7 @@ function MessageView({ msg, sessionId }: { msg: Msg; sessionId: string }) {
 
 function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
   const [inserted, setInserted] = useState(false)
+  const { confirm, alert } = useDialogs()
   // Strip an optional language tag line ("bash\n...") and trailing whitespace.
   const lines = raw.replace(/^\s*\n/, '').split('\n')
   const first = lines[0]?.trim() ?? ''
@@ -503,16 +571,55 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
 
   if (!body) return null
 
-  const insert = () => {
-    // Typed into the terminal input, NO trailing newline: the user reviews it
-    // on their own prompt and presses Enter — or doesn't. That keystroke is
-    // the entire approval model; never "improve" this by appending \n.
-    const bytes = Array.from(new TextEncoder().encode(body))
-    void safeInvoke('ssh_write', { sessionId, data: bytes }).then(() => {
-      setInserted(true)
-      getTerm(sessionId)?.term.focus()
-      setTimeout(() => setInserted(false), 1600)
-    })
+  /* Pasted into the terminal input, NO trailing newline: the user reviews it
+     on their own prompt and presses Enter — or doesn't. That keystroke is the
+     entire approval model; never "improve" this by appending \n.
+
+     It goes through term.paste(), the same path as a user paste: bracketed
+     paste when the remote enabled it (the shell then treats the block as
+     inert text), and the ordered write queue. A raw ssh_write bypassed all of
+     that, and every embedded newline was an Enter: a three-line suggestion ran
+     its first two lines on click. The model's output is steerable by whatever
+     is on the remote screen, so the destructive-command check applies here
+     regardless of the paste-guard setting. */
+  const insert = async () => {
+    const check = checkInsert(body)
+    if (check.kind === 'refuse') {
+      await alert(`This suggestion was not inserted: ${check.reason}. Use Copy if you really want it.`, {
+        title: 'Suggestion refused',
+      })
+      return
+    }
+    const target = getTerm(sessionId)
+    if (!target) {
+      await alert('This session’s terminal is not open, so nothing was inserted.', { title: 'Not inserted' })
+      return
+    }
+    if (check.kind === 'multiline') {
+      const bracketed = target.term.modes.bracketedPasteMode
+      const ok = await confirm(
+        bracketed
+          ? `This suggestion is ${check.lines} lines. It will be pasted as one block; review all of it before pressing Enter.`
+          : `This suggestion is ${check.lines} lines, and this terminal has not enabled bracketed paste: every line except the last will RUN as soon as it is inserted.`,
+        { title: 'Multi-line suggestion', confirmLabel: `Insert ${check.lines} lines`, danger: !bracketed },
+      )
+      if (!ok) return
+    }
+    const reason = isDangerousCommand(body)
+    if (
+      reason &&
+      !(await confirm(`This suggestion looks destructive (${reason}). Insert it?`, {
+        title: 'Destructive suggestion',
+        confirmLabel: 'Insert',
+        danger: true,
+      }))
+    ) {
+      return
+    }
+    target.term.paste(body)
+    target.term.focus()
+    setInserted(true)
+    setTimeout(() => setInserted(false), 1600)
   }
 
   return (
@@ -523,7 +630,7 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
       <span className="flex border-t border-line">
         <button
           type="button"
-          onClick={insert}
+          onClick={() => void insert()}
           className="flex flex-1 items-center justify-center gap-1 py-1 text-[11px] text-accent hover:bg-accent/10"
         >
           {inserted ? <Check size={11} aria-hidden /> : <CornerDownLeft size={11} aria-hidden />}
@@ -545,13 +652,15 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
 /* -------------------------------------------------------------- settings */
 
 function SettingsForm({
-  cfg, keySaved, keyDraft, setKeyDraft, onSave, onRemoveKey,
+  cfg, error, keySaved, keyDraft, setKeyDraft, onSave, onRemoveKey,
 }: {
   cfg: AiConfig | null
+  /** Why the last load/save/remove failed, shown above Save. */
+  error: string | null
   keySaved: boolean
   keyDraft: string
   setKeyDraft: (v: string) => void
-  onSave: (cfg: AiConfig) => void
+  onSave: (cfg: AiConfig) => Promise<void>
   onRemoveKey: () => Promise<void>
 }) {
   const [draft, setDraft] = useState<AiConfig>(
@@ -600,8 +709,10 @@ function SettingsForm({
       {draft.kind === 'claude-code' && (
         <p className="rounded border border-line bg-surface-0 px-2.5 py-2 text-[11px] leading-relaxed text-ink-faint">
           Runs the <code className="font-mono">claude</code> CLI installed on
-          this machine. Auth (API key or claude.ai subscription) is handled by
-          Claude Code itself — nothing to configure here. Responses arrive in
+          this machine as a text-only model: all of its tools, MCP servers,
+          hooks and settings are switched off, in an empty working folder, and
+          a CLI too old to allow that is refused. Auth (API key or claude.ai
+          subscription) is handled by Claude Code itself. Responses arrive in
           one piece rather than streaming.
         </p>
       )}
@@ -641,7 +752,7 @@ function SettingsForm({
           className={inputCls}
         />
         <span className="mt-1 block text-[10.5px] text-ink-faint">
-          Stored in Windows Credential Manager, never in a file. Note: this is
+          Stored in the system credential vault, never in a file. Note: this is
           an API key (console.anthropic.com / platform.openai.com) — chat
           subscriptions (claude.ai, ChatGPT) have no third-party API. Local
           Ollama / LM Studio need no key and send nothing off this machine.
@@ -659,9 +770,15 @@ function SettingsForm({
         )}
       </label>
 
+      {error && (
+        <p role="alert" className="selectable rounded border border-alert/40 bg-alert/10 px-2.5 py-1.5 text-[11px] text-alert">
+          {error}
+        </p>
+      )}
+
       <button
         type="button"
-        onClick={() => onSave(draft)}
+        onClick={() => void onSave(draft)}
         className="w-full rounded border border-accent/60 bg-accent/15 py-1.5 text-[12.5px] font-medium text-accent hover:bg-accent/25"
       >
         Save

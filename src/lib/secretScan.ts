@@ -27,7 +27,23 @@ const RULES: { re: RegExp; reason: string }[] = [
   { re: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/, reason: 'AWS access key id' },
   { re: /\bxox[baprs]-[0-9A-Za-z-]{10,}/, reason: 'Slack token' },
   { re: /\bgh[pousr]_[0-9A-Za-z]{20,}/, reason: 'GitHub token' },
+  // Network-device config secrets: `show running-config` output is the most
+  // common context this app sends, and these forms were missed.
+  { re: /\bsecret\s+[0-9]\s+\S/i, reason: 'Cisco type-N secret (e.g. username … secret 9)' },
+  { re: /\bsnmp-server\s+community\s+\S/i, reason: 'SNMP community string' },
+  { re: /\b(pre-shared-key|key-string)\s+\S/i, reason: 'pre-shared key' },
+  { re: /\b(tacacs|radius)(-server)?\b.*\bkey\s+\S/i, reason: 'TACACS+/RADIUS shared key' },
+  { re: /<phash>[^<]+<\/phash>/i, reason: 'PAN-OS password hash' },
+  { re: /\bauthorization\s*:\s*(bearer|basic)\s+\S/i, reason: 'HTTP Authorization header' },
+  { re: /\bbearer\s+[A-Za-z0-9._~+/-]{20,}/i, reason: 'bearer token' },
+  { re: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/, reason: 'JWT' },
 ]
+
+/* A private key whose BEGIN line scrolled out of the 4 KB tail still leaves
+   its body: runs of full-width base64 lines. Three in a row is far beyond
+   what ordinary output produces by accident. */
+const KEY_BODY_LINE = /^[A-Za-z0-9+/]{60,76}={0,2}$/
+const KEY_BODY_RUN = 3
 
 const MASK = '•'.repeat(6)
 
@@ -50,7 +66,13 @@ function maskLine(line: string): string {
 export function scanForSecrets(text: string): SecretHit[] {
   const hits: SecretHit[] = []
   const seen = new Set<string>()
+  let run = 0
   for (const line of text.split('\n')) {
+    run = KEY_BODY_LINE.test(line.trim()) ? run + 1 : 0
+    if (run === KEY_BODY_RUN) {
+      // The body itself is the secret, so show only the shape.
+      hits.push({ reason: 'private key or certificate body (base64 block)', preview: MASK })
+    }
     for (const rule of RULES) {
       if (rule.re.test(line)) {
         const key = rule.reason + '|' + line

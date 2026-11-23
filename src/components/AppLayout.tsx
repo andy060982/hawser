@@ -13,6 +13,7 @@ import { useDialogs } from '../lib/dialogs'
 import { isDangerousCommand } from '../lib/dangerous'
 import { clearLocal, emitLocal } from '../lib/localTerm'
 import { ReplyGuard } from '../lib/replyGuard'
+import { endpointKey } from '../lib/endpoint'
 import { TitleBar } from './TitleBar'
 import { HostSidebar } from './HostSidebar'
 import { ResizeHandle } from './ResizeHandle'
@@ -87,6 +88,16 @@ const SIDEBAR_MIN = 180
 const SIDEBAR_MAX = 460
 const SIDEBAR_DEFAULT = 260
 
+/** What `config_check` reports (utils::configs::ConfigCheck). */
+interface ConfigCheckResult {
+  status: 'first' | 'unchanged' | 'changed'
+  name: string | null
+  previous: string | null
+  previousModified: number | null
+  added: number
+  removed: number
+}
+
 interface Props {
   /** Seed catalogue, used only when no hosts.json exists yet. */
   hosts: HostNode[]
@@ -114,6 +125,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   /** Latest config check per session. Every (re)connect invalidates it, so a
    *  reply from before a redial — or for a closed tab — is ignored. */
   const configReplies = useRef(new ReplyGuard())
+  /** hostId → a "changed" result whose reply arrived after its tab was closed
+   *  or redialled. The backend had already saved it as the new baseline, so
+   *  dropping it lost the change for good; it is shown on the next connect. */
+  const undeliveredChangeRef = useRef(new Map<string, ConfigCheckResult>())
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -153,6 +168,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   sessionsRef.current = sessions
   const hostsRef = useRef<HostNode[]>(seedHosts)
   hostsRef.current = hosts
+  /** Endpoint identity for transcripts, AI context, snapshots and captures
+   *  (lib/endpoint), with the bastion resolved exactly as the dialer does. */
+  const endpointFor = useCallback(
+    (h: Host) => endpointKey(h, (id) => findHost(hostsRef.current, id)),
+    [],
+  )
   const { settings, ready: settingsReady } = useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
@@ -459,7 +480,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // other terminal app.
     void (host.local
       ? Promise.resolve(null)
-      : safeInvoke<string | null>('session_history', { host: host.hostname, maxBytes: 12_000 })
+      : safeInvoke<string | null>('session_history', { endpoint: endpointFor(host), maxBytes: 12_000 })
     ).then((history) => {
       if (!history) return
       emitLocal(
@@ -468,6 +489,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           `\x1b[38;5;244m${history.split('\n').join('\r\n')}\x1b[0m` +
           `\x1b[38;5;240m--- end of history ---\x1b[0m\r\n\r\n`,
       )
+    }).catch(() => {
+      // No replay is only a missing convenience; the connect proceeds.
     })
 
     // Do NOT dial yet.
@@ -487,7 +510,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     window.setTimeout(() => {
       if (pendingRef.current.has(session.id)) connectPending(session.id, 80, 24)
     }, 1500)
-  }, [nextPaneIndex, confirm])
+  }, [nextPaneIndex, confirm, endpointFor])
 
   /** "What changed since my last visit": for hosts that opt in, capture the
    *  config over a side exec channel and compare it with the newest snapshot.
@@ -496,6 +519,51 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const checkConfigOnConnect = useCallback((sessionId: string, host: Host) => {
     const command = host.configCommand?.trim()
     if (!host.checkConfigOnConnect || !command) return
+
+    const when = (epoch: number | null) => {
+      if (!epoch) return 'your last snapshot'
+      const d = new Date(epoch * 1000)
+      return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+    }
+    const note = (sid: string, text: string) => emitLocal(sid, `\x1b[38;5;244m● ${text}\x1b[0m\r\n`)
+    const dropChip = (sid: string) =>
+      setConfigChanges((m) => {
+        if (!(sid in m)) return m
+        const { [sid]: _gone, ...rest } = m
+        return rest
+      })
+    const report = (sid: string, r: ConfigCheckResult) => {
+      if (r.status === 'first') {
+        dropChip(sid)
+        note(sid, 'config baseline saved; future connects will report changes against it')
+      } else if (r.status === 'unchanged') {
+        dropChip(sid)
+        note(sid, `config unchanged since ${when(r.previousModified)}`)
+      } else if (r.name && r.previous) {
+        emitLocal(
+          sid,
+          `\x1b[38;2;242;178;92m● config changed since ${when(r.previousModified)}: ` +
+            `+${r.added} −${r.removed} lines\x1b[0m \x1b[38;5;244m(status bar → view diff)\x1b[0m\r\n`,
+        )
+        const { name, previous } = r
+        setConfigChanges((m) => ({
+          ...m,
+          [sid]: { hostId: host.id, added: r.added, removed: r.removed, previous, name },
+        }))
+      }
+    }
+
+    // A change found by a check whose tab went away is reported here, in
+    // place of a new check: one would only compare against the snapshot that
+    // change already saved and say "unchanged".
+    const missed = undeliveredChangeRef.current.get(host.id)
+    if (missed) {
+      undeliveredChangeRef.current.delete(host.id)
+      configCheckedRef.current.set(host.id, Date.now())
+      report(sessionId, missed)
+      return
+    }
+
     const last = configCheckedRef.current.get(host.id)
     if (last !== undefined && Date.now() - last < 120_000) return
     configCheckedRef.current.set(host.id, Date.now())
@@ -503,53 +571,40 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     /* Only the latest check for a tab that still exists may write anything:
        a late reply must not print into (or badge) a closed or redialled tab. */
     const current = () => latest() && sessionsRef.current.some((s) => s.id === sessionId)
-    const dropChip = () =>
-      setConfigChanges((m) => {
-        if (!(sessionId in m)) return m
-        const { [sessionId]: _gone, ...rest } = m
-        return rest
-      })
 
-    const note = (text: string) => emitLocal(sessionId, `\x1b[38;5;244m● ${text}\x1b[0m\r\n`)
-    const when = (epoch: number | null) => {
-      if (!epoch) return 'your last snapshot'
-      const d = new Date(epoch * 1000)
-      return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
-    }
-    void safeInvoke<{
-      status: 'first' | 'unchanged' | 'changed'
-      name: string | null
-      previous: string | null
-      previousModified: number | null
-      added: number
-      removed: number
-    }>('config_check', { sessionId, host: host.hostname, command })
+    void safeInvoke<ConfigCheckResult>('config_check', {
+      sessionId,
+      endpoint: endpointFor(host),
+      host: host.hostname,
+      command,
+    })
       .then((r) => {
-        if (!r || !current()) return
-        if (r.status === 'first') {
-          dropChip()
-          note('config baseline saved; future connects will report changes against it')
-        } else if (r.status === 'unchanged') {
-          dropChip()
-          note(`config unchanged since ${when(r.previousModified)}`)
-        } else if (r.name && r.previous) {
-          emitLocal(
-            sessionId,
-            `\x1b[38;2;242;178;92m● config changed since ${when(r.previousModified)}: ` +
-              `+${r.added} −${r.removed} lines\x1b[0m \x1b[38;5;244m(status bar → view diff)\x1b[0m\r\n`,
-          )
-          const { name, previous } = r
-          setConfigChanges((m) => ({
-            ...m,
-            [sessionId]: { hostId: host.id, added: r.added, removed: r.removed, previous, name },
-          }))
+        if (!r) return
+        if (!current()) {
+          // Its tab closed or redialled before it landed. A change was already
+          // saved as the new baseline, so it must still reach the user: in a
+          // tab to this host that is already connected again, or else on the
+          // next connect. Anything else is simply re-checked next time
+          // instead of being throttled.
+          if (r.status === 'changed') {
+            const live = sessionsRef.current.find((s) => s.hostId === host.id && s.status === 'connected')
+            if (live) report(live.id, r)
+            else undeliveredChangeRef.current.set(host.id, r)
+          } else {
+            configCheckedRef.current.delete(host.id)
+          }
+          return
         }
+        report(sessionId, r)
       })
       .catch((e: unknown) => {
-        if (!current()) return
-        note(`config check failed: ${e instanceof Error ? e.message : String(e)}`)
+        if (!current()) {
+          configCheckedRef.current.delete(host.id)
+          return
+        }
+        note(sessionId, `config check failed: ${e instanceof Error ? e.message : String(e)}`)
       })
-  }, [])
+  }, [endpointFor])
 
   /* Closed tabs take their config-change chip and check token with them. */
   useEffect(() => {
@@ -596,6 +651,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       auth: host.auth,
       keyPath: host.keyPath ?? null,
       oneShotPassword: oneShotPassword ?? null,
+      // Names the transcript; see lib/endpoint.
+      endpoint: endpointFor(host),
       // ProxyJump: resolve the bastion's connection details from the
       // catalogue at dial time, so editing the bastion updates every host
       // that rides it. Self-reference and missing hosts degrade to direct.
@@ -645,7 +702,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         const msg = e instanceof Error ? e.message : String(e)
         emitLocal(sessionId, `\r\n\x1b[38;2;185;139;250m● connection failed\x1b[0m\r\n${msg}\r\n`)
       })
-  }, [checkConfigOnConnect])
+  }, [checkConfigOnConnect, endpointFor])
 
   /** Re-dial a dropped or dormant session, reusing its id so the terminal pane,
    *  scrollback, group, and pane number are all preserved — the pane never
@@ -1118,6 +1175,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           if (!command || !host) return
           void safeInvoke<{ path: string; bytes: number; lines: number }>('capture_output', {
             sessionId,
+            endpoint: endpointFor(host),
             host: host.name,
             command,
           })
@@ -1130,7 +1188,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       { label: 'Close tab', danger: true, dividerBefore: true, onSelect: () => closeSession(sessionId) },
     ]
     setMenu({ x, y, items })
-  }, [reconnectSession, splitSession, closeSession, lookupHost])
+  }, [reconnectSession, splitSession, closeSession, lookupHost, endpointFor])
 
   /** Right-click on a folder row in the sidebar. */
   const openFolderMenu = useCallback((folderId: string, name: string, x: number, y: number) => {
@@ -1562,6 +1620,10 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
           <AiPanel
             session={active}
             host={active ? lookupHost(active.hostId) : undefined}
+            endpoint={(() => {
+              const h = active ? lookupHost(active.hostId) : undefined
+              return h ? endpointFor(h) : undefined
+            })()}
             effectiveColor={activeColor}
             onClose={() => setShowAi(false)}
           />
@@ -1642,6 +1704,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       {configFor && (
         <ConfigHistoryDialog
           host={configFor}
+          endpoint={endpointFor(configFor)}
           liveSessionId={
             sessions.find(
               (t) => t.hostId === configFor.id && t.status === 'connected',

@@ -6,8 +6,27 @@ import { foldMatches } from '../lib/foldMatch'
 interface LogEntry {
   name: string
   host: string
+  /** Recorded before transcripts were keyed per host entry: viewable here,
+   *  never replayed or given to the assistant. */
+  legacy: boolean
   started: number | null
   bytes: number
+}
+
+/** One window of a transcript (utils::session_log::LogPage). */
+interface LogPage {
+  text: string
+  start: number
+  end: number
+  total: number
+  firstLine: number
+}
+
+/** Lines in a page's text (it always ends on a line boundary, or at EOF). */
+const lineCount = (text: string) => {
+  let n = 0
+  for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) n++
+  return text.endsWith('\n') || text === '' ? n : n + 1
 }
 
 const fmtBytes = (n: number) => {
@@ -73,18 +92,34 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
   const [logs, setLogs] = useState<LogEntry[] | null>(null)
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<string | null>(null)
-  const [content, setContent] = useState<string>('')
+  /* The loaded part of the open transcript. Transcripts can reach 50 MB, so
+     the backend serves pages and the viewer grows them on request instead of
+     taking the whole file as one string. */
+  const [page, setPage] = useState<LogPage | null>(null)
+  const [readError, setReadError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [listError, setListError] = useState<string | null>(null)
   const [mode, setMode] = useState<'hosts' | 'contents'>('hosts')
   const [result, setResult] = useState<SearchResult | null>(null)
   const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
   /* Line to scroll to and highlight in the open transcript (from a search hit). */
   const [target, setTarget] = useState<{ line: number; q: string } | null>(null)
   const markRef = useRef<HTMLElement>(null)
 
   useEffect(() => {
-    void safeInvoke<LogEntry[]>('logs_list').then((l) => setLogs(l ?? []))
+    void safeInvoke<LogEntry[]>('logs_list')
+      .then((l) => setLogs(l ?? []))
+      .catch((e: unknown) => {
+        setLogs([])
+        setListError(e instanceof Error ? e.message : String(e))
+      })
   }, [])
+
+  /* A search still scanning when the window closes would otherwise run to
+     completion on the backend for nothing. */
+  useEffect(() => () => void safeInvoke('logs_search_cancel').catch(() => {}), [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
@@ -99,23 +134,51 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
 
   const open = (name: string, at: { line: number; q: string } | null = null) => {
     setTarget(at)
-    if (name === selected && !loading) return
-    latest.current = name
+    // Already showing that line (or, with no target, that transcript).
+    if (name === selected && !loading && page) {
+      const last = page.firstLine + lineCount(page.text) - 1
+      if (!at || (at.line >= page.firstLine && at.line <= last)) return
+    }
+    const token = `${name}:${at?.line ?? 'tail'}`
+    latest.current = token
     setSelected(name)
     setLoading(true)
-    setContent('')
-    void safeInvoke<string>('log_read', { name })
-      .then((c) => {
-        if (latest.current === name) setContent(c ?? '')
+    setPage(null)
+    setReadError(null)
+    void safeInvoke<LogPage>('log_read', at ? { name, line: at.line } : { name })
+      .then((p) => {
+        if (latest.current === token) setPage(p ?? null)
       })
       .catch((e) => {
-        if (latest.current === name) {
-          setContent(`Could not read ${name}: ${e instanceof Error ? e.message : e}`)
+        if (latest.current === token) {
+          setReadError(`Could not read ${name}: ${e instanceof Error ? e.message : e}`)
         }
       })
       .finally(() => {
-        if (latest.current === name) setLoading(false)
+        if (latest.current === token) setLoading(false)
       })
+  }
+
+  /** Grow the loaded window by one page before or after it. */
+  const loadMore = (dir: 'before' | 'after') => {
+    if (!selected || !page || loadingMore) return
+    const token = latest.current
+    const name = selected
+    setLoadingMore(true)
+    void safeInvoke<LogPage>('log_read', dir === 'before' ? { name, before: page.start } : { name, after: page.end })
+      .then((p) => {
+        if (!p || latest.current !== token) return
+        setPage((cur) => {
+          if (!cur) return cur
+          return dir === 'before'
+            ? { ...cur, text: p.text + cur.text, start: p.start, firstLine: p.firstLine, total: p.total }
+            : { ...cur, text: cur.text + p.text, end: p.end, total: p.total }
+        })
+      })
+      .catch((e) => {
+        if (latest.current === token) setReadError(`Could not read more: ${e instanceof Error ? e.message : e}`)
+      })
+      .finally(() => setLoadingMore(false))
   }
 
   /* Contents search: debounced, and only the newest query's answer is kept. */
@@ -127,13 +190,23 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
     if (q.length < 2) {
       setResult(null)
       setSearching(false)
+      void safeInvoke('logs_search_cancel').catch(() => {})
       return
     }
     setSearching(true)
+    setSearchError(null)
+    // Each new search supersedes the previous one on the backend too, so a
+    // burst of typing does not leave full scans running in parallel.
     const t = window.setTimeout(() => {
       void safeInvoke<SearchResult>('logs_search', { query: q, limit: 300 })
         .then((r) => {
           if (searchSeq.current === seq) setResult(r ?? null)
+        })
+        .catch((e: unknown) => {
+          if (searchSeq.current === seq) {
+            setResult(null)
+            setSearchError(e instanceof Error ? e.message : String(e))
+          }
         })
         .finally(() => {
           if (searchSeq.current === seq) setSearching(false)
@@ -155,10 +228,14 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
 
   /* The open transcript split around the target line, so only that one line
      needs a wrapper to scroll to and highlight. */
+  const content = page?.text ?? ''
   const split = useMemo(() => {
-    if (!target) return null
+    if (!target || !page) return null
+    // Search hits carry absolute line numbers; the page starts at firstLine.
+    const rel = target.line - page.firstLine + 1
+    if (rel < 1) return null
     let start = 0
-    for (let n = 1; n < target.line; n++) {
+    for (let n = 1; n < rel; n++) {
       const nl = content.indexOf('\n', start)
       if (nl === -1) return null
       start = nl + 1
@@ -166,7 +243,7 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
     const end = content.indexOf('\n', start)
     const stop = end === -1 ? content.length : end
     return { before: content.slice(0, start), line: content.slice(start, stop), after: content.slice(stop) }
-  }, [content, target])
+  }, [content, page, target])
 
   useEffect(() => {
     if (split) markRef.current?.scrollIntoView({ block: 'center' })
@@ -244,6 +321,8 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
                   <p className="px-3 py-6 text-center text-[12px] text-ink-faint">
                     Search every recorded session for a command, an output line, or an error message.
                   </p>
+                ) : searchError ? (
+                  <p className="px-3 py-6 text-center text-[12px] text-alert">Search failed: {searchError}</p>
                 ) : searching && !result ? (
                   <p className="px-3 py-6 text-center text-[12px] text-ink-faint">Searching…</p>
                 ) : !result || result.hits.length === 0 ? (
@@ -287,6 +366,10 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
                 )
               ) : logs === null ? (
                 <p className="px-3 py-6 text-center text-[12px] text-ink-faint">Loading…</p>
+              ) : listError ? (
+                <p className="px-3 py-6 text-center text-[12px] text-alert">
+                  Could not list sessions: {listError}
+                </p>
               ) : filtered.length === 0 ? (
                 <p className="px-3 py-6 text-center text-[12px] text-ink-faint">
                   {logs.length === 0 ? 'No sessions recorded yet.' : 'No hosts match.'}
@@ -306,6 +389,14 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
                       <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">
                         {l.host}
                       </span>
+                      {l.legacy && (
+                        <span
+                          title="Recorded before transcripts were kept per host entry, so it may come from any entry with this hostname. It is never replayed or sent to the assistant."
+                          className="shrink-0 rounded-sm border border-line px-1 text-[9.5px] uppercase tracking-wider text-ink-faint"
+                        >
+                          legacy
+                        </span>
+                      )}
                       <span className="shrink-0 text-[10.5px] tabular-nums text-ink-faint">
                         {fmtBytes(l.bytes)}
                       </span>
@@ -324,20 +415,47 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
             {selected ? (
               loading ? (
                 <p className="p-4 text-[12px] text-ink-faint">Loading…</p>
+              ) : readError && !page ? (
+                <p className="selectable p-4 text-[12px] text-alert">{readError}</p>
               ) : (
-                <pre className="selectable min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-ink-dim">
-                  {split && target ? (
-                    <>
-                      {split.before}
-                      <mark ref={markRef} className="-mx-1 rounded-sm bg-surface-3 px-1 text-ink">
-                        <Highlight text={split.line} q={target.q} />
-                      </mark>
-                      {split.after}
-                    </>
-                  ) : (
-                    content
+                <div className="flex min-h-0 flex-1 flex-col">
+                  {page && page.start > 0 && (
+                    <button
+                      type="button"
+                      disabled={loadingMore}
+                      onClick={() => loadMore('before')}
+                      className="shrink-0 border-b border-line py-1 text-[11px] text-accent hover:bg-surface-1 disabled:opacity-50"
+                    >
+                      Load earlier ({fmtBytes(page.start)} not shown)
+                    </button>
                   )}
-                </pre>
+                  <pre className="selectable min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[12px] leading-relaxed text-ink-dim">
+                    {split && target ? (
+                      <>
+                        {split.before}
+                        <mark ref={markRef} className="-mx-1 rounded-sm bg-surface-3 px-1 text-ink">
+                          <Highlight text={split.line} q={target.q} />
+                        </mark>
+                        {split.after}
+                      </>
+                    ) : (
+                      content
+                    )}
+                  </pre>
+                  {page && page.end < page.total && (
+                    <button
+                      type="button"
+                      disabled={loadingMore}
+                      onClick={() => loadMore('after')}
+                      className="shrink-0 border-t border-line py-1 text-[11px] text-accent hover:bg-surface-1 disabled:opacity-50"
+                    >
+                      Load later ({fmtBytes(page.total - page.end)} not shown)
+                    </button>
+                  )}
+                  {readError && page && (
+                    <p className="shrink-0 border-t border-line px-3 py-1 text-[11px] text-alert">{readError}</p>
+                  )}
+                </div>
               )
             ) : (
               <div className="flex flex-1 items-center justify-center text-[12px] text-ink-faint">

@@ -702,6 +702,8 @@ impl Registry {
         key_path: Option<&str>,
         jump: Option<JumpParams>,
         one_shot_password: Option<&str>,
+        // Endpoint identity for the transcript name (see utils::artifacts).
+        endpoint: Option<&str>,
     ) -> Result<(), SshError> {
         // A reconnect reuses the session id. Tear the previous connection down
         // first: replacing the map entry alone would leave its transport alive
@@ -727,7 +729,7 @@ impl Registry {
             r = self.connect_inner(
                 app, prompts, auth_prompts, session_id, host_id, host, port, username, cols,
                 rows, startup_commands, auth, key_path, jump, one_shot_password, ticket,
-                cancel_rx,
+                cancel_rx, endpoint,
             ) => r,
         };
         // Clear our in-flight marker, but only if it is still ours.
@@ -771,6 +773,7 @@ impl Registry {
         one_shot_password: Option<&str>,
         ticket: u64,
         cancel: watch::Receiver<()>,
+        endpoint: Option<&str>,
     ) -> Result<(), SshError> {
         // Before dialing anything, refuse to send a saved password to a
         // destination the catalogue never bound it to (both the target and any
@@ -920,7 +923,7 @@ impl Registry {
         // Transcript. Opened here rather than inside the task so a failure is
         // visible immediately, and degraded to None rather than propagated:
         // losing a log must never take down a working connection.
-        let mut log = SessionLog::create(host, username).ok();
+        let mut log = SessionLog::create_for(endpoint, host, username).ok();
         if let Some(l) = log.as_ref() {
             let _ = pump_app.emit(
                 &topic,

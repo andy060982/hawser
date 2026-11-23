@@ -36,6 +36,7 @@ async fn ssh_connect(
     key_path: Option<String>,
     jump: Option<ssh::JumpParams>,
     one_shot_password: Option<String>,
+    endpoint: Option<String>,
 ) -> CmdResult<()> {
     let result = registry
         .connect(
@@ -54,6 +55,7 @@ async fn ssh_connect(
             key_path.as_deref(),
             jump,
             one_shot_password.as_deref(),
+            endpoint.as_deref(),
         )
         .await
         .map_err(|e| e.to_string());
@@ -568,13 +570,20 @@ async fn sessions_save(list: serde_json::Value) -> CmdResult<()> {
     utils::hosts::save_sessions(&list).map_err(|e| e.to_string())
 }
 
-/// Tail of the last transcript for a host, for replay into a reconnected tab.
+/// Tail of the last transcript for an endpoint, for replay into a reconnected
+/// tab and as AI context.
 ///
-/// Host-keyed rather than session-keyed: session ids are per-connection, and the
-/// point is to bridge ACROSS connections.
+/// Endpoint-keyed rather than session-keyed: session ids are per-connection, and
+/// the point is to bridge ACROSS connections. Not hostname-keyed either: two
+/// entries sharing an address must never see each other's output.
 #[tauri::command]
-async fn session_history(host: String, max_bytes: usize) -> CmdResult<Option<String>> {
-    utils::session_log::latest_transcript(&host, max_bytes).map_err(|e| e.to_string())
+async fn session_history(endpoint: String, max_bytes: usize) -> CmdResult<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        utils::session_log::latest_transcript(&endpoint, max_bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 /// List past session transcripts (newest first) for the history browser.
@@ -596,20 +605,46 @@ async fn open_logs_folder() -> CmdResult<()> {
     Ok(())
 }
 
-/// Read one transcript by its bare filename.
+/// Read one page of a transcript by its bare filename: the newest page by
+/// default, the page around `line` (a search hit), or the page before/after a
+/// byte offset of a page already shown.
 #[tauri::command]
-async fn log_read(name: String) -> CmdResult<String> {
-    utils::session_log::read_log(&name).map_err(|e| e.to_string())
+async fn log_read(
+    name: String,
+    line: Option<u64>,
+    before: Option<u64>,
+    after: Option<u64>,
+) -> CmdResult<utils::session_log::LogPage> {
+    use utils::session_log::PageAt;
+    let at = match (line, before, after) {
+        (Some(l), _, _) => PageAt::Line(l),
+        (_, Some(b), _) => PageAt::Before(b),
+        (_, _, Some(a)) => PageAt::After(a),
+        _ => PageAt::Tail,
+    };
+    tauri::async_runtime::spawn_blocking(move || utils::session_log::read_log(&name, at))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Search every transcript for a line containing `query` (case-insensitive),
 /// newest session first. Runs on the blocking pool: it reads every log file.
+/// Starting a search supersedes any still running.
 #[tauri::command]
 async fn logs_search(query: String, limit: usize) -> CmdResult<utils::session_log::SearchResult> {
-    tauri::async_runtime::spawn_blocking(move || utils::session_log::search(&query, limit))
+    let generation = utils::session_log::begin_search();
+    tauri::async_runtime::spawn_blocking(move || utils::session_log::search(&query, limit, generation))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
+}
+
+/// Stop any running transcript search.
+#[tauri::command]
+async fn logs_search_cancel() -> CmdResult<()> {
+    utils::session_log::cancel_searches();
+    Ok(())
 }
 
 /// Most recent audit-log entries, newest first, for the Audit panel.
@@ -707,11 +742,25 @@ async fn hosts_probe(
 
 /* ---------------------------------------------------------------- configs */
 
+/// Run blocking snapshot/diff file work off the async workers.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, utils::known_hosts::KnownHostsError> + Send + 'static,
+) -> CmdResult<T> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 /// Capture a device's config over a fresh exec channel and store a snapshot.
+///
+/// `endpoint` is the connection's identity (see utils::artifacts) and keys the
+/// snapshot folder; `host` is only the readable label.
 #[tauri::command]
 async fn config_snapshot(
     registry: State<'_, Registry>,
     session_id: String,
+    endpoint: String,
     host: String,
     command: String,
 ) -> CmdResult<utils::configs::SnapshotResult> {
@@ -725,7 +774,15 @@ async fn config_snapshot(
                 .to_string(),
         );
     }
-    utils::configs::save_snapshot(&host, &output).map_err(|e| e.to_string())
+    let audited_host = host.clone();
+    let saved = blocking(move || utils::configs::save_snapshot(&endpoint, &host, &output)).await?;
+    // Like config_check: host and size only — never the command or config.
+    utils::audit::record(
+        "config.snapshot",
+        format!("saved a config snapshot of {audited_host}"),
+        serde_json::json!({ "host": audited_host, "lines": saved.lines, "ok": true }),
+    );
+    Ok(saved)
 }
 
 /// "What changed since my last visit": capture the config over a fresh exec
@@ -735,6 +792,7 @@ async fn config_snapshot(
 async fn config_check(
     registry: State<'_, Registry>,
     session_id: String,
+    endpoint: String,
     host: String,
     command: String,
 ) -> CmdResult<utils::configs::ConfigCheck> {
@@ -749,12 +807,7 @@ async fn config_check(
         );
     }
     let audited_host = host.clone();
-    let check = tauri::async_runtime::spawn_blocking(move || {
-        utils::configs::check_snapshot(&host, &output)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    let check = blocking(move || utils::configs::check_snapshot(&endpoint, &host, &output)).await?;
     // Like capture_output: host and outcome only — never the command or config.
     utils::audit::record(
         "config.check",
@@ -765,28 +818,30 @@ async fn config_check(
 }
 
 #[tauri::command]
-async fn config_list(host: String) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
-    utils::configs::list_snapshots(&host).map_err(|e| e.to_string())
+async fn config_list(endpoint: String, host: String) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
+    blocking(move || utils::configs::list_snapshots(&endpoint, &host)).await
 }
 
 #[tauri::command]
-async fn config_diff(host: String, older: String, newer: String) -> CmdResult<String> {
-    utils::configs::diff_snapshots(&host, &older, &newer).map_err(|e| e.to_string())
+async fn config_diff(endpoint: String, host: String, older: String, newer: String) -> CmdResult<String> {
+    blocking(move || utils::configs::diff_snapshots(&endpoint, &host, &older, &newer)).await
 }
 
 #[tauri::command]
-async fn config_read(host: String, name: String) -> CmdResult<String> {
-    utils::configs::read_snapshot(&host, &name).map_err(|e| e.to_string())
+async fn config_read(endpoint: String, host: String, name: String) -> CmdResult<String> {
+    blocking(move || utils::configs::read_snapshot(&endpoint, &host, &name)).await
 }
 
 /// Run one command over a fresh hidden exec channel and save its output to a
-/// timestamped file under the host's captures folder — "log just this command's
-/// output" for a `show tech-support`-sized dump, without it scrolling past in
-/// the terminal. Same exec-capture path (and 16 MiB cap) as a config snapshot.
+/// timestamped file under the endpoint's captures folder — "log just this
+/// command's output" for a `show tech-support`-sized dump, without it scrolling
+/// past in the terminal. Same exec-capture path (and 16 MiB cap) as a config
+/// snapshot.
 #[tauri::command]
 async fn capture_output(
     registry: State<'_, Registry>,
     session_id: String,
+    endpoint: String,
     host: String,
     command: String,
 ) -> CmdResult<utils::captures::CaptureResult> {
@@ -800,7 +855,8 @@ async fn capture_output(
                 .to_string(),
         );
     }
-    let saved = utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string());
+    let label = host.clone();
+    let saved = blocking(move || utils::captures::save_capture(&endpoint, &label, &output)).await;
     if let Ok(cap) = &saved {
         // Neither the command nor its output is logged: a command line can carry
         // a token or password (`curl -H 'Authorization: …'`). Only the host and
@@ -948,8 +1004,14 @@ async fn ai_chat(
     system_context: String,
     messages: Vec<utils::ai::ChatMessage>,
 ) -> CmdResult<()> {
-    tokio::spawn(utils::ai::chat(app, run_id, cfg, profile, system_context, messages));
+    utils::ai::start(app, run_id, cfg, profile, system_context, messages);
     Ok(())
+}
+
+/// Stop a running chat; its final `done` event reports "Cancelled.".
+#[tauri::command]
+async fn ai_cancel(run_id: String) -> CmdResult<bool> {
+    Ok(utils::ai::cancel(&run_id))
 }
 
 #[tauri::command]
@@ -1159,6 +1221,7 @@ pub fn run() {
             ssh_keygen,
             ssh_copy_id,
             ai_chat,
+            ai_cancel,
             ai_key_save,
             ai_key_status,
             ai_key_delete,
@@ -1176,6 +1239,7 @@ pub fn run() {
             open_logs_folder,
             log_read,
             logs_search,
+            logs_search_cancel,
             audit_list,
             audit_verify,
             audit_archive,

@@ -23,10 +23,14 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::artifacts;
 use super::known_hosts::KnownHostsError;
+
+/// Header fragment that records the endpoint key: `(endpoint <key>)`.
+const ENDPOINT_MARK: &str = "(endpoint ";
 
 /// `%APPDATA%\hawser\logs`
 pub fn logs_dir() -> Result<PathBuf, KnownHostsError> {
@@ -72,6 +76,13 @@ fn timestamp_name(secs: u64) -> String {
     )
 }
 
+/// First line of every transcript. With an endpoint key it ends in
+/// `(endpoint <key>) ===`, which `latest_transcript` checks.
+fn header_line(username: &str, host: &str, stamp: &str, endpoint: Option<&str>) -> String {
+    let ident = endpoint.map(|e| format!(" {ENDPOINT_MARK}{e})")).unwrap_or_default();
+    format!("=== hawser session: {username}@{host} started {stamp} UTC{ident} ===")
+}
+
 /// Filesystem-safe form of a host label.
 fn slug(s: &str) -> String {
     s.chars()
@@ -95,7 +106,24 @@ pub struct SessionLog {
 impl SessionLog {
     /// Open a transcript for one session. Failure is non-fatal to the caller —
     /// losing a log must never take down a working connection.
+    ///
+    /// Without an endpoint key the file gets the legacy hostname-only name
+    /// (local shells use that, keyed `local-<profile>`). Such a transcript is
+    /// never returned by `latest_transcript`, so it is never fed to the AI or
+    /// replayed into another tab.
     pub fn create(host: &str, username: &str) -> Result<Self, KnownHostsError> {
+        Self::create_for(None, host, username)
+    }
+
+    /// Open a transcript keyed by endpoint identity (see `artifacts`): named
+    /// `<host>@<tag>_<stamp>.log`, with the full key in the header line so a
+    /// reader can confirm which connection actually wrote it.
+    pub fn create_for(
+        endpoint: Option<&str>,
+        host: &str,
+        username: &str,
+    ) -> Result<Self, KnownHostsError> {
+        let endpoint = endpoint.filter(|e| artifacts::validate_endpoint(e).is_ok());
         let dir = logs_dir()?;
         std::fs::create_dir_all(&dir).map_err(|source| KnownHostsError::Io {
             path: dir.clone(),
@@ -114,7 +142,15 @@ impl SessionLog {
         // pane, restored tabs). create_new + a numeric suffix gives each its own
         // file instead of interleaving both into one transcript with a doubled
         // size cap — same scheme as save_capture.
-        let base = format!("{}_{}", slug(host), timestamp_name(now));
+        let base = match endpoint {
+            Some(e) => format!(
+                "{}@{}_{}",
+                artifacts::safe_component(host),
+                artifacts::endpoint_tag(e),
+                timestamp_name(now)
+            ),
+            None => format!("{}_{}", slug(host), timestamp_name(now)),
+        };
         let mut path = dir.join(format!("{base}.log"));
         let mut n = 0u32;
         let mut file = loop {
@@ -144,11 +180,7 @@ impl SessionLog {
         // Belt-and-braces for platforms where the mode above does not apply.
         super::platform::restrict_perms(&path, 0o600);
 
-        let _ = writeln!(
-            file,
-            "=== hawser session: {username}@{host} started {} UTC ===",
-            timestamp_name(now)
-        );
+        let _ = writeln!(file, "{}", header_line(username, host, &timestamp_name(now), endpoint));
 
         Ok(Self {
             file,
@@ -302,157 +334,12 @@ pub(crate) fn strip_ansi(input: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (out, Vec::new())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn search_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!("hawser-search-test-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        for (name, body) in files {
-            std::fs::write(d.join(name), body).unwrap();
-        }
-        d
-    }
-
-    #[test]
-    fn search_finds_lines_case_insensitively_newest_first() {
-        let d = search_dir(&[
-            ("fw1_20260901-100000.log", "fw1# show run\nfw1# Show Interfaces\n"),
-            ("core_20261001-100000.log", "core# show interfaces status\n"),
-            ("notes.txt", "show interfaces"),
-        ]);
-        let r = search_in(&d, "SHOW INTERFACES", 50).unwrap();
-        assert_eq!(r.scanned, 2);
-        assert!(!r.truncated);
-        let got: Vec<_> = r.hits.iter().map(|h| (h.host.as_str(), h.line)).collect();
-        assert_eq!(got, [("core", 1), ("fw1", 2)]);
-        assert_eq!(r.hits[1].text, "fw1# Show Interfaces");
-    }
-
-    #[test]
-    fn search_ignores_tiny_queries_and_caps_results() {
-        let body = "match\n".repeat(100);
-        let d = search_dir(&[
-            ("a_20261001-100000.log", body.as_str()),
-            ("b_20261002-100000.log", body.as_str()),
-        ]);
-        assert!(search_in(&d, " m ", 50).unwrap().hits.is_empty());
-        let r = search_in(&d, "match", 1000).unwrap();
-        assert_eq!(r.hits.len(), 2 * HITS_PER_LOG);
-        assert!(r.truncated);
-        let r = search_in(&d, "match", 10).unwrap();
-        assert_eq!(r.hits.len(), 10);
-        assert!(r.truncated);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn search_does_not_follow_symlinks() {
-        let secret = search_dir(&[("x.txt", "needle in a private file\n")]);
-        let d = search_dir(&[]);
-        std::os::unix::fs::symlink(secret.join("x.txt"), d.join("evil_20261001-100000.log")).unwrap();
-        assert!(search_in(&d, "needle", 50).unwrap().hits.is_empty());
-    }
-
-    #[test]
-    fn match_offset_survives_case_expansion() {
-        // Each 'İ' lowercases to two chars; 300 of them would push a naive
-        // lowercase-offset window right past the match.
-        let line = format!("{}needle{}", "İ".repeat(300), "x".repeat(300));
-        let lower = line.to_lowercase();
-        let at = lower.find("needle").unwrap();
-        assert_eq!(orig_char_index(&line, at), 300);
-        assert!(snippet(&line, orig_char_index(&line, at)).contains("needle"));
-    }
-
-    #[test]
-    fn long_lines_are_windowed_around_the_match() {
-        let line = format!("{}NEEDLE{}", "é".repeat(1000), "x".repeat(1000));
-        let s = snippet(&line, 1000);
-        assert!(s.starts_with('…') && s.ends_with('…'));
-        assert!(s.contains("NEEDLE"));
-        assert!(s.chars().count() <= SNIPPET_CHARS + 2);
-    }
-
-    #[test]
-    fn strips_colour_and_keeps_text() {
-        let (out, rest) = strip_ansi(b"\x1b[1;32mhello\x1b[0m world\r\n");
-        assert_eq!(String::from_utf8_lossy(&out), "hello world\n");
-        assert!(rest.is_empty());
-    }
-
-    #[test]
-    fn carries_split_sequence_across_chunks() {
-        // Sequence cut in half by a chunk boundary.
-        let (out1, rest1) = strip_ansi(b"abc\x1b[3");
-        assert_eq!(String::from_utf8_lossy(&out1), "abc");
-        assert!(!rest1.is_empty(), "incomplete sequence is carried forward");
-
-        let mut joined = rest1;
-        joined.extend_from_slice(b"1mdef");
-        let (out2, rest2) = strip_ansi(&joined);
-        assert_eq!(String::from_utf8_lossy(&out2), "def");
-        assert!(rest2.is_empty());
-    }
-
-    #[test]
-    fn strips_osc_title_sequences() {
-        let (out, _) = strip_ansi(b"\x1b]0;my title\x07prompt$ ");
-        assert_eq!(String::from_utf8_lossy(&out), "prompt$ ");
-    }
-
-    #[test]
-    fn strips_charset_designators() {
-        let (out, rest) = strip_ansi(b"a\x1b(B\x1b[mb\x1b)0c\x1b#8d");
-        assert_eq!(String::from_utf8_lossy(&out), "abcd");
-        assert!(rest.is_empty());
-
-        // Designator split before its final byte is carried, not leaked.
-        let (out1, rest1) = strip_ansi(b"x\x1b(");
-        assert_eq!(String::from_utf8_lossy(&out1), "x");
-        let mut joined = rest1;
-        joined.extend_from_slice(b"By");
-        let (out2, _) = strip_ansi(&joined);
-        assert_eq!(String::from_utf8_lossy(&out2), "y");
-    }
-
-    #[test]
-    fn log_stem_parsing_handles_suffix_and_rejects_other_hosts() {
-        assert_eq!(
-            split_log_name("192.0.2.10_20260918-141530.log"),
-            Some(("192.0.2.10", "20260918-141530"))
-        );
-        assert_eq!(
-            split_log_name("192.0.2.10_20260918-141530.2.log"),
-            Some(("192.0.2.10", "20260918-141530"))
-        );
-        assert_eq!(split_log_name("notes.log"), None);
-
-        // "fw" must not pick up "fw_lab" transcripts, nor "2001:db8::1" those
-        // of "2001:db8::1:5".
-        assert!(is_log_for("fw_", "fw_20261030-101500.log"));
-        assert!(is_log_for("fw_", "fw_20261030-101500.3.log"));
-        assert!(!is_log_for("fw_", "fw_lab_20261030-101500.log"));
-        let p = format!("{}_", slug("2001:db8::1"));
-        assert!(!is_log_for(&p, &format!("{}_20261030-101500.log", slug("2001:db8::1:5"))));
-    }
-
-    #[test]
-    fn timestamp_is_readable_and_sorts() {
-        // 2026-09-17T12:00:00Z
-        let name = timestamp_name(1_789_646_400);
-        assert_eq!(&name[..8], "20260917");
-        assert!(timestamp_name(1_789_646_400) < timestamp_name(1_789_732_800));
-    }
-}
-
 /* -------------------------------------------------------------------------- */
 
-/// Tail of the most recent transcript for a host.
+/// Largest tail `latest_transcript` returns, whatever the caller asks for.
+const MAX_TAIL_BYTES: usize = 256 * 1024;
+
+/// Tail of the most recent transcript written for one endpoint.
 ///
 /// This is the only form of "session history" available on appliances. A Palo
 /// Alto or a switch cannot run tmux, so nothing on the remote survives the
@@ -460,30 +347,40 @@ mod tests {
 /// reconnected tab restores the one thing that actually matters there: what you
 /// ran and what it said.
 ///
-/// Returns None when the host has no prior transcript.
-pub fn latest_transcript(host: &str, max_bytes: usize) -> Result<Option<String>, KnownHostsError> {
-    let dir = match logs_dir() {
-        Ok(d) if d.exists() => d,
-        _ => return Ok(None),
-    };
+/// Keyed by endpoint identity, not hostname. Only a transcript whose filename
+/// carries this endpoint's tag AND whose header names this exact key counts, so
+/// a legacy hostname-keyed file, or one from another catalogue entry that
+/// merely shares the address, is never returned. That is what makes the AI
+/// panel's per-host policy check meaningful: the text it sends came from the
+/// connection whose policy was checked.
+///
+/// Returns None when the endpoint has no prior transcript.
+pub fn latest_transcript(endpoint: &str, max_bytes: usize) -> Result<Option<String>, KnownHostsError> {
+    artifacts::validate_endpoint(endpoint)?;
+    match logs_dir() {
+        Ok(d) if d.exists() => latest_in(&d, endpoint, max_bytes),
+        _ => Ok(None),
+    }
+}
 
-    let prefix = format!("{}_", slug(host));
-
-    // Newest by modified time rather than by filename: a clock change or a
-    // manually copied file would break lexical ordering, and picking the wrong
-    // transcript silently shows the user someone else's session.
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    let entries = std::fs::read_dir(&dir).map_err(|source| KnownHostsError::Io {
-        path: dir.clone(),
+fn latest_in(dir: &Path, endpoint: &str, max_bytes: usize) -> Result<Option<String>, KnownHostsError> {
+    let tag = artifacts::endpoint_tag(endpoint);
+    let entries = std::fs::read_dir(dir).map_err(|source| KnownHostsError::Io {
+        path: dir.to_path_buf(),
         source,
     })?;
 
+    // Newest by modified time rather than by filename: a clock change or a
+    // manually copied file would break lexical ordering.
+    let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // The rest of the name must be exactly a timestamp: slug() maps ':' and
-        // '_' to '_', so a bare prefix match lets "fw" pick up "fw_lab"'s logs
-        // (or one IPv6 address another's) and replay the wrong host's session.
-        if !is_log_for(&prefix, &name) {
+        let Some((host, _)) = split_log_name(&name) else { continue };
+        if artifacts::split_tagged(host).map(|(_, t)| t) != Some(tag.as_str()) {
+            continue;
+        }
+        // DirEntry::file_type does not follow links: only a plain file counts.
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -491,34 +388,51 @@ pub fn latest_transcript(host: &str, max_bytes: usize) -> Result<Option<String>,
             continue; // an aborted session has nothing to replay
         }
         let Ok(modified) = meta.modified() else { continue };
-        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-            newest = Some((modified, entry.path()));
-        }
+        candidates.push((modified, entry.path()));
     }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let Some((_, path)) = newest else {
-        return Ok(None);
-    };
+    let wanted = format!(" {ENDPOINT_MARK}{endpoint}) ===");
+    for (_, path) in candidates {
+        let Ok(mut file) = artifacts::open_regular(&path) else { continue };
+        if !first_line(&mut file).is_some_and(|l| l.ends_with(&wanted)) {
+            continue;
+        }
+        let tail = read_tail(&mut file, max_bytes.min(MAX_TAIL_BYTES))
+            .map_err(|source| KnownHostsError::Io { path: path.clone(), source })?;
+        return Ok(Some(tail));
+    }
+    Ok(None)
+}
 
-    let bytes = std::fs::read(&path).map_err(|source| KnownHostsError::Io {
-        path: path.clone(),
-        source,
-    })?;
+/// The header line, read from the start of the file (bounded).
+fn first_line(file: &mut File) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut head = Vec::new();
+    file.take(4096).read_to_end(&mut head).ok()?;
+    let end = head.iter().position(|&b| b == b'\n')?;
+    Some(String::from_utf8_lossy(&head[..end]).into_owned())
+}
 
-    // Take the tail, then discard the first partial line so the replay never
-    // starts mid-word.
-    let start = bytes.len().saturating_sub(max_bytes);
-    let slice = &bytes[start..];
+/// The last `max_bytes` of the file, starting at a line boundary so a replay
+/// never starts mid-word.
+fn read_tail(file: &mut File, max_bytes: usize) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64).read_to_end(&mut bytes)?;
     let slice = if start > 0 {
-        match slice.iter().position(|&b| b == b'\n') {
-            Some(i) => &slice[i + 1..],
-            None => slice,
+        match bytes.iter().position(|&b| b == b'\n') {
+            Some(i) => &bytes[i + 1..],
+            None => &bytes[..],
         }
     } else {
-        slice
+        &bytes[..]
     };
-
-    Ok(Some(String::from_utf8_lossy(slice).to_string()))
+    Ok(String::from_utf8_lossy(slice).into_owned())
 }
 
 /* -------------------------------------------------------------------------- */
@@ -575,11 +489,17 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
-    /// Bare filename, e.g. "192.0.2.10_20260918-141530.log". Also the id used
-    /// by `read_log`; never a path, so it cannot be pointed outside the dir.
+    /// Bare filename, e.g. "fw1@0123456789abcdef_20260918-141530.log". Also the
+    /// id used by `read_log`; never a path, so it cannot point outside the dir.
     pub name: String,
-    /// Host slug parsed back out of the filename for grouping in the UI.
+    /// Readable host label parsed back out of the filename for grouping.
     pub host: String,
+    /// Endpoint tag for transcripts keyed by endpoint identity.
+    pub endpoint: Option<String>,
+    /// Written before endpoint keying (hostname only): still viewable here, but
+    /// it may belong to any entry that shared the hostname, so it is never
+    /// replayed or sent to the AI.
+    pub legacy: bool,
     /// Unix epoch seconds parsed from the filename's timestamp, for sorting and
     /// display without opening the file.
     pub started: Option<u64>,
@@ -594,11 +514,10 @@ pub fn list() -> Result<Vec<LogEntry>, KnownHostsError> {
     }
 }
 
-fn list_in(dir: &std::path::Path) -> Result<Vec<LogEntry>, KnownHostsError> {
-    let dir = dir.to_path_buf();
+fn list_in(dir: &Path) -> Result<Vec<LogEntry>, KnownHostsError> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|source| KnownHostsError::Io {
-        path: dir.clone(),
+    for entry in std::fs::read_dir(dir).map_err(|source| KnownHostsError::Io {
+        path: dir.to_path_buf(),
         source,
     })? {
         let Ok(entry) = entry else { continue };
@@ -606,12 +525,16 @@ fn list_in(dir: &std::path::Path) -> Result<Vec<LogEntry>, KnownHostsError> {
         if !name.ends_with(".log") {
             continue;
         }
+        // Links and special files are never transcripts this app wrote.
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
         let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
 
-        // Filename shape is "<host>_<YYYYMMDD-HHMMSS>[.<n>].log". Split on the
-        // LAST underscore so hosts containing underscores (slugged dots, etc.)
-        // keep their name intact.
-        let (host, started) = match split_log_name(&name) {
+        // Filename shape is "<host>[@<tag>]_<YYYYMMDD-HHMMSS>[.<n>].log". Split
+        // on the LAST underscore so hosts containing underscores (slugged
+        // dots, etc.) keep their name intact.
+        let (raw_host, started) = match split_log_name(&name) {
             Some((h, stamp)) => (h.to_string(), parse_stamp(stamp)),
             None => {
                 let stem = name.trim_end_matches(".log");
@@ -621,24 +544,27 @@ fn list_in(dir: &std::path::Path) -> Result<Vec<LogEntry>, KnownHostsError> {
                 }
             }
         };
-        out.push(LogEntry { name, host, started, bytes });
+        let (host, endpoint) = match artifacts::split_tagged(&raw_host) {
+            Some((label, tag)) => (label.to_string(), Some(tag.to_string())),
+            None => (raw_host.clone(), None),
+        };
+        let legacy = endpoint.is_none() && !host.starts_with("local-");
+        out.push(LogEntry { name, host, endpoint, legacy, started, bytes });
     }
 
     out.sort_by(|a, b| b.started.cmp(&a.started));
     Ok(out)
 }
 
-/// Read one transcript by name. Rejects anything that is not a bare filename,
-/// so a crafted name cannot escape the logs directory or read through a link.
-pub fn read_log(name: &str) -> Result<String, KnownHostsError> {
-    // Accept only a single *normal* path component ending in .log. Parsing the
-    // name (rather than ad-hoc substring checks) rejects separators, absolute
-    // paths, Windows prefixes, "." and ".." in one shot. The explicit ':' check
-    // additionally blocks Windows drive-relative ("C:foo") and NTFS
-    // alternate-data-stream ("foo.log:evil") syntax — a colon is not a path
-    // separator, so the component parser alone would let those through.
+/// Accept only a single *normal* path component ending in .log. Parsing the
+/// name (rather than ad-hoc substring checks) rejects separators, absolute
+/// paths, Windows prefixes, "." and ".." in one shot. The explicit ':' check
+/// additionally blocks Windows drive-relative ("C:foo") and NTFS
+/// alternate-data-stream ("foo.log:evil") syntax — a colon is not a path
+/// separator, so the component parser alone would let those through.
+fn validate_log_name(name: &str) -> Result<(), KnownHostsError> {
     let single_normal = {
-        let mut comps = std::path::Path::new(name).components();
+        let mut comps = Path::new(name).components();
         matches!(
             (comps.next(), comps.next()),
             (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)
@@ -647,25 +573,152 @@ pub fn read_log(name: &str) -> Result<String, KnownHostsError> {
     if !single_normal || name.contains(':') || name.contains('\0') || !name.ends_with(".log") {
         return Err(KnownHostsError::Parse(format!("invalid log name: {name}")));
     }
+    Ok(())
+}
 
-    let path = logs_dir()?.join(name);
+/// Bytes per transcript page sent to the viewer. A transcript can reach 50 MB;
+/// one IPC string of that size, rendered as one text node, froze the webview.
+pub const PAGE_BYTES: u64 = 512 * 1024;
 
-    // Never read THROUGH a symlink: a link planted at logs_dir/<name> could
-    // redirect the read to any file the process can see. A transcript is always
-    // a regular file this app wrote, so refuse a symlink outright.
-    if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        if meta.file_type().is_symlink() {
-            return Err(KnownHostsError::Parse(format!(
-                "refusing to read a symlinked log: {name}"
-            )));
+/// Which window of a transcript to read.
+#[derive(Debug, Clone, Copy)]
+pub enum PageAt {
+    /// The newest page (the default view).
+    Tail,
+    /// A page around this 1-based line (a search hit).
+    Line(u64),
+    /// The page ending at this byte offset ("load earlier").
+    Before(u64),
+    /// The page starting at this byte offset ("load later").
+    After(u64),
+}
+
+/// One window of a transcript, aligned to whole lines.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogPage {
+    pub text: String,
+    /// Byte range of `text` within the file.
+    pub start: u64,
+    pub end: u64,
+    /// File size, so the viewer knows whether there is more either side.
+    pub total: u64,
+    /// 1-based line number of the first line of `text`.
+    pub first_line: u64,
+}
+
+/// Read one page of a transcript by its bare filename. Never through a
+/// symlink, and never a FIFO or device that could block the read.
+pub fn read_log(name: &str, at: PageAt) -> Result<LogPage, KnownHostsError> {
+    read_page_in(&logs_dir()?, name, at, PAGE_BYTES)
+}
+
+fn read_page_in(dir: &Path, name: &str, at: PageAt, page: u64) -> Result<LogPage, KnownHostsError> {
+    use std::io::{Read, Seek, SeekFrom};
+    validate_log_name(name)?;
+    let path = dir.join(name);
+    let io_err = |source| KnownHostsError::Io { path: path.clone(), source };
+    let mut file = artifacts::open_regular(&path).map_err(io_err)?;
+    let total = file.metadata().map_err(io_err)?.len();
+
+    let (s, e) = match at {
+        PageAt::Tail => (total.saturating_sub(page), total),
+        PageAt::Before(b) => {
+            let b = b.min(total);
+            (b.saturating_sub(page), b)
+        }
+        PageAt::After(a) => {
+            let a = a.min(total);
+            (a, a.saturating_add(page).min(total))
+        }
+        PageAt::Line(n) => {
+            let off = line_offset(&mut file, n).map_err(io_err)?.min(total);
+            let s = off.saturating_sub(page / 4);
+            (s, s.saturating_add(page).min(total))
+        }
+    };
+
+    // Read one byte before `s` to learn whether `s` already sits on a line
+    // start; otherwise the partial first line is dropped.
+    let rs = s.saturating_sub(1);
+    file.seek(SeekFrom::Start(rs)).map_err(io_err)?;
+    let mut buf = Vec::new();
+    (&mut file).take(e - rs).read_to_end(&mut buf).map_err(io_err)?;
+
+    let mut lo = 0usize;
+    if s > 0 && !buf.is_empty() {
+        lo = 1;
+        if buf[0] != b'\n' {
+            if let Some(i) = buf[1..].iter().position(|&b| b == b'\n') {
+                lo = i + 2;
+            }
         }
     }
+    let mut hi = buf.len();
+    if e < total && lo < hi {
+        if let Some(i) = buf[lo..].iter().rposition(|&b| b == b'\n') {
+            hi = lo + i + 1;
+        }
+    }
+    // A single line longer than a page has nothing to align on; show the raw
+    // slice rather than an empty page.
+    if lo >= hi && e > s {
+        lo = usize::from(s > 0);
+        hi = buf.len();
+    }
+    let start = rs + lo as u64;
+    let end = rs + hi as u64;
+    let first_line = 1 + count_newlines(&mut file, start).map_err(io_err)?;
+    Ok(LogPage {
+        text: String::from_utf8_lossy(&buf[lo..hi]).into_owned(),
+        start,
+        end,
+        total,
+        first_line,
+    })
+}
 
-    // Lossy, like latest_transcript: strip_ansi keeps raw high bytes (Latin-1
-    // gear output, a cat'd binary) and the size cap can cut a multibyte char,
-    // so a strict UTF-8 read would make the whole transcript unviewable.
-    let bytes = std::fs::read(&path).map_err(|source| KnownHostsError::Io { path, source })?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// Byte offset where 1-based line `n` starts (the file length if it has fewer).
+fn line_offset(file: &mut File, n: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    if n <= 1 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut seen = 0u64;
+    let mut off = 0u64;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let got = file.read(&mut chunk)?;
+        if got == 0 {
+            return Ok(off);
+        }
+        for (i, &b) in chunk[..got].iter().enumerate() {
+            if b == b'\n' {
+                seen += 1;
+                if seen == n - 1 {
+                    return Ok(off + i as u64 + 1);
+                }
+            }
+        }
+        off += got as u64;
+    }
+}
+
+/// Newlines in the first `upto` bytes of the file.
+fn count_newlines(file: &mut File, upto: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = file.take(upto);
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut count = 0u64;
+    loop {
+        let got = reader.read(&mut chunk)?;
+        if got == 0 {
+            return Ok(count);
+        }
+        count += chunk[..got].iter().filter(|&&b| b == b'\n').count() as u64;
+    }
 }
 
 /* ------------------------------------------------------------------ search */
@@ -693,15 +746,36 @@ pub struct SearchResult {
     /// True when a cap cut the results short (total hits, hits per session, or
     /// an oversized transcript read only in part).
     pub truncated: bool,
+    /// A newer search (or an explicit cancel) stopped this one early.
+    pub cancelled: bool,
 }
 
 /// Most matches reported from any one transcript, so one chatty session (a
-/// `show log` dump) cannot crowd every other session out of the results.
+/// `show log` dump) cannot crowd every other session out of the results. The
+/// NEWEST matches in the file are the ones kept.
 const HITS_PER_LOG: usize = 25;
-/// Bytes read from any one transcript.
-const SEARCH_READ_CAP: u64 = 32 * 1024 * 1024;
+/// Bytes read from any one transcript. Above the 50 MB transcript cap plus
+/// its header and footer, so in practice the whole file is searched.
+const SEARCH_READ_CAP: u64 = 64 * 1024 * 1024;
+/// Bytes of one line examined; a `cat` of a binary can make one huge "line".
+const SEARCH_LINE_CAP: usize = 1024 * 1024;
 /// Characters of context kept around a match on a very long line.
 const SNIPPET_CHARS: usize = 240;
+
+/// Generation of the newest search. Typing starts a new scan every pause, and
+/// each scan can read hundreds of MB; a scan whose generation is no longer
+/// current stops at the next check instead of running to completion.
+static SEARCH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Register a new search, superseding every earlier one.
+pub fn begin_search() -> u64 {
+    SEARCH_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// Stop every running search (the history window closed, or the query was cleared).
+pub fn cancel_searches() {
+    SEARCH_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// Case-insensitive substring search across every transcript, newest session
 /// first. This is the "memory" view: "when did I last run X, and on which box?"
@@ -709,76 +783,151 @@ const SNIPPET_CHARS: usize = 240;
 /// Reads only regular `.log` files in the logs directory (never through a
 /// symlink, same rule as `read_log`). A query shorter than 2 characters returns
 /// nothing rather than every line ever recorded.
-pub fn search(query: &str, limit: usize) -> Result<SearchResult, KnownHostsError> {
+pub fn search(query: &str, limit: usize, generation: u64) -> Result<SearchResult, KnownHostsError> {
+    let stale = || SEARCH_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation;
     match logs_dir() {
-        Ok(d) if d.exists() => search_in(&d, query, limit),
-        _ => Ok(SearchResult { hits: Vec::new(), scanned: 0, truncated: false }),
+        Ok(d) if d.exists() => search_in(&d, query, limit, &stale),
+        _ => Ok(SearchResult { hits: Vec::new(), scanned: 0, truncated: false, cancelled: false }),
     }
 }
 
-fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Result<SearchResult, KnownHostsError> {
+fn search_in(
+    dir: &Path,
+    query: &str,
+    limit: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SearchResult, KnownHostsError> {
     use std::io::Read;
 
-    let needle = query.trim().to_lowercase();
-    let mut res = SearchResult { hits: Vec::new(), scanned: 0, truncated: false };
+    let needle = fold(query.trim());
+    let mut res = SearchResult { hits: Vec::new(), scanned: 0, truncated: false, cancelled: false };
     if needle.chars().count() < 2 {
         return Ok(res);
     }
     let limit = limit.clamp(1, 1000);
 
-    for log in list_in(dir)? {
+    'logs: for log in list_in(dir)? {
+        if cancelled() {
+            res.cancelled = true;
+            break;
+        }
         if res.hits.len() >= limit {
             res.truncated = true;
             break;
         }
-        let path = dir.join(&log.name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(m) if m.file_type().is_file() => {}
-            _ => continue,
-        }
-        let Ok(file) = std::fs::File::open(&path) else { continue };
-        let mut bytes = Vec::new();
-        if file.take(SEARCH_READ_CAP).read_to_end(&mut bytes).is_err() {
-            continue;
-        }
+        let Ok(file) = artifacts::open_regular(&dir.join(&log.name)) else { continue };
+        res.scanned += 1;
         if log.bytes > SEARCH_READ_CAP {
             res.truncated = true;
         }
-        res.scanned += 1;
 
-        let text = String::from_utf8_lossy(&bytes);
-        let mut in_log = 0;
-        for (i, line) in text.lines().enumerate() {
-            let lower = line.to_lowercase();
-            let Some(at) = lower.find(&needle) else { continue };
-            if in_log == HITS_PER_LOG || res.hits.len() >= limit {
-                res.truncated = true;
-                break;
+        // Streamed line by line, so memory stays bounded however big the file.
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file.take(SEARCH_READ_CAP));
+        let mut found: std::collections::VecDeque<SearchHit> = std::collections::VecDeque::new();
+        let mut raw = Vec::new();
+        let mut line_no = 0u64;
+        loop {
+            raw.clear();
+            match read_line_capped(&mut reader, &mut raw, SEARCH_LINE_CAP) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
             }
-            in_log += 1;
-            res.hits.push(SearchHit {
+            line_no += 1;
+            if line_no % 4096 == 0 && cancelled() {
+                res.cancelled = true;
+                break 'logs;
+            }
+            while matches!(raw.last(), Some(b'\n' | b'\r')) {
+                raw.pop();
+            }
+            let line = String::from_utf8_lossy(&raw);
+            let Some(at) = fold(&line).find(&needle) else { continue };
+            if found.len() == HITS_PER_LOG {
+                found.pop_front();
+                res.truncated = true;
+            }
+            found.push_back(SearchHit {
                 name: log.name.clone(),
                 host: log.host.clone(),
                 started: log.started,
-                line: (i + 1) as u64,
-                text: snippet(line, orig_char_index(line, at)),
+                line: line_no,
+                text: snippet(&line, orig_char_index(&line, at)),
             });
         }
+        let room = limit - res.hits.len();
+        if found.len() > room {
+            res.truncated = true;
+        }
+        let skip = found.len().saturating_sub(room);
+        res.hits.extend(found.into_iter().skip(skip));
     }
     Ok(res)
 }
 
-/// Char index in `line` of the character whose lowercase form starts at byte
-/// `lower_at` of `line.to_lowercase()`. Lowercasing can change length (`İ` → `i̇`
-/// is one char to two), so an offset in the lowercased text cannot be reused
-/// against the original directly.
-fn orig_char_index(line: &str, lower_at: usize) -> usize {
+/// `read_until(b'\n')` that keeps at most `cap` bytes of the line but still
+/// consumes all of it. Returns the bytes consumed (0 at end of file).
+fn read_line_capped<R: std::io::BufRead>(r: &mut R, out: &mut Vec<u8>, cap: usize) -> std::io::Result<usize> {
     let mut consumed = 0;
+    loop {
+        let buf = r.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(consumed);
+        }
+        let (used, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (buf.len(), false),
+        };
+        let keep = cap.saturating_sub(out.len()).min(used);
+        out.extend_from_slice(&buf[..keep]);
+        r.consume(used);
+        consumed += used;
+        if done {
+            return Ok(consumed);
+        }
+    }
+}
+
+/// Append the case fold of `c` to `out`. Must stay identical to
+/// `src/lib/foldMatch.ts`, which highlights what this matched:
+/// - per-character lowercase (no context, so offsets map back simply);
+/// - final sigma ς folded to σ, so `ΠΑΝΕΠΙΣ` still finds `ΠΑΝΕΠΙΣΤΗΜΙΟ` and
+///   `οδοσ` finds `οδος`;
+/// - the combining dot (U+0307) after an `i` dropped, so `İstanbul`
+///   (lowercase "i̇stanbul") is found by `istanbul` and the reverse.
+///
+/// No Unicode normalisation: std has none, and the frontend must fold the same way.
+fn fold_char(c: char, prev_i: &mut bool, out: &mut String) {
+    for l in c.to_lowercase() {
+        if l == '\u{307}' && *prev_i {
+            *prev_i = false;
+            continue;
+        }
+        let l = if l == 'ς' { 'σ' } else { l };
+        out.push(l);
+        *prev_i = l == 'i';
+    }
+}
+
+fn fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_i = false;
+    for c in s.chars() {
+        fold_char(c, &mut prev_i, &mut out);
+    }
+    out
+}
+
+/// Char index in `line` of the character whose fold starts at byte `folded_at`
+/// of `fold(line)`. Folding can change length (`İ` is two bytes, `i` one), so
+/// an offset in the folded text cannot be reused against the original.
+fn orig_char_index(line: &str, folded_at: usize) -> usize {
+    let mut out = String::new();
+    let mut prev_i = false;
     for (i, c) in line.chars().enumerate() {
-        if consumed >= lower_at {
+        if out.len() >= folded_at {
             return i;
         }
-        consumed += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+        fold_char(c, &mut prev_i, &mut out);
     }
     line.chars().count()
 }
@@ -801,9 +950,10 @@ fn snippet(line: &str, at: usize) -> String {
     out
 }
 
-/// Split "<host>_<YYYYMMDD-HHMMSS>[.<n>].log" into (host slug, stamp), where
-/// ".<n>" is the collision suffix `SessionLog::create` adds. None unless the
-/// part after the last underscore is a well-formed timestamp.
+/// Split "<host>_<YYYYMMDD-HHMMSS>[.<n>].log" into (host part, stamp), where
+/// ".<n>" is the collision suffix `SessionLog::create` adds and the host part
+/// may end in "@<tag>". None unless the part after the last underscore is a
+/// well-formed timestamp.
 fn split_log_name(name: &str) -> Option<(&str, &str)> {
     let stem = name.strip_suffix(".log")?;
     let stem = match stem.rsplit_once('.') {
@@ -815,23 +965,17 @@ fn split_log_name(name: &str) -> Option<(&str, &str)> {
     Some((host, stamp))
 }
 
-/// True when `name` is a transcript whose host slug is exactly `prefix` minus
-/// its trailing underscore — i.e. nothing but a timestamp (and optional
-/// collision suffix) follows the prefix.
-fn is_log_for(prefix: &str, name: &str) -> bool {
-    match (name.strip_prefix(prefix), split_log_name(name)) {
-        (Some(_), Some((host, _))) => host.len() + 1 == prefix.len(),
-        _ => false,
-    }
-}
-
 /// Inverse of `timestamp_name`: "YYYYMMDD-HHMMSS" back to epoch seconds.
+///
+/// Every field is range-checked and the arithmetic is checked: a filename
+/// dated before 1970 (or the 31st of February) used to cast a negative day
+/// count to u64. Only filenames are parsed here, and anything this app did not
+/// write must degrade to "no date", never to a panic (panic = abort).
 fn parse_stamp(s: &str) -> Option<u64> {
     let (date, time) = s.split_once('-')?;
     // Require exactly 8 + 6 ASCII digits. Without the digit check, a multibyte
     // char that satisfies the byte-length test (e.g. "123é456") would panic at
-    // the byte-offset slices below — and with panic=abort that kills the whole
-    // app when logs_list scans a crafted filename.
+    // the byte-offset slices below.
     if date.len() != 8
         || time.len() != 6
         || !date.bytes().all(|b| b.is_ascii_digit())
@@ -846,12 +990,330 @@ fn parse_stamp(s: &str) -> Option<u64> {
     let mi: u64 = time[2..4].parse().ok()?;
     let se: u64 = time[4..6].parse().ok()?;
 
-    // Days since epoch (Howard Hinnant's days_from_civil).
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if y < 1970 || !(1..=month_days).contains(&d) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+
+    // Days since epoch (Howard Hinnant's days_from_civil); y >= 1970 keeps
+    // every intermediate non-negative.
     let yy = if mo <= 2 { y - 1 } else { y };
-    let era = (if yy >= 0 { yy } else { yy - 399 }) / 400;
-    let yoe = (yy - era * 400) as i64;
+    let era = yy / 400;
+    let yoe = yy - era * 400;
     let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some((days as u64) * 86_400 + h * 3600 + mi * 60 + se)
+    let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
+    days.checked_mul(86_400)?.checked_add(h * 3600 + mi * 60 + se)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("hawser-search-test-{}", artifacts::random_hex(8)));
+        std::fs::create_dir_all(&d).unwrap();
+        for (name, body) in files {
+            std::fs::write(d.join(name), body).unwrap();
+        }
+        d
+    }
+
+    const NEVER: &dyn Fn() -> bool = &|| false;
+
+    #[test]
+    fn search_finds_lines_case_insensitively_newest_first() {
+        let d = search_dir(&[
+            ("fw1_20260901-100000.log", "fw1# show run\nfw1# Show Interfaces\n"),
+            ("core_20261001-100000.log", "core# show interfaces status\n"),
+            ("notes.txt", "show interfaces"),
+        ]);
+        let r = search_in(&d, "SHOW INTERFACES", 50, NEVER).unwrap();
+        assert_eq!(r.scanned, 2);
+        assert!(!r.truncated);
+        let got: Vec<_> = r.hits.iter().map(|h| (h.host.as_str(), h.line)).collect();
+        assert_eq!(got, [("core", 1), ("fw1", 2)]);
+        assert_eq!(r.hits[1].text, "fw1# Show Interfaces");
+    }
+
+    #[test]
+    fn search_ignores_tiny_queries_and_caps_results() {
+        let body = "match\n".repeat(100);
+        let d = search_dir(&[
+            ("a_20261001-100000.log", body.as_str()),
+            ("b_20261002-100000.log", body.as_str()),
+        ]);
+        assert!(search_in(&d, " m ", 50, NEVER).unwrap().hits.is_empty());
+        let r = search_in(&d, "match", 1000, NEVER).unwrap();
+        assert_eq!(r.hits.len(), 2 * HITS_PER_LOG);
+        assert!(r.truncated);
+        let r = search_in(&d, "match", 10, NEVER).unwrap();
+        assert_eq!(r.hits.len(), 10);
+        assert!(r.truncated);
+    }
+
+    #[test]
+    fn search_keeps_the_newest_hits_of_a_chatty_session() {
+        let body: String = (1..=100).map(|i| format!("match {i}\n")).collect();
+        let d = search_dir(&[("a_20261001-100000.log", body.as_str())]);
+        let r = search_in(&d, "match", 1000, NEVER).unwrap();
+        let lines: Vec<u64> = r.hits.iter().map(|h| h.line).collect();
+        assert_eq!(lines, (76..=100).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn a_superseded_search_stops_early() {
+        let d = search_dir(&[("a_20261001-100000.log", "match\n")]);
+        let r = search_in(&d, "match", 50, &|| true).unwrap();
+        assert!(r.cancelled);
+        assert!(r.hits.is_empty());
+        // The generation counter is what lib.rs wires in.
+        let g = begin_search();
+        let stale = || SEARCH_GEN.load(std::sync::atomic::Ordering::SeqCst) != g;
+        assert!(!stale());
+        cancel_searches();
+        assert!(stale());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_does_not_follow_symlinks() {
+        let secret = search_dir(&[("x.txt", "needle in a private file\n")]);
+        let d = search_dir(&[]);
+        std::os::unix::fs::symlink(secret.join("x.txt"), d.join("evil_20261001-100000.log")).unwrap();
+        assert!(search_in(&d, "needle", 50, NEVER).unwrap().hits.is_empty());
+    }
+
+    #[test]
+    fn folding_matches_turkish_dotted_i_and_greek_sigma() {
+        let d = search_dir(&[(
+            "a_20261001-100000.log",
+            "İSTANBUL office\nflight to izmir\nΠΑΝΕΠΙΣΤΗΜΙΟ\nοδος\n",
+        )]);
+        let lines = |q: &str| -> Vec<u64> {
+            search_in(&d, q, 50, NEVER).unwrap().hits.iter().map(|h| h.line).collect()
+        };
+        assert_eq!(lines("istanbul"), [1]);
+        assert_eq!(lines("İzmir"), [2]);
+        assert_eq!(lines("ΠΑΝΕΠΙΣ"), [3]);
+        assert_eq!(lines("οδοσ"), [4]);
+        assert_eq!(fold("ΟΣ"), "οσ");
+        assert_eq!(fold("İ"), "i");
+    }
+
+    #[test]
+    fn match_offset_survives_case_expansion() {
+        // Each 'İ' is two bytes but folds to one; 300 of them would push a
+        // naive folded-offset window right past the match.
+        let line = format!("{}needle{}", "İ".repeat(300), "x".repeat(300));
+        let at = fold(&line).find("needle").unwrap();
+        assert_eq!(orig_char_index(&line, at), 300);
+        assert!(snippet(&line, orig_char_index(&line, at)).contains("needle"));
+    }
+
+    #[test]
+    fn long_lines_are_windowed_around_the_match() {
+        let line = format!("{}NEEDLE{}", "é".repeat(1000), "x".repeat(1000));
+        let s = snippet(&line, 1000);
+        assert!(s.starts_with('…') && s.ends_with('…'));
+        assert!(s.contains("NEEDLE"));
+        assert!(s.chars().count() <= SNIPPET_CHARS + 2);
+    }
+
+    #[test]
+    fn strips_colour_and_keeps_text() {
+        let (out, rest) = strip_ansi(b"\x1b[1;32mhello\x1b[0m world\r\n");
+        assert_eq!(String::from_utf8_lossy(&out), "hello world\n");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn carries_split_sequence_across_chunks() {
+        // Sequence cut in half by a chunk boundary.
+        let (out1, rest1) = strip_ansi(b"abc\x1b[3");
+        assert_eq!(String::from_utf8_lossy(&out1), "abc");
+        assert!(!rest1.is_empty(), "incomplete sequence is carried forward");
+
+        let mut joined = rest1;
+        joined.extend_from_slice(b"1mdef");
+        let (out2, rest2) = strip_ansi(&joined);
+        assert_eq!(String::from_utf8_lossy(&out2), "def");
+        assert!(rest2.is_empty());
+    }
+
+    #[test]
+    fn strips_osc_title_sequences() {
+        let (out, _) = strip_ansi(b"\x1b]0;my title\x07prompt$ ");
+        assert_eq!(String::from_utf8_lossy(&out), "prompt$ ");
+    }
+
+    #[test]
+    fn strips_charset_designators() {
+        let (out, rest) = strip_ansi(b"a\x1b(B\x1b[mb\x1b)0c\x1b#8d");
+        assert_eq!(String::from_utf8_lossy(&out), "abcd");
+        assert!(rest.is_empty());
+
+        // Designator split before its final byte is carried, not leaked.
+        let (out1, rest1) = strip_ansi(b"x\x1b(");
+        assert_eq!(String::from_utf8_lossy(&out1), "x");
+        let mut joined = rest1;
+        joined.extend_from_slice(b"By");
+        let (out2, _) = strip_ansi(&joined);
+        assert_eq!(String::from_utf8_lossy(&out2), "y");
+    }
+
+    #[test]
+    fn log_names_parse_with_and_without_an_endpoint_tag() {
+        assert_eq!(
+            split_log_name("192.0.2.10_20260918-141530.log"),
+            Some(("192.0.2.10", "20260918-141530"))
+        );
+        assert_eq!(
+            split_log_name("192.0.2.10_20260918-141530.2.log"),
+            Some(("192.0.2.10", "20260918-141530"))
+        );
+        assert_eq!(split_log_name("notes.log"), None);
+        let tag = artifacts::endpoint_tag("host:h-1");
+        let name = format!("fw_lab@{tag}_20261030-101500.3.log");
+        let (host, _) = split_log_name(&name).unwrap();
+        assert_eq!(artifacts::split_tagged(host), Some(("fw_lab", tag.as_str())));
+
+        let d = search_dir(&[
+            (name.as_str(), "x\n"),
+            ("fw_lab_20261030-101500.log", "x\n"),
+            ("local-zsh_20261030-101500.log", "x\n"),
+        ]);
+        let mut got: Vec<_> = list_in(&d)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.host, e.endpoint.is_some(), e.legacy))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("fw_lab".to_string(), false, true),
+                ("fw_lab".to_string(), true, false),
+                ("local-zsh".to_string(), false, false),
+            ]
+        );
+    }
+
+    /// A transcript as `SessionLog::create_for` would write it.
+    fn transcript(endpoint: Option<&str>, host: &str, stamp: &str, body: &str) -> (String, String) {
+        let name = match endpoint {
+            Some(e) => format!("{}@{}_{stamp}.log", artifacts::safe_component(host), artifacts::endpoint_tag(e)),
+            None => format!("{}_{stamp}.log", slug(host)),
+        };
+        (name, format!("{}\n{body}", header_line("admin", host, stamp, endpoint)))
+    }
+
+    #[test]
+    fn latest_transcript_is_per_endpoint_and_never_legacy() {
+        let a = "host:prod-fw";
+        let b = "host:lab-fw|via:host:bastion-b";
+        let files = [
+            transcript(Some(a), "10.0.0.1", "20261101-090000", "prod show run\n"),
+            transcript(Some(b), "10.0.0.1", "20261101-080000", "lab output\n"),
+            // Newest of all, but hostname-keyed: must never be picked.
+            transcript(None, "10.0.0.1", "20261101-100000", "legacy output\n"),
+        ];
+        let refs: Vec<(&str, &str)> = files.iter().map(|(n, b)| (n.as_str(), b.as_str())).collect();
+        let d = search_dir(&refs);
+        let got_a = latest_in(&d, a, 4000).unwrap().unwrap();
+        assert!(got_a.contains("prod show run") && !got_a.contains("lab") && !got_a.contains("legacy"));
+        let got_b = latest_in(&d, b, 4000).unwrap().unwrap();
+        assert!(got_b.contains("lab output") && !got_b.contains("prod"));
+        assert_eq!(latest_in(&d, "host:other", 4000).unwrap(), None);
+        assert_eq!(latest_in(&d, "qc:admin@10.0.0.1:22", 4000).unwrap(), None);
+    }
+
+    #[test]
+    fn latest_transcript_checks_the_header_not_just_the_name() {
+        // Right tag in the name, but the header names another endpoint (a
+        // renamed or copied file): not this endpoint's output.
+        let a = "host:a";
+        let (name, _) = transcript(Some(a), "fw", "20261101-090000", "");
+        let (_, other_body) = transcript(Some("host:b"), "fw", "20261101-090000", "b's output\n");
+        let d = search_dir(&[(name.as_str(), other_body.as_str())]);
+        assert_eq!(latest_in(&d, a, 4000).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_transcript_skips_links() {
+        let a = "host:a";
+        let (name, body) = transcript(Some(a), "fw", "20261101-090000", "real\n");
+        let elsewhere = search_dir(&[("x.log", body.as_str())]);
+        let d = search_dir(&[]);
+        std::os::unix::fs::symlink(elsewhere.join("x.log"), d.join(&name)).unwrap();
+        assert_eq!(latest_in(&d, a, 4000).unwrap(), None);
+    }
+
+    #[test]
+    fn pages_tile_the_transcript_on_line_boundaries() {
+        let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+        let d = search_dir(&[("a_20261001-100000.log", body.as_str())]);
+        let name = "a_20261001-100000.log";
+        let check = |p: &LogPage| {
+            let first = p.text.lines().next().unwrap();
+            assert_eq!(first, format!("line{}", p.first_line), "page {p:?}");
+            assert!(p.text.ends_with('\n'));
+        };
+
+        let tail = read_page_in(&d, name, PageAt::Tail, 100).unwrap();
+        assert_eq!((tail.end, tail.total), (body.len() as u64, body.len() as u64));
+        check(&tail);
+
+        // Walking back with Before() reassembles the whole file exactly.
+        let mut text = tail.text.clone();
+        let mut start = tail.start;
+        while start > 0 {
+            let p = read_page_in(&d, name, PageAt::Before(start), 100).unwrap();
+            check(&p);
+            assert_eq!(p.end, start);
+            text = p.text + &text;
+            start = p.start;
+        }
+        assert_eq!(text, body);
+
+        let around = read_page_in(&d, name, PageAt::Line(57), 100).unwrap();
+        check(&around);
+        assert!(around.text.contains("line57\n"));
+        let next = read_page_in(&d, name, PageAt::After(around.end), 100).unwrap();
+        check(&next);
+        assert_eq!(next.start, around.end);
+
+        assert!(read_page_in(&d, "../x.log", PageAt::Tail, 100).is_err());
+    }
+
+    #[test]
+    fn timestamp_is_readable_and_sorts() {
+        // 2026-09-17T12:00:00Z
+        let name = timestamp_name(1_789_646_400);
+        assert_eq!(&name[..8], "20260917");
+        assert!(timestamp_name(1_789_646_400) < timestamp_name(1_789_732_800));
+        assert_eq!(parse_stamp(&name), Some(1_789_646_400));
+    }
+
+    #[test]
+    fn parse_stamp_rejects_impossible_dates_instead_of_wrapping() {
+        assert_eq!(parse_stamp("19691231-120000"), None); // before the epoch
+        assert_eq!(parse_stamp("00000101-000000"), None);
+        assert_eq!(parse_stamp("20260231-000000"), None);
+        assert_eq!(parse_stamp("20261301-000000"), None);
+        assert_eq!(parse_stamp("20260101-250000"), None);
+        assert_eq!(parse_stamp("20260101-006000"), None);
+        assert_eq!(parse_stamp("19700101-000000"), Some(0));
+        assert_eq!(parse_stamp("20240229-000000"), Some(1_709_164_800));
+        assert_eq!(parse_stamp("99991231-235959"), Some(253_402_300_799));
+        assert_eq!(split_log_name("lab_19691231-120000.log"), None);
+    }
 }

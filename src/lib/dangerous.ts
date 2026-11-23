@@ -30,3 +30,27 @@ export function isDangerousCommand(text: string): string | null {
   }
   return null
 }
+
+/** Whether model-written text may be typed into a terminal, and how.
+ *
+ *  - `refuse`: it holds control characters (CR, ESC, ^C, DEL, C1 controls…).
+ *    A CR is Enter, ESC starts a key sequence, ^U wipes the line; none belongs
+ *    in a suggestion, and AI output is attacker-steerable through the context.
+ *  - `multiline`: every LF is Enter to a shell or a device CLI without
+ *    bracketed paste, so every line but the last would run on insert. The
+ *    caller must confirm.
+ *  - `ok`: one line, nothing that acts before the user presses Enter. */
+export type InsertCheck =
+  | { kind: 'ok' }
+  | { kind: 'multiline'; lines: number }
+  | { kind: 'refuse'; reason: string }
+
+// Tab and LF are the only C0 characters allowed; U+2028/2029 render as line
+// breaks without looking like one.
+const CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]/
+
+export function checkInsert(text: string): InsertCheck {
+  if (CONTROL.test(text)) return { kind: 'refuse', reason: 'it contains control characters' }
+  const lines = text.split('\n').length
+  return lines > 1 ? { kind: 'multiline', lines } : { kind: 'ok' }
+}
