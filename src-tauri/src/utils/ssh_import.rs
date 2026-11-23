@@ -45,8 +45,15 @@ pub enum JumpRef {
     /// Another concrete alias of the same import, used as written.
     Alias { alias: String },
     /// An address. `user` is None when nothing (neither the hop nor the
-    /// config) named one.
-    Literal { host: String, port: u16, user: Option<String> },
+    /// config) named one. `key_path` is the IdentityFile the config gives
+    /// that hop name (as ssh would use it to log in to the jump host).
+    Literal {
+        host: String,
+        port: u16,
+        user: Option<String>,
+        #[serde(rename = "keyPath")]
+        key_path: Option<String>,
+    },
 }
 
 /// One candidate host.
@@ -60,6 +67,13 @@ pub struct ScannedHost {
     pub user: Option<String>,
     pub key_path: Option<String>,
     pub jump: Option<JumpRef>,
+    /// Jump hosts ssh would really go through (0 for a direct route). Only
+    /// a single hop maps onto Hawser; anything else sets `unsupported_route`.
+    pub jump_hops: usize,
+    /// Set when the configured route cannot be reproduced (more than one
+    /// hop, or a hop that itself needs ProxyCommand). `jump` then holds the
+    /// first hop only, and the preview leaves the host unchecked.
+    pub unsupported_route: Option<String>,
     pub warnings: Vec<String>,
     /// `file:line` of the Host line, or `PuTTY session`.
     pub origin: String,
@@ -244,8 +258,8 @@ struct Directive {
 struct Reader {
     home: PathBuf,
     canon_home: Option<PathBuf>,
-    ssh_dir: PathBuf,
-    stack: Vec<PathBuf>,
+    stack: Vec<FileKey>,
+    dir_entries_left: usize,
     files: usize,
     total: u64,
     conds: Vec<Cond>,
@@ -265,8 +279,8 @@ impl Reader {
         Reader {
             home: home.to_path_buf(),
             canon_home: std::fs::canonicalize(home).ok(),
-            ssh_dir: home.join(".ssh"),
             stack: Vec::new(),
+            dir_entries_left: MAX_DIR_ENTRIES,
             files: 0,
             total: 0,
             conds: vec![Cond::Always],
@@ -284,64 +298,73 @@ impl Reader {
         push_capped(&mut self.report.warnings, w);
     }
 
-    /// Read one file into the directive list. `top` is the file the user
-    /// chose (allowed anywhere); included files must be inside the home
-    /// directory. Errors on the top file are returned, on included files
-    /// they become warnings.
-    fn read_file(&mut self, path: &Path, cond: usize, depth: usize, top: bool) -> Result<(), String> {
+    /// Read the file the user chose (allowed anywhere; symlinks followed).
+    /// Its errors are returned.
+    fn read_top(&mut self, path: &Path) -> Result<(), String> {
         let shown = path.display().to_string();
-        let fail = |me: &mut Self, msg: String| -> Result<(), String> {
-            if top {
-                Err(msg)
-            } else {
-                me.warn(msg);
-                Ok(())
-            }
+        // No metadata() before the open: the opened handle is what is checked
+        // (a FIFO cannot block the open, see open_top).
+        let file = open_top(path).map_err(|e| format!("{shown}: {e}"))?;
+        let key = match file_key_top(&file, path) {
+            Ok(k) => k,
+            Err(e) => return Err(format!("{shown}: {e}")),
         };
+        self.read_opened(file, key, &shown, 0, 0).map_err(|e| format!("{shown}: {e}"))
+    }
+
+    /// Read one included file, already resolved by `include_paths` to a real
+    /// path inside the canonical home with no symlink in it. It is opened
+    /// without following links and must be the very file that was
+    /// validated. Errors become warnings.
+    #[allow(clippy::clone_on_copy)] // the key is a PathBuf off Unix
+    fn read_included(&mut self, inc: &Resolved, cond: usize, depth: usize) {
+        let shown = inc.path.display().to_string();
         if depth > MAX_INCLUDE_DEPTH {
-            return fail(self, format!("{shown}: Include nested more than {MAX_INCLUDE_DEPTH} levels deep, not read"));
+            return self.warn(format!("{shown}: Include nested more than {MAX_INCLUDE_DEPTH} levels deep, not read"));
         }
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(e) => return fail(self, format!("{shown}: {e}")),
+        if self.files >= MAX_FILES {
+            return self.warn(format!("{shown}: more than {MAX_FILES} config files, not read"));
+        }
+        let Some(home) = self.canon_home.clone() else {
+            return self.warn(format!("{shown}: your home folder could not be resolved, Include not followed"));
         };
+        let file = match open_included(inc, &home) {
+            Ok(f) => f,
+            Err(e) => return self.warn(format!("{shown}: {e}")),
+        };
+        if let Err(e) = self.read_opened(file, inc.key.clone(), &shown, cond, depth) {
+            self.warn(format!("{shown}: {e}"));
+        }
+    }
+
+    /// Read and parse an opened file. The handle's own metadata (fstat) is
+    /// what decides regular-file and size, never a separate path lookup.
+    fn read_opened(&mut self, file: std::fs::File, key: FileKey, shown: &str, cond: usize, depth: usize) -> Result<(), String> {
+        let meta = file.metadata().map_err(|e| e.to_string())?;
         // Only regular files: a FIFO or a device (/dev/zero) would block or
         // never end.
         if !meta.is_file() {
-            return fail(self, format!("{shown}: not a regular file, not read"));
+            return Err("not a regular file, not read".to_string());
         }
         if meta.len() > MAX_FILE_BYTES {
-            return fail(self, format!("{shown}: larger than {} KiB, not read", MAX_FILE_BYTES / 1024));
+            return Err(format!("larger than {} KiB, not read", MAX_FILE_BYTES / 1024));
         }
-        let canon = match std::fs::canonicalize(path) {
-            Ok(c) => c,
-            Err(e) => return fail(self, format!("{shown}: {e}")),
-        };
-        if !top {
-            let inside = self.canon_home.as_ref().map(|h| canon.starts_with(h)).unwrap_or(false);
-            if !inside {
-                return fail(self, format!("{shown}: outside your home folder, Include not followed"));
-            }
-        }
-        if self.stack.contains(&canon) {
-            return fail(self, format!("{shown}: Include cycle, not read again"));
+        if self.stack.contains(&key) {
+            return Err("Include cycle, not read again".to_string());
         }
         if self.files >= MAX_FILES {
-            return fail(self, format!("{shown}: more than {MAX_FILES} config files, not read"));
+            return Err(format!("more than {MAX_FILES} config files, not read"));
         }
         let mut buf = Vec::new();
-        let read = std::fs::File::open(path).and_then(|f| f.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf));
-        if let Err(e) = read {
-            return fail(self, format!("{shown}: {e}"));
-        }
+        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
         if buf.len() as u64 > MAX_FILE_BYTES {
-            return fail(self, format!("{shown}: larger than {} KiB, not read", MAX_FILE_BYTES / 1024));
+            return Err(format!("larger than {} KiB, not read", MAX_FILE_BYTES / 1024));
         }
         if self.total + buf.len() as u64 > MAX_TOTAL_BYTES {
-            return fail(self, format!("{shown}: config files exceed {} MiB together, not read", MAX_TOTAL_BYTES / 1024 / 1024));
+            return Err(format!("config files exceed {} MiB together, not read", MAX_TOTAL_BYTES / 1024 / 1024));
         }
         if buf.contains(&0) {
-            return fail(self, format!("{shown}: looks like a binary file, not read"));
+            return Err("looks like a binary file, not read".to_string());
         }
         self.files += 1;
         self.total += buf.len() as u64;
@@ -352,9 +375,9 @@ impl Reader {
                 String::from_utf8_lossy(e.as_bytes()).into_owned()
             }
         };
-        self.report.files_read.push(shown.clone());
-        self.stack.push(canon);
-        self.parse_text(&text, &shown, cond, depth);
+        self.report.files_read.push(shown.to_string());
+        self.stack.push(key);
+        self.parse_text(&text, shown, cond, depth);
         self.stack.pop();
         Ok(())
     }
@@ -408,13 +431,18 @@ impl Reader {
                         self.warn(format!("{origin}: Include without a file"));
                     }
                     for pat in args {
-                        let paths = self.include_paths(&pat);
+                        let paths = match self.include_paths(&pat) {
+                            Ok(p) => p,
+                            Err(why) => {
+                                self.warn(format!("{origin}: Include {pat}: {why}, not followed"));
+                                continue;
+                            }
+                        };
                         if paths.is_empty() {
                             push_capped(&mut self.report.skipped, format!("Include {pat} at {origin} matched no files"));
                         }
-                        for p in paths {
-                            // Errors on included files are warnings (Ok).
-                            let _ = self.read_file(&p, cond, depth + 1, false);
+                        for p in &paths {
+                            self.read_included(p, cond, depth + 1);
                         }
                     }
                     // `cond` is this file's own: an included file's Host lines
@@ -437,63 +465,459 @@ impl Reader {
     }
 
     /// The files one Include argument names: `~` expanded, relative paths
-    /// resolved against `~/.ssh`, `*`/`?` globbed, sorted (as glob(3)).
-    fn include_paths(&self, pat: &str) -> Vec<PathBuf> {
-        let expanded = if pat == "~" {
-            self.home.clone()
-        } else if let Some(r) = pat.strip_prefix("~/").or_else(|| pat.strip_prefix("~\\")) {
-            self.home.join(r)
-        } else {
-            PathBuf::from(pat)
-        };
-        let full = if expanded.is_absolute() { expanded } else { self.ssh_dir.join(expanded) };
-        expand_glob(&full)
+    /// resolved against `~/.ssh`, `*`/`?` globbed, sorted per directory (as
+    /// glob(3)).
+    ///
+    /// Containment comes first and is lexical: the argument must name a
+    /// place under the home folder (no network path, no other drive, no
+    /// `..` above home) before anything on disk is touched. The glob is then
+    /// walked one directory at a time from the canonical home; each
+    /// component is looked at with symlink_metadata, and a symlink is
+    /// followed only when its target (read, not followed) is itself inside
+    /// home. Matches are capped while the directories are being read.
+    fn include_paths(&mut self, pat: &str) -> Result<Vec<Resolved>, String> {
+        let canon = self.canon_home.clone().ok_or("your home folder could not be resolved")?;
+        let comps = include_components(pat, &self.home, &canon)?;
+        let cap = MAX_FILES.saturating_sub(self.files);
+        let mut w = Walker { home: &canon, entries_left: self.dir_entries_left, hops_left: MAX_SYMLINK_HOPS, notes: Vec::new() };
+        let found = w.glob(&comps, cap);
+        self.dir_entries_left = w.entries_left;
+        let notes = std::mem::take(&mut w.notes);
+        for n in notes {
+            self.warn(format!("Include {pat}: {n}"));
+        }
+        Ok(found)
     }
 }
 
-/// Expand `*` and `?` in any component of a path. Names starting with `.`
-/// match only a pattern that starts with `.`, as glob(3). Sorted, capped.
-pub fn expand_glob(path: &Path) -> Vec<PathBuf> {
-    let mut current: Vec<PathBuf> = vec![PathBuf::new()];
-    for comp in path.components() {
-        let part = match comp {
-            Component::Normal(p) => p.to_string_lossy().into_owned(),
-            other => {
-                for c in current.iter_mut() {
-                    c.push(other.as_os_str());
-                }
-                continue;
-            }
-        };
-        if !part.contains(['*', '?']) {
-            for c in current.iter_mut() {
-                c.push(&part);
-            }
-            continue;
-        }
-        let mut next = Vec::new();
-        for dir in &current {
-            let Ok(rd) = std::fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }) else { continue };
-            let mut names: Vec<String> = rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| (!n.starts_with('.') || part.starts_with('.')) && glob_match(&part, n, false))
-                .collect();
-            names.sort();
-            for n in names {
-                if next.len() >= MAX_FILES {
-                    break;
-                }
-                next.push(dir.join(n));
-            }
-        }
-        current = next;
-        if current.is_empty() {
-            break;
+/// How many symlinks one Include may pass through, as the kernel's limit.
+const MAX_SYMLINK_HOPS: usize = 32;
+/// Directory entries examined by all Include globs of one scan together, so
+/// a glob over a huge directory stays bounded even when little matches.
+pub const MAX_DIR_ENTRIES: usize = 20_000;
+
+/// What identifies a file for Include cycle detection.
+#[cfg(unix)]
+type FileKey = (u64, u64);
+#[cfg(not(unix))]
+type FileKey = PathBuf;
+
+/// An Include target after validation: its real path (inside the canonical
+/// home, no symlink component) and the identity it had then.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub path: PathBuf,
+    key: FileKey,
+}
+
+/// One component of an Include path below the home folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Comp {
+    Name(std::ffi::OsString),
+    Parent,
+}
+
+/// Whether a path is a network or device path (`\\server\share`,
+/// `//server/share`, `\\?\UNC\...`, `\\.\pipe\...`). Lexical only. A local
+/// verbatim drive path (`\\?\C:\...`, what canonicalize returns on Windows)
+/// is not.
+fn is_network_path(s: &str) -> bool {
+    let b = s.replace('/', "\\");
+    let Some(rest) = b.strip_prefix("\\\\") else { return false };
+    let r = rest.as_bytes();
+    let verbatim_drive = cfg!(windows) && r.len() >= 4 && r[0] == b'?' && r[1] == b'\\' && r[2].is_ascii_alphabetic() && r[3] == b':';
+    !verbatim_drive
+}
+
+/// Path components compare: ASCII case-folded on Windows (its paths are
+/// case-insensitive), exact elsewhere.
+fn same_component(a: Component<'_>, b: Component<'_>) -> bool {
+    if cfg!(windows) {
+        a.as_os_str().to_string_lossy().eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    } else {
+        a == b
+    }
+}
+
+/// `full` below `base`, as Include components, or None when `full` is not
+/// under `base` or (below it) holds anything but names, `.` and `..`.
+fn below(full: &Path, base: &Path) -> Option<Vec<Comp>> {
+    let mut f = full.components();
+    for b in base.components() {
+        if !same_component(f.next()?, b) {
+            return None;
         }
     }
-    current.retain(|p| !p.as_os_str().is_empty() && p.exists());
-    current
+    let mut out = Vec::new();
+    for c in f {
+        match c {
+            Component::Normal(n) => out.push(Comp::Name(n.to_os_string())),
+            Component::CurDir => {}
+            Component::ParentDir => out.push(Comp::Parent),
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The components of an Include argument below the home folder. Purely
+/// lexical: no filesystem access. Err when the argument names a network
+/// path, `~user`, or anything outside home.
+fn include_components(pat: &str, home: &Path, canon_home: &Path) -> Result<Vec<Comp>, String> {
+    if is_network_path(pat) {
+        return Err("network paths are not followed".to_string());
+    }
+    let expanded = if pat == "~" {
+        home.to_path_buf()
+    } else if let Some(r) = pat.strip_prefix("~/").or_else(|| pat.strip_prefix("~\\")) {
+        home.join(r)
+    } else if pat.starts_with('~') {
+        return Err("~user is not expanded".to_string());
+    } else {
+        PathBuf::from(pat)
+    };
+    // join() replaces the base when `expanded` has a root or a prefix (an
+    // absolute path, or on Windows `\\x` / `D:x`): the result is checked as a
+    // whole below.
+    let full = if expanded.is_absolute() { expanded } else { home.join(".ssh").join(expanded) };
+    if is_network_path(&full.to_string_lossy()) {
+        return Err("network paths are not followed".to_string());
+    }
+    let comps = below(&full, canon_home)
+        .or_else(|| below(&full, home))
+        .ok_or("outside your home folder")?;
+    // `..` may not climb above home (checked again on the real path while
+    // walking, where symlink targets can add `..` too).
+    let mut depth: isize = 0;
+    for c in &comps {
+        match c {
+            Comp::Name(_) => depth += 1,
+            Comp::Parent => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("outside your home folder".to_string());
+                }
+            }
+        }
+    }
+    if depth == 0 {
+        return Err("names your home folder itself, not a file".to_string());
+    }
+    Ok(comps)
+}
+
+/// The Include glob walk. Every path it holds is real (no symlink in it)
+/// and inside `home`.
+struct Walker<'a> {
+    home: &'a Path,
+    entries_left: usize,
+    hops_left: usize,
+    notes: Vec<String>,
+}
+
+impl Walker<'_> {
+    fn note(&mut self, n: String) {
+        if self.notes.len() < 20 && !self.notes.contains(&n) {
+            self.notes.push(n);
+        }
+    }
+
+    /// `pos` with one `..` applied, or None (noted) when that leaves home.
+    fn up(&mut self, pos: &Path) -> Option<PathBuf> {
+        if pos == self.home || !pos.starts_with(self.home) {
+            self.note("outside your home folder, not followed".to_string());
+            return None;
+        }
+        pos.parent().map(Path::to_path_buf)
+    }
+
+    /// Step from the real directory `pos` into `name`, resolving a symlink
+    /// there. Returns the real path, or None when there is nothing there or
+    /// it leads out of home.
+    fn step(&mut self, pos: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+        let cand = pos.join(name);
+        let meta = std::fs::symlink_metadata(&cand).ok()?;
+        if !meta.file_type().is_symlink() {
+            return Some(cand);
+        }
+        if self.hops_left == 0 {
+            self.note("too many levels of symbolic links, not followed".to_string());
+            return None;
+        }
+        self.hops_left -= 1;
+        // The link's text is read, not followed: its target is checked
+        // lexically before anything there is touched.
+        let target = std::fs::read_link(&cand).ok()?;
+        let ts = target.to_string_lossy();
+        if is_network_path(&ts) {
+            self.note(format!("{} points at a network path, not followed", cand.display()));
+            return None;
+        }
+        let (start, comps) = if target.has_root() || target.components().any(|c| matches!(c, Component::Prefix(_))) {
+            match below(&target, self.home) {
+                Some(c) => (self.home.to_path_buf(), c),
+                None => {
+                    self.note(format!("{} points outside your home folder, not followed", cand.display()));
+                    return None;
+                }
+            }
+        } else {
+            let mut c = Vec::new();
+            for comp in target.components() {
+                match comp {
+                    Component::Normal(n) => c.push(Comp::Name(n.to_os_string())),
+                    Component::ParentDir => c.push(Comp::Parent),
+                    Component::CurDir => {}
+                    Component::Prefix(_) | Component::RootDir => return None,
+                }
+            }
+            (pos.to_path_buf(), c)
+        };
+        self.literal(start, &comps)
+    }
+
+    /// Resolve components taken literally (a symlink target: no globbing).
+    fn literal(&mut self, mut pos: PathBuf, comps: &[Comp]) -> Option<PathBuf> {
+        for c in comps {
+            pos = match c {
+                Comp::Parent => self.up(&pos)?,
+                Comp::Name(n) => self.step(&pos, n)?,
+            };
+        }
+        Some(pos)
+    }
+
+    /// Expand the Include components from home, with `*`/`?` in any name.
+    /// At most `cap` results; the cap also bounds every intermediate level
+    /// and is applied while each directory is read.
+    fn glob(&mut self, comps: &[Comp], cap: usize) -> Vec<Resolved> {
+        let mut current: Vec<PathBuf> = vec![self.home.to_path_buf()];
+        let mut capped = false;
+        for c in comps {
+            let mut next = Vec::new();
+            match c {
+                Comp::Parent => {
+                    for p in &current {
+                        if let Some(u) = self.up(p) {
+                            next.push(u);
+                        }
+                    }
+                }
+                Comp::Name(n) => {
+                    let part = n.to_string_lossy().into_owned();
+                    if !part.contains(['*', '?']) {
+                        for p in &current {
+                            if let Some(r) = self.step(p, n) {
+                                next.push(r);
+                            }
+                        }
+                    } else {
+                        'dirs: for dir in &current {
+                            if next.len() >= cap {
+                                capped = true;
+                                break;
+                            }
+                            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+                            let mut names: Vec<std::ffi::OsString> = Vec::new();
+                            for e in rd {
+                                if self.entries_left == 0 {
+                                    self.note(format!("more than {MAX_DIR_ENTRIES} directory entries examined; the rest were not"));
+                                    break;
+                                }
+                                self.entries_left -= 1;
+                                let Ok(e) = e else { continue };
+                                let fname = e.file_name();
+                                let shown = fname.to_string_lossy();
+                                if (!shown.starts_with('.') || part.starts_with('.')) && glob_match(&part, &shown, false) {
+                                    if next.len() + names.len() >= cap {
+                                        capped = true;
+                                        break;
+                                    }
+                                    names.push(fname);
+                                }
+                            }
+                            names.sort();
+                            for name in names {
+                                if let Some(r) = self.step(dir, &name) {
+                                    next.push(r);
+                                }
+                                if next.len() >= cap {
+                                    capped = true;
+                                    break 'dirs;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            current = next;
+            if current.is_empty() {
+                break;
+            }
+        }
+        if capped {
+            self.note(format!("matched more than {cap} files; the rest were not read"));
+        }
+        let mut out = Vec::new();
+        for p in current {
+            // Final identity, taken without following a link (the path is
+            // real, so this is the file itself).
+            let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            #[cfg(unix)]
+            let key = {
+                use std::os::unix::fs::MetadataExt;
+                (m.dev(), m.ino())
+            };
+            #[cfg(not(unix))]
+            let key = p.clone();
+            out.push(Resolved { path: p, key });
+        }
+        out
+    }
+}
+
+/// Open the file the user chose. Symlinks are followed (it is their pick);
+/// on Unix O_NONBLOCK keeps a FIFO from blocking the open (the handle is
+/// then refused as not a regular file).
+fn open_top(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    o.open(path)
+}
+
+fn file_key_top(file: &std::fs::File, path: &Path) -> std::io::Result<FileKey> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        let m = file.metadata()?;
+        Ok((m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        std::fs::canonicalize(path)
+    }
+}
+
+/// Open a validated Include target without following any symlink, and
+/// check (fstat) that the handle is the regular file that was validated.
+fn open_included(inc: &Resolved, home: &Path) -> Result<std::fs::File, String> {
+    let file = open_no_follow(&inc.path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file, not read".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = home;
+        if (meta.dev(), meta.ino()) != inc.key {
+            return Err("changed while it was being read, not read".to_string());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("is a link, not read".to_string());
+        }
+        match final_path(&file) {
+            Some(p) if p.starts_with(home) || below(&p, home).is_some() => {}
+            _ => return Err("outside your home folder, Include not followed".to_string()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = home;
+    Ok(file)
+}
+
+/// Unix: walk from `/` with openat, every directory O_DIRECTORY|O_NOFOLLOW
+/// and the file O_NOFOLLOW|O_NONBLOCK, so no component can be a symlink,
+/// even one swapped in after validation.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bad = || Error::new(ErrorKind::InvalidInput, "not an absolute plain path");
+    let mut it = path.components();
+    if it.next() != Some(Component::RootDir) {
+        return Err(bad());
+    }
+    let mut names = Vec::new();
+    for c in it {
+        match c {
+            Component::Normal(n) => names.push(CString::new(n.as_bytes()).map_err(|_| bad())?),
+            _ => return Err(bad()),
+        }
+    }
+    let (last, dirs) = names.split_last().ok_or_else(bad)?;
+    let open_fd = |fd: libc::c_int| -> std::io::Result<OwnedFd> {
+        if fd < 0 {
+            Err(Error::last_os_error())
+        } else {
+            // SAFETY: a fresh descriptor from open/openat that nothing else owns.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    };
+    // SAFETY: a NUL-terminated literal path.
+    let mut dir = open_fd(unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?;
+    for d in dirs {
+        // SAFETY: `dir` is an open directory and `d` a NUL-terminated name.
+        dir = open_fd(unsafe {
+            libc::openat(dir.as_raw_fd(), d.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        })?;
+    }
+    // SAFETY: as above.
+    let f = open_fd(unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            last.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    })?;
+    Ok(std::fs::File::from(f))
+}
+
+/// Windows: open the reparse point itself rather than its target, so a
+/// link swapped in at the last component is seen (and refused) instead of
+/// followed; the handle's final path is checked against home as well.
+#[cfg(windows)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// The path an open handle really refers to (`\\?\C:\...`).
+#[cfg(windows)]
+fn final_path(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: the handle is open for the call; buffer and length agree.
+    let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle() as _, buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])))
 }
 
 /* -------------------------------------------------------------- evaluation */
@@ -704,6 +1128,29 @@ fn resolve_base(conds: &[Cond], directives: &[Directive], name: &str, warnings: 
     (hostname, user, port, e)
 }
 
+/// The hops ssh goes through before it reaches jump host `name` (0 when
+/// it is dialled directly), following that host's own ProxyJump. None when
+/// it cannot be followed: a ProxyCommand, an unreadable hop or a loop.
+fn hop_route(conds: &[Cond], directives: &[Directive], name: &str, depth: usize) -> Option<usize> {
+    if depth >= 8 {
+        return None;
+    }
+    match effective(conds, directives, name).proxy {
+        None | Some(Proxy::None) => Some(0),
+        Some(Proxy::Command) => None,
+        Some(Proxy::Jump(spec)) => {
+            let hops: Vec<&str> = spec.split(',').map(str::trim).filter(|h| !h.is_empty()).collect();
+            let (_, first, _) = parse_jump_hop(hops.first()?)?;
+            // ssh ignores a ProxyJump that names the host itself (typical
+            // of a `Host *` ProxyJump that also matches the bastion).
+            if hops.len() == 1 && first.eq_ignore_ascii_case(name) {
+                return Some(0);
+            }
+            Some(hops.len() + hop_route(conds, directives, &first, depth + 1)?)
+        }
+    }
+}
+
 fn evaluate(r: &mut Reader, local_user: &str) {
     let aliases = std::mem::take(&mut r.aliases);
     let alias_set: HashSet<String> = aliases.iter().map(|(a, _)| a.to_ascii_lowercase()).collect();
@@ -742,6 +1189,8 @@ fn evaluate(r: &mut Reader, local_user: &str) {
             warnings.extend(w);
             p
         });
+        let mut jump_hops = 0usize;
+        let mut unsupported_route = None;
         let jump = match &e.proxy {
             None | Some(Proxy::None) => None,
             Some(Proxy::Command) => {
@@ -750,33 +1199,58 @@ fn evaluate(r: &mut Reader, local_user: &str) {
             }
             Some(Proxy::Jump(spec)) => {
                 let hops: Vec<&str> = spec.split(',').map(str::trim).filter(|h| !h.is_empty()).collect();
-                if hops.len() > 1 {
-                    warnings.push(format!("ProxyJump has {} hops; only the first ({}) is used", hops.len(), hops[0]));
-                }
-                match hops.first().and_then(|h| parse_jump_hop(h).map(|p| (*h, p))) {
+                match hops.first().and_then(|h| parse_jump_hop(h)) {
                     None => {
                         warnings.push(format!("ProxyJump {spec} could not be read and was not imported"));
                         None
                     }
-                    Some((_, (_, hh, _))) if hh.eq_ignore_ascii_case(&alias) => {
+                    Some((_, hh, _)) if hops.len() == 1 && hh.eq_ignore_ascii_case(&alias) => {
                         warnings.push("ProxyJump points at the host itself; ignored".to_string());
                         None
                     }
-                    Some((_, (None, hh, None))) if alias_set.contains(&hh.to_ascii_lowercase()) => {
-                        Some(JumpRef::Alias { alias: hh })
-                    }
-                    Some((_, (hu, hh, hp))) => {
-                        // Not a plain alias: resolve the hop name through the
-                        // config (as ssh does for each hop), then apply the
-                        // hop's own user/port.
-                        let mut jw = Vec::new();
-                        let (jh, ju, jp, _) = resolve_base(&r.conds, &r.directives, &hh, &mut jw);
-                        let host = if plain_value(&jh, 255) { jh } else { hh };
-                        Some(JumpRef::Literal {
-                            host,
-                            port: hp.unwrap_or(jp),
-                            user: hu.or(ju).filter(|u| plain_value(u, 255)),
-                        })
+                    Some((hu, hh, hp)) => {
+                        // What ssh really goes through: every listed hop, plus
+                        // whatever the first hop itself needs to be reached
+                        // (its own ProxyJump, as ssh evaluates it for that hop).
+                        let behind = hop_route(&r.conds, &r.directives, &hh, 0);
+                        let total = behind.map(|b| hops.len() + b);
+                        jump_hops = total.unwrap_or(hops.len() + 1);
+                        if total != Some(1) {
+                            let why = match total {
+                                Some(n) => format!("route not supported ({n} hops: {spec}{}); Hawser uses one jump host", if n > hops.len() { format!(", and {hh} has its own ProxyJump") } else { String::new() }),
+                                None => format!("route not supported (jump host {hh} needs ProxyCommand or a ProxyJump loop to be reached)"),
+                            };
+                            warnings.push(why.clone());
+                            unsupported_route = Some(why);
+                        }
+                        if hu.is_none() && hp.is_none() && alias_set.contains(&hh.to_ascii_lowercase()) {
+                            Some(JumpRef::Alias { alias: hh })
+                        } else {
+                            // Not a plain alias: resolve the hop name through the
+                            // config (as ssh does for each hop), then apply the
+                            // hop's own user/port. Its IdentityFile comes along,
+                            // so the jump host logs in as ssh would.
+                            let mut jw = Vec::new();
+                            let (jh, ju, jp, je) = resolve_base(&r.conds, &r.directives, &hh, &mut jw);
+                            let host = if plain_value(&jh, 255) { jh } else { hh.clone() };
+                            let port = hp.unwrap_or(jp);
+                            let user = hu.or(ju).filter(|u| plain_value(u, 255));
+                            let key_path = je.identity.as_ref().map(|(raw, _)| {
+                                let ctx = TokenCtx {
+                                    home: &r.home,
+                                    local_user,
+                                    hostname: &host,
+                                    alias: &hh,
+                                    user: user.as_deref().unwrap_or(local_user),
+                                    port,
+                                };
+                                let (p, w) = expand_identity(raw, &ctx);
+                                jw.extend(w);
+                                p
+                            });
+                            warnings.extend(jw.into_iter().map(|w| format!("jump host {hh}: {w}")));
+                            Some(JumpRef::Literal { host, port, user, key_path })
+                        }
                     }
                 }
             }
@@ -788,6 +1262,8 @@ fn evaluate(r: &mut Reader, local_user: &str) {
             user,
             key_path,
             jump,
+            jump_hops,
+            unsupported_route,
             warnings,
             origin,
         });
@@ -811,7 +1287,7 @@ fn finish(mut r: Reader, local_user: &str) -> ImportReport {
 /// Scan an OpenSSH client config file and everything it includes.
 pub fn scan_ssh_config(path: &Path, home: &Path, local_user: &str) -> Result<ImportReport, String> {
     let mut r = Reader::new(home);
-    r.read_file(path, 0, 0, true)?;
+    r.read_top(path)?;
     Ok(finish(r, local_user))
 }
 
@@ -946,6 +1422,8 @@ pub fn map_putty_session(s: &PuttySession) -> Result<Option<ScannedHost>, String
         user,
         key_path,
         jump: None,
+        jump_hops: 0,
+        unsupported_route: None,
         warnings,
         origin: "PuTTY session".to_string(),
     }))
@@ -1241,22 +1719,27 @@ mod tests {
         assert_eq!(host(&r, "inner").jump, Some(JumpRef::Alias { alias: "bastion".into() }));
         assert_eq!(
             host(&r, "literal").jump,
-            Some(JumpRef::Literal { host: "gw.example.com".into(), port: 2222, user: Some("ops".into()) })
+            Some(JumpRef::Literal { host: "gw.example.com".into(), port: 2222, user: Some("ops".into()), key_path: None })
         );
-        assert_eq!(host(&r, "v6").jump, Some(JumpRef::Literal { host: "2001:db8::1".into(), port: 2200, user: None }));
-        assert_eq!(host(&r, "url").jump, Some(JumpRef::Literal { host: "gw2".into(), port: 23, user: Some("u".into()) }));
+        assert_eq!(host(&r, "v6").jump, Some(JumpRef::Literal { host: "2001:db8::1".into(), port: 2200, user: None, key_path: None }));
+        assert_eq!(host(&r, "url").jump, Some(JumpRef::Literal { host: "gw2".into(), port: 23, user: Some("u".into()), key_path: None }));
         let m = host(&r, "multi");
         assert_eq!(m.jump, Some(JumpRef::Alias { alias: "bastion".into() }));
         assert!(m.warnings.iter().any(|w| w.contains("2 hops")));
+        assert_eq!(m.jump_hops, 2);
+        assert!(m.unsupported_route.as_deref().is_some_and(|w| w.contains("route not supported (2 hops")));
+        // A single hop whose own config adds nothing is supported.
+        let i = host(&r, "inner");
+        assert_eq!((i.jump_hops, i.unsupported_route.as_deref()), (1, None));
         // An alias with a user override resolves through the config.
         assert_eq!(
             host(&r, "aliasuser").jump,
-            Some(JumpRef::Literal { host: "bastion.example.com".into(), port: 22, user: Some("root".into()) })
+            Some(JumpRef::Literal { host: "bastion.example.com".into(), port: 22, user: Some("root".into()), key_path: None })
         );
         // A non-alias hop name still picks up matching pattern blocks.
         assert_eq!(
             host(&r, "corpjump").jump,
-            Some(JumpRef::Literal { host: "edge.corp".into(), port: 2201, user: Some("corpuser".into()) })
+            Some(JumpRef::Literal { host: "edge.corp".into(), port: 2201, user: Some("corpuser".into()), key_path: None })
         );
         assert_eq!(host(&r, "selfie").jump, None);
         // `none` first wins over the later Host * ProxyJump.
@@ -1483,9 +1966,17 @@ Host *
         assert_eq!(d.user.as_deref(), Some("me"));
         assert_eq!(
             d.jump,
-            Some(JumpRef::Literal { host: "bastion.example.org".into(), port: 2222, user: Some("ops".into()) })
+            Some(JumpRef::Literal {
+                host: "bastion.example.org".into(),
+                port: 2222,
+                user: Some("ops".into()),
+                key_path: Some("/home/alice/.ssh/id_ed25519".into()),
+            })
         );
         assert!(d.warnings.iter().any(|w| w.contains("2 hops")));
+        assert_eq!(d.jump_hops, 2);
+        assert!(d.unsupported_route.is_some());
+        assert_eq!(host(&r, "app-1").unsupported_route, None);
         let l = host(&r, "legacy-switch");
         assert!(l.warnings.iter().any(|w| w.contains("ProxyCommand")));
         assert!(r.skipped.iter().any(|s| s.contains("Match block")));
@@ -1581,8 +2072,243 @@ Host *
     fn report_serializes_camel_case() {
         let r = parse("Host a\n  ProxyJump u@b:2\n");
         let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v["hosts"][0]["jump"], serde_json::json!({ "kind": "literal", "host": "b", "port": 2, "user": "u" }));
+        assert_eq!(v["hosts"][0]["jump"], serde_json::json!({ "kind": "literal", "host": "b", "port": 2, "user": "u", "keyPath": null }));
+        assert_eq!(v["hosts"][0]["jumpHops"], 1);
+        assert!(v["hosts"][0]["unsupportedRoute"].is_null());
         assert!(v.get("unsupportedKeys").is_some() && v.get("localUser").is_some() && v.get("filesRead").is_some());
         assert!(v["hosts"][0].get("keyPath").is_some());
     }
+
+    /* ---------------------------------------- Include containment (P2) */
+
+    #[test]
+    fn include_paths_validated_lexically_before_any_access() {
+        // Nothing under these paths exists: every verdict is lexical.
+        let home = Path::new("/nonexistent-hawser/alice");
+        let ok = |p: &str| include_components(p, home, home);
+        for bad in [
+            "//server/share/cfg",
+            "\\\\server\\share\\cfg",
+            "\\\\?\\UNC\\server\\share\\cfg",
+            "\\\\.\\pipe\\x",
+            "/etc/ssh/ssh_config",
+            "/nonexistent-hawser/bob/.ssh/config",
+            "~/../bob/.ssh/config",
+            "../../etc/passwd",
+            "~bob/.ssh/config",
+            "~",
+            "..",
+        ] {
+            assert!(ok(bad).is_err(), "{bad} should be refused");
+        }
+        assert!(ok("//server/x").unwrap_err().contains("network"));
+        assert!(ok("/etc/ssh/ssh_config").unwrap_err().contains("outside your home"));
+        assert_eq!(
+            ok("config.d/*.conf").unwrap(),
+            vec![Comp::Name(".ssh".into()), Comp::Name("config.d".into()), Comp::Name("*.conf".into())]
+        );
+        assert_eq!(ok("~/x").unwrap(), vec![Comp::Name("x".into())]);
+        assert_eq!(ok("/nonexistent-hawser/alice/.ssh/x").unwrap().len(), 2);
+        // `..` that stays inside home is fine: ~/.ssh/../shared = ~/shared.
+        assert!(ok("../shared").is_ok());
+        assert!(is_network_path("//a/b") && is_network_path("\\\\a\\b") && !is_network_path("/a//b"));
+    }
+
+    #[test]
+    fn include_network_and_outside_paths_warned_not_read() {
+        let t = TempHome::new("net");
+        let cfg = t.write(
+            ".ssh/config",
+            "Include //fileserver/share/ssh.conf\nInclude \\\\\\\\fileserver\\\\share\\\\x.conf\nInclude /etc/ssh/ssh_config\nHost ok\n",
+        );
+        let r = scan_ssh_config(&cfg, &t.0, "alice").unwrap();
+        assert_eq!(r.hosts.len(), 1);
+        assert_eq!(r.files_read.len(), 1);
+        assert_eq!(r.warnings.iter().filter(|w| w.contains("network paths are not followed")).count(), 2, "{:?}", r.warnings);
+        assert!(r.warnings.iter().any(|w| w.contains("/etc/ssh/ssh_config") && w.contains("outside your home")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_glob_walk_checks_every_component() {
+        use std::os::unix::fs::symlink;
+        let t = TempHome::new("walk");
+        let outside = TempHome::new("walk-outside");
+        outside.write("d/evil.conf", "Host evil\n");
+        // A glob directory that is a symlink out of home: refused, its
+        // target directory never listed for matches.
+        symlink(outside.0.join("d"), t.0.join(".ssh/conf.d")).unwrap();
+        // A symlink chain that stays inside home is followed.
+        t.write("shared/real.conf", "Host shared\n");
+        symlink("../shared/real.conf", t.0.join(".ssh/rel.conf")).unwrap();
+        symlink(t.0.join(".ssh/rel.conf"), t.0.join(".ssh/abs.conf")).unwrap();
+        // A link inside a glob match that points out is refused per file.
+        t.write(".ssh/inc/a.conf", "Host a\n");
+        symlink(outside.0.join("d/evil.conf"), t.0.join(".ssh/inc/b.conf")).unwrap();
+        let cfg = t.write(".ssh/config", "Include conf.d/*\nInclude rel.conf abs.conf\nInclude inc/*.conf\nHost main\n");
+        let r = scan_ssh_config(&cfg, &t.0, "alice").unwrap();
+        let names: Vec<&str> = r.hosts.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, vec!["shared", "a", "main"], "{:?}", r.warnings);
+        assert!(r.warnings.iter().any(|w| w.contains("conf.d") && w.contains("outside your home")));
+        assert!(r.warnings.iter().any(|w| w.contains("b.conf") && w.contains("outside your home")));
+        // The real path is what was read (no symlink in it).
+        assert!(r.files_read.iter().all(|f| !f.contains("rel.conf") && !f.contains("abs.conf")));
+        assert_eq!(r.files_read.iter().filter(|f| f.ends_with("shared/real.conf")).count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_symlink_loop_is_bounded() {
+        use std::os::unix::fs::symlink;
+        let t = TempHome::new("loop");
+        symlink("b", t.0.join(".ssh/a")).unwrap();
+        symlink("a", t.0.join(".ssh/b")).unwrap();
+        let cfg = t.write(".ssh/config", "Include a\nHost ok\n");
+        let r = scan_ssh_config(&cfg, &t.0, "alice").unwrap();
+        assert_eq!(r.hosts.len(), 1);
+        assert!(r.warnings.iter().any(|w| w.contains("too many levels")));
+    }
+
+    #[test]
+    fn include_glob_cap_applies_while_enumerating() {
+        let t = TempHome::new("cap");
+        for i in 0..50 {
+            t.write(&format!(".ssh/many/f{i:02}"), "");
+        }
+        let home = t.0.clone();
+        let comps = include_components("many/*", &home, &home).unwrap();
+        let mut w = Walker { home: &home, entries_left: 1000, hops_left: MAX_SYMLINK_HOPS, notes: Vec::new() };
+        let got = w.glob(&comps, 5);
+        assert_eq!(got.len(), 5);
+        // Stopped at the first match over the cap: 6 entries examined, not 50.
+        assert_eq!(1000 - w.entries_left, 6);
+        assert!(w.notes.iter().any(|n| n.contains("more than 5")));
+        // The per-scan entry budget stops a huge directory too.
+        let mut w = Walker { home: &home, entries_left: 10, hops_left: MAX_SYMLINK_HOPS, notes: Vec::new() };
+        let got = w.glob(&comps, 1000);
+        assert_eq!(got.len(), 10);
+        assert_eq!(w.entries_left, 0);
+        assert!(w.notes.iter().any(|n| n.contains("directory entries")));
+
+        // End to end: at most MAX_FILES files per scan.
+        for i in 0..(MAX_FILES + 20) {
+            t.write(&format!(".ssh/wide/f{i:03}"), "");
+        }
+        let cfg = t.write(".ssh/config", "Include wide/*\n");
+        let r = scan_ssh_config(&cfg, &t.0, "alice").unwrap();
+        assert_eq!(r.files_read.len(), MAX_FILES);
+        assert!(r.warnings.iter().any(|w| w.contains("matched more than")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn included_file_opened_without_following_and_checked_by_fstat() {
+        use std::os::unix::fs::symlink;
+        let t = TempHome::new("nofollow");
+        let real = t.write(".ssh/real.conf", "Host real\n");
+        let other = t.write(".ssh/other.conf", "Host other\n");
+        let resolve = |p: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::symlink_metadata(p).unwrap();
+            Resolved { path: p.to_path_buf(), key: (m.dev(), m.ino()) }
+        };
+        let inc = resolve(&real);
+        assert!(open_included(&inc, &t.0).is_ok());
+        // Swapped for a symlink after validation: O_NOFOLLOW refuses it.
+        fs::remove_file(&real).unwrap();
+        symlink(&other, &real).unwrap();
+        assert!(open_included(&inc, &t.0).is_err());
+        // Swapped for another regular file: fstat identity differs.
+        fs::remove_file(&real).unwrap();
+        fs::copy(&other, &real).unwrap();
+        assert!(open_included(&inc, &t.0).unwrap_err().contains("changed"));
+        // A directory on the way swapped for a symlink: refused too.
+        let sub = t.write(".ssh/sub/x.conf", "Host x\n");
+        let inc = resolve(&sub);
+        fs::rename(t.0.join(".ssh/sub"), t.0.join(".ssh/sub-moved")).unwrap();
+        symlink(t.0.join(".ssh/sub-moved"), t.0.join(".ssh/sub")).unwrap();
+        assert!(open_no_follow(&sub).is_err());
+        assert!(open_included(&inc, &t.0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn included_fifo_does_not_block() {
+        let t = TempHome::new("fifo");
+        let fifo = t.0.join(".ssh/pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let cfg = t.write(".ssh/config", "Include pipe\nHost ok\n");
+        let r = scan_ssh_config(&cfg, &t.0, "alice").unwrap();
+        assert_eq!(r.hosts.len(), 1);
+        assert!(r.warnings.iter().any(|w| w.contains("not a regular file")));
+        // The chosen file being a FIFO does not block either.
+        assert!(scan_ssh_config(&fifo, &t.0, "alice").unwrap_err().contains("not a regular file"));
+    }
+
+    /* --------------------------------------------- routes kept honest (P2) */
+
+    #[test]
+    fn multi_hop_route_marked_unsupported() {
+        let r = parse(
+            "Host edge\n  HostName edge.example\n\
+             Host inner\n  HostName inner.example\n  ProxyJump edge\n\
+             Host twohop\n  ProxyJump edge,inner.example\n\
+             Host nested\n  ProxyJump inner\n\
+             Host viacmd\n  ProxyJump cmdhop\n\
+             Host cmdhop\n  ProxyCommand nc %h %p\n\
+             Host loopa\n  ProxyJump loopb\nHost loopb\n  ProxyJump loopa\n",
+        );
+        let t = host(&r, "twohop");
+        assert_eq!(t.jump, Some(JumpRef::Alias { alias: "edge".into() }));
+        assert_eq!(t.jump_hops, 2);
+        assert!(t.unsupported_route.as_deref().unwrap().contains("2 hops"));
+        // One hop written, but that hop has its own ProxyJump: two in total.
+        let n = host(&r, "nested");
+        assert_eq!(n.jump, Some(JumpRef::Alias { alias: "inner".into() }));
+        assert_eq!(n.jump_hops, 2);
+        assert!(n.unsupported_route.as_deref().unwrap().contains("inner has its own ProxyJump"));
+        // A hop reached through ProxyCommand, or a loop, cannot be followed.
+        assert!(host(&r, "viacmd").unsupported_route.as_deref().unwrap().contains("ProxyCommand"));
+        assert!(host(&r, "loopa").unsupported_route.is_some());
+        assert_eq!(host(&r, "inner").unsupported_route, None);
+        assert_eq!(host(&r, "edge").jump_hops, 0);
+    }
+
+    #[test]
+    fn literal_hop_through_alias_keeps_its_identity_hostname_and_port() {
+        let r = parse(
+            "Host bastion\n  HostName bastion.example.com\n  Port 2200\n  User jumper\n  IdentityFile ~/.ssh/bastion_%r\n\
+             Host app\n  ProxyJump ops@bastion\n\
+             Host app2\n  ProxyJump bastion:2222\n\
+             Host *\n  IdentityFile ~/.ssh/id_default\n",
+        );
+        assert_eq!(
+            host(&r, "app").jump,
+            Some(JumpRef::Literal {
+                host: "bastion.example.com".into(),
+                port: 2200,
+                user: Some("ops".into()),
+                // %r is the hop's user, as ssh expands it for that hop.
+                key_path: Some("/home/alice/.ssh/bastion_ops".into()),
+            })
+        );
+        assert_eq!(
+            host(&r, "app2").jump,
+            Some(JumpRef::Literal {
+                host: "bastion.example.com".into(),
+                port: 2222,
+                user: Some("jumper".into()),
+                key_path: Some("/home/alice/.ssh/bastion_jumper".into()),
+            })
+        );
+        // A literal address with no IdentityFile anywhere stays keyless.
+        let r = parse("Host app\n  ProxyJump gw.example\n");
+        assert_eq!(
+            host(&r, "app").jump,
+            Some(JumpRef::Literal { host: "gw.example".into(), port: 22, user: None, key_path: None })
+        );
+    }
+
 }

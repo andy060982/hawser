@@ -753,7 +753,7 @@ export type ImportSource = 'ssh-config' | 'putty'
 /** A scanned host's ProxyJump, as the backend reports it (ssh_import.rs). */
 export type ScannedJump =
   | { kind: 'alias'; alias: string }
-  | { kind: 'literal'; host: string; port: number; user: string | null }
+  | { kind: 'literal'; host: string; port: number; user: string | null; keyPath?: string | null }
 
 export interface ScannedHost {
   name: string
@@ -762,6 +762,11 @@ export interface ScannedHost {
   user: string | null
   keyPath: string | null
   jump: ScannedJump | null
+  /** Jump hosts ssh would really go through (0 or absent: direct). */
+  jumpHops?: number
+  /** Set when the configured route cannot be reproduced with Hawser's one
+   *  jump host: `jump` is then the first hop only. */
+  unsupportedRoute?: string | null
   warnings: string[]
   origin: string
 }
@@ -789,8 +794,15 @@ export interface ImportRow {
   /** What the jump column shows; undefined for no jump. */
   jumpLabel?: string
   warnings: string[]
-  status: 'new' | 'duplicate' | 'warning'
-  /** Whether the row starts checked: everything except duplicates. */
+  /** `route`: the ProxyJump chain is longer than one hop (unchecked; asks
+   *  before importing it with the first hop only). `blocked`: the jump host
+   *  is not in this import, so the row cannot be imported (it would
+   *  otherwise be saved as a direct route). */
+  status: 'new' | 'duplicate' | 'warning' | 'route' | 'blocked'
+  /** Why a `blocked` row cannot be imported. */
+  blockedReason?: string
+  /** Whether the row starts checked: everything except duplicates, routes
+   *  Hawser cannot follow, and blocked rows. */
   checked: boolean
 }
 
@@ -818,14 +830,19 @@ export function planImport(report: ScanReport, existing: HostNode[]): ImportRow[
   for (const h of allHosts(existing)) if (!byKey.has(hostKey(h))) byKey.set(hostKey(h), h)
   const local = report.localUser
   const rowKeys = report.hosts.map((s) => importEndpointKey(s.hostname, s.port, s.user ?? local))
-  return report.hosts.map((s, index) => {
+  const rows = report.hosts.map((s, index): ImportRow => {
     const username = s.user ?? local
     const warnings = [...s.warnings]
     if (s.user === null && !local) warnings.push('no user name; set it after importing')
     const dup = byKey.get(rowKeys[index])
     let jumpLabel: string | undefined
+    let blockedReason: string | undefined
     if (s.jump?.kind === 'alias') {
       jumpLabel = s.jump.alias
+      const target = jumpAliasRow(report.hosts, s.jump.alias)
+      if (target < 0 || target === index) {
+        blockedReason = `its jump host ${s.jump.alias} is not in this import, and importing it without one would connect directly`
+      }
     } else if (s.jump?.kind === 'literal') {
       const key = literalJumpKey(s.jump, local)
       const ex = byKey.get(key)
@@ -836,7 +853,16 @@ export function planImport(report: ScanReport, existing: HostNode[]): ImportRow[
           ? report.hosts[row].name
           : `${literalLabel(s.jump, local)} (new)`
     }
-    const status: ImportRow['status'] = dup ? 'duplicate' : warnings.length ? 'warning' : 'new'
+    const route = !!s.unsupportedRoute || (s.jumpHops ?? 0) > 1
+    const status: ImportRow['status'] = blockedReason
+      ? 'blocked'
+      : dup
+        ? 'duplicate'
+        : route
+          ? 'route'
+          : warnings.length
+            ? 'warning'
+            : 'new'
     return {
       index,
       scanned: s,
@@ -846,9 +872,85 @@ export function planImport(report: ScanReport, existing: HostNode[]): ImportRow[
       jumpLabel,
       warnings,
       status,
-      checked: !dup,
+      ...(blockedReason ? { blockedReason } : {}),
+      checked: !dup && !route && !blockedReason,
     }
   })
+  // A host riding a blocked row (that is not an existing host either) is
+  // blocked too: it could only be saved as a direct route.
+  for (let changed = true; changed; ) {
+    changed = false
+    for (const r of rows) {
+      const j = r.scanned.jump
+      if (r.status === 'blocked' || j?.kind !== 'alias') continue
+      const t = rows[jumpAliasRow(report.hosts, j.alias)]
+      if (t && t.status === 'blocked' && !t.duplicateOf) {
+        r.status = 'blocked'
+        r.blockedReason = `its jump host ${j.alias} cannot be imported (${t.blockedReason})`
+        r.checked = false
+        changed = true
+      }
+    }
+  }
+  return rows
+}
+
+/** The row of the import an alias jump names (case-insensitive, first
+ *  wins), or -1. */
+function jumpAliasRow(hosts: ScannedHost[], alias: string): number {
+  const a = alias.toLowerCase()
+  return hosts.findIndex((h) => h.name.toLowerCase() === a)
+}
+
+/** The rows an import really takes for a set of checked rows.
+ *
+ *  Blocked rows are never taken. A checked host whose jump alias is
+ *  another row of the import that is NOT checked, and that does not
+ *  duplicate an existing catalogue host, takes that row too ("added as jump
+ *  host"): saving the destination without it would silently make it a
+ *  direct connection. Transitively, so a jump host's own jump alias comes
+ *  along as well. `implied` maps each such added row to the names of the
+ *  hosts that need it. */
+export function importSelection(
+  rows: ImportRow[],
+  checked: ReadonlySet<number>,
+): { picked: Set<number>; implied: Map<number, string[]> } {
+  const byIndex = new Map(rows.map((r) => [r.index, r]))
+  const picked = new Set<number>()
+  for (const i of checked) if (byIndex.get(i) && byIndex.get(i)!.status !== 'blocked') picked.add(i)
+  const implied = new Map<number, string[]>()
+  const queue = [...picked]
+  while (queue.length) {
+    const r = byIndex.get(queue.shift()!)!
+    const j = r.scanned.jump
+    if (j?.kind !== 'alias') continue
+    const t = rows.find((x) => x.scanned.name.toLowerCase() === j.alias.toLowerCase())
+    if (!t || t.index === r.index || t.status === 'blocked') continue
+    if (picked.has(t.index) && !implied.has(t.index)) continue
+    if (!picked.has(t.index) && t.duplicateOf) continue
+    implied.set(t.index, [...(implied.get(t.index) ?? []), r.scanned.name])
+    if (!picked.has(t.index)) {
+      picked.add(t.index)
+      queue.push(t.index)
+    }
+  }
+  return { picked, implied }
+}
+
+/** Checked rows whose ProxyJump chain is longer than Hawser's one jump
+ *  host: importing them needs an explicit confirmation. */
+export function routeRowsToConfirm(rows: ImportRow[], checked: ReadonlySet<number>): ImportRow[] {
+  return rows.filter((r) => checked.has(r.index) && r.status === 'route')
+}
+
+/** The confirmation text for `routeRowsToConfirm`. */
+export function routeConfirmText(rows: ImportRow[]): string {
+  const lines = rows.slice(0, 8).map((r) => {
+    const hops = r.scanned.jumpHops ?? 0
+    return `• ${r.scanned.name}: ${hops > 1 ? `${hops} hops` : 'a route Hawser cannot follow'}; will connect via ${r.jumpLabel ?? 'the first hop'} only`
+  })
+  if (rows.length > 8) lines.push(`…and ${rows.length - 8} more`)
+  return `${rows.length === 1 ? 'This host uses' : 'These hosts use'} a ProxyJump route Hawser cannot reproduce (it supports one jump host). If imported, ${rows.length === 1 ? 'it' : 'each'} will connect via the first hop only, which may not reach the same server or may expose it differently.\n\n${lines.join('\n')}\n\nImport with the first hop only?`
 }
 
 /** Where imported hosts go. */
@@ -893,7 +995,33 @@ export function buildImport(
   localUser: string,
 ): { catalogue: HostNode[]; added: number; notes: string[] } {
   const notes: string[] = []
-  const picked = rows.filter((r) => checked.has(r.index))
+  // Blocked rows dropped; jump hosts a checked row needs added.
+  const { picked: take, implied } = importSelection(rows, checked)
+  // A row whose alias jump host is neither taken nor an existing host is
+  // refused, never saved as a direct route; repeated so a refusal also
+  // refuses the hosts that ride it.
+  const byLower = new Map<string, ImportRow>()
+  for (const r of rows) if (!byLower.has(r.scanned.name.toLowerCase())) byLower.set(r.scanned.name.toLowerCase(), r)
+  for (let changed = true; changed; ) {
+    changed = false
+    for (const i of take) {
+      const r = rows.find((x) => x.index === i)!
+      const j = r.scanned.jump
+      if (j?.kind !== 'alias') continue
+      const t = byLower.get(j.alias.toLowerCase())
+      const ok = !!t && t.index !== r.index && (take.has(t.index) || !!t.duplicateOf)
+      if (!ok) {
+        take.delete(i)
+        notes.push(`${r.scanned.name}: not imported, its jump host ${j.alias} is not available (it would otherwise connect directly)`)
+        changed = true
+      }
+    }
+  }
+  const picked = rows.filter((r) => take.has(r.index))
+  for (const [i, needs] of implied) notes.push(`${rows.find((r) => r.index === i)!.scanned.name}: added as jump host for ${needs.join(', ')}`)
+  for (const r of picked) {
+    if (r.status === 'route') notes.push(`${r.scanned.name}: imported with the first hop only (${r.jumpLabel ?? 'jump host'})`)
+  }
   const tempId = (i: number) => `${TEMP}${i}`
   const byName = new Map<string, ImportRow>()
   for (const r of rows) if (!byName.has(r.scanned.name.toLowerCase())) byName.set(r.scanned.name.toLowerCase(), r)
@@ -924,13 +1052,12 @@ export function buildImport(
     }
     if (s.jump?.kind === 'alias') {
       const target = byName.get(s.jump.alias.toLowerCase())
-      if (target && target.index !== r.index && checked.has(target.index)) {
+      if (target && target.index !== r.index && take.has(target.index)) {
         h.jumpHostId = tempId(target.index)
       } else if (target?.duplicateOf) {
         external.set(id, target.duplicateOf.id)
-      } else {
-        notes.push(`${s.name}: its jump host ${s.jump.alias} was not selected, so it was imported without one`)
       }
+      // No other case: rows without a usable jump host were refused above.
     } else if (s.jump?.kind === 'literal') {
       const key = literalJumpKey(s.jump, localUser)
       const ex = existingByKey.get(key)
@@ -949,7 +1076,10 @@ export function buildImport(
             hostname: s.jump.host,
             port: s.jump.port,
             username: s.jump.user ?? localUser,
-            auth: 'password',
+            // The IdentityFile ssh would use for that hop; else a password
+            // asked for on connect.
+            auth: s.jump.keyPath ? 'key' : 'password',
+            ...(s.jump.keyPath ? { keyPath: s.jump.keyPath } : {}),
           }
           created.set(key, jh)
           notes.push(`created jump host ${jh.name}`)

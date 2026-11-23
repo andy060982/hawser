@@ -3,8 +3,9 @@ import { AlertTriangle, ChevronDown, ChevronRight, Download, RefreshCw, X } from
 import type { HostNode } from '../types'
 import { safeInvoke } from '../lib/tauri'
 import { useModalLayer } from '../lib/useModalLayer'
+import { useDialogs } from '../lib/dialogs'
 import {
-  buildImport, folderLabels, importFolderName, planImport,
+  buildImport, folderLabels, importFolderName, importSelection, planImport, routeConfirmText, routeRowsToConfirm,
   type ImportRow, type ImportSource, type ImportTarget, type ScanReport,
 } from '../lib/tree'
 
@@ -49,6 +50,7 @@ export function ImportHostsDialog({
   const [showSummary, setShowSummary] = useState(false)
 
   useModalLayer(true, onClose)
+  const { confirm } = useDialogs()
 
   const rows = useMemo(() => (report ? planImport(report, catalogue) : []), [report, catalogue])
   const folders = useMemo(() => [...folderLabels(catalogue)], [catalogue])
@@ -96,15 +98,36 @@ export function ImportHostsDialog({
     scan(s, path)
   }
 
-  const toggle = (i: number) =>
+  // Checking a host whose ProxyJump chain Hawser cannot follow asks first:
+  // it would connect via the first hop only.
+  const confirmRoutes = async (adding: Set<number>): Promise<boolean> => {
+    const risky = routeRowsToConfirm(rows, adding)
+    if (risky.length === 0) return true
+    return confirm(routeConfirmText(risky), { title: 'Route not supported', confirmLabel: 'Import with first hop only', danger: true })
+  }
+  const toggle = async (i: number) => {
+    const row = rows.find((r) => r.index === i)
+    if (!row || row.status === 'blocked') return
+    if (!checked.has(i) && !(await confirmRoutes(new Set([i])))) return
     setChecked((prev) => {
       const next = new Set(prev)
       if (next.has(i)) next.delete(i)
       else next.add(i)
       return next
     })
-  const allChecked = rows.length > 0 && rows.every((r) => checked.has(r.index))
-  const toggleAll = () => setChecked(allChecked ? new Set() : new Set(rows.map((r) => r.index)))
+  }
+  const selectable = rows.filter((r) => r.status !== 'blocked')
+  const allChecked = selectable.length > 0 && selectable.every((r) => checked.has(r.index))
+  const toggleAll = async () => {
+    if (allChecked) return setChecked(new Set())
+    const adding = new Set(selectable.filter((r) => !checked.has(r.index)).map((r) => r.index))
+    // Declining the route warning still selects everything else.
+    const withRoutes = await confirmRoutes(adding)
+    setChecked(new Set(selectable.filter((r) => withRoutes || r.status !== 'route' || checked.has(r.index)).map((r) => r.index)))
+  }
+  // What an import takes right now: blocked rows never, jump hosts the
+  // checked rows need always (shown as "added as jump host").
+  const selection = useMemo(() => importSelection(rows, checked), [rows, checked])
 
   const target: ImportTarget =
     targetSel === 'new'
@@ -114,7 +137,7 @@ export function ImportHostsDialog({
         : { kind: 'folder', id: targetSel }
 
   const doImport = () => {
-    if (!report || checked.size === 0) return
+    if (!report || selection.picked.size === 0) return
     const picked = new Set(checked)
     const { localUser } = report
     // Rows are re-planned against the catalogue the parent passes, so a
@@ -234,7 +257,7 @@ export function ImportHostsDialog({
               <thead className="sticky top-0 bg-surface-2 text-[11px] text-ink-faint">
                 <tr className="border-b border-line">
                   <th className="w-8 px-3 py-1.5">
-                    <input type="checkbox" aria-label="Select all" checked={allChecked} onChange={toggleAll} disabled={rows.length === 0} />
+                    <input type="checkbox" aria-label="Select all" checked={allChecked} onChange={() => void toggleAll()} disabled={selectable.length === 0} />
                   </th>
                   <th className="px-2 py-1.5 font-normal">Name</th>
                   <th className="px-2 py-1.5 font-normal">user@host:port</th>
@@ -245,7 +268,13 @@ export function ImportHostsDialog({
               </thead>
               <tbody>
                 {rows.map((r) => (
-                  <Row key={r.index} row={r} checked={checked.has(r.index)} onToggle={() => toggle(r.index)} />
+                  <Row
+                    key={r.index}
+                    row={r}
+                    checked={checked.has(r.index)}
+                    jumpFor={selection.implied.get(r.index)}
+                    onToggle={() => void toggle(r.index)}
+                  />
                 ))}
               </tbody>
             </table>
@@ -288,10 +317,10 @@ export function ImportHostsDialog({
           <button
             type="button"
             onClick={doImport}
-            disabled={!report || checked.size === 0}
+            disabled={!report || selection.picked.size === 0}
             className="h-7 rounded border border-accent bg-accent px-3 font-medium text-surface-0 hover:opacity-90 disabled:opacity-40"
           >
-            Import {checked.size} host{checked.size === 1 ? '' : 's'}
+            Import {selection.picked.size} host{selection.picked.size === 1 ? '' : 's'}
           </button>
         </footer>
       </div>
@@ -313,15 +342,23 @@ function SourceButton({ active, onClick, children }: { active: boolean; onClick:
   )
 }
 
-function Row({ row, checked, onToggle }: { row: ImportRow; checked: boolean; onToggle: () => void }) {
+function Row({ row, checked, jumpFor, onToggle }: { row: ImportRow; checked: boolean; jumpFor?: string[]; onToggle: () => void }) {
   const s = row.scanned
   const id = `imp-row-${row.index}`
   const portPart = s.port !== 22 ? `:${s.port}` : ''
   const keyName = s.keyPath ? s.keyPath.split(/[\\/]/).pop() : ''
   return (
-    <tr className={`border-b border-line/60 align-top ${checked ? '' : 'opacity-60'}`}>
+    <tr className={`border-b border-line/60 align-top ${checked || jumpFor ? '' : 'opacity-60'}`}>
       <td className="px-3 py-1.5">
-        <input id={id} type="checkbox" checked={checked} onChange={onToggle} aria-label={`Import ${s.name}`} />
+        <input
+          id={id}
+          type="checkbox"
+          checked={checked || !!jumpFor}
+          disabled={row.status === 'blocked' || (!!jumpFor && !checked)}
+          onChange={onToggle}
+          aria-label={`Import ${s.name}`}
+          title={jumpFor && !checked ? `Needed as the jump host of ${jumpFor.join(', ')}` : row.blockedReason}
+        />
       </td>
       <td className="px-2 py-1.5 text-ink">
         <label htmlFor={id} className="cursor-pointer break-all">{s.name}</label>
@@ -343,8 +380,16 @@ function Row({ row, checked, onToggle }: { row: ImportRow; checked: boolean; onT
         {keyName || <span className="text-ink-faint">—</span>}
       </td>
       <td className="px-2 py-1.5 text-ink-dim">{row.jumpLabel ?? <span className="text-ink-faint">—</span>}</td>
-      <td className="px-2 py-1.5 whitespace-nowrap">
-        {row.status === 'duplicate' ? (
+      <td className={`px-2 py-1.5 ${row.status === 'blocked' ? 'max-w-[18rem]' : 'whitespace-nowrap'}`}>
+        {row.status === 'blocked' ? (
+          <span className="text-warn" title={row.blockedReason}>cannot import: {row.blockedReason}</span>
+        ) : jumpFor && !checked ? (
+          <span className="text-accent" title={`Needed by ${jumpFor.join(', ')}`}>added as jump host</span>
+        ) : row.status === 'route' ? (
+          <span className="text-warn" title={s.unsupportedRoute ?? undefined}>
+            route not supported ({(s.jumpHops ?? 0) > 1 ? `${s.jumpHops} hops` : 'ProxyCommand'})
+          </span>
+        ) : row.status === 'duplicate' ? (
           <span className="text-ink-faint">duplicate of {row.duplicateOf?.name}</span>
         ) : row.status === 'warning' ? (
           <span className="text-warn">warning</span>

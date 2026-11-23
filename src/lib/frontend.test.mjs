@@ -1042,7 +1042,7 @@ test('kept copies merge by id, the backend list first', () => {
 
 /* ------------------------------------------ ssh config / PuTTY import */
 
-import { buildImport, importFolderName, planImport } from './tree.ts'
+import { buildImport, importFolderName, importSelection, planImport, routeConfirmText, routeRowsToConfirm } from './tree.ts'
 
 const scanned = (over) => ({
   name: 'h', hostname: 'h.example', port: 22, user: 'me', keyPath: null, jump: null, warnings: [], origin: 'config:1',
@@ -1153,8 +1153,108 @@ test('import build: jump hosts link to the import, an existing host, or a create
   // Every jumpHostId points at a host that exists in the result.
   const ids = new Set(hosts.map((h) => h.id))
   for (const h of hosts) if (h.jumpHostId) assert.ok(ids.has(h.jumpHostId), `${h.name} -> ${h.jumpHostId}`)
-  // A jump alias left unchecked is dropped with a note.
+  // A jump alias left unchecked is added as the jump host, never dropped
+  // (that would silently make app a direct connection).
   const partial = buildImport(rows, new Set([1]), existing, { kind: 'top' }, 'local')
-  assert.equal(allOf(partial.catalogue).find((h) => h.name === 'app').jumpHostId, undefined)
-  assert.ok(partial.notes.some((n) => n.includes('was not selected')))
+  const ph = allOf(partial.catalogue)
+  assert.equal(ph.find((h) => h.name === 'app').jumpHostId, ph.find((h) => h.name === 'bastion').id)
+  assert.equal(partial.added, 2)
+  assert.ok(partial.notes.some((n) => n.includes('bastion: added as jump host for app')))
+})
+
+test('import route: multi-hop ProxyJump is unchecked, asks before importing, never reduced silently', () => {
+  const rows = planImport(report([
+    scanned({ name: 'edge', hostname: 'edge.example' }),
+    scanned({
+      name: 'deep', hostname: 'deep.internal', jump: { kind: 'alias', alias: 'edge' }, jumpHops: 3,
+      unsupportedRoute: 'route not supported (3 hops: edge,mid,inner); Hawser uses one jump host',
+      warnings: ['route not supported (3 hops: edge,mid,inner); Hawser uses one jump host'],
+    }),
+    scanned({ name: 'one', hostname: 'one.internal', jump: { kind: 'alias', alias: 'edge' }, jumpHops: 1 }),
+  ]), [])
+  assert.deepEqual(rows.map((r) => [r.status, r.checked]), [['new', true], ['route', false], ['new', true]])
+  // The default selection imports nothing with a reduced route.
+  const def = new Set(rows.filter((r) => r.checked).map((r) => r.index))
+  assert.deepEqual(routeRowsToConfirm(rows, def), [])
+  assert.ok(!allOf(buildImport(rows, def, [], { kind: 'top' }, 'local').catalogue).some((h) => h.name === 'deep'))
+  // Checking it needs the explicit confirmation, which names the first hop.
+  const withDeep = new Set([...def, 1])
+  const ask = routeRowsToConfirm(rows, withDeep)
+  assert.deepEqual(ask.map((r) => r.scanned.name), ['deep'])
+  const text = routeConfirmText(ask)
+  assert.match(text, /deep: 3 hops; will connect via edge only/)
+  assert.match(text, /first hop only/)
+  // Once confirmed, it is imported via the first hop, with a note.
+  const built = buildImport(rows, withDeep, [], { kind: 'top' }, 'local')
+  const hs = allOf(built.catalogue)
+  assert.equal(hs.find((h) => h.name === 'deep').jumpHostId, hs.find((h) => h.name === 'edge').id)
+  assert.ok(built.notes.some((n) => n.includes('deep: imported with the first hop only')))
+})
+
+test('import route: a literal hop carries the IdentityFile of the alias it names', () => {
+  const rows = planImport(report([
+    scanned({
+      name: 'app', hostname: 'app.internal',
+      jump: { kind: 'literal', host: 'bastion.example.com', port: 2200, user: 'ops', keyPath: '/home/me/.ssh/bastion_key' },
+      jumpHops: 1,
+    }),
+    scanned({ name: 'plain', hostname: 'p.internal', jump: { kind: 'literal', host: 'gw.example', port: 22, user: null, keyPath: null }, jumpHops: 1 }),
+  ]), [])
+  const hs = allOf(buildImport(rows, new Set([0, 1]), [], { kind: 'top' }, 'local').catalogue)
+  const bastion = hs.find((h) => h.id === hs.find((x) => x.name === 'app').jumpHostId)
+  assert.deepEqual(
+    [bastion.hostname, bastion.port, bastion.username, bastion.auth, bastion.keyPath],
+    ['bastion.example.com', 2200, 'ops', 'key', '/home/me/.ssh/bastion_key'],
+  )
+  const gw = hs.find((h) => h.id === hs.find((x) => x.name === 'plain').jumpHostId)
+  assert.equal(gw.auth, 'password')
+  assert.equal(gw.keyPath, undefined)
+})
+
+test('import route: a destination never loses its jump host to an unchecked or missing alias', () => {
+  const existing = existingCatalogue()
+  const rows = planImport(report([
+    scanned({ name: 'bastion', hostname: 'bastion.internal', user: 'jump', keyPath: '/k' }),
+    scanned({ name: 'app', hostname: 'app.internal', jump: { kind: 'alias', alias: 'bastion' }, jumpHops: 1 }),
+    // The alias exists in the config but is not in the report (e.g. its
+    // HostName was unusable): the row is blocked.
+    scanned({ name: 'orphan', hostname: 'o.internal', jump: { kind: 'alias', alias: 'ghost' }, jumpHops: 1 }),
+    // Rides a blocked row: blocked too.
+    scanned({ name: 'rider', hostname: 'r.internal', jump: { kind: 'alias', alias: 'orphan' }, jumpHops: 2 }),
+    // Jump alias duplicates an existing host: links there, not added.
+    scanned({ name: 'dupjump', hostname: 'web.example', port: 2222, user: 'deploy' }),
+    scanned({ name: 'viadup', hostname: 'v.internal', jump: { kind: 'alias', alias: 'dupjump' }, jumpHops: 1 }),
+  ]), existing)
+  assert.equal(rows[2].status, 'blocked')
+  assert.equal(rows[2].checked, false)
+  assert.match(rows[2].blockedReason, /ghost is not in this import/)
+  assert.equal(rows[3].status, 'blocked')
+  assert.match(rows[3].blockedReason, /orphan cannot be imported/)
+  // Preview: with only app checked, bastion shows as "added as jump host".
+  const sel = importSelection(rows, new Set([1, 2, 3, 5]))
+  assert.deepEqual([...sel.implied], [[0, ['app']]])
+  assert.deepEqual([...sel.picked].sort(), [0, 1, 5])
+  // Build matches the preview: blocked rows refused even if passed in,
+  // bastion added with its key, viadup linked to the existing host.
+  const { catalogue, added, notes } = buildImport(rows, new Set([1, 2, 3, 5]), existing, { kind: 'top' }, 'local')
+  const hs = allOf(catalogue)
+  const by = (n) => hs.find((h) => h.name === n)
+  assert.equal(added, 3)
+  assert.equal(by('app').jumpHostId, by('bastion').id)
+  assert.equal(by('bastion').keyPath, '/k')
+  assert.equal(by('viadup').jumpHostId, 'h-web')
+  assert.equal(by('orphan'), undefined)
+  assert.equal(by('rider'), undefined)
+  assert.ok(notes.some((n) => n.includes('added as jump host for app')))
+  // No imported host is ever saved direct when its scan had a jump.
+  for (const r of rows) {
+    const h = by(r.scanned.name)
+    if (h && r.scanned.jump) assert.ok(h.jumpHostId, `${h.name} lost its jump host`)
+  }
+  // Even a hand-built row list that bypasses planImport cannot save a
+  // destination whose alias is missing as a direct route.
+  const raw = [{ ...rows[2], status: 'new', checked: true }]
+  const forced = buildImport(raw, new Set([2]), [], { kind: 'top' }, 'local')
+  assert.equal(forced.added, 0)
+  assert.ok(forced.notes.some((n) => n.includes('orphan: not imported')))
 })
