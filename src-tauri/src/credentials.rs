@@ -89,7 +89,8 @@ pub fn validate_id(id: &str) -> Result<(), String> {
 /// search (no `kSecReturnData`), so opening the host editor cannot raise a
 /// Keychain "allow access" prompt; on Linux a Secret Service search, which
 /// lists locked items without unlocking them; on Windows `CredReadW`, whose
-/// DPAPI decrypt never prompts (the blob is wiped before it is freed).
+/// DPAPI decrypt never prompts (the blob is wiped in place before it is freed;
+/// see `imp::secret_exists` for why no metadata-only call is used there).
 pub fn has_secret(host_id: &str) -> bool {
     matches!(imp::secret_exists(host_id), Ok(true))
 }
@@ -241,9 +242,18 @@ mod imp {
         Ok(())
     }
 
-    /// Whether a credential exists. Credential Manager has no metadata-only
-    /// lookup by name, but its DPAPI decrypt is silent (no prompt); the blob is
-    /// wiped and freed without being copied.
+    /// Whether a credential exists.
+    ///
+    /// Credential Manager has no metadata-only lookup. `CredEnumerateW` with
+    /// the exact target name as its filter was considered and rejected: it
+    /// returns the same `CREDENTIALW` records, decrypted blob included, so it
+    /// copies no less than `CredReadW` (and a filter is a wildcard pattern, so
+    /// an exact name needs escaping it does not offer). `CredReadW` is
+    /// acceptable because (1) it never prompts: the blob is DPAPI-decrypted
+    /// silently with the user's own logon key, which this process already
+    /// runs under, so nothing is revealed that the process could not read
+    /// anyway; and (2) the plaintext never leaves the API's buffer: it is
+    /// wiped in place before `CredFree`, and nothing is copied out of it.
     pub fn secret_exists(host_id: &str) -> Result<bool, CredError> {
         let target_w = wide(&target_name(host_id));
         let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();

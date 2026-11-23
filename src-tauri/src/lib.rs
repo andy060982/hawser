@@ -688,13 +688,12 @@ async fn hosts_load() -> CmdResult<Option<serde_json::Value>> {
 /// the destinations that still use them in `tree` (an edited, deleted or
 /// repointed host). Narrowing and saving are one operation, narrowing first:
 /// if a binding cannot be narrowed nothing is saved and the error says so.
+/// `generation`: the frontend's save number; a save that is not newer than
+/// the last one published is refused as stale (utils::hosts::STALE_SAVE), so
+/// an older tree never replaces a newer one.
 #[tauri::command]
-async fn hosts_save(tree: serde_json::Value, narrow: Option<Vec<String>>) -> CmdResult<()> {
-    off(move || match narrow.as_deref() {
-        Some(ids) if !ids.is_empty() => utils::hosts::save_and_narrow(&tree, ids),
-        _ => utils::hosts::save(&tree).map_err(|e| e.to_string()),
-    })
-    .await
+async fn hosts_save(tree: serde_json::Value, narrow: Option<Vec<String>>, generation: Option<u64>) -> CmdResult<()> {
+    off(move || utils::hosts::save_and_narrow(&tree, narrow.as_deref().unwrap_or(&[]), generation)).await
 }
 
 /// The first-run seed: written only if no catalogue file exists. Returns
@@ -1497,14 +1496,15 @@ pub fn run() {
     // The app-wide instance lock, before ANY store is opened (the audit
     // writer, hosts, bindings, the vault journal, settings): see
     // utils::instance. Held until the process exits.
-    let _instance = match utils::instance::acquire() {
-        Ok(utils::instance::Acquire::Held(lock)) => Some(lock),
-        Ok(utils::instance::Acquire::Busy) => return run_second_instance(context),
-        Err(e) => {
-            // No usable app-data folder: no store can be opened either, so
-            // there is nothing for a second instance to race on.
-            eprintln!("hawser: could not take the instance lock ({e}); continuing without it");
-            None
+    // Fails CLOSED: only "another live instance holds it" hands off; any
+    // other failure to take the lock is shown and the app exits, never runs
+    // unguarded.
+    let _instance = match utils::instance::decide(utils::instance::acquire()) {
+        utils::instance::Startup::Run(lock) => lock,
+        utils::instance::Startup::HandOff => return run_second_instance(context),
+        utils::instance::Startup::Refuse(message) => {
+            utils::instance::fatal_dialog("Hawser cannot start", &message);
+            std::process::exit(1);
         }
     };
     let app = with_single_instance_plugin(with_app_menu(tauri::Builder::default()), |app| {
@@ -1540,31 +1540,20 @@ pub fn run() {
             // migration reads it — and reintroduce the frontend-writable-source
             // bug. Run inline (small catalogue + a few vault reads); a panic is
             // contained so a migration hiccup never blocks startup.
-            // First, settle a password save a crash interrupted (the vault
-            // intent journal): its secret ends up paired with the binding it
-            // was saved for, or removed.
-            match std::panic::catch_unwind(utils::hosts::repair_vault_intent) {
-                Ok(Ok(Some(r))) => {
-                    let (summary, id) = match &r {
-                        utils::hosts::Repair::Completed(id) => ("an interrupted password save had completed", id),
-                        utils::hosts::Repair::BindingFinished(id) => ("finished recording where an interrupted password save may be sent", id),
-                        utils::hosts::Repair::SecretRemoved(id) => ("removed a password whose save was interrupted; save it again", id),
-                    };
-                    eprintln!("hawser: {summary} ('{id}')");
-                    utils::audit::record("credential.repair", summary, serde_json::json!({ "hostId": id, "ok": true }));
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => eprintln!("hawser: {e}"),
-                Err(_) => eprintln!("hawser: the vault journal repair panicked"),
+            // A W4b build journaled each password / AI key save; one left
+            // behind by a crash is settled fail-closed, without deleting a
+            // secret (its legacy authorization is withdrawn). This build
+            // stores a secret and its destinations as one vault item, so it
+            // writes no journals.
+            if let Ok(Some(id)) = std::panic::catch_unwind(utils::hosts::retire_legacy_journal) {
+                let summary = "a password save was interrupted by an earlier build; it will not be sent until it is saved again";
+                eprintln!("hawser: {summary} ('{id}')");
+                utils::audit::record("credential.repair", summary, serde_json::json!({ "hostId": id, "ok": true }));
             }
-            match std::panic::catch_unwind(utils::ai::repair_ai_intent) {
-                Ok(Ok(Some(summary))) => {
-                    eprintln!("hawser: {summary}");
-                    utils::audit::record("ai.key_repair", summary, serde_json::json!({ "profile": "default", "ok": true }));
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => eprintln!("hawser: {e}"),
-                Err(_) => eprintln!("hawser: the AI key journal repair panicked"),
+            if let Ok(true) = std::panic::catch_unwind(utils::ai::retire_legacy_journal) {
+                let summary = "an AI key save was interrupted by an earlier build; save the key again to use it";
+                eprintln!("hawser: {summary}");
+                utils::audit::record("ai.key_repair", summary, serde_json::json!({ "profile": "default", "ok": true }));
             }
             let _ = std::panic::catch_unwind(utils::hosts::migrate_bindings);
             let _ = std::panic::catch_unwind(utils::ai::migrate_ai_origins);
@@ -1791,25 +1780,45 @@ fn with_single_instance_plugin<R: tauri::Runtime>(
     builder.plugin(tauri_plugin_single_instance::init(move |app, _argv, _cwd| on_second(app)))
 }
 
-/// Another process holds the instance lock: open nothing, let the plugin hand
-/// this launch to the running window (it exits the process when it can), and
-/// exit cleanly if it could not. No window is created and no store is opened.
-fn run_second_instance(mut context: tauri::Context<tauri::Wry>) {
-    context.config_mut().app.windows.clear();
-    // A launch at the same moment as the first: give that one time to open
-    // its hand-off endpoint, so this one reaches it instead of racing it.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let built = with_single_instance_plugin(tauri::Builder::default(), |_| {})
-        .setup(|_| {
-            // Reached only when the plugin did not hand off and exit.
-            eprintln!("hawser: another Hawser instance is running; exiting");
-            std::process::exit(0)
-        })
-        .build(context);
-    if let Err(e) = built {
-        eprintln!("hawser: another Hawser instance is running; exiting ({e})");
+/// Another process holds the instance lock: open nothing, hand this launch to
+/// the running window, and exit. No window is created and no store is opened.
+///
+/// macOS: this process never runs the single-instance plugin (whose setup
+/// binds the hand-off socket when it finds none, and could then capture a
+/// primary that is still starting). It connects to the primary's socket
+/// itself, retrying with backoff for ~3 s (utils::instance::hand_off).
+fn run_second_instance(context: tauri::Context<tauri::Wry>) {
+    #[cfg(target_os = "macos")]
+    {
+        let socket = utils::instance::plugin_socket(&context.config().identifier);
+        let backoff: Vec<std::time::Duration> =
+            utils::instance::HAND_OFF_BACKOFF_MS.iter().map(|ms| std::time::Duration::from_millis(*ms)).collect();
+        if !utils::instance::hand_off(&socket, &utils::instance::hand_off_message(), &backoff) {
+            eprintln!("hawser: another Hawser instance is running but did not answer; exiting");
+        }
+        std::process::exit(0)
     }
-    std::process::exit(0)
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Elsewhere the plugin hands off (and exits the process when it can).
+        // Its endpoint opens during the primary's setup, so give a launch at
+        // the same moment as the primary a moment first; see the plugin
+        // limitation in utils::instance.
+        let mut context = context;
+        context.config_mut().app.windows.clear();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let built = with_single_instance_plugin(tauri::Builder::default(), |_| {})
+            .setup(|_| {
+                // Reached only when the plugin did not hand off and exit.
+                eprintln!("hawser: another Hawser instance is running; exiting");
+                std::process::exit(0)
+            })
+            .build(context);
+        if let Err(e) = built {
+            eprintln!("hawser: another Hawser instance is running; exiting ({e})");
+        }
+        std::process::exit(0)
+    }
 }
 
 #[cfg(test)]

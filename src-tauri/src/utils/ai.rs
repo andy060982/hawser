@@ -45,6 +45,8 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
+
+use super::vault_item;
 use tokio::sync::oneshot;
 
 use crate::credentials;
@@ -97,11 +99,13 @@ fn vault_profile(profile: &str) -> String {
 
 /* ------------------------------------------------------------ key binding */
 
-// Backend-owned record of the origin (kind + base_url) each AI profile's key
-// may be sent to, in `ai_origins.json`. Written only at key-save time and at
-// startup migration — never through a frontend command — so a compromised
-// webview that rewrites the frontend-owned ai.json cannot redirect the key to
-// its own server. Mirrors the SSH credential→destination binding.
+// The origin (kind + base_url) each AI profile's key may be sent to is
+// backend-owned: a compromised webview that rewrites the frontend-owned
+// ai.json cannot redirect the key to its own server. This build stores it IN
+// the key's own vault item (a v2 envelope, see `save_key`). Keys saved by
+// earlier builds are plain, with their origin in `ai_origins.json` (written
+// only at key-save time and by the one-time startup migration); that record
+// is read-only legacy now, dropped when the key is next saved or removed.
 
 fn data_dir() -> Option<PathBuf> {
     crate::utils::known_hosts::store_path().ok()?.parent().map(Path::to_path_buf)
@@ -121,36 +125,13 @@ fn load_ai_origins() -> Result<serde_json::Value, String> {
     }
 }
 
-/// Serialises every reader and writer of the (key, origin) pair.
-///
-/// The key lives in the OS vault and its origin in `ai_origins.json`: two
-/// stores that cannot be written atomically together. Saving a new key for a
-/// new provider writes one and then the other, so a chat that read them
-/// independently could pair the NEW key with the OLD origin and send it there.
-/// Holding this lock across the save (both writes, and the rollback when the
-/// second fails) and across the chat's read of both means a chat only ever
-/// sees a matching pair: entirely before the save, or entirely after it.
+/// Serialises every reader and writer of a key and its origin. The pair is one
+/// vault item, so this is not what keeps them consistent; it orders a save,
+/// a delete and the legacy (plain key + ai_origins.json) read, which does
+/// touch two stores.
 fn binding_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Set when a key save could neither bind the new key, nor put the previous
-/// key back, nor remove the new key: the vault may then hold the NEW key while
-/// the origin map still names the OLD provider. Chats refuse while it is set —
-/// until a key save or delete succeeds, or the app restarts (the user was told
-/// to remove or re-save the key). In process only, read and written under the
-/// binding lock.
-static KEY_BINDING_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-const POISONED_MESSAGE: &str = "The AI key is not used: saving it failed half-way, so it may not match the provider it is allowed to go to. Save the key again (or remove it) in the AI panel settings.";
-
-fn set_poisoned(on: bool) {
-    KEY_BINDING_POISONED.store(on, std::sync::atomic::Ordering::SeqCst);
-}
-
-fn is_poisoned() -> bool {
-    KEY_BINDING_POISONED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn write_ai_origins(map: &serde_json::Value) -> Result<(), String> {
@@ -226,267 +207,82 @@ pub fn migrate_ai_origins() {
     let _ = crate::utils::hosts::save_named(MIGRATED_MARKER, &json!({ "done": true }));
 }
 
-/// Save a key and bind it to its origin, as one operation: if the binding
-/// cannot be written, the vault is put back the way it was (the previous key,
-/// or no key), so a failed save never leaves a new key bound to an old origin
-/// or an unbound key behind.
+/// Save a key together with the origin it may be sent to, as ONE vault item
+/// (utils::vault_item): a single write, so a key can never be left paired
+/// with another provider's origin, whatever fails or crashes. If the write
+/// fails, the previous item (and its origin) stands.
 pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
     let _binding = binding_lock();
-    save_key_locked(profile, key, kind, base_url, &VaultKeys)
+    save_key_with(&VaultKeys, profile, key, kind, base_url)
 }
 
-/// The vault and origin-map operations a key save needs, behind a seam so the
-/// failure paths (and the poisoned latch) are testable.
+/// The vault operations a key save and a chat's read need, behind a seam so
+/// they are testable.
 trait KeyStore {
-    fn read(&self, slot: &str) -> Option<zeroize::Zeroizing<String>>;
-    fn write(&self, slot: &str, key: &str) -> Result<(), credentials::CredError>;
-    fn delete(&self, slot: &str) -> Result<(), credentials::CredError>;
-    fn bind(&self, profile: &str, kind: &str, base_url: &str) -> Result<(), String>;
-    /// Where a save journals its intent (`ai.intent`); `None`: not journaled.
-    fn journal(&self) -> Option<PathBuf> {
-        None
-    }
-    /// The origin `profile`'s key is bound to now.
-    fn origin(&self, profile: &str) -> Option<(String, String)> {
+    fn read(&self, slot: &str) -> Result<zeroize::Zeroizing<String>, credentials::CredError>;
+    fn write(&self, slot: &str, item: &str) -> Result<(), credentials::CredError>;
+    /// The origin an earlier build recorded for a plain key (ai_origins.json).
+    fn legacy_origin(&self, profile: &str) -> Option<(String, String)> {
         saved_origin(profile)
+    }
+    /// Drop that legacy record.
+    fn drop_legacy_origin(&self, profile: &str) -> Result<(), String> {
+        drop_origin(profile)
     }
 }
 
 struct VaultKeys;
 
 impl KeyStore for VaultKeys {
-    fn read(&self, slot: &str) -> Option<zeroize::Zeroizing<String>> {
-        credentials::read_secret(slot).ok()
+    fn read(&self, slot: &str) -> Result<zeroize::Zeroizing<String>, credentials::CredError> {
+        credentials::read_secret(slot)
     }
-    fn write(&self, slot: &str, key: &str) -> Result<(), credentials::CredError> {
-        credentials::write_secret(slot, "api-key", key)
-    }
-    fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
-        credentials::delete_secret(slot)
-    }
-    fn bind(&self, profile: &str, kind: &str, base_url: &str) -> Result<(), String> {
-        snapshot_origin(profile, kind, base_url)
-    }
-    fn journal(&self) -> Option<PathBuf> {
-        data_dir().map(|d| d.join(AI_INTENT))
+    fn write(&self, slot: &str, item: &str) -> Result<(), credentials::CredError> {
+        credentials::write_secret(slot, "api-key", item)
     }
 }
 
-/* ------------------------------------------------------ key save journal */
-
-// The same crash window as a host password (utils::hosts, "vault intent
-// journal"): the key and its origin are two stores. A save journals its
-// intent in `ai.intent` before the vault write, notes when the key has
-// landed, and clears the journal once the origin is bound. At startup
-// `repair_ai_intent` finishes the origin when the new key is known to be in
-// the vault, and otherwise removes the key. Never a new key behind an old
-// origin.
-
-const AI_INTENT: &str = "ai.intent";
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum AiPhase {
-    Staged,
-    Written,
-    Ambiguous,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AiIntent {
-    profile: String,
-    kind: String,
-    base_url: String,
-    phase: AiPhase,
-}
-
-const INJECTED_CRASH: &str = "injected crash";
-
-#[cfg(test)]
-thread_local! {
-    static CRASH_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
-fn crashed(step: u8) -> bool {
-    #[cfg(test)]
-    {
-        CRASH_AT.with(|c| c.get() == step)
-    }
-    #[cfg(not(test))]
-    {
-        let _ = step;
-        false
-    }
-}
-
-fn note_intent(journal: &Option<PathBuf>, intent: &AiIntent) -> Result<(), String> {
-    let Some(p) = journal else { return Ok(()) };
-    let text = serde_json::to_string(intent).map_err(|e| e.to_string())?;
-    crate::utils::hosts::write_atomic(p, &text).map_err(|e| e.to_string())
-}
-
-fn clear_intent(journal: &Option<PathBuf>) {
-    if let Some(p) = journal {
-        let _ = std::fs::remove_file(p);
-    }
-}
-
-/// Settle a key save a crash interrupted (see above). Startup, before the
-/// webview loads. `Some(message)` when something was repaired.
-pub fn repair_ai_intent() -> Result<Option<String>, String> {
-    let _binding = binding_lock();
-    repair_ai_intent_with(&VaultKeys)
-}
-
-fn repair_ai_intent_with(store: &impl KeyStore) -> Result<Option<String>, String> {
-    let journal = store.journal();
-    let Some(path) = journal.as_ref() else { return Ok(None) };
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    let Ok(intent) = serde_json::from_str::<AiIntent>(&text) else {
-        clear_intent(&journal);
-        return Err(format!("{} was not a valid journal and was removed", path.display()));
-    };
-    let want = (intent.kind.clone(), intent.base_url.clone());
-    if intent.phase != AiPhase::Ambiguous && store.origin(&intent.profile).as_ref() == Some(&want) {
-        clear_intent(&journal);
-        return Ok(Some("an interrupted AI key save had completed".into()));
-    }
-    if intent.phase == AiPhase::Written && store.bind(&intent.profile, &intent.kind, &intent.base_url).is_ok() {
-        clear_intent(&journal);
-        set_poisoned(false);
-        return Ok(Some("finished binding an AI key whose save was interrupted".into()));
-    }
-    match store.delete(&vault_profile(&intent.profile)) {
-        Ok(()) | Err(credentials::CredError::NotFound(_)) => {
-            clear_intent(&journal);
-            set_poisoned(false);
-            Ok(Some("removed an AI key whose save was interrupted; save it again".into()))
-        }
-        Err(e) => {
-            set_poisoned(true);
-            Err(format!("an interrupted AI key save could not be repaired ({e}); AI chats are blocked until the key is saved again"))
-        }
-    }
-}
-
-/// `save_key` with the binding lock held.
-fn save_key_locked(profile: &str, key: &str, kind: &str, base_url: &str, store: &impl KeyStore) -> Result<(), String> {
-    let slot = vault_profile(profile);
-    let previous = store.read(&slot);
-    let journal = store.journal();
-    let mut intent =
-        AiIntent { profile: profile.to_string(), kind: kind.to_string(), base_url: base_url.to_string(), phase: AiPhase::Staged };
-    note_intent(&journal, &intent).map_err(|e| format!("could not record the key save before making it ({e}); nothing was changed"))?;
-    if crashed(1) {
-        return Err(INJECTED_CRASH.into());
-    }
-    if let Err(e) = store.write(&slot, key) {
-        clear_intent(&journal);
-        return Err(e.to_string());
-    }
-    if crashed(2) {
-        return Err(INJECTED_CRASH.into());
-    }
-    intent.phase = AiPhase::Written;
-    let _ = note_intent(&journal, &intent);
-    if crashed(3) {
-        return Err(INJECTED_CRASH.into());
-    }
-    let bound = store.bind(profile, kind, base_url);
-    if bound.is_ok() && crashed(4) {
-        return Err(INJECTED_CRASH.into());
-    }
-    if bound.is_err() {
-        intent.phase = AiPhase::Ambiguous;
-        let _ = note_intent(&journal, &intent);
-        if crashed(5) {
-            return Err(INJECTED_CRASH.into());
-        }
-    }
-    let (result, stuck) = finish_key_save(&slot, previous, bound, store);
-    if crashed(6) {
-        return Err(INJECTED_CRASH.into());
-    }
-    // A stuck outcome (the key could be neither restored nor removed) keeps
-    // the Ambiguous journal: the next start removes the key.
-    if !stuck {
-        clear_intent(&journal);
-    }
-    result
-}
-
-/// The rest of a key save once the bind was attempted (rollback included).
-/// The flag: the vault was left holding a key it could not remove.
-fn finish_key_save(
-    slot: &str,
-    previous: Option<zeroize::Zeroizing<String>>,
-    bound: Result<(), String>,
-    store: &impl KeyStore,
-) -> (Result<(), String>, bool) {
-    let mut stuck = false;
-    let r = finish_key_save_inner(slot, previous, bound, store, &mut stuck);
-    (r, stuck)
-}
-
-fn finish_key_save_inner(
-    slot: &str,
-    previous: Option<zeroize::Zeroizing<String>>,
-    bound: Result<(), String>,
-    store: &impl KeyStore,
-    stuck: &mut bool,
-) -> Result<(), String> {
-    if let Err(e) = bound {
-        let restored = match previous {
-            Some(old) => store.write(slot, &old),
-            None => match store.delete(slot) {
-                Err(credentials::CredError::NotFound(_)) => Ok(()),
-                r => r,
-            },
-        };
-        if let Err(rollback) = restored {
-            // Neither the new binding nor the old key could be put in place,
-            // so the vault may hold the NEW key under the OLD origin. Fail
-            // closed: remove the key, so no chat can send it anywhere until
-            // it is saved again.
-            return Err(match store.delete(slot) {
-                Ok(()) | Err(credentials::CredError::NotFound(_)) => format!(
-                    "could not bind the key to its provider ({e}) or restore the previous key ({rollback}); the key was removed, save it again"
-                ),
-                Err(del) => {
-                    // The vault may hold the new key under the old origin, and
-                    // nothing more can be done about it now: refuse every chat
-                    // until a save or delete succeeds (or a restart).
-                    set_poisoned(true);
-                    *stuck = true;
-                    format!(
-                        "could not bind the key to its provider ({e}), restore the previous key ({rollback}) or remove it ({del}); AI chats are blocked until the key is saved again or removed"
-                    )
-                }
-            });
-        }
-        return Err(format!("could not bind the key to its provider: {e}"));
-    }
-    set_poisoned(false);
+fn save_key_with(store: &impl KeyStore, profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
+    let item = vault_item::encode(&vault_item::Envelope {
+        user: "api-key".into(),
+        secret: zeroize::Zeroizing::new(key.to_string()),
+        destinations: None,
+        origin: Some((kind.to_string(), base_url.to_string())),
+    })?;
+    store.write(&vault_profile(profile), &item).map_err(|e| e.to_string())?;
+    // The envelope carries the origin now. Best effort: a legacy record is
+    // ignored for an envelope, and dropping it keeps an older build (which
+    // would read the envelope text as the key) from sending it anywhere.
+    let _ = store.drop_legacy_origin(profile);
     Ok(())
 }
 
-pub fn key_exists(profile: &str) -> bool {
-    credentials::has_secret(&vault_profile(profile))
+/// The key for `profile` and the origin it may be sent to, read as one vault
+/// item (or, for a plain key an earlier build saved, with its legacy origin
+/// from ai_origins.json). `(None, None)` when no key can be read. A damaged
+/// item is an error: it is never sent anywhere.
+fn read_key(
+    store: &impl KeyStore,
+    profile: &str,
+) -> Result<(Option<zeroize::Zeroizing<String>>, Option<(String, String)>), String> {
+    let Ok(raw) = store.read(&vault_profile(profile)) else {
+        return Ok((None, None));
+    };
+    match vault_item::decode(raw) {
+        Ok(vault_item::Item::V2(env)) => match env.origin {
+            Some(origin) => Ok((Some(env.secret), Some(origin))),
+            None => Err(DAMAGED_KEY.into()),
+        },
+        Ok(vault_item::Item::Legacy(key)) => Ok((Some(key), store.legacy_origin(profile))),
+        Err(e) => Err(format!("{DAMAGED_KEY} ({e})")),
+    }
 }
 
-/// Remove a profile's key and its origin binding. A missing key is not an
-/// error — the end state the user asked for already holds.
-pub fn delete_key(profile: &str) -> Result<(), String> {
-    let _binding = binding_lock();
-    match credentials::delete_secret(&vault_profile(profile)) {
-        Ok(()) | Err(credentials::CredError::NotFound(_)) => {}
-        Err(e) => return Err(e.to_string()),
-    }
+const DAMAGED_KEY: &str =
+    "The saved AI key could not be read, so it is not used. Save it again (or remove it) in the AI panel settings";
+
+/// Remove `profile` from the legacy origins map.
+fn drop_origin(profile: &str) -> Result<(), String> {
     match load_ai_origins() {
         Ok(mut map) => {
             if let Some(obj) = map.as_object_mut() {
@@ -494,13 +290,51 @@ pub fn delete_key(profile: &str) -> Result<(), String> {
                     write_ai_origins(&map)?;
                 }
             }
+            Ok(())
         }
-        // Unreadable map: deleting means no binding survives, so reset it.
-        Err(_) => write_ai_origins(&json!({}))?,
+        // Unreadable map: no legacy origin may survive, so reset it.
+        Err(_) => write_ai_origins(&json!({})),
     }
-    // No key, no binding: nothing left that could pair up wrongly.
-    set_poisoned(false);
-    Ok(())
+}
+
+/// W4b builds journaled each key save in `ai.intent`. One left behind means a
+/// save was interrupted, so a plain key may not match its legacy origin.
+/// Settled fail-closed and without deleting the key: the profile's legacy
+/// origin is dropped (chats refuse the key until it is saved again, which
+/// writes an envelope), then the journal is removed. Startup, before the
+/// webview loads. True when a journal was settled.
+pub fn retire_legacy_journal() -> bool {
+    let Some(dir) = data_dir() else { return false };
+    let _binding = binding_lock();
+    retire_legacy_journal_at(&dir.join("ai.intent"), drop_origin)
+}
+
+fn retire_legacy_journal_at(journal: &Path, drop: impl FnOnce(&str) -> Result<(), String>) -> bool {
+    let Ok(text) = std::fs::read_to_string(journal) else { return false };
+    let profile = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("profile").and_then(|p| p.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "default".into());
+    if drop(&profile).is_err() {
+        // Kept for the next start, which tries again.
+        return false;
+    }
+    std::fs::remove_file(journal).is_ok()
+}
+
+pub fn key_exists(profile: &str) -> bool {
+    credentials::has_secret(&vault_profile(profile))
+}
+
+/// Remove a profile's key and any legacy origin record. A missing key is not
+/// an error — the end state the user asked for already holds.
+pub fn delete_key(profile: &str) -> Result<(), String> {
+    let _binding = binding_lock();
+    match credentials::delete_secret(&vault_profile(profile)) {
+        Ok(()) | Err(credentials::CredError::NotFound(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    drop_origin(profile)
 }
 
 /// Same origin for binding purposes: equal kind, and base URLs equal once a
@@ -796,26 +630,19 @@ async fn run(
             AiEvent { run_id: run_id.to_string(), delta, done: false, error: None },
         );
     };
-    if is_poisoned() {
-        return Err(POISONED_MESSAGE.into());
-    }
     if cfg.kind == CLI_KIND {
         return run_cli(&emit, cli_prompt(system_context, &messages)).await;
     }
-    // Key and origin read as one unit, under the lock a key save holds (see
-    // binding_lock), so they always belong together. On the blocking pool: a
-    // keychain read can show a prompt, and the lock can wait on a save's.
-    let slot = vault_profile(profile);
+    // Key and origin come from ONE vault item (see save_key), so they always
+    // belong together. On the blocking pool: a keychain read can show a
+    // prompt, and the lock can wait on a save's.
     let prof = profile.to_string();
-    let (key, origin, poisoned) = tokio::task::spawn_blocking(move || {
+    let (key, origin) = tokio::task::spawn_blocking(move || {
         let _binding = binding_lock();
-        (credentials::read_secret(&slot).ok(), saved_origin(&prof), is_poisoned())
+        read_key(&VaultKeys, &prof)
     })
     .await
-    .map_err(|e| format!("could not read the AI key: {e}"))?;
-    if poisoned {
-        return Err(POISONED_MESSAGE.into());
-    }
+    .map_err(|e| format!("could not read the AI key: {e}"))??;
     let scrub_with = key.clone();
     run_http(&emit, cfg, system_context, messages, key, origin)
         .await
@@ -1618,139 +1445,112 @@ async fn check_managed_policy() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// A key store whose every write after the first, every delete and every
-    /// bind fail: the triple failure a save cannot recover from.
+    /// In-memory vault + legacy origin record.
     #[derive(Default)]
-    struct Broken {
-        writes: std::sync::atomic::AtomicUsize,
-        fail_delete: bool,
+    struct MemStore {
+        item: Mutex<Option<String>>,
+        legacy: Mutex<Option<(String, String)>>,
+        fail_write: std::sync::atomic::AtomicBool,
     }
 
-    impl KeyStore for Broken {
-        fn read(&self, _: &str) -> Option<zeroize::Zeroizing<String>> {
-            Some(zeroize::Zeroizing::new("old-key".into()))
+    impl KeyStore for MemStore {
+        fn read(&self, slot: &str) -> Result<zeroize::Zeroizing<String>, credentials::CredError> {
+            self.item.lock().unwrap().clone().map(zeroize::Zeroizing::new).ok_or(credentials::CredError::NotFound(slot.into()))
         }
-        fn write(&self, slot: &str, _: &str) -> Result<(), credentials::CredError> {
-            if self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Ok(())
-            } else {
-                Err(credentials::CredError::Malformed(slot.into()))
+        fn write(&self, slot: &str, item: &str) -> Result<(), credentials::CredError> {
+            if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(credentials::CredError::Malformed(slot.into()));
             }
+            *self.item.lock().unwrap() = Some(item.into());
+            Ok(())
         }
-        fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
-            if self.fail_delete {
-                Err(credentials::CredError::Malformed(slot.into()))
-            } else {
-                Ok(())
-            }
+        fn legacy_origin(&self, _: &str) -> Option<(String, String)> {
+            self.legacy.lock().unwrap().clone()
         }
-        fn bind(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-            Err("disk full".into())
+        fn drop_legacy_origin(&self, _: &str) -> Result<(), String> {
+            *self.legacy.lock().unwrap() = None;
+            Ok(())
         }
     }
 
-    struct Fine;
-    impl KeyStore for Fine {
-        fn read(&self, _: &str) -> Option<zeroize::Zeroizing<String>> {
-            None
-        }
-        fn write(&self, _: &str, _: &str) -> Result<(), credentials::CredError> {
-            Ok(())
-        }
-        fn delete(&self, _: &str) -> Result<(), credentials::CredError> {
-            Ok(())
-        }
-        fn bind(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-            Ok(())
-        }
+    fn origin(kind: &str, url: &str) -> Option<(String, String)> {
+        Some((kind.to_string(), url.to_string()))
+    }
+
+    /// W4c: the key and its origin are one vault item, written once.
+    #[test]
+    fn an_ai_key_and_its_origin_round_trip_as_one_vault_item() {
+        let st = MemStore::default();
+        save_key_with(&st, "default", "sk-new", "anthropic", "https://api.anthropic.com").unwrap();
+        assert!(st.item.lock().unwrap().as_deref().unwrap().starts_with("{\"v\":2"));
+        let (key, o) = read_key(&st, "default").unwrap();
+        assert_eq!(key.as_deref().map(String::as_str), Some("sk-new"));
+        assert_eq!(o, origin("anthropic", "https://api.anthropic.com"));
+        // No key: nothing to send.
+        let empty = MemStore::default();
+        let (key, o) = read_key(&empty, "default").unwrap();
+        assert!(key.is_none() && o.is_none());
     }
 
     #[test]
-    fn a_save_that_cannot_bind_restore_or_remove_poisons_ai_until_saved() {
-        let _binding = binding_lock();
-        // Recoverable: the new key is removed, nothing is poisoned.
-        let removable = Broken { fail_delete: false, ..Default::default() };
-        assert!(save_key_locked("default", "new", "openai", "https://api.openai.com/v1", &removable).is_err());
-        assert!(!is_poisoned());
-        // Bind, restore and remove all fail: chats refuse.
-        let stuck = Broken { fail_delete: true, ..Default::default() };
-        let e = save_key_locked("default", "new", "openai", "https://api.openai.com/v1", &stuck).unwrap_err();
-        assert!(e.contains("blocked"), "{e}");
-        assert!(is_poisoned());
-        // A successful save clears it.
-        save_key_locked("default", "new", "openai", "https://api.openai.com/v1", &Fine).unwrap();
-        assert!(!is_poisoned());
+    fn a_failed_key_write_keeps_the_previous_key_with_its_origin() {
+        let st = MemStore::default();
+        save_key_with(&st, "default", "sk-old", "openai", "https://api.openai.com/v1").unwrap();
+        st.fail_write.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(save_key_with(&st, "default", "sk-new", "anthropic", "https://api.anthropic.com").is_err());
+        let (key, o) = read_key(&st, "default").unwrap();
+        assert_eq!(key.as_deref().map(String::as_str), Some("sk-old"));
+        assert_eq!(o, origin("openai", "https://api.openai.com/v1"));
     }
 
-    /// W4b: an AI key save that dies after any step is repaired at the next
-    /// start: the new key ends up with its new origin, or is removed.
+    /// W4c migration: a plain key saved by an earlier build keeps its legacy
+    /// origin until the next save writes an envelope (and drops the record).
     #[test]
-    fn a_crash_at_any_step_of_a_key_save_is_repaired_consistently() {
-        #[derive(Default)]
-        struct MemStore {
-            key: Mutex<Option<String>>,
-            origin: Mutex<Option<(String, String)>>,
-            fail_bind: std::sync::atomic::AtomicBool,
-            dir: PathBuf,
+    fn a_legacy_plain_key_uses_its_legacy_origin_until_saved_again() {
+        let st = MemStore::default();
+        *st.item.lock().unwrap() = Some("sk-legacy".into());
+        *st.legacy.lock().unwrap() = origin("openai", "https://api.openai.com/v1");
+        let (key, o) = read_key(&st, "default").unwrap();
+        assert_eq!(key.as_deref().map(String::as_str), Some("sk-legacy"));
+        assert_eq!(o, origin("openai", "https://api.openai.com/v1"));
+        // No legacy origin: the key is read but has nowhere it may go.
+        *st.legacy.lock().unwrap() = None;
+        assert_eq!(read_key(&st, "default").unwrap().1, None);
+        *st.legacy.lock().unwrap() = origin("openai", "https://api.openai.com/v1");
+        save_key_with(&st, "default", "sk-legacy", "openai", "https://api.openai.com/v1").unwrap();
+        assert_eq!(*st.legacy.lock().unwrap(), None, "legacy record dropped");
+        assert_eq!(read_key(&st, "default").unwrap().1, origin("openai", "https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn a_damaged_or_host_shaped_key_item_is_never_used() {
+        let st = MemStore::default();
+        for raw in ["{\"v\":2,\"secret\":", "{\"v\":2,\"secret\":\"k\",\"destinations\":[]}"] {
+            *st.item.lock().unwrap() = Some(raw.into());
+            *st.legacy.lock().unwrap() = origin("openai", "https://api.openai.com/v1");
+            assert!(read_key(&st, "default").is_err(), "{raw}");
         }
-        impl KeyStore for MemStore {
-            fn read(&self, _: &str) -> Option<zeroize::Zeroizing<String>> {
-                self.key.lock().unwrap().clone().map(zeroize::Zeroizing::new)
-            }
-            fn write(&self, _: &str, key: &str) -> Result<(), credentials::CredError> {
-                *self.key.lock().unwrap() = Some(key.into());
-                Ok(())
-            }
-            fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
-                self.key.lock().unwrap().take().map(|_| ()).ok_or(credentials::CredError::NotFound(slot.into()))
-            }
-            fn bind(&self, _: &str, kind: &str, base_url: &str) -> Result<(), String> {
-                if self.fail_bind.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err("disk full".into());
-                }
-                *self.origin.lock().unwrap() = Some((kind.into(), base_url.into()));
-                Ok(())
-            }
-            fn journal(&self) -> Option<PathBuf> {
-                Some(self.dir.join(AI_INTENT))
-            }
-            fn origin(&self, _: &str) -> Option<(String, String)> {
-                self.origin.lock().unwrap().clone()
-            }
-        }
-        let _binding = binding_lock();
-        let old = ("openai".to_string(), "https://api.openai.com/v1".to_string());
-        let new = ("anthropic".to_string(), "https://api.anthropic.com".to_string());
-        for step in 1..=6u8 {
-            let dir = std::env::temp_dir().join(format!("hawser-ai-intent-{}-{step}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let st = MemStore { dir, ..Default::default() };
-            save_key_locked("default", "old-key", &old.0, &old.1, &st).unwrap();
-            st.fail_bind.store(step >= 5, std::sync::atomic::Ordering::SeqCst);
-            CRASH_AT.with(|c| c.set(step));
-            let r = save_key_locked("default", "new-key", &new.0, &new.1, &st);
-            CRASH_AT.with(|c| c.set(0));
-            assert_eq!(r.unwrap_err(), INJECTED_CRASH, "step {step}");
-            st.fail_bind.store(false, std::sync::atomic::Ordering::SeqCst);
-            set_poisoned(false); // a restart
-            assert!(repair_ai_intent_with(&st).unwrap().is_some(), "step {step}");
-            assert!(!st.journal().unwrap().exists(), "step {step}");
-            let key = st.key.lock().unwrap().clone();
-            let origin = st.origin.lock().unwrap().clone();
-            match key.as_deref() {
-                Some("new-key") => assert_eq!(origin, Some(new.clone()), "step {step}"),
-                Some("old-key") => assert_eq!(origin, Some(old.clone()), "step {step}"),
-                None => {}
-                k => panic!("step {step}: {k:?}"),
-            }
-            if matches!(step, 1 | 2 | 5 | 6) {
-                assert_eq!(key, None, "step {step}: ambiguous, removed");
-            } else {
-                assert_eq!(key.as_deref(), Some("new-key"), "step {step}");
-            }
-        }
-        set_poisoned(false);
+    }
+
+    /// W4c: a W4b journal withdraws the legacy origin (fail closed) and keeps
+    /// the key; one that cannot be settled stays for the next start.
+    #[test]
+    fn a_leftover_w4b_ai_journal_withdraws_the_legacy_origin() {
+        let dir = std::env::temp_dir().join(format!("hawser-ai-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = dir.join("ai.intent");
+        assert!(!retire_legacy_journal_at(&j, |_| Ok(())), "no journal");
+        std::fs::write(&j, r#"{"profile":"default","kind":"x","baseUrl":"y","phase":"written"}"#).unwrap();
+        assert!(!retire_legacy_journal_at(&j, |_| Err("disk full".into())));
+        assert!(j.exists(), "kept for the next start");
+        let mut dropped = None;
+        assert!(retire_legacy_journal_at(&j, |p| {
+            dropped = Some(p.to_string());
+            Ok(())
+        }));
+        assert_eq!(dropped.as_deref(), Some("default"));
+        assert!(!j.exists());
     }
 
     fn loopback(raw: &str) -> bool {

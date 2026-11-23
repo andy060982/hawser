@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DialIdentity, Host, HostNode, Session, Transfer, TransferProgressEvent, TransferFailureEvent, WorkspaceView } from '../types'
 import {
   addFolder, allFolders, allHosts, bindingChanged, catalogueProblem, countHosts,
-  findHost, isBorrowed, moveHost, NarrowQueue, reidentify, sanitizeImport, setVaultFoldsCase,
+  findHost, isBorrowed, moveHost, NarrowQueue, reidentify, SaveQueue, sanitizeImport, setVaultFoldsCase,
   effectiveHostColor, removeFolder, removeHost, renameFolder, setFolderColor, upsertHost,
   jumpDependents, folderLabels,
 } from '../lib/tree'
@@ -438,25 +438,37 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  Sent with the catalogue save, which narrows them first and saves only
    *  if that worked; kept until a save that carried them succeeds. */
   const narrowQueueRef = useRef(new NarrowQueue())
-  const persistHosts = useCallback((next: HostNode[], narrow: string[] = []) => {
-    setHosts(next)
-    const queue = narrowQueueRef.current
-    queue.add(narrow)
-    if (!loadedRef.current) return
-    const batch = queue.take()
-    safeInvoke('hosts_save', { tree: next, narrow: [...batch.keys()] })
-      .then(() => {
-        queue.settle(batch)
-        saveFailedRef.current = false
-      })
-      .catch((e) => {
+  /** One catalogue save in flight at a time, coalesced to the newest tree
+   *  and numbered, so an older tree can never publish after a newer one
+   *  (lib/tree.ts SaveQueue; the backend refuses a stale generation). */
+  const saveQueueRef = useRef<SaveQueue<HostNode[]> | null>(null)
+  if (!saveQueueRef.current) {
+    saveQueueRef.current = new SaveQueue<HostNode[]>(
+      (tree, narrow, generation) => safeInvoke('hosts_save', { tree, narrow, generation }),
+      narrowQueueRef.current,
+      (e) => {
+        if (e === null) {
+          saveFailedRef.current = false
+          return
+        }
         if (saveFailedRef.current) return
         saveFailedRef.current = true
         void alert(
           `Your change to the host list could not be saved, and will be lost when Hawser closes unless a later save succeeds.\n\n${e instanceof Error ? e.message : e}`,
           { title: 'Hosts not saved' },
         )
-      })
+      },
+    )
+  }
+  const persistHosts = useCallback((next: HostNode[], narrow: string[] = []) => {
+    setHosts(next)
+    if (!loadedRef.current) {
+      // Not loaded yet: nothing may be written, but the ids stay queued for
+      // the first save.
+      narrowQueueRef.current.add(narrow)
+      return
+    }
+    void saveQueueRef.current?.save(next, narrow)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

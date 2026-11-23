@@ -444,7 +444,11 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let r = NetTools::port_check("127.0.0.1", port, 1000).await.unwrap();
+        // Windows retries the SYN to a closed loopback port before it reports
+        // the RST (about 2 s), so a 1 s timeout would expire first and read as
+        // FILTERED; the verdict itself is right once the refusal arrives.
+        let timeout = if cfg!(windows) { 5000 } else { 1000 };
+        let r = NetTools::port_check("127.0.0.1", port, timeout).await.unwrap();
         assert!(r.contains("CLOSED"), "{r}");
     }
 

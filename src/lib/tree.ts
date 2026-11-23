@@ -316,7 +316,10 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
   }
 
   const existingIds = new Set(taken)
-  /** Imported id -> the id it ends up with (itself when it did not collide). */
+  /** Imported id, by its vault key -> the id it ends up with (itself when it
+   *  did not collide). Keyed like the collision check, so a reference spelled
+   *  in another case (`H-LENDER` borrowing `h-lender`, one entry where the
+   *  vault folds case) follows the rename too. */
   const remap = new Map<string, string>()
 
   const walk = (list: HostNode[]): HostNode[] =>
@@ -325,7 +328,7 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
         taken.has(key(n.id)) || !usableImportedId(n.id)
           ? freshId(isFolder(n) ? 'f' : 'h')
           : (taken.add(key(n.id)), n.id)
-      if (!remap.has(n.id)) remap.set(n.id, id)
+      if (!remap.has(key(n.id))) remap.set(key(n.id), id)
       return isFolder(n)
         ? { ...n, id, children: walk(n.children) }
         : { ...n, id }
@@ -338,7 +341,7 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
   // uses is dropped rather than bound to an unrelated local host.
   const fix = (ref: string | undefined): string | undefined => {
     if (ref === undefined) return undefined
-    if (remap.has(ref)) return remap.get(ref)
+    if (remap.has(key(ref))) return remap.get(key(ref))
     return existingIds.has(key(ref)) || !usableImportedId(ref) ? undefined : ref
   }
   const relink = (list: HostNode[]): HostNode[] =>
@@ -572,6 +575,100 @@ export class NarrowQueue {
    *  were queued again since (a newer save carries them). */
   settle(batch: Map<string, number>): void {
     for (const [id, g] of batch) if (this.gen.get(id) === g) this.gen.delete(id)
+  }
+}
+
+/** The backend's answer to a save older than the last one it published
+ *  (utils::hosts::STALE_SAVE), with that last generation. */
+const STALE = /stale catalogue save \(generation \d+; last saved (\d+)\)/
+
+function staleBase(e: unknown): number | null {
+  const m = STALE.exec(e instanceof Error ? e.message : String(e))
+  return m ? Number(m[1]) : null
+}
+
+/** Serialises catalogue saves: at most one in flight, the next one sent only
+ *  after it settles, and every tree queued meanwhile coalesced into the
+ *  newest. Each save carries a generation that only grows (seeded from the
+ *  clock, so a reloaded page continues above its predecessor), and the
+ *  backend refuses one that is not newer than the last it published. So an
+ *  older tree can never publish after a newer one. Vault ids to narrow ride
+ *  the save that carries them (`NarrowQueue`). */
+export class SaveQueue<T> {
+  private latest: { tree: T } | null = null
+  private gen = 0
+  private pumping: Promise<void> | null = null
+  private readonly send: (tree: T, narrow: string[], generation: number) => Promise<unknown>
+  private readonly narrow: NarrowQueue
+  private readonly onResult: (error: unknown) => void
+  private readonly now: () => number
+
+  /** `onResult` is called once per save that was sent: `null` on success. */
+  constructor(
+    send: (tree: T, narrow: string[], generation: number) => Promise<unknown>,
+    narrow: NarrowQueue,
+    onResult: (error: unknown) => void,
+    now: () => number = Date.now,
+  ) {
+    this.send = send
+    this.narrow = narrow
+    this.onResult = onResult
+    this.now = now
+  }
+
+  /** Queue `tree` (replacing any not sent yet) and the ids to narrow with
+   *  it. Resolves once everything queued so far has been sent. */
+  save(tree: T, ids: Iterable<string> = []): Promise<void> {
+    this.narrow.add(ids)
+    this.latest = { tree }
+    if (!this.pumping) this.pumping = this.pump()
+    return this.pumping
+  }
+
+  private next(): number {
+    this.gen = Math.max(this.gen + 1, this.now())
+    return this.gen
+  }
+
+  private async pump(): Promise<void> {
+    // try/finally in this one function: the reset runs in the same tick as
+    // the last check for a queued tree, so a save() after it starts a new
+    // pump and none is ever left unsent. The first await comes before any
+    // work, so `pumping` is always set before this can finish.
+    try {
+      await null
+      while (this.latest) {
+        const { tree } = this.latest
+        this.latest = null
+        const batch = this.narrow.take()
+        let error: unknown = null
+        let saved = false
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await this.send(tree, [...batch.keys()], this.next())
+            saved = true
+            break
+          } catch (e) {
+            error = e
+            const base = staleBase(e)
+            // Refused as stale: the backend published a generation above ours
+            // (a reloaded page, a clock step back). Nothing of ours is in
+            // flight, so continue above it, once; a newer queued tree (sent
+            // next, with these ids still queued) supersedes this one anyway.
+            if (base === null || attempt > 0) break
+            this.gen = Math.max(this.gen, base)
+            if (this.latest) {
+              error = null
+              break
+            }
+          }
+        }
+        if (saved) this.narrow.settle(batch)
+        if (saved || error !== null) this.onResult(saved ? null : error)
+      }
+    } finally {
+      this.pumping = null
+    }
   }
 }
 

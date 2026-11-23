@@ -11,7 +11,7 @@ import {
   markFailed, netTargetError, parsePort, policyFor, queuedRow, retryJobs, validateForward,
 } from './transfers.ts'
 import {
-  bindingChanged, catalogueProblem, credentialDestinations, isBorrowed, NarrowQueue, reidentify, sameVaultId,
+  bindingChanged, catalogueProblem, credentialDestinations, isBorrowed, NarrowQueue, reidentify, sameVaultId, SaveQueue,
   sanitizeImport, setVaultFoldsCase, usableImportedId, vaultIdKey,
 } from './tree.ts'
 import { clearLocal, emitLocal, onLocal } from './localTerm.ts'
@@ -524,6 +524,98 @@ test('queued narrowing survives a failed save and clears only when carried', () 
   assert.deepEqual(q.pending(), [])
 })
 
+
+/* W4c: catalogue saves are serialised, coalesced and numbered. */
+test('catalogue saves run one at a time, coalesce to the newest tree, and never go backwards', async () => {
+  const calls = []
+  const gates = []
+  const send = (tree, narrow, generation) => {
+    calls.push({ tree, narrow, generation })
+    const d = deferred()
+    gates.push(d)
+    return d.promise
+  }
+  const results = []
+  const q = new SaveQueue(send, new NarrowQueue(), (e) => results.push(e), () => 100)
+  const done = q.save(['A'], ['lender'])
+  q.save(['B'])
+  await null
+  await null
+  assert.equal(calls.length, 1, 'one save in flight')
+  assert.deepEqual(calls[0].tree, ['B'], 'queued trees coalesce before sending')
+  q.save(['C'])
+  q.save(['D'], ['other'])
+  assert.equal(calls.length, 1, 'still waiting for the first')
+  gates[0].resolve()
+  for (let i = 0; i < 5 && calls.length < 2; i++) await null
+  assert.equal(calls.length, 2)
+  assert.deepEqual(calls[1].tree, ['D'], 'only the newest of C and D is sent')
+  assert.deepEqual(calls[1].narrow, ['other'], 'lender was carried by the first save')
+  assert.ok(calls[1].generation > calls[0].generation)
+  gates[1].resolve()
+  await done
+  assert.deepEqual(results, [null, null])
+  // A failure keeps the narrowing queued for the next save.
+  const q2 = new SaveQueue(send, new NarrowQueue(), (e) => results.push(e))
+  const p = q2.save(['E'], ['x'])
+  await null
+  await null
+  gates[2].reject(new Error('disk full'))
+  await p
+  const p2 = q2.save(['F'])
+  await null
+  await null
+  assert.deepEqual(calls[3].narrow, ['x'], 'retried with the next save')
+  gates[3].resolve()
+  await p2
+})
+
+test('a save refused as stale continues above the backend generation, once', async () => {
+  const calls = []
+  let refuse = true
+  const send = async (tree, narrow, generation) => {
+    calls.push(generation)
+    if (refuse) {
+      refuse = false
+      throw new Error(`stale catalogue save (generation ${generation}; last saved 5000)`)
+    }
+  }
+  const results = []
+  const q = new SaveQueue(send, new NarrowQueue(), (e) => results.push(e), () => 10)
+  await q.save(['A'])
+  assert.deepEqual(calls, [10, 5001])
+  assert.deepEqual(results, [null])
+  // Refused twice: reported, not retried forever.
+  const always = async (_t, _n, g) => {
+    throw new Error(`stale catalogue save (generation ${g}; last saved 9000)`)
+  }
+  const r2 = []
+  await new SaveQueue(always, new NarrowQueue(), (e) => r2.push(e)).save(['A'])
+  assert.equal(r2.length, 1)
+  assert.ok(String(r2[0]).includes('stale'))
+})
+
+test('an import remaps a credential reference spelled in another case where the vault folds', () => {
+  try {
+    setVaultFoldsCase(true)
+    const existing = [mkHost({ id: 'h-lender' })]
+    const [lender, borrower] = reidentify(
+      [mkHost({ id: 'h-lender', hostname: 'l' }), mkHost({ id: 'h-b', hostname: 'b', credentialId: 'H-LENDER' })],
+      existing,
+    )
+    assert.notEqual(vaultIdKey(lender.id), 'h-lender', 'the imported lender is re-id\'d')
+    assert.equal(borrower.credentialId, lender.id, 'the borrower follows it, not the local h-lender')
+    setVaultFoldsCase(false)
+    const [l2, b2] = reidentify(
+      [mkHost({ id: 'h-lender', hostname: 'l' }), mkHost({ id: 'h-b', hostname: 'b', credentialId: 'H-LENDER' })],
+      existing,
+    )
+    assert.notEqual(l2.id, 'h-lender')
+    assert.equal(b2.credentialId, 'H-LENDER', 'a distinct entry where the vault is case-sensitive')
+  } finally {
+    setVaultFoldsCase(true)
+  }
+})
 
 /* ------------------------------------------------------------------ W5 */
 

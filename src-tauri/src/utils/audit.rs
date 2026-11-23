@@ -144,6 +144,8 @@ const EV_DROPPED: &str = "audit.dropped";
 /// Records accepted before an exit that could not write them in time, spilled
 /// to `audit.pending-*.jsonl` and recorded at the next start.
 const EV_RECOVERED: &str = "audit.recovered";
+/// Detail key of the unique id every accepted record carries (spill dedupe).
+const RID: &str = "rid";
 /// Prefix / suffix of spilled-record files beside the log.
 const PENDING_PREFIX: &str = "audit.pending-";
 const PENDING_SUFFIX: &str = ".jsonl";
@@ -1209,6 +1211,45 @@ impl<A: Anchor> Log<A> {
         res.map_err(|e| e.to_string())
     }
 
+    /// Which of `want` (record ids) the live log already holds. Streams the
+    /// whole file, keeping only matches, under the file lock and after any
+    /// interrupted rotation is settled (so the file scanned is the one the
+    /// next append goes to).
+    fn ids_present(
+        &self,
+        want: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>, KnownHostsError> {
+        #[derive(Deserialize)]
+        struct Line {
+            #[serde(default)]
+            detail: Ids,
+        }
+        #[derive(Deserialize, Default)]
+        struct Ids {
+            #[serde(default)]
+            rid: Option<String>,
+        }
+        let mut found = std::collections::HashSet::new();
+        let _lock = FileLock::acquire(&self.path)?;
+        if self.recover_rotation()? == Rotation::Pending {
+            return Err(KnownHostsError::Parse(ROTATION_PENDING.to_string()));
+        }
+        let f = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+            Err(e) => return Err(io_err(&self.path)(e)),
+        };
+        for_each_line(f, |line| {
+            if let Some(rid) = line.and_then(|l| serde_json::from_slice::<Line>(l).ok()).and_then(|l| l.detail.rid) {
+                if want.contains(&rid) {
+                    found.insert(rid);
+                }
+            }
+        })
+        .map_err(io_err(&self.path))?;
+        Ok(found)
+    }
+
     /// The newest `limit` records, newest first, from a tail window of the
     /// file (never the whole history): records are read backwards until
     /// `limit` lines are in hand or 32 MiB has been read.
@@ -1831,6 +1872,11 @@ struct PendingRec {
 struct Pending {
     next: u64,
     recs: BTreeMap<u64, PendingRec>,
+    /// Set by the exit spill, in the same critical section that takes `recs`:
+    /// admission is closed, and a record accepted after it is spilled on its
+    /// own, straight into this folder, rather than left in a map nobody
+    /// will spill again.
+    closed: Option<PathBuf>,
 }
 
 type SharedPending = std::sync::Arc<Mutex<Pending>>;
@@ -1862,8 +1908,20 @@ impl Writer {
     }
 
     fn record(&self, event: &str, summary: String, detail: Value) {
+        // Every accepted record carries a unique id from here on, in its
+        // detail (so in the hashed entry): spill recovery skips any id the
+        // log already holds, whatever else the record says.
+        let detail = with_rid(detail, &super::artifacts::random_hex(16));
         let id = {
             let mut p = lock_pending(&self.pending);
+            if let Some(dir) = p.closed.clone() {
+                drop(p);
+                let rec = PendingRec { event: event.to_string(), summary, detail, accepted: now_secs(), in_progress: false };
+                if let Err(e) = write_spill(&dir, &spill_text([&rec].into_iter(), 0)) {
+                    eprintln!("hawser: could not keep an audit record accepted during exit ({event}): {e}");
+                }
+                return;
+            }
             if p.recs.len() >= MAX_PENDING {
                 drop(p);
                 if self.dropped.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1925,61 +1983,95 @@ impl Writer {
     }
 
     /// Move every accepted-but-unwritten record into `dir/audit.pending-<ts>.jsonl`
-    /// (0600), one JSON object per line. The writer skips any record it has not
-    /// started yet once it is spilled, so it is never written twice; one it had
-    /// started is marked `uncertain` (de-duplicated at ingest). Returns the file.
+    /// (0600), one JSON object per line, and close admission: a record accepted
+    /// after this is spilled to a file of its own (see `record`). The writer
+    /// skips any record it has not started yet once it is spilled; one it had
+    /// started may still land, and is skipped at ingest by its id. Returns
+    /// the file.
     fn spill(&self, dir: &Path) -> std::io::Result<Option<PathBuf>> {
-        let recs = std::mem::take(&mut lock_pending(&self.pending).recs);
+        let recs = {
+            let mut p = lock_pending(&self.pending);
+            p.closed = Some(dir.to_path_buf());
+            std::mem::take(&mut p.recs)
+        };
         let lost = self.dropped.swap(0, Ordering::SeqCst);
         if recs.is_empty() && lost == 0 {
             return Ok(None);
         }
-        let mut text = String::new();
-        for r in recs.values() {
-            let line = serde_json::json!({
-                "event": r.event, "summary": r.summary, "detail": r.detail,
-                "accepted": r.accepted, "uncertain": r.in_progress,
-            });
-            text.push_str(&line.to_string());
-            text.push('\n');
-        }
-        if lost > 0 {
-            let line = serde_json::json!({
-                "event": EV_DROPPED,
-                "summary": format!("{lost} audit entr{} could not be recorded: the writer was blocked and its queue was full", if lost == 1 { "y" } else { "ies" }),
-                "detail": { "count": lost }, "accepted": now_secs(), "uncertain": false,
-            });
-            text.push_str(&line.to_string());
-            text.push('\n');
-        }
-        std::fs::create_dir_all(dir)?;
-        let ts = now_secs();
-        for n in 0..1000u32 {
-            let name = match n {
-                0 => format!("{PENDING_PREFIX}{ts}{PENDING_SUFFIX}"),
-                n => format!("{PENDING_PREFIX}{ts}-{n}{PENDING_SUFFIX}"),
-            };
-            let path = dir.join(name);
-            let mut opts = OpenOptions::new();
-            opts.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            match opts.open(&path) {
-                Ok(mut f) => {
-                    f.write_all(text.as_bytes())?;
-                    f.sync_all()?;
-                    let _ = sync_dir(&path);
-                    return Ok(Some(path));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(std::io::Error::other("no free audit.pending file name"))
+        write_spill(dir, &spill_text(recs.values(), lost)).map(Some)
     }
+}
+
+/// `detail` with the record id `rid` added (a non-object detail is wrapped as
+/// `value`, exactly as `sanitize` would store it).
+fn with_rid(detail: Value, rid: &str) -> Value {
+    let mut map = match detail {
+        Value::Object(m) => m,
+        Value::Null => serde_json::Map::new(),
+        other => serde_json::Map::from_iter([("value".to_string(), other)]),
+    };
+    map.insert(RID.into(), Value::String(rid.to_string()));
+    Value::Object(map)
+}
+
+/// The record id stored in a detail object, if any.
+fn rid_of(detail: &Value) -> Option<&str> {
+    detail.get(RID).and_then(Value::as_str)
+}
+
+/// Spill-file text: one JSON object per record, plus a dropped-count note.
+fn spill_text<'a>(recs: impl Iterator<Item = &'a PendingRec>, lost: u64) -> String {
+    let mut text = String::new();
+    for r in recs {
+        let line = serde_json::json!({
+            "event": r.event, "summary": r.summary, "detail": r.detail,
+            "accepted": r.accepted, "uncertain": r.in_progress,
+        });
+        text.push_str(&line.to_string());
+        text.push('\n');
+    }
+    if lost > 0 {
+        let line = serde_json::json!({
+            "event": EV_DROPPED,
+            "summary": format!("{lost} audit entr{} could not be recorded: the writer was blocked and its queue was full", if lost == 1 { "y" } else { "ies" }),
+            "detail": with_rid(serde_json::json!({ "count": lost }), &super::artifacts::random_hex(16)),
+            "accepted": now_secs(), "uncertain": false,
+        });
+        text.push_str(&line.to_string());
+        text.push('\n');
+    }
+    text
+}
+
+/// Write `text` to a new `dir/audit.pending-<ts>[-n].jsonl` (0600, synced).
+fn write_spill(dir: &Path, text: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let ts = now_secs();
+    for n in 0..1000u32 {
+        let name = match n {
+            0 => format!("{PENDING_PREFIX}{ts}{PENDING_SUFFIX}"),
+            n => format!("{PENDING_PREFIX}{ts}-{n}{PENDING_SUFFIX}"),
+        };
+        let path = dir.join(name);
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(mut f) => {
+                f.write_all(text.as_bytes())?;
+                f.sync_all()?;
+                let _ = sync_dir(&path);
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free audit.pending file name"))
 }
 
 fn serve<A: Anchor + 'static>(
@@ -2073,11 +2165,16 @@ fn serve<A: Anchor + 'static>(
 
 /// Record what an earlier exit spilled (`audit.pending-*.jsonl` beside the
 /// log): an `audit.recovered` note per file, then each record, with the time
-/// it was originally accepted. A record marked `uncertain` (the writer had
-/// started on it) is skipped when the log's tail already has it. A file is
-/// removed only once all of it is recorded; if recording stops part-way it
-/// stays for the next start (whose pass may then repeat the part already
-/// written, which the `audit.recovered` notes make visible).
+/// it was originally accepted.
+///
+/// Idempotent, by record id: every spilled record carries the id it was given
+/// when it was accepted, and the note gets one derived from the file. Before
+/// a file is replayed the whole live log is scanned (streaming) for those
+/// ids, and any already present is skipped: one the writer did land after
+/// all, and everything a crash mid-recovery already wrote. A file is removed
+/// only once all of it is recorded; a removal that fails just repeats the
+/// (now empty) pass next time. Spill files from builds before record ids fall
+/// back to matching an uncertain record against the log's recent tail.
 fn ingest_pending<A: Anchor>(log: &Log<A>) {
     let Some(dir) = log.path.parent() else { return };
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -2100,33 +2197,53 @@ fn ingest_pending<A: Anchor>(log: &Log<A>) {
             None => bad += 1,
         });
         let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let note = log.record(
-            EV_RECOVERED,
-            &format!(
-                "{} audit entr{} accepted before the previous exit, which could not wait for them, are recorded below (from {name}){}",
-                rows.len(),
-                if rows.len() == 1 { "y" } else { "ies" },
-                if bad > 0 { format!("; {bad} unreadable line(s) skipped") } else { String::new() }
-            ),
-            serde_json::json!({ "count": rows.len(), "file": name, "unreadable": bad }),
-        );
-        if let Err(e) = note {
-            eprintln!("hawser: could not record spilled audit entries yet ({e}); kept {name}");
-            return;
+        let note_rid = format!("recovered-{}", &hex(&Sha256::digest([name.as_bytes(), b"\0", &bytes].concat()))[..32]);
+        let mut want: std::collections::HashSet<String> =
+            rows.iter().filter_map(|v| v.get("detail").and_then(rid_of)).map(str::to_string).collect();
+        want.insert(note_rid.clone());
+        let present = match log.ids_present(&want) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("hawser: could not record spilled audit entries yet ({e}); kept {name}");
+                return;
+            }
+        };
+        if !present.contains(&note_rid) {
+            let note = log.record(
+                EV_RECOVERED,
+                &format!(
+                    "{} audit entr{} accepted before the previous exit, which could not wait for them, are recorded below (from {name}){}",
+                    rows.len(),
+                    if rows.len() == 1 { "y" } else { "ies" },
+                    if bad > 0 { format!("; {bad} unreadable line(s) skipped") } else { String::new() }
+                ),
+                serde_json::json!({ "count": rows.len(), "file": name, "unreadable": bad, RID: note_rid }),
+            );
+            if let Err(e) = note {
+                eprintln!("hawser: could not record spilled audit entries yet ({e}); kept {name}");
+                return;
+            }
         }
-        let recent = log.list(256).unwrap_or_default();
+        let mut recent: Option<Vec<AuditView>> = None;
         for v in rows {
             let event = v.get("event").and_then(Value::as_str).unwrap_or_default().to_string();
             let summary = v.get("summary").and_then(Value::as_str).unwrap_or_default().to_string();
             let mut detail = v.get("detail").cloned().unwrap_or(Value::Null);
-            if v.get("uncertain").and_then(Value::as_bool) == Some(true) {
-                let want = sanitize(detail.clone());
-                if recent.iter().any(|r| r.event == event && r.summary == summary && r.detail == want) {
-                    continue;
+            match rid_of(&detail) {
+                Some(r) if present.contains(r) => continue,
+                Some(_) => {}
+                // A pre-id spill: the old best-effort tail match.
+                None if v.get("uncertain").and_then(Value::as_bool) == Some(true) => {
+                    let want = sanitize(detail.clone());
+                    let tail = recent.get_or_insert_with(|| log.list(256).unwrap_or_default());
+                    if tail.iter().any(|r| r.event == event && r.summary == summary && r.detail == want) {
+                        continue;
+                    }
                 }
+                None => {}
             }
             if !detail.is_object() {
-                detail = serde_json::json!({});
+                detail = serde_json::json!({ "value": detail });
             }
             if let Some(o) = detail.as_object_mut() {
                 o.insert("acceptedAt".into(), v.get("accepted").cloned().unwrap_or(Value::Null));
@@ -2192,33 +2309,56 @@ fn migrate_audit_files(from: &Path, to: &Path) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(to)?;
     super::platform::restrict_perms(to, 0o700);
-    if let Ok(dir) = std::fs::read_dir(from) {
-        for entry in dir.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let ours = name == AUDIT_FILE
-                || (name.starts_with("audit-") && name.ends_with(".archived.jsonl"))
-                || name.starts_with("audit.jsonl.");
-            if !ours || name.ends_with(".lock") || !entry.file_type().is_ok_and(|t| t.is_file()) {
-                continue;
+    // Every error below propagates, so the marker is written only once every
+    // source file was read and copied. A missing source folder has nothing to
+    // copy; any other failure to list it is an error, never "nothing there".
+    match std::fs::read_dir(from) {
+        Ok(dir) => {
+            for entry in dir {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let ours = name == AUDIT_FILE
+                    || (name.starts_with("audit-") && name.ends_with(".archived.jsonl"))
+                    || name.starts_with("audit.jsonl.");
+                if !ours || name.ends_with(".lock") || !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let dest = to.join(&*name);
+                if !migration_needs_copy(&entry.path(), &dest)? {
+                    continue;
+                }
+                let tmp = to.join(format!(".migrating-{name}"));
+                let _ = std::fs::remove_file(&tmp);
+                copy_synced(&mut File::open(entry.path())?, &tmp)?;
+                std::fs::rename(&tmp, &dest)?;
             }
-            let dest = to.join(&*name);
-            if !migration_needs_copy(&entry.path(), &dest)? {
-                continue;
-            }
-            let tmp = to.join(format!(".migrating-{name}"));
-            let _ = std::fs::remove_file(&tmp);
-            std::fs::copy(entry.path(), &tmp)?;
-            File::open(&tmp)?.sync_all()?;
-            std::fs::rename(&tmp, &dest)?;
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     sync_dir(&marker)?;
     let tmp = to.join(".migrating-audit.migrated");
-    std::fs::write(&tmp, b"1\n")?;
-    File::open(&tmp)?.sync_all()?;
+    let _ = std::fs::remove_file(&tmp);
+    copy_synced(&mut &b"1\n"[..], &tmp)?;
     std::fs::rename(&tmp, &marker)?;
     sync_dir(&marker)
+}
+
+/// Copy `src` into a new file at `dest` and sync it through the SAME write
+/// handle before closing it. (Windows FlushFileBuffers needs write access: a
+/// sync through a handle reopened read-only fails with access denied.)
+fn copy_synced(src: &mut impl Read, dest: &Path) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut out = opts.open(dest)?;
+    std::io::copy(src, &mut out)?;
+    out.sync_all()
 }
 
 /// Whether `dest` still needs `src` copied over it: missing, or a strict
@@ -3293,6 +3433,120 @@ mod tests {
         ingest_pending(&log);
         let all = lines(&p);
         assert_eq!(all.len(), 2, "only the recovered note was added: {all:?}");
+    }
+
+    fn spill_line(rid: &str, summary: &str, uncertain: bool) -> String {
+        json!({ "event": "connect", "summary": summary, "detail": { "host": "fw1", "rid": rid }, "accepted": 1, "uncertain": uncertain })
+            .to_string()
+    }
+
+    fn summaries(p: &Path) -> Vec<String> {
+        lines(p).iter().map(|l| serde_json::from_str::<AuditEntry>(l).unwrap().summary).collect()
+    }
+
+    /// W4c: dedupe is by record id, never by content. A record that did not
+    /// land is recorded even when an identical-looking one is in the log; one
+    /// that did land is skipped wherever it is in the file.
+    #[test]
+    fn spill_recovery_dedupes_by_record_id_not_by_content() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        log.record("connect", "same", json!({ "host": "fw1", "rid": "a1" })).unwrap();
+        rec(&log, 300); // pushes it far outside any tail window
+        let spill = p.with_file_name(format!("{PENDING_PREFIX}1{PENDING_SUFFIX}"));
+        let text = [spill_line("a1", "same", true), spill_line("b2", "same", true)].join("\n");
+        std::fs::write(&spill, format!("{text}\n")).unwrap();
+        ingest_pending(&log);
+        let got = summaries(&p);
+        assert_eq!(got.len(), 301 + 2, "the note and b2 only");
+        assert!(got[301].contains("recorded below"));
+        assert_eq!(got[302], "same");
+        let last: AuditEntry = serde_json::from_str(lines(&p).last().unwrap()).unwrap();
+        assert_eq!(last.detail.get(RID), Some(&json!("b2")));
+        assert!(!spill.exists());
+        assert_eq!(status(&restart(&p, &m)), Status::Verified);
+    }
+
+    /// W4c: a crash part-way through recovery (or a spill that could not be
+    /// removed) never duplicates on the next pass, note included.
+    #[test]
+    fn interrupted_spill_recovery_is_idempotent() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        let spill = p.with_file_name(format!("{PENDING_PREFIX}1{PENDING_SUFFIX}"));
+        let text = [spill_line("r1", "one", false), spill_line("r2", "two", false), spill_line("r3", "three", false)].join("\n");
+        std::fs::write(&spill, format!("{text}\n")).unwrap();
+        let keep = std::fs::read(&spill).unwrap();
+        ingest_pending(&log);
+        assert_eq!(summaries(&p).len(), 4);
+        // As if the first pass had died before removing the file.
+        std::fs::write(&spill, &keep).unwrap();
+        ingest_pending(&restart(&p, &m));
+        assert_eq!(summaries(&p).len(), 4, "nothing replayed");
+        assert!(!spill.exists());
+        // As if it had died after the note and the first record only.
+        let (p2, m2) = (tmp(), Mem::default());
+        let log2 = restart(&p2, &m2);
+        let spill2 = p2.with_file_name(spill.file_name().unwrap());
+        std::fs::write(&spill2, &keep).unwrap();
+        ingest_pending(&log2);
+        let full = lines(&p2);
+        std::fs::write(&p2, format!("{}\n{}\n", full[0], full[1])).unwrap();
+        let (p3, m3) = (p2.clone(), Mem::default()); // a fresh seal: the cut is not what is tested here
+        std::fs::write(&spill2, &keep).unwrap();
+        ingest_pending(&restart(&p3, &m3));
+        let got = summaries(&p3);
+        assert_eq!(got.iter().filter(|s| s.contains("recorded below")).count(), 1, "{got:?}");
+        assert_eq!(got.iter().filter(|s| *s == "one").count(), 1, "{got:?}");
+        assert!(got.contains(&"two".to_string()) && got.contains(&"three".to_string()), "{got:?}");
+    }
+
+    /// W4c: every accepted record gets an id, and a record accepted after the
+    /// exit spill closed admission is spilled on its own, not lost.
+    #[test]
+    fn records_accepted_after_the_exit_spill_are_kept() {
+        let (p, m) = (tmp(), Mem::default());
+        let (release, stuck) = mpsc::channel::<()>();
+        let (p2, m2) = (p.clone(), m.clone());
+        let w = Writer::spawn(move || {
+            let _ = stuck.recv();
+            Ok(restart(&p2, &m2))
+        })
+        .unwrap();
+        w.record("connect", "before".into(), json!({ "n": 1 }));
+        let aside = p.parent().unwrap().join("aside");
+        let first = w.spill(&aside).unwrap().expect("spilled");
+        w.record("disconnect", "after".into(), json!("plain"));
+        let files: Vec<PathBuf> = std::fs::read_dir(&aside).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(files.len(), 2, "the late record has its own spill file: {files:?}");
+        let mut rids = Vec::new();
+        for f in &files {
+            let v: Value = serde_json::from_str(std::fs::read_to_string(f).unwrap().lines().next().unwrap()).unwrap();
+            let rid = v["detail"][RID].as_str().unwrap().to_string();
+            assert_eq!(rid.len(), 32, "128-bit id");
+            rids.push(rid);
+        }
+        assert_ne!(rids[0], rids[1]);
+        let late = files.iter().find(|f| **f != first).unwrap();
+        assert!(std::fs::read_to_string(late).unwrap().contains("\"value\":\"plain\""));
+        release.send(()).unwrap();
+        assert!(w.flush(Duration::from_secs(5)));
+        assert!(!p.exists() || lines(&p).is_empty(), "nothing spilled was also written");
+    }
+
+    /// W4c (item 5): a source folder that cannot be listed is an error, and
+    /// no completion marker is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_migration_source_that_cannot_be_read_never_writes_the_marker() {
+        let root = tmp().parent().unwrap().to_path_buf();
+        let (from, to) = (root.join("roaming-file"), root.join("local"));
+        std::fs::write(&from, b"not a folder").unwrap();
+        assert!(migrate_audit_files(&from, &to).is_err());
+        assert!(!to.join("audit.migrated").exists());
+        // A missing source folder simply has nothing to copy.
+        migrate_audit_files(&root.join("absent"), &to).unwrap();
+        assert!(to.join("audit.migrated").exists());
     }
 
     /// W4b: an archive verified and hashed outside the locks is used only if

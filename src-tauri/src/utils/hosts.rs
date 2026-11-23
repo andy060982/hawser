@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 
 use super::known_hosts::KnownHostsError;
+use super::vault_item::{self, Destination, Envelope, Item};
 
 /// Serialises every catalogue/settings write so two concurrent saves can neither
 /// interleave on a shared scratch file nor race on the final replace.
@@ -266,13 +267,6 @@ pub fn load() -> Result<Option<Value>, KnownHostsError> {
     }
 }
 
-/// Write the catalogue atomically. Losing the host list to a mid-write crash
-/// would be a real data-loss bug, so this goes through `write_atomic`
-/// (unique temp, rename-replace, process-wide serialisation).
-pub fn save(tree: &Value) -> Result<(), KnownHostsError> {
-    save_at(&hosts_path()?, tree)
-}
-
 fn catalogue_text(tree: &Value) -> Result<String, KnownHostsError> {
     if !tree.is_array() {
         return Err(KnownHostsError::Parse("the host catalogue must be a list".into()));
@@ -280,6 +274,10 @@ fn catalogue_text(tree: &Value) -> Result<String, KnownHostsError> {
     serde_json::to_string_pretty(tree).map_err(|e| KnownHostsError::Parse(e.to_string()))
 }
 
+/// Write the catalogue atomically. Losing the host list to a mid-write crash
+/// would be a real data-loss bug, so this goes through `write_atomic`
+/// (unique temp, rename-replace, process-wide serialisation). Published only
+/// through `save_and_narrow`, which orders saves.
 fn save_at(path: &Path, tree: &Value) -> Result<(), KnownHostsError> {
     write_atomic(path, &catalogue_text(tree)?)
 }
@@ -340,24 +338,52 @@ pub fn keep_catalogue_backup() -> Result<Option<PathBuf>, KnownHostsError> {
         .ok_or_else(|| KnownHostsError::Parse(format!("could not keep a copy of {}", path.display())))
 }
 
+/// Serialises catalogue publication (and the narrowing that goes with it),
+/// holding the generation of the last tree published this run.
+static CATALOGUE_LOCK: Mutex<u64> = Mutex::new(0);
+
+/// Prefix of the error a stale save gets (the frontend recognises it).
+pub const STALE_SAVE: &str = "stale catalogue save";
+
 /// Save the catalogue AND revoke, for each vault id in `narrow`, every bound
-/// destination that no host in `tree` uses any more — as one operation.
+/// destination that no host in `tree` uses any more — as one operation, under
+/// one lock that also orders publication.
+///
+/// `generation`: the frontend numbers its saves; one that is not newer than
+/// the last tree published is refused (`STALE_SAVE`), so an older tree can
+/// never replace a newer one however the IPC calls are scheduled. `None` (an
+/// older caller) is unordered.
 ///
 /// Narrowing runs FIRST, and a narrowing failure saves nothing: the edit is
 /// reported as not saved (the frontend keeps it and retries with the next
 /// save). The other order could leave the catalogue edited while the old
-/// destination still receives the password. Destinations are derived here,
-/// from `tree`, with the vault's own id rule (`binding_key`); narrowing only
-/// ever removes, so a frontend-supplied tree can revoke but never authorize.
-pub fn save_and_narrow(tree: &Value, narrow: &[String]) -> Result<(), String> {
+/// destination still receives the password. A narrowing that did succeed
+/// before a later one failed stays applied: narrowing only ever removes
+/// destinations, so that is safe, and the retry repeats it as a no-op.
+/// Destinations are derived here, from `tree`, with the vault's own id rule
+/// (`binding_key`); a frontend-supplied tree can revoke but never authorize.
+pub fn save_and_narrow(tree: &Value, narrow: &[String], generation: Option<u64>) -> Result<(), String> {
     let hosts = hosts_path().map_err(|e| e.to_string())?;
     let bindings = bindings_path().map_err(|e| e.to_string())?;
-    save_and_narrow_at(&hosts, &bindings, tree, narrow)
+    save_and_narrow_with(&OsVault, &hosts, &bindings, tree, narrow, generation)
 }
 
-fn save_and_narrow_at(hosts: &Path, bindings: &Path, tree: &Value, narrow: &[String]) -> Result<(), String> {
+fn save_and_narrow_with(
+    vault: &impl VaultOps,
+    hosts: &Path,
+    bindings: &Path,
+    tree: &Value,
+    narrow: &[String],
+    generation: Option<u64>,
+) -> Result<(), String> {
     if !tree.is_array() {
         return Err("the host catalogue must be a list".into());
+    }
+    let mut last = CATALOGUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(g) = generation {
+        if g <= *last {
+            return Err(format!("{STALE_SAVE} (generation {g}; last saved {})", *last));
+        }
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut failed = Vec::new();
@@ -365,7 +391,7 @@ fn save_and_narrow_at(hosts: &Path, bindings: &Path, tree: &Value, narrow: &[Str
         if check_host_cred_id(id).is_err() || !seen.insert(binding_key(id)) {
             continue;
         }
-        if let Err(e) = narrow_binding_at(bindings, id, &catalogue_dests(tree, id)) {
+        if let Err(e) = narrow_binding_with(vault, bindings, id, &catalogue_dests(tree, id)) {
             failed.push(format!("{id}: {e}"));
         }
     }
@@ -375,7 +401,11 @@ fn save_and_narrow_at(hosts: &Path, bindings: &Path, tree: &Value, narrow: &[Str
             failed.join("; ")
         ));
     }
-    save_at(hosts, tree).map_err(|e| e.to_string())
+    save_at(hosts, tree).map_err(|e| e.to_string())?;
+    if let Some(g) = generation {
+        *last = g;
+    }
+    Ok(())
 }
 
 /// Destinations in `tree` whose effective vault entry (`credentialId`, else
@@ -405,21 +435,23 @@ fn catalogue_dests(tree: &Value, cred_id: &str) -> Vec<Dest> {
 /* -------------------------------------------------------------------------- */
 
 // -------------------------------------------------------------------------
-// Backend-owned credential→destination bindings.
+// Backend-owned credential→destination authorization.
 //
 // `ssh_connect` must not decide "may this saved password go to this host?" by
 // reading the FRONTEND-owned catalogue (hosts.json): a compromised webview can
 // rewrite that file via `hosts_save`, add an attacker destination that borrows
 // a victim's `credentialId`, then connect — and the backend would treat it as
-// authorized. So the authorization lives in a file only the backend writes:
-// `credential_bindings.json`, mapping `cred_id -> [ {host,port,username}, … ]`.
+// authorized. So the authorization is backend-owned. This build stores it in
+// the secret's own vault item (see "vault item" below), written only when the
+// human saves the secret, and only ever narrowed afterwards. Repointing it
+// therefore requires `credential_save`, which overwrites the secret itself —
+// an attacker cannot keep a victim's password while redirecting it.
 //
-// It is written ONLY at credential-save time (the human is present and just
-// typed the secret) and, once, at startup migration (from the on-disk catalogue
-// BEFORE the webview loads). Repointing a binding therefore requires calling
-// `credential_save`, which overwrites the secret itself — so an attacker cannot
-// keep a victim's password while redirecting it. Later edits to hosts.json have
-// no effect on what is authorized.
+// Secrets saved by earlier builds are plain, and their authorization is in
+// `credential_bindings.json` (`cred_id -> [ {host,port,username}, … ]`),
+// written at their save time and once by the startup migration. That file is
+// read-only legacy now: it only shrinks, and a re-save replaces it with an
+// envelope.
 // -------------------------------------------------------------------------
 
 fn bindings_path() -> Result<PathBuf, KnownHostsError> {
@@ -536,8 +568,8 @@ fn write_bindings_at(path: &Path, map: &Value) -> Result<(), KnownHostsError> {
 /// Catalogue destinations that legitimately use vault entry `cred_id`: the owner
 /// record (`id == cred_id`) and any borrower (`credentialId == cred_id`), each
 /// contributing its own `hostname`/`port`/`username`.
-fn dests_for_cred(cred_id: &str) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
+fn dests_for_cred(cred_id: &str) -> Vec<Dest> {
+    let mut out: Vec<Dest> = Vec::new();
     if let Ok(Some(tree)) = load() {
         walk_hosts(&tree, &mut |node| {
             let id = node.get("id").and_then(Value::as_str);
@@ -548,10 +580,10 @@ fn dests_for_cred(cred_id: &str) -> Vec<Value> {
             }
             if let (Some(h), Some(p), Some(u)) = (
                 node.get("hostname").and_then(Value::as_str),
-                node.get("port").and_then(Value::as_u64),
+                node.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()),
                 node.get("username").and_then(Value::as_str),
             ) {
-                let d = json!({ "host": h, "port": p, "username": u });
+                let d = Dest { host: h.into(), port: p, username: u.into() };
                 if !out.contains(&d) {
                     out.push(d);
                 }
@@ -573,12 +605,22 @@ impl Dest {
     fn to_json(&self) -> Value {
         json!({ "host": self.host, "port": u64::from(self.port), "username": self.username })
     }
+
+    fn tuple(&self) -> Destination {
+        (self.host.clone(), self.port, self.username.clone())
+    }
+
+    fn is(&self, d: &Destination) -> bool {
+        self.host == d.0 && self.port == d.1 && self.username == d.2
+    }
 }
 
-/// Record the destinations `cred_id` may be sent to, in backend-owned state.
-/// The owner's own (host, port, username) is passed explicitly (authoritative,
-/// and free of any hosts.json write-ordering dependency); catalogue borrowers of
-/// `cred_id` present at this moment are included too.
+/// Record the destinations `cred_id` may be sent to in the LEGACY binding
+/// file, for a secret an earlier build saved as plain text (the startup
+/// backfill, `migrate_bindings`). The owner's own (host, port, username) is
+/// passed explicitly; catalogue borrowers of `cred_id` present at this moment
+/// are included too. Secrets saved by this build carry their destinations in
+/// their own vault item instead (`save_credential`).
 pub fn snapshot_binding(
     cred_id: &str,
     host: &str,
@@ -589,10 +631,6 @@ pub fn snapshot_binding(
     snapshot_binding_at(&path, cred_id, &Dest { host: host.into(), port, username: username.into() }, None)
 }
 
-/// `exact`: the destination set the caller approved (the editor's view of the
-/// catalogue AFTER the edit), which REPLACES the binding, so an edited host's
-/// old address is revoked. `None` keeps the older rule (the catalogue's current
-/// users plus the owner), for paths that have no such view.
 fn snapshot_binding_at(
     path: &Path,
     cred_id: &str,
@@ -600,30 +638,38 @@ fn snapshot_binding_at(
     exact: Option<&[Dest]>,
 ) -> Result<(), KnownHostsError> {
     let dests = binding_dests(cred_id, owner, exact)?;
-    put_binding_at(path, cred_id, dests)
+    put_binding_at(path, cred_id, dests.iter().map(Dest::to_json).collect())
 }
 
-/// The destination list a save binds (see `snapshot_binding_at`).
-fn binding_dests(cred_id: &str, owner: &Dest, exact: Option<&[Dest]>) -> Result<Vec<Value>, KnownHostsError> {
+/// The destinations a save binds. `exact`: the set the caller approved (the
+/// editor's view of the catalogue AFTER the edit), which REPLACES the binding,
+/// so an edited host's old address is revoked. `None` keeps the older rule
+/// (the catalogue's current users plus the owner), for paths that have no
+/// such view. The owner is always included.
+fn binding_dests(cred_id: &str, owner: &Dest, exact: Option<&[Dest]>) -> Result<Vec<Dest>, KnownHostsError> {
     if crate::credentials::is_reserved_id(cred_id) {
         return Err(KnownHostsError::Parse(format!(
             "'{cred_id}' is a reserved id and cannot be bound to a host"
         )));
     }
     crate::credentials::validate_id(cred_id).map_err(KnownHostsError::Parse)?;
-    let mut dests: Vec<Value> = match exact {
-        Some(list) => list.iter().map(Dest::to_json).collect(),
+    let mut dests: Vec<Dest> = match exact {
+        Some(list) => list.to_vec(),
         None => dests_for_cred(cred_id),
     };
-    let owner = owner.to_json();
-    if !dests.contains(&owner) {
-        dests.push(owner);
+    if !dests.contains(owner) {
+        dests.push(owner.clone());
     }
-    dests.dedup();
-    Ok(dests)
+    let mut unique: Vec<Dest> = Vec::with_capacity(dests.len());
+    for d in dests {
+        if !unique.contains(&d) {
+            unique.push(d);
+        }
+    }
+    Ok(unique)
 }
 
-/// Replace `cred_id`'s binding with `dests`.
+/// Replace `cred_id`'s legacy binding with `dests`.
 fn put_binding_at(path: &Path, cred_id: &str, dests: Vec<Value>) -> Result<(), KnownHostsError> {
     let _guard = BINDINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // A corrupt file is replaced rather than merged into.
@@ -634,10 +680,11 @@ fn put_binding_at(path: &Path, cred_id: &str, dests: Vec<Value>) -> Result<(), K
     write_bindings_at(path, &map)
 }
 
-/// Drop a credential's bindings (called when its secret is deleted).
+/// Drop a credential's legacy binding.
 fn remove_binding_at(path: &Path, cred_id: &str) -> Result<(), KnownHostsError> {
     let _guard = BINDINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // An unreadable file has nothing to remove; leave it for inspection.
+    // An unreadable file has nothing to remove; leave it for inspection (it
+    // authorizes nothing while unreadable).
     let Ok(mut map) = read_bindings_at(path) else {
         return Ok(());
     };
@@ -649,10 +696,10 @@ fn remove_binding_at(path: &Path, cred_id: &str) -> Result<(), KnownHostsError> 
     Ok(())
 }
 
-/// Authorize sending the vault secret keyed by `cred_id` to `host:port` as
-/// `username`, consulting ONLY the backend-owned binding file — never the
-/// frontend-writable catalogue. Unknown credential, unreadable bindings, or an
-/// unmatched destination returns false (fail closed).
+/// The LEGACY rule, for a plain secret an earlier build saved: may it go to
+/// `host:port` as `username`, per the backend-owned binding file (never the
+/// frontend-writable catalogue)? Unknown credential, unreadable bindings, or
+/// an unmatched destination returns false (fail closed).
 fn binding_is_authorized_at(path: &Path, cred_id: &str, host: &str, port: u16, username: &str) -> bool {
     if crate::credentials::is_reserved_id(cred_id) || crate::credentials::validate_id(cred_id).is_err() {
         return false;
@@ -664,39 +711,30 @@ fn binding_is_authorized_at(path: &Path, cred_id: &str, host: &str, port: u16, u
     dest_authorized_in(list, host, port, username)
 }
 
-/* ------------------------------------------------- vault + binding as a unit */
+/* ---------------------------------------- vault item: secret + destinations */
 
-// A saved secret and its binding live in two stores (the OS vault and
-// credential_bindings.json) that cannot be written atomically together. Every
-// operation on the pair — save, delete, narrowing, and the connect-time read —
-// runs under VAULT_LOCK, so a connect sees the pair entirely before or entirely
-// after a save, never the new secret against the old binding. A save whose
-// binding cannot be written puts the previous secret back; if even that fails
-// the secret is removed, and if THAT fails the id is "poisoned": refused for
-// sending until a save or delete of it succeeds (or the app restarts, by which
-// point the user has been told to re-save it).
+// A saved secret and the destinations it may be sent to are ONE vault item, a
+// versioned envelope (utils::vault_item). One vault write saves, replaces or
+// narrows both, so they are consistent by construction: no crash, failed
+// second write or interrupted rollback can pair a new secret with an old
+// destination, and there is nothing to journal or repair. (W4b kept them in
+// two stores, with an intent journal per store; both are gone.)
+//
+// VAULT_LOCK still serialises every read-modify-write of an item (a narrowing
+// that reads the envelope and writes it back must not clobber a save that
+// landed in between), and the connect-time read.
+//
+// Items an earlier build saved hold the plain secret, authorized by
+// credential_bindings.json. They keep working, read-only: their legacy binding
+// can only shrink. The next save of the password writes an envelope and drops
+// the legacy entry.
 
-/// Serialises every vault+binding transaction. Taken before BINDINGS_LOCK.
+/// Serialises every vault-item transaction. Taken before BINDINGS_LOCK (and
+/// after CATALOGUE_LOCK).
 static VAULT_LOCK: Mutex<()> = Mutex::new(());
 
 fn vault_lock() -> std::sync::MutexGuard<'static, ()> {
     VAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Ids whose secret may not match their binding (see above), by binding key.
-static POISONED: Mutex<std::collections::BTreeSet<String>> = Mutex::new(std::collections::BTreeSet::new());
-
-fn poison(cred_id: &str, on: bool) {
-    let mut set = POISONED.lock().unwrap_or_else(|e| e.into_inner());
-    if on {
-        set.insert(binding_key(cred_id));
-    } else {
-        set.remove(&binding_key(cred_id));
-    }
-}
-
-fn is_poisoned(cred_id: &str) -> bool {
-    POISONED.lock().unwrap_or_else(|e| e.into_inner()).contains(&binding_key(cred_id))
 }
 
 /// The OS vault, behind a seam so the transactions are testable.
@@ -704,6 +742,8 @@ pub trait VaultOps {
     fn read(&self, id: &str) -> Result<zeroize::Zeroizing<String>, crate::credentials::CredError>;
     fn write(&self, id: &str, user: &str, secret: &str) -> Result<(), crate::credentials::CredError>;
     fn delete(&self, id: &str) -> Result<(), crate::credentials::CredError>;
+    /// Whether an item exists, without decrypting it (no unlock prompt).
+    fn exists(&self, id: &str) -> bool;
 }
 
 pub struct OsVault;
@@ -718,6 +758,9 @@ impl VaultOps for OsVault {
     fn delete(&self, id: &str) -> Result<(), crate::credentials::CredError> {
         crate::credentials::delete_secret(id)
     }
+    fn exists(&self, id: &str) -> bool {
+        crate::credentials::has_secret(id)
+    }
 }
 
 fn check_host_cred_id(cred_id: &str) -> Result<(), String> {
@@ -727,7 +770,8 @@ fn check_host_cred_id(cred_id: &str) -> Result<(), String> {
     crate::credentials::validate_id(cred_id)
 }
 
-/// Save a secret and bind it, as one unit. `exact`: see `snapshot_binding_at`.
+/// Save a secret together with the destinations it may be sent to, as ONE
+/// vault write. `exact`: see `binding_dests`.
 pub fn save_credential(
     cred_id: &str,
     username: &str,
@@ -748,257 +792,59 @@ fn save_credential_with(
     owner: &Dest,
     exact: Option<&[Dest]>,
 ) -> Result<(), String> {
-    use crate::credentials::CredError;
     check_host_cred_id(cred_id)?;
-    let _vault = vault_lock();
-    // The previous value, to put back if the binding cannot be written. A
-    // vault that cannot be read now would make the save unrecoverable, so it
-    // is refused rather than attempted.
-    let previous = match vault.read(cred_id) {
-        Ok(old) => Some(old),
-        Err(CredError::NotFound(_)) => None,
-        Err(e) => return Err(format!("could not read the saved credential to replace it safely: {e}")),
-    };
     let dests = binding_dests(cred_id, owner, exact).map_err(|e| e.to_string())?;
-
-    // Journal the transaction before the vault changes (see `Intent`), so a
-    // crash at any later point is repaired at the next start.
-    let journal = intent_path_for(path);
-    let mut intent = Intent {
-        id: cred_id.to_string(),
-        old_binding_hash: binding_hash(current_binding(path).as_ref()),
-        new_binding: dests.clone(),
-        phase: Phase::Staged,
-    };
-    write_intent(&journal, &intent).map_err(|e| format!("could not record the save before making it ({e}); nothing was changed"))?;
-    if crashed(1) {
-        return Err(INJECTED_CRASH.into());
-    }
-    if let Err(e) = vault.write(cred_id, username, secret) {
-        clear_intent(&journal);
-        return Err(e.to_string());
-    }
-    if crashed(2) {
-        return Err(INJECTED_CRASH.into());
-    }
-    // The vault now holds the new secret. If this note cannot be written the
-    // journal still says Staged, which a repair treats as ambiguous (the
-    // secret is removed): safe, only less convenient.
-    intent.phase = Phase::Written;
-    let _ = write_intent(&journal, &intent);
-    if crashed(3) {
-        return Err(INJECTED_CRASH.into());
-    }
-    let Err(bind_err) = put_binding_at(path, cred_id, dests) else {
-        if crashed(4) {
-            return Err(INJECTED_CRASH.into());
-        }
-        clear_intent(&journal);
-        poison(cred_id, false);
-        return Ok(());
-    };
-    // From here the vault may hold either secret while a rollback runs: a
-    // crash anywhere below must end with the secret removed.
-    intent.phase = Phase::Ambiguous;
-    let _ = write_intent(&journal, &intent);
-    if crashed(5) {
-        return Err(INJECTED_CRASH.into());
-    }
-    // The binding still names the OLD destinations: restore the old secret
-    // (or no secret) so the pair stays consistent.
-    let restored = match &previous {
-        Some(old) => vault.write(cred_id, username, old),
-        None => match vault.delete(cred_id) {
-            Err(CredError::NotFound(_)) => Ok(()),
-            r => r,
-        },
-    };
-    if crashed(6) {
-        return Err(INJECTED_CRASH.into());
-    }
-    match restored {
-        Ok(()) => {
-            clear_intent(&journal);
-            Err(format!("could not record where the password may be sent ({bind_err}); nothing was changed"))
-        }
-        Err(rollback) => match vault.delete(cred_id) {
-            Ok(()) | Err(CredError::NotFound(_)) => {
-                let _ = remove_binding_at(path, cred_id);
-                clear_intent(&journal);
-                poison(cred_id, false);
-                Err(format!(
-                    "could not record where the password may be sent ({bind_err}) or restore the previous one ({rollback}); the saved password was removed, save it again"
-                ))
-            }
-            Err(del) => {
-                // The journal stays (Ambiguous): the next start removes it.
-                poison(cred_id, true);
-                Err(format!(
-                    "could not record where the password may be sent ({bind_err}), restore the previous one ({rollback}) or remove it ({del}); it will not be used until it is saved again"
-                ))
-            }
-        },
-    }
-}
-
-/* ------------------------------------------------------ vault intent journal */
-
-// The vault and the bindings file cannot be written atomically together, and
-// the in-memory poison latch does not survive a crash. So a save journals its
-// intent in `vault.intent` (0600, beside the bindings) BEFORE touching the
-// vault, notes when the vault write has landed, and clears the journal once
-// the binding is written. At startup, before the webview loads,
-// `repair_vault_intent` settles a journal left behind:
-// - the binding already names the new destinations: just clear it;
-// - the vault write is known to have landed and the binding is still the old
-//   one: finish writing the binding (the new secret gets its new binding);
-// - anything else (the vault write may or may not have landed, a rollback was
-//   interrupted, the binding changed under it): delete the secret and its
-//   binding — the user saves the password again.
-// So a crash at any point leaves the secret either paired with the binding
-// it was saved for, or deleted; never a new secret behind an old binding.
-
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum Phase {
-    /// Journaled; the vault write may or may not have happened.
-    Staged,
-    /// The vault holds the new secret; the binding may still be the old one.
-    Written,
-    /// A rollback is in progress: which secret the vault holds is unknown.
-    Ambiguous,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Intent {
-    id: String,
-    /// SHA-256 of the binding as it was before the save (see `binding_hash`).
-    old_binding_hash: String,
-    /// The destinations the new secret is to be bound to.
-    new_binding: Vec<Value>,
-    phase: Phase,
-}
-
-const INJECTED_CRASH: &str = "injected crash";
-
-// Test hook: the save "dies" right after step N (no cleanup at all).
-#[cfg(test)]
-thread_local! {
-    static CRASH_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
-fn crashed(step: u8) -> bool {
-    #[cfg(test)]
-    {
-        CRASH_AT.with(|c| c.get() == step)
-    }
-    #[cfg(not(test))]
-    {
-        let _ = step;
-        false
-    }
-}
-
-fn intent_path_for(bindings: &Path) -> PathBuf {
-    bindings.with_file_name("vault.intent")
-}
-
-/// The whole bindings map as it is now (an unreadable file reads as a marker
-/// string, which never matches a recorded hash of a real map).
-fn current_binding(path: &Path) -> Option<Value> {
-    let _guard = BINDINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    match read_bindings_at(path) {
-        Ok(map) => Some(map),
-        Err(()) => Some(Value::String("<unreadable>".into())),
-    }
-}
-
-/// Hash of the whole bindings map, as text. The whole map, not one entry, so
-/// any later change to the file (a narrowing, another id's save) shows.
-fn binding_hash(map: Option<&Value>) -> String {
-    use sha2::{Digest, Sha256};
-    let text = serde_json::to_string(map.unwrap_or(&Value::Null)).unwrap_or_default();
-    Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn write_intent(path: &Path, intent: &Intent) -> Result<(), KnownHostsError> {
-    let text = serde_json::to_string(intent).map_err(|e| KnownHostsError::Parse(e.to_string()))?;
-    write_atomic(path, &text)
-}
-
-fn clear_intent(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    sync_parent(path);
-}
-
-/// What a startup repair did.
-#[derive(Debug, PartialEq)]
-pub enum Repair {
-    /// The save had completed; only the journal was left.
-    Completed(String),
-    /// The secret had landed; its binding was finished.
-    BindingFinished(String),
-    /// Which secret the vault held was unknown: it was removed.
-    SecretRemoved(String),
-}
-
-/// Settle a save interrupted by a crash (see above). Call at startup, before
-/// the webview can invoke anything.
-pub fn repair_vault_intent() -> Result<Option<Repair>, String> {
-    let path = bindings_path().map_err(|e| e.to_string())?;
-    repair_vault_intent_with(&OsVault, &path)
-}
-
-fn repair_vault_intent_with(vault: &impl VaultOps, path: &Path) -> Result<Option<Repair>, String> {
-    use crate::credentials::CredError;
-    let journal = intent_path_for(path);
+    let item = vault_item::encode(&Envelope {
+        user: username.to_string(),
+        secret: zeroize::Zeroizing::new(secret.to_string()),
+        destinations: Some(dests.iter().map(Dest::tuple).collect()),
+        origin: None,
+    })?;
     let _vault = vault_lock();
-    let text = match std::fs::read_to_string(&journal) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", journal.display())),
-    };
-    let Ok(intent) = serde_json::from_str::<Intent>(&text) else {
-        // Only this app writes it, atomically; junk names no id to repair.
-        clear_intent(&journal);
-        return Err(format!("{} was not a valid journal and was removed", journal.display()));
-    };
-    let id = intent.id.clone();
-    if check_host_cred_id(&id).is_err() {
-        clear_intent(&journal);
-        return Err(format!("the journal named an invalid vault id '{id}' and was removed"));
-    }
-    let map = current_binding(path);
-    let bound_now = map.as_ref().and_then(|m| m.get(binding_key(&id))).and_then(Value::as_array);
-    if intent.phase != Phase::Ambiguous && bound_now == Some(&intent.new_binding) {
-        clear_intent(&journal);
-        return Ok(Some(Repair::Completed(id)));
-    }
-    if intent.phase == Phase::Written && binding_hash(map.as_ref()) == intent.old_binding_hash {
-        if put_binding_at(path, &id, intent.new_binding.clone()).is_ok() {
-            clear_intent(&journal);
-            poison(&id, false);
-            return Ok(Some(Repair::BindingFinished(id)));
-        }
-    }
-    match vault.delete(&id) {
-        Ok(()) | Err(CredError::NotFound(_)) => {
-            let _ = remove_binding_at(path, &id);
-            clear_intent(&journal);
-            poison(&id, false);
-            Ok(Some(Repair::SecretRemoved(id)))
-        }
-        Err(e) => {
-            // Keep the journal for the next start; refuse to send it now.
-            poison(&id, true);
-            Err(format!("an interrupted password save for '{id}' could not be repaired ({e}); it will not be used until it is saved again"))
-        }
-    }
+    // The one write. If it fails the previous item (envelope or plain secret)
+    // is untouched, with its own authorization.
+    vault.write(cred_id, username, &item).map_err(|e| e.to_string())?;
+    // The envelope authorizes now; a legacy binding for this id is obsolete.
+    // Best effort: it is ignored for an envelope item, and dropping it keeps
+    // an older build (which would read the envelope text as the password)
+    // from sending it to a legacy destination after a downgrade.
+    let _ = remove_binding_at(path, cred_id);
+    Ok(())
 }
 
-/// Delete a secret and, once it is gone, its binding. A vault error keeps the
-/// binding (the secret is still there) and is returned.
+/// Earlier (W4b) builds journaled each password save in `vault.intent`. One
+/// left behind means a save was interrupted, so that id's plain secret may not
+/// match its legacy binding. Settled fail-closed and without deleting any
+/// secret: the id's legacy binding is dropped (the password stays saved but is
+/// not sent until it is saved again, which writes an envelope), then the
+/// journal is removed. Call at startup, before the webview loads. Returns the
+/// id withdrawn.
+pub fn retire_legacy_journal() -> Option<String> {
+    let path = bindings_path().ok()?;
+    retire_legacy_journal_at(&path)
+}
+
+fn retire_legacy_journal_at(path: &Path) -> Option<String> {
+    let journal = path.with_file_name("vault.intent");
+    let text = std::fs::read_to_string(&journal).ok()?;
+    let _vault = vault_lock();
+    let id = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string))
+        .filter(|id| check_host_cred_id(id).is_ok());
+    if let Some(id) = &id {
+        if remove_binding_at(path, id).is_err() {
+            // Kept for the next start, which tries again.
+            return None;
+        }
+    }
+    let _ = std::fs::remove_file(&journal);
+    sync_parent(&journal);
+    id
+}
+
+/// Delete a secret and, once it is gone, any legacy binding. A vault error
+/// keeps both (the secret is still there) and is returned.
 pub fn delete_credential(cred_id: &str) -> Result<(), String> {
     let path = bindings_path().map_err(|e| e.to_string())?;
     delete_credential_with(&OsVault, &path, cred_id)
@@ -1010,36 +856,61 @@ fn delete_credential_with(vault: &impl VaultOps, path: &Path, cred_id: &str) -> 
     let _vault = vault_lock();
     match vault.delete(cred_id) {
         Ok(()) | Err(CredError::NotFound(_)) => {
-            poison(cred_id, false);
-            // Without the secret the binding authorizes nothing; a failure to
-            // drop it is harmless (a later save rewrites it).
+            // Without the secret a binding authorizes nothing; a failure to
+            // drop it is harmless (a later save drops it).
             let _ = remove_binding_at(path, cred_id);
-            // A journal left by an interrupted save of this id is settled too.
-            let journal = intent_path_for(path);
-            if std::fs::read_to_string(&journal)
-                .ok()
-                .and_then(|t| serde_json::from_str::<Intent>(&t).ok())
-                .is_some_and(|i| same_cred(&i.id, cred_id))
-            {
-                clear_intent(&journal);
-            }
             Ok(())
         }
         Err(e) => Err(e.to_string()),
     }
 }
 
-/// Shrink a binding to the destinations in `keep` (never adds one: widening
-/// needs the secret re-typed, i.e. a save). For revoking a host's old address
-/// when it is edited, deleted, or stops borrowing the credential.
+/// Shrink a credential's destinations to those in `keep` (never adds one:
+/// widening needs the secret re-typed, i.e. a save). For revoking a host's old
+/// address when it is edited, deleted, or stops borrowing the credential.
 pub fn narrow_binding(cred_id: &str, keep: &[Dest]) -> Result<(), String> {
     let path = bindings_path().map_err(|e| e.to_string())?;
-    narrow_binding_at(&path, cred_id, keep)
+    narrow_binding_with(&OsVault, &path, cred_id, keep)
 }
 
-fn narrow_binding_at(path: &Path, cred_id: &str, keep: &[Dest]) -> Result<(), String> {
+/// One write: the envelope is rewritten with fewer destinations, or (for a
+/// plain secret from an earlier build) the legacy binding is. On failure the
+/// old item stands, with its old destinations; that is the state before the
+/// edit, so the error is reported and the caller retries.
+fn narrow_binding_with(vault: &impl VaultOps, path: &Path, cred_id: &str, keep: &[Dest]) -> Result<(), String> {
+    use crate::credentials::CredError;
     check_host_cred_id(cred_id)?;
     let _vault = vault_lock();
+    // Nothing saved (asked without decrypting, so no unlock prompt): only a
+    // stale legacy entry can be left to shrink.
+    if !vault.exists(cred_id) {
+        return narrow_legacy_at(path, cred_id, keep);
+    }
+    let raw = match vault.read(cred_id) {
+        Ok(raw) => raw,
+        Err(CredError::NotFound(_)) => return narrow_legacy_at(path, cred_id, keep),
+        Err(e) => return Err(format!("could not read the saved password to withdraw it: {e}")),
+    };
+    match vault_item::decode(raw) {
+        Ok(Item::V2(mut env)) => {
+            let Some(list) = env.destinations.take() else {
+                return Err(format!("'{cred_id}' is not a host credential"));
+            };
+            let before = list.len();
+            let kept: Vec<Destination> = list.into_iter().filter(|d| keep.iter().any(|k| k.is(d))).collect();
+            if kept.len() == before {
+                return Ok(());
+            }
+            env.destinations = Some(kept);
+            let item = vault_item::encode(&env)?;
+            vault.write(cred_id, &env.user, &item).map_err(|e| e.to_string())
+        }
+        Ok(Item::Legacy(_)) => narrow_legacy_at(path, cred_id, keep),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn narrow_legacy_at(path: &Path, cred_id: &str, keep: &[Dest]) -> Result<(), String> {
     let _guard = BINDINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut map = read_bindings_at(path).map_err(|_| "the credential bindings file is unreadable".to_string())?;
     let key = binding_key(cred_id);
@@ -1047,17 +918,18 @@ fn narrow_binding_at(path: &Path, cred_id: &str, keep: &[Dest]) -> Result<(), St
         return Ok(());
     };
     let keep: Vec<Value> = keep.iter().map(Dest::to_json).collect();
+    let before = list.len();
     let narrowed: Vec<Value> = list.into_iter().filter(|d| keep.contains(d)).collect();
+    if narrowed.len() == before {
+        return Ok(());
+    }
     if let Some(obj) = map.as_object_mut() {
-        if narrowed.len() == obj.get(&key).and_then(Value::as_array).map_or(0, Vec::len) {
-            return Ok(());
-        }
         obj.insert(key, Value::Array(narrowed));
     }
     write_bindings_at(path, &map).map_err(|e| e.to_string())
 }
 
-/// What the vault holds for a connect, read together with its binding.
+/// What the vault holds for a connect, read together with its destinations.
 pub enum StoredSecret {
     /// Nothing saved under this id.
     None,
@@ -1066,13 +938,16 @@ pub enum StoredSecret {
     Authorized(zeroize::Zeroizing<String>),
     /// A secret exists but this destination is not bound to it.
     Unbound,
-    /// The secret may not match its binding (a failed save); refused.
+    /// No longer produced: a save is one vault write, so a secret can no
+    /// longer be left half-saved. Kept so callers matching on it still build.
+    #[allow(dead_code)]
     Poisoned,
 }
 
-/// Read `cred_id`'s secret and check its binding for this destination in one
-/// critical section. `check_binding`: false for a key passphrase (used
-/// locally, never sent).
+/// Read `cred_id`'s item and check this destination against the destinations
+/// stored in it (or, for a plain secret from an earlier build, its legacy
+/// binding). `check_binding`: false for a key passphrase (used locally, never
+/// sent). An item that is not a readable envelope fails closed (an error).
 pub fn read_authorized(
     cred_id: &str,
     dest: &Dest,
@@ -1091,19 +966,23 @@ fn read_authorized_with(
 ) -> Result<StoredSecret, crate::credentials::CredError> {
     use crate::credentials::CredError;
     let _vault = vault_lock();
-    if check_binding && is_poisoned(cred_id) {
-        return Ok(StoredSecret::Poisoned);
-    }
-    let secret = match vault.read(cred_id) {
+    let raw = match vault.read(cred_id) {
         Err(CredError::NotFound(_)) => return Ok(StoredSecret::None),
         Err(e) => return Err(e),
         Ok(s) => s,
     };
-    if !check_binding {
-        return Ok(StoredSecret::Authorized(secret));
+    match vault_item::decode(raw) {
+        Ok(Item::V2(env)) => {
+            let ok = !check_binding || env.destinations.as_ref().is_some_and(|l| l.iter().any(|d| dest.is(d)));
+            Ok(if ok { StoredSecret::Authorized(env.secret) } else { StoredSecret::Unbound })
+        }
+        Ok(Item::Legacy(secret)) => {
+            let ok = !check_binding
+                || path.is_some_and(|p| binding_is_authorized_at(p, cred_id, &dest.host, dest.port, &dest.username));
+            Ok(if ok { StoredSecret::Authorized(secret) } else { StoredSecret::Unbound })
+        }
+        Err(e) => Err(CredError::Malformed(format!("{} ({e})", crate::credentials::target_name(cred_id)))),
     }
-    let ok = path.is_some_and(|p| binding_is_authorized_at(p, cred_id, &dest.host, dest.port, &dest.username));
-    Ok(if ok { StoredSecret::Authorized(secret) } else { StoredSecret::Unbound })
 }
 
 /// Remove secrets saved under quick-connect ids (`qc-…`): a quick-connect host
@@ -1416,6 +1295,9 @@ mod tests {
             }
             self.items.lock().unwrap().remove(id).map(|_| ()).ok_or(CredError::NotFound(id.into()))
         }
+        fn exists(&self, id: &str) -> bool {
+            self.items.lock().unwrap().contains_key(id)
+        }
     }
 
     fn bindings_in(tag: &str) -> PathBuf {
@@ -1434,8 +1316,22 @@ mod tests {
         Dest { host: h.into(), port, username: u.into() }
     }
 
+    /// The secret stored for `id`, decoded from its envelope (or a legacy
+    /// plain secret as is).
     fn secret_of(v: &FakeVault, id: &str) -> Option<String> {
-        v.items.lock().unwrap().get(id).cloned()
+        let raw = v.items.lock().unwrap().get(id).cloned()?;
+        Some(match vault_item::decode(zeroize::Zeroizing::new(raw)).unwrap() {
+            Item::V2(env) => env.secret.to_string(),
+            Item::Legacy(s) => s.to_string(),
+        })
+    }
+
+    fn stored_dests(v: &FakeVault, id: &str) -> Option<Vec<Destination>> {
+        let raw = v.items.lock().unwrap().get(id).cloned()?;
+        match vault_item::decode(zeroize::Zeroizing::new(raw)).unwrap() {
+            Item::V2(env) => env.destinations,
+            Item::Legacy(_) => None,
+        }
     }
 
     fn authorized(v: &FakeVault, p: &Path, id: &str, d: &Dest) -> Option<String> {
@@ -1445,59 +1341,81 @@ mod tests {
         }
     }
 
+    /// W4c: the secret and its destinations are one vault item.
     #[test]
-    fn a_save_whose_binding_fails_restores_the_previous_secret() {
+    fn a_secret_and_its_destinations_round_trip_as_one_vault_item() {
         let v = FakeVault::default();
-        let ok = bindings_in("ok");
-        let a = dest("10.0.0.1", 22, "admin");
-        save_credential_with(&v, &ok, "h-tx1", "admin", "old", &a, None).unwrap();
-        // The binding write fails: the old secret is back, still bound to A.
-        let bad = bindings_in("fail-writes");
-        std::fs::copy(&ok, &bad).unwrap();
-        let b = dest("10.0.0.2", 22, "admin");
-        assert!(save_credential_with(&v, &bad, "h-tx1", "admin", "new", &b, Some(&[b.clone()])).is_err());
-        assert_eq!(secret_of(&v, "h-tx1").as_deref(), Some("old"));
-        assert_eq!(authorized(&v, &bad, "h-tx1", &a).as_deref(), Some("old"));
-        assert!(authorized(&v, &bad, "h-tx1", &b).is_none());
+        let p = bindings_in("ok");
+        let (a, b) = (dest("10.0.0.1", 22, "admin"), dest("10.0.0.2", 2222, "root"));
+        save_credential_with(&v, &p, "h-rt", "admin", "s3cr\"et", &a, Some(&[a.clone(), b.clone()])).unwrap();
+        let raw = v.items.lock().unwrap().get("h-rt").cloned().unwrap();
+        assert!(raw.starts_with("{\"v\":2"), "stored as an envelope");
+        assert_eq!(stored_dests(&v, "h-rt"), Some(vec![a.tuple(), b.tuple()]));
+        assert_eq!(authorized(&v, &p, "h-rt", &a).as_deref(), Some("s3cr\"et"));
+        assert_eq!(authorized(&v, &p, "h-rt", &b).as_deref(), Some("s3cr\"et"));
+        assert!(authorized(&v, &p, "h-rt", &dest("evil", 22, "admin")).is_none());
+        // A key passphrase is not bound (used locally, never sent).
+        assert!(matches!(
+            read_authorized_with(&v, Some(&p), "h-rt", &dest("evil", 22, "x"), false).unwrap(),
+            StoredSecret::Authorized(_)
+        ));
+        // Nothing is written to the legacy binding file.
+        assert!(read_bindings_at(&p).unwrap().get(binding_key("h-rt")).is_none());
     }
 
     #[test]
-    fn a_first_save_whose_binding_fails_leaves_no_secret() {
+    fn a_failed_vault_write_leaves_the_previous_secret_with_its_own_destinations() {
         let v = FakeVault::default();
-        let bad = bindings_in("fail-writes");
-        assert!(save_credential_with(&v, &bad, "h-tx2", "u", "pw", &dest("a", 22, "u"), None).is_err());
+        let p = bindings_in("ok");
+        let (a, b) = (dest("10.0.0.1", 22, "admin"), dest("10.0.0.2", 22, "admin"));
+        save_credential_with(&v, &p, "h-tx1", "admin", "old", &a, None).unwrap();
+        v.fail_write.store(1, Ordering::SeqCst);
+        assert!(save_credential_with(&v, &p, "h-tx1", "admin", "new", &b, Some(&[b.clone()])).is_err());
+        assert_eq!(authorized(&v, &p, "h-tx1", &a).as_deref(), Some("old"));
+        assert!(authorized(&v, &p, "h-tx1", &b).is_none());
+        // A first save that fails leaves nothing.
+        v.fail_write.store(1, Ordering::SeqCst);
+        assert!(save_credential_with(&v, &p, "h-tx2", "u", "pw", &a, None).is_err());
         assert_eq!(secret_of(&v, "h-tx2"), None);
     }
 
+    /// W4c migration: a plain secret saved by an earlier build, with its
+    /// destinations in credential_bindings.json, keeps working read-only;
+    /// the next save writes an envelope and drops the legacy entry.
     #[test]
-    fn an_unrecoverable_save_is_poisoned_until_saved_again() {
+    fn a_legacy_plain_secret_keeps_working_until_it_is_saved_again() {
         let v = FakeVault::default();
-        let ok = bindings_in("ok");
-        let a = dest("10.0.0.1", 22, "admin");
-        save_credential_with(&v, &ok, "h-tx3", "admin", "old", &a, None).unwrap();
-        let bad = bindings_in("fail-writes");
-        std::fs::copy(&ok, &bad).unwrap();
-        // Binding fails, restoring the old secret fails (2nd write), and so
-        // does removing the new one: the id is refused, not sent.
-        v.fail_write.store(2, Ordering::SeqCst);
-        v.fail_delete.store(true, Ordering::SeqCst);
-        assert!(save_credential_with(&v, &bad, "h-tx3", "admin", "new", &a, None).is_err());
-        assert_eq!(secret_of(&v, "h-tx3").as_deref(), Some("new"));
-        assert!(matches!(read_authorized_with(&v, Some(&bad), "h-tx3", &a, true).unwrap(), StoredSecret::Poisoned));
-        // A successful save clears it.
-        v.fail_delete.store(false, Ordering::SeqCst);
-        save_credential_with(&v, &ok, "h-tx3", "admin", "newer", &a, None).unwrap();
-        assert_eq!(authorized(&v, &ok, "h-tx3", &a).as_deref(), Some("newer"));
+        let p = bindings_in("ok");
+        let (a, b) = (dest("fw-01", 22, "admin"), dest("fw-02", 22, "admin"));
+        v.items.lock().unwrap().insert("h-old".into(), "legacy-pw".into());
+        put_binding_at(&p, "h-old", vec![a.to_json()]).unwrap();
+        assert_eq!(authorized(&v, &p, "h-old", &a).as_deref(), Some("legacy-pw"));
+        assert!(authorized(&v, &p, "h-old", &b).is_none());
+        // Legacy narrowing shrinks the legacy file and never touches the secret.
+        narrow_binding_with(&v, &p, "h-old", &[]).unwrap();
+        assert!(authorized(&v, &p, "h-old", &a).is_none());
+        assert_eq!(v.items.lock().unwrap().get("h-old").map(String::as_str), Some("legacy-pw"));
+        // Saving again upgrades it.
+        save_credential_with(&v, &p, "h-old", "admin", "legacy-pw", &b, Some(&[b.clone()])).unwrap();
+        assert_eq!(stored_dests(&v, "h-old"), Some(vec![b.tuple()]));
+        assert!(read_bindings_at(&p).unwrap().get(binding_key("h-old")).is_none(), "legacy entry dropped");
+        assert_eq!(authorized(&v, &p, "h-old", &b).as_deref(), Some("legacy-pw"));
+        // A stale legacy entry never widens an envelope.
+        put_binding_at(&p, "h-old", vec![a.to_json()]).unwrap();
+        assert!(authorized(&v, &p, "h-old", &a).is_none());
     }
 
     #[test]
-    fn an_unreadable_previous_secret_refuses_the_save() {
+    fn a_damaged_or_future_vault_item_fails_closed() {
         let v = FakeVault::default();
-        v.fail_read.store(true, Ordering::SeqCst);
-        let ok = bindings_in("ok");
-        assert!(save_credential_with(&v, &ok, "h-tx4", "u", "pw", &dest("a", 22, "u"), None).is_err());
-        v.fail_read.store(false, Ordering::SeqCst);
-        assert_eq!(secret_of(&v, "h-tx4"), None);
+        let p = bindings_in("ok");
+        let a = dest("a", 22, "u");
+        for raw in ["{\"v\":2,\"secret\":\"pw\"", "{\"v\":9,\"secret\":\"pw\",\"destinations\":[[\"a\",22,\"u\"]]}"] {
+            v.items.lock().unwrap().insert("h-bad".into(), raw.into());
+            put_binding_at(&p, "h-bad", vec![a.to_json()]).unwrap();
+            assert!(read_authorized_with(&v, Some(&p), "h-bad", &a, true).is_err(), "{raw}");
+            assert!(narrow_binding_with(&v, &p, "h-bad", &[]).is_err(), "{raw}");
+        }
     }
 
     #[test]
@@ -1512,22 +1430,30 @@ mod tests {
         assert!(authorized(&v, &p, "h-tx5", &new).is_some());
     }
 
+    /// W4c: narrowing rewrites the envelope in one write; a failed write
+    /// leaves the old envelope (the old, wider set) and is reported.
     #[test]
-    fn narrowing_only_ever_removes_destinations() {
+    fn narrowing_rewrites_the_envelope_and_only_ever_removes_destinations() {
         let v = FakeVault::default();
         let p = bindings_in("ok");
         let (a, b, c) = (dest("a", 22, "u"), dest("b", 22, "u"), dest("c", 22, "u"));
         save_credential_with(&v, &p, "h-tx6", "u", "pw", &a, Some(&[a.clone(), b.clone()])).unwrap();
-        narrow_binding_at(&p, "h-tx6", &[a.clone(), c.clone()]).unwrap();
+        v.fail_write.store(1, Ordering::SeqCst);
+        assert!(narrow_binding_with(&v, &p, "h-tx6", &[a.clone()]).is_err());
+        assert!(authorized(&v, &p, "h-tx6", &b).is_some(), "the old envelope stands");
+        narrow_binding_with(&v, &p, "h-tx6", &[a.clone(), c.clone()]).unwrap();
         assert!(authorized(&v, &p, "h-tx6", &a).is_some());
         assert!(authorized(&v, &p, "h-tx6", &b).is_none(), "revoked");
         assert!(authorized(&v, &p, "h-tx6", &c).is_none(), "never added");
-        // Narrowing an unbound id is a no-op.
-        narrow_binding_at(&p, "h-unbound", &[a]).unwrap();
+        assert_eq!(secret_of(&v, "h-tx6").as_deref(), Some("pw"), "the secret is kept");
+        // Narrowing an id with no saved secret is a no-op (and reads nothing).
+        v.fail_read.store(true, Ordering::SeqCst);
+        narrow_binding_with(&v, &p, "h-unbound", &[a]).unwrap();
+        v.fail_read.store(false, Ordering::SeqCst);
     }
 
     #[test]
-    fn delete_keeps_the_binding_when_the_vault_refuses() {
+    fn delete_keeps_the_secret_when_the_vault_refuses() {
         let v = FakeVault::default();
         let p = bindings_in("ok");
         let a = dest("a", 22, "u");
@@ -1535,10 +1461,38 @@ mod tests {
         v.fail_delete.store(true, Ordering::SeqCst);
         assert!(delete_credential_with(&v, &p, "h-tx7").is_err());
         v.fail_delete.store(false, Ordering::SeqCst);
-        assert!(authorized(&v, &p, "h-tx7", &a).is_some(), "secret and binding both kept");
+        assert!(authorized(&v, &p, "h-tx7", &a).is_some(), "secret and destinations both kept");
         delete_credential_with(&v, &p, "h-tx7").unwrap();
         assert!(matches!(read_authorized_with(&v, Some(&p), "h-tx7", &a, true).unwrap(), StoredSecret::None));
         assert!(!binding_is_authorized_at(&p, "h-tx7", "a", 22, "u"));
+    }
+
+    /// W4c: a W4b intent journal is settled by withdrawing the id's legacy
+    /// binding (fail closed), never by deleting a secret.
+    #[test]
+    fn a_leftover_w4b_journal_withdraws_the_legacy_binding_and_keeps_the_secret() {
+        let v = FakeVault::default();
+        let p = bindings_in("ok");
+        let a = dest("a", 22, "u");
+        v.items.lock().unwrap().insert("h-j".into(), "pw".into());
+        put_binding_at(&p, "h-j", vec![a.to_json()]).unwrap();
+        put_binding_at(&p, "h-other", vec![a.to_json()]).unwrap();
+        let journal = p.with_file_name("vault.intent");
+        std::fs::write(&journal, r#"{"id":"h-j","oldBindingHash":"x","newBinding":[],"phase":"staged"}"#).unwrap();
+        assert_eq!(retire_legacy_journal_at(&p).as_deref(), Some("h-j"));
+        assert!(!journal.exists());
+        assert!(authorized(&v, &p, "h-j", &a).is_none(), "not sent until saved again");
+        assert_eq!(secret_of(&v, "h-j").as_deref(), Some("pw"), "never deleted");
+        assert!(binding_is_authorized_at(&p, "h-other", "a", 22, "u"), "other ids untouched");
+        assert_eq!(retire_legacy_journal_at(&p), None, "nothing left");
+        // A bindings file that cannot be written keeps the journal for the next start.
+        let bad = bindings_in("fail-writes");
+        std::fs::copy(&p, &bad).unwrap();
+        put_binding_at(&p, "h-j", vec![a.to_json()]).unwrap();
+        std::fs::copy(&p, &bad).unwrap();
+        std::fs::write(bad.with_file_name("vault.intent"), r#"{"id":"h-j"}"#).unwrap();
+        assert_eq!(retire_legacy_journal_at(&bad), None);
+        assert!(bad.with_file_name("vault.intent").exists());
     }
 
     #[test]
@@ -1632,79 +1586,6 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
-    /// W4b: a save that dies after any step is repaired at the next start so
-    /// that the secret is paired with the binding it was saved for, or gone.
-    #[test]
-    fn a_crash_at_any_step_of_a_save_is_repaired_consistently() {
-        let (a, b) = (dest("10.0.0.1", 22, "admin"), dest("10.0.0.2", 22, "admin"));
-        let bound = |p: &Path, id: &str| -> Option<Value> {
-            read_bindings_at(p).unwrap().get(binding_key(id)).cloned()
-        };
-        // Steps 1-4: the normal path. 5-6: inside a rollback (binding write fails).
-        for step in 1..=6u8 {
-            let v = FakeVault::default();
-            let ok = bindings_in("ok");
-            let id = format!("h-crash{step}");
-            save_credential_with(&v, &ok, &id, "admin", "old", &a, Some(&[a.clone()])).unwrap();
-            let old_binding = bound(&ok, &id);
-            let p = if step >= 5 {
-                let bad = bindings_in("fail-writes");
-                std::fs::copy(&ok, &bad).unwrap();
-                bad
-            } else {
-                ok.clone()
-            };
-            CRASH_AT.with(|c| c.set(step));
-            let r = save_credential_with(&v, &p, &id, "admin", "new", &b, Some(&[b.clone()]));
-            CRASH_AT.with(|c| c.set(0));
-            assert_eq!(r.unwrap_err(), INJECTED_CRASH, "step {step}");
-            assert!(intent_path_for(&p).exists(), "step {step}: journal left behind");
-
-            // "Restart": the in-memory poison latch is gone with the process.
-            poison(&id, false);
-            let repaired = repair_vault_intent_with(&v, &p).unwrap();
-            assert!(repaired.is_some(), "step {step}");
-            assert!(!intent_path_for(&p).exists(), "step {step}: journal cleared");
-            let new_binding = Some(json!([b.to_json()]));
-            match secret_of(&v, &id).as_deref() {
-                Some("new") => assert_eq!(bound(&p, &id), new_binding, "step {step}: new secret, new binding"),
-                Some("old") => assert_eq!(bound(&p, &id), old_binding, "step {step}: old secret, old binding"),
-                None => {}
-                other => panic!("step {step}: unexpected secret {other:?}"),
-            }
-            // The new secret is never sendable to the old destination.
-            if secret_of(&v, &id).as_deref() == Some("new") {
-                assert!(authorized(&v, &p, &id, &a).is_none(), "step {step}");
-            }
-            match step {
-                1 | 2 | 5 | 6 => assert_eq!(repaired, Some(Repair::SecretRemoved(id.clone())), "step {step}"),
-                3 => assert_eq!(repaired, Some(Repair::BindingFinished(id.clone()))),
-                _ => assert_eq!(repaired, Some(Repair::Completed(id.clone()))),
-            }
-        }
-    }
-
-    #[test]
-    fn a_completed_save_leaves_no_journal_and_repair_is_a_no_op() {
-        let v = FakeVault::default();
-        let p = bindings_in("ok");
-        save_credential_with(&v, &p, "h-j1", "u", "pw", &dest("a", 22, "u"), None).unwrap();
-        assert!(!intent_path_for(&p).exists());
-        assert_eq!(repair_vault_intent_with(&v, &p).unwrap(), None);
-        // A failed rollback that cannot remove the secret keeps the journal.
-        let bad = bindings_in("fail-writes");
-        std::fs::copy(&p, &bad).unwrap();
-        v.fail_write.store(2, Ordering::SeqCst);
-        v.fail_delete.store(true, Ordering::SeqCst);
-        assert!(save_credential_with(&v, &bad, "h-j1", "u", "new", &dest("b", 22, "u"), None).is_err());
-        assert!(intent_path_for(&bad).exists());
-        assert!(repair_vault_intent_with(&v, &bad).is_err(), "the vault still refuses");
-        assert!(intent_path_for(&bad).exists(), "kept for the next start");
-        v.fail_delete.store(false, Ordering::SeqCst);
-        assert_eq!(repair_vault_intent_with(&v, &bad).unwrap(), Some(Repair::SecretRemoved("h-j1".into())));
-        assert_eq!(secret_of(&v, "h-j1"), None);
-    }
-
     #[test]
     fn saving_the_catalogue_narrows_first_and_saves_nothing_if_that_fails() {
         let v = FakeVault::default();
@@ -1714,17 +1595,41 @@ mod tests {
         save_credential_with(&v, &ok, "lender", "u", "pw", &a, Some(&[a.clone(), b.clone()])).unwrap();
         // The borrower on b.h is removed from the catalogue.
         let tree = json!([{ "kind": "host", "id": "lender", "hostname": "a.h", "port": 22, "username": "u" }]);
-        let bad = bindings_in("fail-writes");
-        std::fs::copy(&ok, &bad).unwrap();
-        let err = save_and_narrow_at(&bad.with_file_name("hosts.json"), &bad, &tree, &["lender".into()]).unwrap_err();
+        v.fail_write.store(1, Ordering::SeqCst);
+        let err = save_and_narrow_with(&v, &hosts, &ok, &tree, &["lender".into()], None).unwrap_err();
         assert!(err.contains("not saved"), "{err}");
-        assert!(!bad.with_file_name("hosts.json").exists(), "the catalogue was not written");
-        assert!(authorized(&v, &bad, "lender", &b).is_some(), "binding unchanged");
-        // Working bindings: narrowed and saved together.
-        save_and_narrow_at(&hosts, &ok, &tree, &["lender".into()]).unwrap();
+        assert!(!hosts.exists(), "the catalogue was not written");
+        assert!(authorized(&v, &ok, "lender", &b).is_some(), "the old envelope stands");
+        // The vault works again: narrowed and saved together.
+        save_and_narrow_with(&v, &hosts, &ok, &tree, &["lender".into()], None).unwrap();
         assert!(hosts.exists());
         assert!(authorized(&v, &ok, "lender", &b).is_none(), "revoked");
         assert!(authorized(&v, &ok, "lender", &a).is_some());
+    }
+
+    /// W4c: saves are numbered; an older tree can never publish after a newer
+    /// one, whatever order the calls arrive in.
+    #[test]
+    fn an_older_catalogue_tree_never_publishes_after_a_newer_one() {
+        let v = FakeVault::default();
+        let p = bindings_in("ok");
+        let hosts = p.with_file_name("hosts.json");
+        let base = *CATALOGUE_LOCK.lock().unwrap_or_else(|e| e.into_inner()) + 1_000_000;
+        let older = json!([{ "kind": "host", "id": "borrower", "hostname": "b.h", "port": 22, "username": "u" }]);
+        let newer = json!([]);
+        save_and_narrow_with(&v, &hosts, &p, &newer, &[], Some(base + 2)).unwrap();
+        let err = save_and_narrow_with(&v, &hosts, &p, &older, &[], Some(base + 1)).unwrap_err();
+        assert!(err.starts_with(STALE_SAVE), "{err}");
+        let err = save_and_narrow_with(&v, &hosts, &p, &older, &[], Some(base + 2)).unwrap_err();
+        assert!(err.starts_with(STALE_SAVE), "an equal generation is not newer: {err}");
+        assert_eq!(read_json(&hosts).unwrap(), Some(newer));
+        save_and_narrow_with(&v, &hosts, &p, &older, &[], Some(base + 3)).unwrap();
+        assert_eq!(read_json(&hosts).unwrap(), Some(older));
+        // A refused (failed) save does not advance the generation.
+        v.items.lock().unwrap().insert("x".into(), "{\"v\":2,".into());
+        assert!(save_and_narrow_with(&v, &hosts, &p, &json!([]), &["x".into()], Some(base + 10)).is_err());
+        v.items.lock().unwrap().remove("x");
+        save_and_narrow_with(&v, &hosts, &p, &json!([]), &[], Some(base + 4)).unwrap();
     }
 
     #[test]
