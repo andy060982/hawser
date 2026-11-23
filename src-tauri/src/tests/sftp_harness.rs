@@ -1756,6 +1756,135 @@ async fn in_place_replace_refuses_when_its_lstat_fails() {
     }
 }
 
+/// Whether two remote names are the same file (one inode, two names).
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a).unwrap(), std::fs::metadata(b).unwrap());
+    (a.dev(), a.ino()) == (b.dev(), b.ino())
+}
+
+/// W3e item 1: a `Never` upload committed by hard link on a server that
+/// denies REMOVE (OpenSSH `-P remove`). (a) Every REMOVE of a staging name is
+/// denied: the staging name is renamed to a fresh throwaway name (whose
+/// REMOVE is denied too), and the upload succeeds with a WARNING that names
+/// the leftover, says it is a second name for the same file, and says it must
+/// be deleted manually. (b) Only the original staging name's REMOVE is
+/// denied: the rename to a throwaway name and its REMOVE clean up, silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_hardlink_with_remove_denied_never_leaves_a_silent_second_name() {
+    let h = harness_with(Opts { hardlink: true, ..Default::default() }).await;
+    h.put_local("n.txt", b"new", 0o644);
+    h.fault("remove", "hawserpart", usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let renamed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&renamed);
+    h.fault("rename", "hawserpart -> ", 1, vec![hook(move || flag.store(true, Ordering::SeqCst))]);
+    let (_, notes) = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap();
+    assert!(renamed.load(Ordering::SeqCst), "the throwaway RENAME was not tried");
+    assert_eq!(h.remote_body("n.txt"), b"new");
+    let part = h.remote_named(PART_SUFFIX);
+    assert_eq!(part.len(), 1, "{part:?}");
+    assert!(same_inode(&h.remote.join(&part[0]), &h.remote.join("n.txt")));
+    let left = format!("/{}", part[0]);
+    assert!(
+        notes.iter().any(|n| n.contains(&left)
+            && n.contains("SECOND NAME FOR THE SAME FILE")
+            && n.contains("deleted manually")),
+        "{notes:?}"
+    );
+
+    let h = harness_with(Opts { hardlink: true, ..Default::default() }).await;
+    h.put_local("n.txt", b"new", 0o644);
+    h.fault("remove", "hawserpart", 1, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let (_, notes) = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(h.remote_body("n.txt"), b"new");
+    Harness::assert_clean(&h.remote);
+}
+
+/// W3e item 2: the install is refused after the move-aside, the original is
+/// hard-linked back, and the backup name cannot be removed (REMOVE denied,
+/// even after a rename to a throwaway name). The upload stops there: no
+/// in-place write (its truncating OPEN would change the backup too), and the
+/// error names both names and says they are the same file. Nothing is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_restore_by_hardlink_with_backup_remove_denied_never_writes_in_place() {
+    let h = harness_with(Opts { hardlink: true, ..Default::default() }).await;
+    h.put_remote("cfg.txt", b"old", 0o600);
+    h.put_local("cfg.txt", b"new contents", 0o644);
+    h.fault("rename", "hawserpart -> /cfg.txt", usize::MAX, vec![Act::Fail(StatusCode::Failure)]);
+    h.fault("remove", "hawserbak", usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let opened = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&opened);
+    h.fault("open", "=/cfg.txt", usize::MAX, vec![hook(move || flag.store(true, Ordering::SeqCst))]);
+    let (_tx, rx) = watch::channel(false);
+    let mut p = Progress::detached(rx);
+    let local = h.local.join("cfg.txt").to_string_lossy().to_string();
+    let e = copy_local_file(&h.conn, &mut p, &local, "/cfg.txt", Overwrite::Replace)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!opened.load(Ordering::SeqCst), "the destination was opened for an in-place write");
+    assert!(!p.take_notes().iter().any(|n| n.contains("written in place")));
+    assert_eq!(h.remote_body("cfg.txt"), b"old");
+    let (bak, part) = (h.remote_named(BAK_SUFFIX), h.remote_named(PART_SUFFIX));
+    assert_eq!((bak.len(), part.len()), (1, 1), "{bak:?} {part:?}");
+    assert!(same_inode(&h.remote.join(&bak[0]), &h.remote.join("cfg.txt")));
+    assert!(
+        e.contains(&format!("/{}", bak[0]))
+            && e.contains("/cfg.txt")
+            && e.contains("SAME FILE")
+            && e.contains(&format!("/{}", part[0])),
+        "{e}"
+    );
+    assert_eq!(std::fs::read(h.remote.join(&part[0])).unwrap(), b"new contents");
+}
+
+/// W3e item 3: a folder upload cancelled while the in-place fallback's LSTAT
+/// of the destination is pending ends as CANCELLED (not as a failed file in
+/// a partial transfer). The destination is untouched and the staged copy
+/// dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_cancel_during_the_in_place_check_is_cancelled() {
+    let h = harness(false).await;
+    std::fs::create_dir(h.remote.join("d")).unwrap();
+    std::fs::create_dir(h.local.join("d")).unwrap();
+    h.put_remote("d/a.bin", b"old", 0o644);
+    h.put_local("d/a.bin", b"new body", 0o644);
+    let (tx, rx) = cancel_switch();
+    let faults = Arc::clone(&h.faults);
+    // The move-aside is refused (so the upload falls back to in place); the
+    // next LSTAT of the destination is the in-place check: cancel during it.
+    h.fault(
+        "rename",
+        "/d/a.bin -> ",
+        1,
+        vec![
+            hook(move || {
+                let tx = Arc::clone(&tx);
+                faults.lock().unwrap().push(Fault {
+                    op: "lstat",
+                    path: "=/d/a.bin".into(),
+                    times: 1,
+                    acts: vec![
+                        hook(move || {
+                            let _ = tx.send(true);
+                        }),
+                        Act::Before(Duration::from_millis(500)),
+                    ],
+                })
+            }),
+            Act::Fail(StatusCode::PermissionDenied),
+        ],
+    );
+    h.fault("rename", "", usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let mut p = Progress::detached(rx);
+    let local = h.local.join("d").to_string_lossy().to_string();
+    let e = upload_tree(&h.conn, &mut p, &local, "/d", Overwrite::Replace).await.unwrap_err();
+    assert!(matches!(e, SshError::TransferCancelled), "{e}");
+    assert_eq!(std::fs::read(h.remote.join("d/a.bin")).unwrap(), b"old");
+    Harness::assert_clean(&h.remote.join("d"));
+}
+
 /// W3d item 5: both sessions leave while the mux's writer is parked inside
 /// an SSH send (the server stopped reading) and its readers inside the full
 /// queue — none of them could see the sessions go. Dropping both ends stops

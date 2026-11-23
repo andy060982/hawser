@@ -5632,6 +5632,10 @@ enum RemoteDest {
 enum UploadCommit {
     /// In place, with an optional note (a backup left behind).
     Done(Option<String>),
+    /// In place, but the server would not delete the staging name, which is
+    /// still a hard link to the uploaded file. The text names it and says it
+    /// must be deleted by hand; it is shown as a warning, not a quiet note.
+    DoneWithSecondName(String),
     /// The server would not rename the staged copy into place, and the
     /// original (if any) is still at the destination: write in place instead.
     /// The complete staged copy is still at its staging name.
@@ -5860,13 +5864,32 @@ async fn copy_local_file(
             p.finish_file(done);
             Ok(done)
         }
+        UploadCommit::DoneWithSecondName(warning) => {
+            p.warn(warning);
+            p.finish_file(done);
+            Ok(done)
+        }
         UploadCommit::InPlace => {
             // The complete upload stays at `tmp` until the in-place write has
             // fully succeeded.
             let why = "the server would not rename the uploaded copy into place";
-            let checked = check_in_place_target(sftp, &p.cancel, &target, replace).await.map_err(|e| {
-                transfer_error(sftp_dead(&e), format!("{e}; the complete upload is kept on the server at {tmp}"))
-            })?;
+            let checked = match check_in_place_target(sftp, &p.cancel, &target, replace).await {
+                Ok(c) => c,
+                // A cancel stays a cancel (a folder transfer then ends as
+                // cancelled, not with a failed file). Nothing was written to
+                // `target`; the staged copy (no other name links to it here)
+                // is dropped as on any other cancel.
+                Err(SshError::TransferCancelled) => {
+                    remove_remote_quietly(sftp, &tmp).await;
+                    return Err(SshError::TransferCancelled);
+                }
+                Err(e) => {
+                    return Err(transfer_error(
+                        sftp_dead(&e),
+                        format!("{e}; the complete upload is kept on the server at {tmp}"),
+                    ))
+                }
+            };
             p.warn(in_place_warning(&target, why));
             use tokio::io::AsyncSeekExt;
             step(&p.cancel, src.seek(std::io::SeekFrom::Start(0)))
@@ -6035,6 +6058,38 @@ async fn remove_backup(sftp: &SftpConn, bak: &str, target: &str) -> Option<Strin
     }
 }
 
+/// Drop `name`, a hard link (second name) to a file that must stay at its
+/// other name. REMOVE first; if the server refuses it for that name, RENAME
+/// it to a fresh unique throwaway name beside `beside` (with `suffix`) and
+/// REMOVE that. `Err` says which name is left (a description naming every
+/// path it may be at) and why; the caller must never treat that file as
+/// ours to truncate, since another name shares it.
+async fn drop_second_name(
+    sftp: &SftpConn,
+    name: &str,
+    beside: &str,
+    suffix: &str,
+) -> Result<(), (String, SshError)> {
+    let never = uncancellable();
+    let refused = match step(&never, sftp.hi.remove_file(name)).await {
+        Ok(()) => return Ok(()),
+        Err(e) if sftp_dead(&e) => return Err((name.to_string(), e)),
+        Err(e) => e,
+    };
+    let throwaway = remote_staging(beside, suffix);
+    match step(&never, sftp.hi.rename(name, throwaway.clone())).await {
+        Ok(()) => {}
+        Err(e) if sftp_dead(&e) => {
+            return Err((format!("{name} (or {throwaway}, if the server completes the rename)"), e))
+        }
+        Err(_) => return Err((name.to_string(), refused)),
+    }
+    match step(&never, sftp.hi.remove_file(throwaway.clone())).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err((throwaway, e)),
+    }
+}
+
 /// How `place_remote_noreplace` ended.
 enum Placed {
     /// Hard-linked: `to` is a second name for `from`, which still exists.
@@ -6100,16 +6155,21 @@ async fn place_remote_noreplace(sftp: &SftpConn, from: &str, to: &str) -> Placed
 /// connection is dropped; it is never reported as an ordinary refusal.
 async fn commit_never(sftp: &SftpConn, tmp: &str, target: &str) -> Result<UploadCommit, SshError> {
     match place_remote_noreplace(sftp, tmp, target).await {
-        Placed::Linked => match step(&uncancellable(), sftp.hi.remove_file(tmp)).await {
+        // The upload is at `target`; `tmp` is a second name for it and must
+        // go (a server may deny REMOVE, e.g. OpenSSH `-P remove`, while
+        // allowing the link). Never silently left behind.
+        Placed::Linked => match drop_second_name(sftp, tmp, target, PART_SUFFIX).await {
             Ok(()) => Ok(UploadCommit::Done(None)),
-            Err(e) if sftp_dead(&e) => Err(SshError::ChannelLost(format!(
+            Err((left, e)) if sftp_dead(&e) => Err(SshError::ChannelLost(format!(
                 "{target} was uploaded, but the connection failed while removing its staging \
-                 name {tmp} ({e}); that is a second name for the same file"
+                 name ({e}): {left} may still be a second name for the same file (a hard link, \
+                 not a copy); if it is there, delete it manually"
             ))),
-            Err(e) => Ok(UploadCommit::Done(Some(format!(
-                "{target} was uploaded, but its staging name {tmp} could not be removed ({e}); it \
-                 is a second name for the same file"
-            )))),
+            Err((left, e)) => Ok(UploadCommit::DoneWithSecondName(format!(
+                "{target} was uploaded, but the server would not delete its staging name ({e}): \
+                 {left} is a SECOND NAME FOR THE SAME FILE (a hard link, not a copy: a change \
+                 through either name changes both). It must be deleted manually"
+            ))),
         },
         Placed::Renamed => Ok(UploadCommit::Done(None)),
         Placed::Exists => {
@@ -6134,22 +6194,44 @@ async fn commit_never(sftp: &SftpConn, tmp: &str, target: &str) -> Result<Upload
     }
 }
 
+/// How `put_back` ended.
+enum PutBack {
+    /// The original is at `target` again, and the backup name is gone.
+    Restored,
+    /// The original is at `target` again (hard-linked back), but the backup
+    /// name could not be dropped: both are names for the SAME file. The error
+    /// names both and says so. Nothing may write `target` in place now: that
+    /// would change the backup too.
+    Twinned(SshError),
+    /// Not put back.
+    Failed(SshError),
+}
+
 /// Move the original back from `bak` to `target` after a failed replace,
 /// never over whatever appeared at `target` meanwhile (see
 /// `place_remote_noreplace`, and its residual). Hard-linked back, the backup
-/// name is then dropped.
-async fn put_back(sftp: &SftpConn, bak: &str, target: &str) -> Result<(), SshError> {
+/// name is then dropped (see `drop_second_name`); if it cannot be, that is
+/// `Twinned`, never a silent success.
+async fn put_back(sftp: &SftpConn, bak: &str, target: &str) -> PutBack {
     match place_remote_noreplace(sftp, bak, target).await {
-        Placed::Linked => {
-            remove_remote_quietly(sftp, bak).await;
-            Ok(())
-        }
-        Placed::Renamed => Ok(()),
-        Placed::Exists => Err(SshError::PartialTransfer(format!(
+        Placed::Linked => match drop_second_name(sftp, bak, target, BAK_SUFFIX).await {
+            Ok(()) => PutBack::Restored,
+            Err((left, e)) => PutBack::Twinned(transfer_error(
+                sftp_dead(&e),
+                format!(
+                    "the original was linked back to {target}, but its backup name could not be \
+                     removed ({e}): {left} and {target} are the SAME FILE (two names for one \
+                     file, not two copies), so {target} was not written in place; delete {left} \
+                     manually"
+                ),
+            )),
+        },
+        Placed::Renamed => PutBack::Restored,
+        Placed::Exists => PutBack::Failed(SshError::PartialTransfer(format!(
             "something else is at {target} now, so it was not moved back over it"
         ))),
-        Placed::Refused(e) | Placed::LinkLost(e) | Placed::RenameLost(e) => Err(e),
-        Placed::Unchecked { check, .. } => Err(check),
+        Placed::Refused(e) | Placed::LinkLost(e) | Placed::RenameLost(e) => PutBack::Failed(e),
+        Placed::Unchecked { check, .. } => PutBack::Failed(check),
     }
 }
 
@@ -6234,11 +6316,15 @@ async fn commit_upload(sftp: &SftpConn, tmp: &str, target: &str, replace: bool) 
                 remote_kind(&m)
             );
             return Err(match put_back(sftp, &bak, target).await {
-                Ok(()) => {
+                PutBack::Restored => {
                     remove_remote_quietly(sftp, tmp).await;
                     SshError::PartialTransfer(format!("{why}; it was put back as it was and not replaced"))
                 }
-                Err(e2) => transfer_error(
+                PutBack::Twinned(e2) => transfer_error(
+                    sftp_dead(&e2),
+                    format!("{why}, so it was not replaced. {e2}. The new copy is kept at {tmp}"),
+                ),
+                PutBack::Failed(e2) => transfer_error(
                     sftp_dead(&e2),
                     format!("{why}, and could not be put back ({e2}): it is at {bak}, and the new copy at {tmp}"),
                 ),
@@ -6270,8 +6356,14 @@ async fn commit_upload(sftp: &SftpConn, tmp: &str, target: &str, replace: bool) 
         };
     }
     match put_back(sftp, &bak, target).await {
-        Ok(()) => Ok(UploadCommit::InPlace),
-        Err(e2) => Err(transfer_error(
+        PutBack::Restored => Ok(UploadCommit::InPlace),
+        // Never on to the in-place fallback: its truncating OPEN would hit
+        // the inode the backup name shares.
+        PutBack::Twinned(e2) => Err(transfer_error(
+            sftp_dead(&e2),
+            format!("could not put the upload in place ({e}). {e2}. The new copy is kept at {tmp}"),
+        )),
+        PutBack::Failed(e2) => Err(transfer_error(
             sftp_dead(&e2),
             format!(
                 "could not put the upload in place ({e}) or move the original back ({e2}): the \
