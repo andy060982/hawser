@@ -69,6 +69,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU3QTJDQjI5OTI5ODUyNjgKUldSb1VwaVNLY3VpNTROeXkwdlRjcEEwRFZEQ1JqU0RhK0RvdEdpVmFIZTZmaTVnaUtoN0RDSHcK",
       "endpoints": ["https://github.com/andy060982/hawser/releases/latest/download/latest.json"],
+      "requireSignedVersion": true,
       "windows": { "installMode": "passive" }
     }
   }

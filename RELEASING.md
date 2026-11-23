@@ -16,6 +16,28 @@ or its password is lost, no installed copy can update itself again.** Users
 would have to download a build signed with a new key by hand. Keep a backup of
 the key file and its password outside this machine.
 
+### Signatures are bound to a version
+
+The app sets `plugins.updater.requireSignedVersion: true`. Each `.sig` must
+carry the version it was signed for in its trusted comment
+(`timestamp:…\tfile:…\tversion:X.Y.Z`), and that version must equal the
+`version` in `latest.json`. The trusted comment is covered by the signature,
+so a tampered `latest.json` can't pair "0.9.0" with the URL and signature of
+an older genuine bundle. It's rejected before anything is installed.
+
+- `tauri build` writes the version itself, from `@tauri-apps/cli` 2.11.5
+  onwards (package.json pins `~2.11.5`, matching the `tauri` 2.11 runtime).
+- `tauri signer sign` writes it **only with `--app-version X.Y.Z`**. Without
+  the flag it prints a warning, and the app would refuse the bundle.
+- Both release scripts check this before publishing (see below). A
+  signature without a version, or for another version, stops the release.
+
+0.6.0, the first release with an updater, is the first to be signed with this
+key, so there are no older, version-less signatures by this key for anyone to
+replay. That stays true only as long as every bundle signed with the key goes
+through `tauri build` or `tauri signer sign --app-version`. Never sign anything
+else with `~/.tauri/hawser.key`.
+
 ## Who handles what
 
 | Platform | Built by | Updater bundle | `latest.json` targets |
@@ -52,10 +74,16 @@ offers "Download from GitHub" instead.
    and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` from the repo secrets. It checks
    that the `.sig` files exist, then uploads the installers, the portable exe,
    the `.deb`, the AppImage and both `.sig` files to the release.
-3. **manifest**: downloads the `.sig` files from the release and runs
-   `scripts/latest-json.mjs build`. That script refuses any signature not made
-   by the key in `tauri.conf.json`. The job then uploads `latest.json`. If it
-   is re-run, it keeps any macOS entries already merged for the same version.
+3. **manifest**: downloads the `.sig` files and the updater bundles
+   (`*-setup.exe`, `*.AppImage`) from the release, then runs
+   `scripts/latest-json.mjs build`. Before writing anything, that script
+   verifies each minisign signature (Ed25519, in Node) against the exact
+   bytes users will download, with the key in `tauri.conf.json`. It requires
+   each signature to be bound to the release version, and each bundle's file
+   name to carry that version. The job then uploads `latest.json`. If it is
+   re-run, it keeps any macOS entries already merged for the same version,
+   after checking that each one is still signed by the app key for this
+   version.
 
 When the run finishes, Windows and Linux users are offered the update. macOS
 users are not offered anything yet: their check reports that no update has
@@ -86,10 +114,12 @@ tarball holds the un-stapled app. In that case, rebuild the tarball and sign it
 again:
 
 ```sh
+V=$(node -p "require('./src-tauri/tauri.conf.json').version")   # from the repo root
 cd src-tauri/target/universal-apple-darwin/release/bundle/macos
 rm -f Hawser.app.tar.gz Hawser.app.tar.gz.sig
 COPYFILE_DISABLE=1 tar -czf Hawser.app.tar.gz Hawser.app
-npx tauri signer sign -f ~/.tauri/hawser.key Hawser.app.tar.gz   # prompts for the password
+# --app-version is required: the app refuses a signature without it.
+npx tauri signer sign --app-version "$V" -f ~/.tauri/hawser.key Hawser.app.tar.gz   # prompts for the password
 cd -
 ```
 
@@ -105,8 +135,10 @@ node scripts/add-macos-to-latest.mjs --arch universal --bundle "$B"
 The script:
 
 - reads the version from `tauri.conf.json` and works on release `vX.Y.Z`;
-- refuses a `.sig` that wasn't made by the app's key, and a `latest.json` for
-  any other version;
+- verifies the `.sig` against the bundle's bytes with the app's key, and
+  requires it to be bound to that version. A bundle signed without
+  `--app-version` is refused;
+- refuses a `latest.json` for any other version;
 - uploads `Hawser_X.Y.Z_universal.app.tar.gz` and its `.sig` **first**, then
   the merged `latest.json` with `gh release upload --clobber`, so the manifest
   never points at a file that isn't there yet.

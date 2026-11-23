@@ -17,16 +17,17 @@
 //
 // Repeat with another --arch/--bundle to add a second architecture.
 //
-// It refuses a bundle whose signature was not made by the key in
-// tauri.conf.json (an update the app would reject), and a latest.json for a
-// different version. The bundle and .sig are uploaded BEFORE latest.json, so
+// It verifies the signature against the bundle's bytes with the key in
+// tauri.conf.json and requires it to be bound to the release version (the
+// app sets requireSignedVersion), so it refuses an update the app would
+// reject. It also refuses a latest.json for a different version. The bundle and .sig are uploaded BEFORE latest.json, so
 // the manifest never points at a missing file. Requires the GitHub CLI (gh),
 // logged in with write access to the repo.
 import { execFileSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { assertSignedBy, downloadUrl, macKeys, mergePlatforms, readPubkey } from './latest-json.mjs'
+import { assertReleaseSignature, downloadUrl, macKeys, mergePlatforms, readPubkey } from './latest-json.mjs'
 
 function args(argv) {
   const out = {}
@@ -54,13 +55,17 @@ function main() {
   if (!bundle.endsWith('.app.tar.gz')) throw new Error(`${bundle} is not an .app.tar.gz updater bundle`)
   const sigPath = a.sig ? resolve(String(a.sig)) : `${bundle}.sig`
   if (!existsSync(bundle)) throw new Error(`no bundle at ${bundle}`)
-  if (!existsSync(sigPath)) throw new Error(`no signature at ${sigPath} (sign with: npx tauri signer sign -f ~/.tauri/hawser.key "${bundle}")`)
   const keys = macKeys(arch)
 
   const { pubkey, version } = readPubkey(join(root, 'src-tauri', 'tauri.conf.json'))
+  if (!existsSync(sigPath)) {
+    throw new Error(`no signature at ${sigPath} (sign with: npx tauri signer sign --app-version ${version} -f ~/.tauri/hawser.key "${bundle}")`)
+  }
   const tag = `v${version}`
   const signature = readFileSync(sigPath, 'utf8').trim()
-  assertSignedBy(signature, pubkey, sigPath)
+  // Read once: the bytes verified here are the bytes uploaded below.
+  const bytes = readFileSync(bundle)
+  assertReleaseSignature({ signature, pubkey, data: bytes, version, what: sigPath })
 
   // Versioned, per-arch asset name, so architectures and releases never clash.
   const asset = `Hawser_${version}_${arch}.app.tar.gz`
@@ -78,7 +83,7 @@ function main() {
       return
     }
     const staged = join(work, asset)
-    copyFileSync(bundle, staged)
+    writeFileSync(staged, bytes)
     writeFileSync(`${staged}.sig`, `${signature}\n`)
     gh(['release', 'upload', tag, staged, `${staged}.sig`, '--repo', repo, '--clobber'])
     writeFileSync(join(work, 'latest.json'), text)

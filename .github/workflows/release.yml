@@ -102,7 +102,9 @@ jobs:
         # GitHub runner. On Windows the flag is simply ignored.
         # createUpdaterArtifacts signs the NSIS installer and the AppImage with
         # the minisign key from the repo secrets (the CLI reads both variables
-        # itself; they are never echoed). A missing key fails the build.
+        # itself; they are never echoed). A missing key fails the build. The
+        # CLI (@tauri-apps/cli >= 2.11.5, from package-lock.json) binds each
+        # signature to the app version, which requireSignedVersion demands.
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -168,12 +170,15 @@ jobs:
         with:
           node-version: 22
 
-      - name: Fetch signatures
+      # The updater bundles too: latest-json.mjs verifies every signature
+      # against the exact bytes users will download before publishing.
+      - name: Fetch signatures and updater bundles
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p sigs prev
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir sigs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*-setup.exe' --pattern '*.AppImage' --dir sigs
           # A re-run keeps the macOS entries already merged into latest.json.
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'latest.json' --dir prev || true
           ls -l sigs
@@ -181,7 +186,7 @@ jobs:
       - name: Build latest.json
         run: >-
           node scripts/latest-json.mjs build
-          --tag "$TAG" --repo "$GITHUB_REPOSITORY" --sigdir sigs
+          --tag "$TAG" --repo "$GITHUB_REPOSITORY" --sigdir sigs --assetdir sigs
           --changelog CHANGELOG.md --conf src-tauri/tauri.conf.json
           --existing prev/latest.json --out latest.json
 

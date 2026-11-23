@@ -7,7 +7,7 @@
 import { useSyncExternalStore } from 'react'
 import { inTauri, safeInvoke } from './tauri'
 import {
-  canInstall, describeError, formatNotes, parseLastCheck, type InstallKind, type UpdateInfo, type UpdateState,
+  DownloadTracker, canInstall, describeError, formatNotes, parseLastCheck, type InstallKind, type UpdateInfo, type UpdateState,
 } from './updater'
 
 const LAST_CHECK_KEY = 'hawser.update.lastCheck'
@@ -15,8 +15,8 @@ const LAST_CHECK_KEY = 'hawser.update.lastCheck'
 type UpdateHandle = import('@tauri-apps/plugin-updater').Update
 
 let state: UpdateState = { phase: 'idle' }
-let handle: UpdateHandle | null = null
-let downloadedFor: string | null = null
+// The current Tauri update handle and whether its bytes are downloaded.
+const download = new DownloadTracker<UpdateHandle>()
 let installKind: InstallKind | null = null
 const listeners = new Set<() => void>()
 
@@ -85,14 +85,16 @@ export function checkForUpdates(manual: boolean): Promise<void> {
       const now = Date.now()
       writeLastCheck(now)
       if (!update) {
-        void handle?.close().catch(() => {})
-        handle = null
+        void download.handle?.close().catch(() => {})
+        download.adopt(null)
         set({ phase: 'current', manual, checkedAt: now })
         return
       }
-      if (handle && handle !== update) void handle.close().catch(() => {})
-      if (downloadedFor !== update.version) downloadedFor = null
-      handle = update
+      // Closing the old handle drops its downloaded bytes; adopting the new
+      // one marks it undownloaded, even when it offers the same version.
+      const old = download.handle
+      if (old && old !== update) void old.close().catch(() => {})
+      download.adopt(update)
       const info: UpdateInfo = {
         version: update.version,
         currentVersion: update.currentVersion,
@@ -126,11 +128,11 @@ export async function openReleasesPage(): Promise<void> {
 /** "Install and restart". Downloads (with progress), asks before dropping
  *  live sessions, then installs and relaunches. Only ever called from a click. */
 export async function installUpdate(confirmRestart: (version: string) => Promise<boolean>): Promise<void> {
-  if (!canInstall(state) || !handle || state.phase !== 'available') return
+  const update = download.handle
+  if (!canInstall(state) || !update || state.phase !== 'available') return
   const { info, install } = state
-  const update = handle
   try {
-    if (downloadedFor !== info.version) {
+    if (download.needsDownload(update)) {
       let received = 0
       let total: number | null = null
       set({ phase: 'downloading', info, install, received, total })
@@ -139,7 +141,7 @@ export async function installUpdate(confirmRestart: (version: string) => Promise
         else if (ev.event === 'Progress') received += ev.data.chunkLength
         set({ phase: 'downloading', info, install, received, total })
       })
-      downloadedFor = info.version
+      download.markDownloaded(update)
     }
   } catch (e) {
     set({ phase: 'error', manual: true, info, install, message: describeError(e, 'download') })
@@ -147,6 +149,12 @@ export async function installUpdate(confirmRestart: (version: string) => Promise
   }
   // The download is kept: declining here and clicking again goes straight on.
   if (!(await confirmRestart(info.version))) {
+    set({ phase: 'available', info, install, dismissed: false })
+    return
+  }
+  // Checks wait while a download is shown, but never install bytes this
+  // handle no longer has: offer the update again instead.
+  if (download.needsDownload(update)) {
     set({ phase: 'available', info, install, dismissed: false })
     return
   }

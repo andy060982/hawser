@@ -6,11 +6,15 @@
 //
 // `build` is run by the `manifest` job in .github/workflows/release.yml after
 // the Windows and Linux bundles are on the release. It reads the downloaded
-// .sig files (each named <asset>.sig), checks every signature was made by the
-// key whose public half is in src-tauri/tauri.conf.json, and writes the
-// manifest. scripts/add-macos-to-latest.mjs reuses the helpers for the macOS
-// entries. Nothing here reads or prints a private key.
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+// .sig files (each named <asset>.sig) and the assets themselves, verifies
+// every signature (minisign, Ed25519) against the exact asset bytes with the
+// public key in src-tauri/tauri.conf.json, requires each signature to be bound
+// to the release version (the "version:" field of its trusted comment, which
+// the app enforces with requireSignedVersion), and writes the manifest.
+// scripts/add-macos-to-latest.mjs reuses the helpers for the macOS entries.
+// Nothing here reads or prints a private key.
+import { createHash, createPublicKey, verify as edVerify } from 'node:crypto'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -56,39 +60,123 @@ export function downloadUrl(repo, tag, asset) {
   return `https://github.com/${repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(asset)}`
 }
 
-/** Key id (8 bytes, hex) of a minisign public key as tauri.conf.json stores it
- *  (base64 of the .pub file). */
-export function pubkeyId(pubkeyB64) {
-  const text = Buffer.from(pubkeyB64.trim(), 'base64').toString('utf8')
-  const line = text.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('untrusted comment:'))
-  const raw = Buffer.from(line ?? '', 'base64')
-  if (raw.length !== 42) throw new Error('the updater public key is not a minisign public key')
-  return raw.subarray(2, 10).toString('hex')
+/* Minisign, as tauri signer writes it (both files base64-encoded once more):
+ *
+ *   public key   untrusted comment: ...
+ *                base64( "Ed" | key id [8] | Ed25519 public key [32] )
+ *   signature    untrusted comment: ...
+ *                base64( alg [2] | key id [8] | Ed25519 signature [64] )
+ *                trusted comment: <text>
+ *                base64( Ed25519 signature of (signature [64] | <text>) )
+ *
+ * alg "ED" signs the BLAKE2b-512 hash of the file (what tauri signer makes);
+ * legacy "Ed" signs the file itself. Both are accepted, as the plugin does. */
+
+function decodeOuter(b64) {
+  const text = Buffer.from(String(b64 ?? '').trim(), 'base64').toString('utf8')
+  return text.replace(/\r\n/g, '\n').split('\n')
 }
 
-/** Key id of the key that made a Tauri .sig (base64 of a minisign signature
- *  file). Throws when it is not one. */
-export function signatureKeyId(sigB64) {
-  const text = Buffer.from(String(sigB64).trim(), 'base64').toString('utf8')
-  const lines = text.split('\n').map((l) => l.trim())
-  if (!lines[0]?.startsWith('untrusted comment:') || !lines.some((l) => l.startsWith('trusted comment:'))) {
+/** Parse a minisign public key as tauri.conf.json stores it. */
+export function parsePublicKey(pubkeyB64) {
+  const lines = decodeOuter(pubkeyB64).map((l) => l.trim())
+  const line = lines.find((l) => l && !l.startsWith('untrusted comment:'))
+  const raw = Buffer.from(line ?? '', 'base64')
+  if (raw.length !== 42 || raw.subarray(0, 2).toString('latin1') !== 'Ed') {
+    throw new Error('the updater public key is not a minisign public key')
+  }
+  const key = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: raw.subarray(10).toString('base64url') }, format: 'jwk' })
+  return { keyId: raw.subarray(2, 10).toString('hex'), key }
+}
+
+/** Key id (8 bytes, hex) of a minisign public key. */
+export function pubkeyId(pubkeyB64) {
+  return parsePublicKey(pubkeyB64).keyId
+}
+
+/** Parse a Tauri .sig (base64 of a minisign signature file). Throws when it
+ *  is not one. Nothing returned is trustworthy until verifyMinisign passes. */
+export function parseSignature(sigB64) {
+  const lines = decodeOuter(sigB64)
+  if (!lines[0]?.startsWith('untrusted comment:') || !lines[2]?.startsWith('trusted comment: ')) {
     throw new Error('not a minisign signature (expected the contents of a .sig file made by tauri signer)')
   }
-  const raw = Buffer.from(lines[1] ?? '', 'base64')
+  const raw = Buffer.from(lines[1].trim(), 'base64')
   if (raw.length !== 74) throw new Error('malformed minisign signature line')
-  return raw.subarray(2, 10).toString('hex')
+  const alg = raw.subarray(0, 2).toString('latin1')
+  if (alg !== 'ED' && alg !== 'Ed') throw new Error(`unsupported minisign signature algorithm '${alg}'`)
+  const globalSig = Buffer.from((lines[3] ?? '').trim(), 'base64')
+  if (globalSig.length !== 64) throw new Error('malformed minisign global signature')
+  return {
+    alg,
+    keyId: raw.subarray(2, 10).toString('hex'),
+    sig: raw.subarray(10),
+    trustedComment: lines[2].slice('trusted comment: '.length),
+    globalSig,
+  }
 }
 
-/** Throw unless `sig` was made by the key behind `pubkey`. */
+/** Key id of the key that made a Tauri .sig. */
+export function signatureKeyId(sigB64) {
+  return parseSignature(sigB64).keyId
+}
+
+/** Throw unless `sig` names the key behind `pubkey` (a quick, early check;
+ *  verifyMinisign is the real one). */
 export function assertSignedBy(sig, pubkey, what) {
   const want = pubkeyId(pubkey)
   const got = signatureKeyId(sig)
   if (got !== want) throw new Error(`${what} is signed by key ${got}, but the app trusts key ${want}`)
 }
 
+/** The `version:` field of a trusted comment (tab-separated key:value
+ *  pairs), as tauri-plugin-updater reads it; null when there is none. */
+export function signedVersion(trustedComment) {
+  for (const field of String(trustedComment).split('\t')) {
+    if (field.startsWith('version:')) return field.slice('version:'.length)
+  }
+  return null
+}
+
+/** Verify a minisign signature with `pubkey`. With `data` (a Buffer of the
+ *  exact file bytes) the file signature is checked too; without it only the
+ *  global signature, which authenticates the trusted comment. Returns the
+ *  now-authenticated trusted comment and signed version. */
+export function verifyMinisign(sigB64, pubkeyB64, data, what = 'signature') {
+  const pub = parsePublicKey(pubkeyB64)
+  const s = parseSignature(sigB64)
+  if (s.keyId !== pub.keyId) throw new Error(`${what} is signed by key ${s.keyId}, but the app trusts key ${pub.keyId}`)
+  if (data !== undefined) {
+    const msg = s.alg === 'ED' ? createHash('blake2b512').update(data).digest() : Buffer.from(data)
+    if (!edVerify(null, msg, pub.key, s.sig)) throw new Error(`${what} does not match the file it is published with`)
+  }
+  const global = Buffer.concat([s.sig, Buffer.from(s.trustedComment, 'utf8')])
+  if (!edVerify(null, global, pub.key, s.globalSig)) throw new Error(`${what} has a forged or altered trusted comment`)
+  return { trustedComment: s.trustedComment, version: signedVersion(s.trustedComment) }
+}
+
+/** Everything the app will check, done before publishing: the signature is
+ *  the app key's, matches `data`, and is bound to `version`. */
+export function assertReleaseSignature({ signature, pubkey, data, version, what }) {
+  const v = verifyMinisign(signature, pubkey, data, what).version
+  if (v === null) {
+    throw new Error(`${what} is not bound to a version (re-sign with: tauri signer sign --app-version ${version} ...); the app requires signed versions`)
+  }
+  if (v !== version) throw new Error(`${what} was signed for version ${v}, not ${version}`)
+}
+
+/** Refuse an asset whose file name names another version (Hawser_0.6.0_...
+ *  on the 0.6.1 release): a second guard against publishing a stale bundle. */
+export function assertAssetVersion(asset, version) {
+  if (!String(asset).includes(`_${version}_`)) {
+    throw new Error(`${asset} does not carry the release version ${version} in its name (expected Hawser_${version}_...)`)
+  }
+}
+
 /** Platform entries for every signature found: `sigs` maps an asset name to
- *  its .sig contents. */
-export function desktopPlatforms({ sigs, repo, tag, pubkey }) {
+ *  its .sig contents, `readAsset(name)` returns that asset's bytes. Each
+ *  signature is verified against those bytes and must be bound to `version`. */
+export function desktopPlatforms({ sigs, readAsset, repo, tag, version, pubkey }) {
   const platforms = {}
   for (const t of DESKTOP_TARGETS) {
     const matches = Object.keys(sigs).filter((n) => n.endsWith(t.suffix))
@@ -97,7 +185,8 @@ export function desktopPlatforms({ sigs, repo, tag, pubkey }) {
     }
     const asset = matches[0]
     const signature = sigs[asset].trim()
-    assertSignedBy(signature, pubkey, asset)
+    assertAssetVersion(asset, version)
+    assertReleaseSignature({ signature, pubkey, data: readAsset(asset), version, what: asset })
     for (const k of t.keys) platforms[k] = { signature, url: downloadUrl(repo, tag, asset) }
   }
   return platforms
@@ -106,9 +195,14 @@ export function desktopPlatforms({ sigs, repo, tag, pubkey }) {
 /** Entries from an earlier latest.json for the same version that this build
  *  does not produce (the macOS ones Andy adds by hand), so re-running the CI
  *  job never drops them. A manifest for another version contributes nothing. */
-export function carriedPlatforms(existing, version, produced) {
+export function carriedPlatforms(existing, version, produced, pubkey) {
   if (!existing || existing.version !== version || typeof existing.platforms !== 'object' || !existing.platforms) return {}
-  return Object.fromEntries(Object.entries(existing.platforms).filter(([k]) => !(k in produced)))
+  const kept = Object.entries(existing.platforms).filter(([k]) => !(k in produced))
+  // Their bytes were verified when they were added; re-check that each is
+  // still the app key's and bound to this version (no download needed: the
+  // global signature covers the trusted comment).
+  for (const [k, e] of kept) assertReleaseSignature({ signature: e?.signature, pubkey, data: undefined, version, what: `the existing ${k} entry` })
+  return Object.fromEntries(kept)
 }
 
 export function buildManifest({ version, notes, pubDate, platforms }) {
@@ -147,7 +241,7 @@ export function readPubkey(confPath) {
 function main() {
   const a = args(process.argv.slice(2))
   if (a._?.[0] !== 'build') {
-    console.error('usage: latest-json.mjs build --tag vX.Y.Z --sigdir DIR --repo OWNER/NAME [--changelog CHANGELOG.md] [--conf src-tauri/tauri.conf.json] [--existing old-latest.json] [--out latest.json]')
+    console.error('usage: latest-json.mjs build --tag vX.Y.Z --sigdir DIR --repo OWNER/NAME [--assetdir DIR] [--changelog CHANGELOG.md] [--conf src-tauri/tauri.conf.json] [--existing old-latest.json] [--out latest.json]')
     process.exit(2)
   }
   const tag = String(a.tag ?? '')
@@ -175,12 +269,18 @@ function main() {
     }
   }
   const releaseUrl = `https://github.com/${repo}/releases/tag/${tag}`
-  const produced = desktopPlatforms({ sigs, repo, tag, pubkey })
+  const assetdir = String(a.assetdir ?? a.sigdir)
+  const readAsset = (name) => {
+    const p = join(assetdir, name)
+    if (!existsSync(p)) throw new Error(`${name} was not downloaded to ${assetdir}: its signature cannot be verified`)
+    return readFileSync(p)
+  }
+  const produced = desktopPlatforms({ sigs, readAsset, repo, tag, version, pubkey })
   const manifest = buildManifest({
     version,
     notes: releaseNotes(changelog, version, releaseUrl),
     pubDate: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-    platforms: { ...carriedPlatforms(existing, version, produced), ...produced },
+    platforms: { ...carriedPlatforms(existing, version, produced, pubkey), ...produced },
   })
   const out = String(a.out ?? 'latest.json')
   writeFileSync(out, `${JSON.stringify(manifest, null, 2)}\n`)

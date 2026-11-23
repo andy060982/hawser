@@ -192,6 +192,37 @@ export function canInstall(state: UpdateState): boolean {
   return state.phase === 'available' && state.install.kind === 'self'
 }
 
+/** Which update handle holds downloaded bytes. Each check returns a new
+ *  handle and closes the one it replaces, which frees that handle's bytes, so
+ *  "downloaded" belongs to a handle, never to a version: the same version
+ *  offered again by a re-check must be downloaded again. */
+export class DownloadTracker<H> {
+  private current: H | null = null
+  private downloaded = false
+
+  /** The handle the next install uses. */
+  get handle(): H | null {
+    return this.current
+  }
+
+  /** Make `h` the current handle. A different handle starts undownloaded. */
+  adopt(h: H | null): void {
+    if (h === this.current) return
+    this.current = h
+    this.downloaded = false
+  }
+
+  /** `h` finished downloading. Ignored unless it is still the current one. */
+  markDownloaded(h: H): void {
+    if (h === this.current) this.downloaded = true
+  }
+
+  /** Must `h` download before it can install? */
+  needsDownload(h: H): boolean {
+    return h !== this.current || !this.downloaded
+  }
+}
+
 /** Settings → Updates status line. */
 export function statusLine(state: UpdateState, lastCheck: number | null, now: number): string {
   switch (state.phase) {

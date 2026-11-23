@@ -2,20 +2,40 @@
 // tooling (scripts/latest-json.mjs).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
-  CHECK_INTERVAL_MS, autoCheckDue, bannerModel, canInstall, describeError, formatNotes, parseLastCheck,
+  CHECK_INTERVAL_MS, DownloadTracker, autoCheckDue, bannerModel, canInstall, describeError, formatNotes, parseLastCheck,
   progressPercent, progressText, restartConfirmText, statusLine,
 } from './updater.ts'
 import {
-  assertSignedBy, buildManifest, carriedPlatforms, desktopPlatforms, downloadUrl, macKeys, mergePlatforms, pubkeyId,
-  releaseNotes, signatureKeyId,
+  assertAssetVersion, assertReleaseSignature, assertSignedBy, buildManifest, carriedPlatforms, desktopPlatforms,
+  downloadUrl, macKeys, mergePlatforms, pubkeyId, releaseNotes, signatureKeyId, signedVersion, verifyMinisign,
 } from '../../scripts/latest-json.mjs'
 
 // A throwaway minisign keypair made for these tests only (tauri signer
-// generate); key A signed SIG, key B signed nothing.
-const A_PUB = 'dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM1OUUyOTI5RkZFMkQzQzcKUldUSDArTC9LU21leGJnZkFSbnlHcmZXdiszWXBDWFU2QS96WGMxWDdyU2lSa2lONVN6cDhRZ3AK'
+// generate, CLI 2.11.5, no password; the secret half was discarded). Key A
+// signed the fixtures below; key B signed nothing.
+//   EXE_SIG    EXE bytes, tauri signer sign --app-version 0.7.0
+//   APPIMG_SIG APPIMG bytes, --app-version 0.7.0
+//   OLD_SIG    EXE bytes, --app-version 0.6.0
+//   LEGACY_SIG LEGACY bytes, no --app-version (no version: field)
+const A_PUB = 'dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdFNzUyNTQyQ0MzQzkzOTQKUldTVWt6ek1RaVYxZnVLOVRsZ1Z1SE9aTFR6Qmc1QTBQV3oybkRGTTZqRnhtdlFmak9VNCswUUcK'
 const B_PUB = 'dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU1NDcyMjE2OUNGQkZFMkEKUldRcS92dWNGaUpIVlhEN2hKcENFT0dhemY5NWlyMFo3U1YvcjljWHlGeXZEcmZ1RTlkclRPVXkK'
-const SIG = 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSDArTC9LU21leGZzQUNubVI1VmpkODVTWlllSEtHZUkrRU1IMmZzeStrU2dOMnEwVnc3amZ0TVhSMTZiQXpvRmErUXZobWlQTmJMb1R4aURvTldya1VTQy9zWSszTHdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDE4MTgwCWZpbGU6Zi5iaW4KZ0FTRFlnMVc3WEdwZU5RMHVqSDZyckxmYlFGeTh0ZzhOVnZudWpycm5TMWtQQ3U2VFVvTlNJK1p6U3RiM2xieFdEUkp4d2l2aWx6Njk0VnBtWkdJQnc9PQo='
+const EXE = Buffer.from('hawser test bundle\n')
+const APPIMG = Buffer.from('hawser test appimage\n')
+const LEGACY = Buffer.from('legacy\n')
+const EXE_SIG = 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTVWt6ek1RaVYxZm01cnIySUJhSzAzWXJsbDg5d3hGZEFuSVVXSDFNN1dTUGdPVVV0dXdKdW91QnB2eUk2YnYyNjBSVm5BMzZBQ1JMN2x3S0hwbzAyYUU0Ym85dWNuM3c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDE5MTY2CWZpbGU6SGF3c2VyXzAuNy4wX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjcuMApVK1B0Vk96SFRoTGtUQXcrLzFXcEpYc0drbCt6UVo3VERldE9qQTZhUGV0SU1IaTJ0dzJQSGpoNHJZbmtoNlZmVWw5SDdFaDJyWUw1RVdyVEIwQ1lCQT09Cg=='
+const APPIMG_SIG = 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTVWt6ek1RaVYxZnRMSTdMMDJWQkVieHRrdUUxUGtMcFA3SEE3bHZyOWFENUQwQkt6b2ttWnYxZWpkTjdVSlpXQmYyOHRJaW54M3N5a1FRK3FWQ2IvdVJXVDZXNmdZZUE0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDE5Mjk5CWZpbGU6SGF3c2VyXzAuNy4wX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MC43LjAKVU5ZNlhycjN0bnI1YytSckU5QkprRVI0WmovMjJCVHVKbE9HOTZYVnI5amQ3ekxqc0d3VW80UWluTk9MelZDZXNBKy9obW9XUzdqQUhoSEFsVTdqRHc9PQo='
+const OLD_SIG = 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTVWt6ek1RaVYxZm5KLzZqQ3JYbGNvNmNVUmZpNjZ3MzYxTERlVmJvdjFmbExNdTVoZVJjVmo2cm85WlNKWVFub0lMYm52TFNXYkN2ajZGbE1sdjFHa0h1QWJpZVUyYWdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDE5MzAwCWZpbGU6SGF3c2VyXzAuNy4wX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjYuMApMU0ErdjZ0TFFtYkdIbERTWkFKS25SeDdsTkpRbm0yeXljSGhDeWk5NWQyZVQ5bFdRUXUwWUxEaWFYTmR6Q0tOTEZVZE5QVEZEUWlIL0IvNHdMRzBBdz09Cg=='
+const LEGACY_SIG = 'dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTVWt6ek1RaVYxZmduQVd1b2JscnVhb3JRRlNoYVJLa2wzQTJVTDErd2VYMWgxS0Z6S2M2eXZhdU5IM3hLa2xPRGFlNTkxVFpyYjRWb21kMnJ6R3o2RGZrZW9BRmx5dnd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NDE5MTY3CWZpbGU6bGVnYWN5LmJpbgpkenlrWXFCWUxMQ1B0T2JyNm5TcWFlVzk1bkFmM1lQSFk0TmxLYU16UHRQT1RoUktHM29xZVlVdnNhVWplZmdEcU1PWlJiVDNiU3ZqSExub3d1UnZEUT09Cg=='
+const SIG = EXE_SIG
+
+/** Re-encode a .sig with its trusted comment replaced (signatures untouched). */
+function withTrustedComment(sigB64, comment) {
+  const lines = Buffer.from(sigB64, 'base64').toString('utf8').split('\n')
+  lines[2] = `trusted comment: ${comment}`
+  return Buffer.from(lines.join('\n')).toString('base64')
+}
 
 const info = { version: '0.7.0', currentVersion: '0.6.0', notes: 'Fixes.' }
 const SELF = { kind: 'self', reason: 'app bundle' }
@@ -155,22 +175,80 @@ test('signatures are checked against the app key before they are published', () 
 })
 
 test('the CI manifest maps the NSIS installer and the AppImage to their targets', () => {
-  const sigs = { 'Hawser_0.7.0_x64-setup.exe': `${SIG}\n`, 'Hawser_0.7.0_amd64.AppImage': SIG }
-  const p = desktopPlatforms({ sigs, repo: 'o/r', tag: 'v0.7.0', pubkey: A_PUB })
+  const sigs = { 'Hawser_0.7.0_x64-setup.exe': `${EXE_SIG}\n`, 'Hawser_0.7.0_amd64.AppImage': APPIMG_SIG }
+  const files = { 'Hawser_0.7.0_x64-setup.exe': EXE, 'Hawser_0.7.0_amd64.AppImage': APPIMG }
+  const readAsset = (n) => files[n]
+  const base = { sigs, readAsset, repo: 'o/r', tag: 'v0.7.0', version: '0.7.0', pubkey: A_PUB }
+  const p = desktopPlatforms(base)
   assert.deepEqual(Object.keys(p).sort(), ['linux-x86_64', 'linux-x86_64-appimage', 'windows-x86_64', 'windows-x86_64-nsis'])
   assert.equal(p['windows-x86_64'].url, 'https://github.com/o/r/releases/download/v0.7.0/Hawser_0.7.0_x64-setup.exe')
   assert.equal(p['linux-x86_64'].url, 'https://github.com/o/r/releases/download/v0.7.0/Hawser_0.7.0_amd64.AppImage')
-  assert.equal(p['windows-x86_64'].signature, SIG, 'the .sig contents, trimmed')
-  assert.throws(() => desktopPlatforms({ sigs: { 'Hawser_0.7.0_x64-setup.exe': SIG }, repo: 'o/r', tag: 'v0.7.0', pubkey: A_PUB }), /AppImage/)
+  assert.equal(p['windows-x86_64'].signature, EXE_SIG, 'the .sig contents, trimmed')
+  assert.throws(() => desktopPlatforms({ ...base, sigs: { 'Hawser_0.7.0_x64-setup.exe': EXE_SIG } }), /AppImage/)
   assert.throws(
-    () => desktopPlatforms({ sigs: { ...sigs, 'Hawser_0.6.0_x64-setup.exe': SIG }, repo: 'o/r', tag: 'v0.7.0', pubkey: A_PUB }),
+    () => desktopPlatforms({ ...base, sigs: { ...sigs, 'Hawser_0.6.0_x64-setup.exe': EXE_SIG } }),
     /found 2/,
     'a stale installer is refused, not guessed between',
   )
-  assert.throws(() => desktopPlatforms({ sigs, repo: 'o/r', tag: 'v0.7.0', pubkey: B_PUB }), /trusts key/)
+  assert.throws(() => desktopPlatforms({ ...base, pubkey: B_PUB }), /trusts key/)
+  // The .sig of one bundle beside another bundle: right key, wrong bytes.
+  assert.throws(
+    () => desktopPlatforms({ ...base, readAsset: (n) => (n.endsWith('.AppImage') ? EXE : files[n]) }),
+    /Hawser_0\.7\.0_amd64\.AppImage does not match the file/,
+  )
+  assert.throws(
+    () => desktopPlatforms({ ...base, sigs: { ...sigs, 'Hawser_0.7.0_x64-setup.exe': OLD_SIG } }),
+    /signed for version 0\.6\.0, not 0\.7\.0/,
+  )
+  assert.throws(
+    () => desktopPlatforms({ ...base, tag: 'v0.7.1', version: '0.7.1' }),
+    /does not carry the release version 0\.7\.1/,
+    'a bundle named for another version is refused before its signature is read',
+  )
   const m = buildManifest({ version: '0.7.0', notes: 'n', pubDate: '2026-12-01T00:00:00Z', platforms: p })
   assert.deepEqual(Object.keys(m), ['version', 'notes', 'pub_date', 'platforms'])
   assert.equal(downloadUrl('o/r', 'v1.0.0', 'a b.exe'), 'https://github.com/o/r/releases/download/v1.0.0/a%20b.exe')
+})
+
+test('minisign signatures are verified in full against the file bytes', () => {
+  const ok = verifyMinisign(EXE_SIG, A_PUB, EXE)
+  assert.equal(ok.version, '0.7.0')
+  assert.match(ok.trustedComment, /^timestamp:\d+\tfile:Hawser_0\.7\.0_x64-setup\.exe\tversion:0\.7\.0$/)
+  assert.equal(verifyMinisign(LEGACY_SIG, A_PUB, LEGACY).version, null, 'a legacy signature verifies but carries no version')
+  assert.throws(() => verifyMinisign(EXE_SIG, A_PUB, Buffer.concat([EXE, Buffer.from('x')])), /does not match the file/)
+  assert.throws(() => verifyMinisign(EXE_SIG, A_PUB, APPIMG), /does not match the file/)
+  assert.throws(() => verifyMinisign(EXE_SIG, B_PUB, EXE), /trusts key/)
+  // Editing the trusted comment (e.g. adding or changing version:) breaks the
+  // global signature, with or without the file.
+  const forged = withTrustedComment(LEGACY_SIG, 'timestamp:1795419167\tfile:legacy.bin\tversion:9.9.9')
+  assert.throws(() => verifyMinisign(forged, A_PUB, LEGACY), /forged or altered trusted comment/)
+  const relabelled = withTrustedComment(OLD_SIG, 'timestamp:1795419300\tfile:Hawser_0.7.0_x64-setup.exe\tversion:0.7.0')
+  assert.throws(() => verifyMinisign(relabelled, A_PUB), /forged/, 'a 0.6.0 signature relabelled 0.7.0')
+  assert.equal(verifyMinisign(EXE_SIG, A_PUB).version, '0.7.0', 'without bytes only the trusted comment is checked')
+  assert.throws(() => verifyMinisign('not base64 at all', A_PUB, EXE), /not a minisign signature/)
+})
+
+test('a release signature must be bound to the release version', () => {
+  const r = { pubkey: A_PUB, what: 'x.sig' }
+  assert.doesNotThrow(() => assertReleaseSignature({ ...r, signature: EXE_SIG, data: EXE, version: '0.7.0' }))
+  assert.throws(() => assertReleaseSignature({ ...r, signature: LEGACY_SIG, data: LEGACY, version: '0.7.0' }), /not bound to a version .*--app-version 0\.7\.0/)
+  assert.throws(() => assertReleaseSignature({ ...r, signature: OLD_SIG, data: EXE, version: '0.7.0' }), /signed for version 0\.6\.0/)
+  assert.throws(() => assertReleaseSignature({ ...r, signature: EXE_SIG, data: EXE, version: '0.7.0-rc.1' }), /signed for version 0\.7\.0/)
+  assert.equal(signedVersion('timestamp:1\tfile:a\tversion:1.2.3'), '1.2.3')
+  assert.equal(signedVersion('timestamp:1\tfile:app-version:2.zip'), null, 'only a whole field counts')
+  assert.equal(signedVersion('timestamp:1\tfile:a'), null)
+  assert.doesNotThrow(() => assertAssetVersion('Hawser_0.7.0_universal.app.tar.gz', '0.7.0'))
+  assert.throws(() => assertAssetVersion('Hawser_0.7.0_universal.app.tar.gz', '0.7.1'), /does not carry/)
+  assert.throws(() => assertAssetVersion('Hawser_10.7.0_x64-setup.exe', '0.7.0'), /does not carry/)
+})
+
+test('the app requires signed versions and is built with a CLI that writes them', () => {
+  const conf = JSON.parse(readFileSync(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'))
+  assert.equal(conf.plugins.updater.requireSignedVersion, true)
+  const lock = JSON.parse(readFileSync(new URL('../../package-lock.json', import.meta.url), 'utf8'))
+  const cli = lock.packages['node_modules/@tauri-apps/cli'].version.split('.').map(Number)
+  // 2.11.5 is the first CLI that binds signatures to the app version.
+  assert.ok(cli[0] > 2 || (cli[0] === 2 && (cli[1] > 11 || (cli[1] === 11 && cli[2] >= 5))), `@tauri-apps/cli ${cli.join('.')} is too old`)
 })
 
 test('the macOS merge adds darwin targets and refuses another version', () => {
@@ -187,8 +265,38 @@ test('the macOS merge adds darwin targets and refuses another version', () => {
 
 test('a CI re-run keeps the macOS entries of the same version only', () => {
   const produced = { 'windows-x86_64': { signature: 'new', url: 'w' } }
-  const prev = { version: '0.7.0', platforms: { 'windows-x86_64': { signature: 'old', url: 'w' }, 'darwin-aarch64': { signature: 'm', url: 'm' } } }
-  assert.deepEqual(carriedPlatforms(prev, '0.7.0', produced), { 'darwin-aarch64': { signature: 'm', url: 'm' } })
-  assert.deepEqual(carriedPlatforms(prev, '0.7.1', produced), {}, 'older release: nothing carried')
-  assert.deepEqual(carriedPlatforms(null, '0.7.0', produced), {})
+  const mac = { signature: APPIMG_SIG, url: 'm' }
+  const prev = { version: '0.7.0', platforms: { 'windows-x86_64': { signature: 'old', url: 'w' }, 'darwin-aarch64': mac } }
+  assert.deepEqual(carriedPlatforms(prev, '0.7.0', produced, A_PUB), { 'darwin-aarch64': mac })
+  assert.deepEqual(carriedPlatforms(prev, '0.7.1', produced, A_PUB), {}, 'older release: nothing carried')
+  assert.deepEqual(carriedPlatforms(null, '0.7.0', produced, A_PUB), {})
+  const legacy = { ...prev, platforms: { ...prev.platforms, 'darwin-aarch64': { signature: LEGACY_SIG, url: 'm' } } }
+  assert.throws(() => carriedPlatforms(legacy, '0.7.0', produced, A_PUB), /existing darwin-aarch64 entry is not bound to a version/)
+  assert.throws(() => carriedPlatforms(prev, '0.7.0', produced, B_PUB), /trusts key/)
+})
+
+test('download state belongs to the update handle, not the version', () => {
+  const t = new DownloadTracker()
+  const first = { version: '0.7.0' }
+  assert.equal(t.handle, null)
+  t.adopt(first)
+  assert.equal(t.needsDownload(first), true)
+  t.markDownloaded(first)
+  assert.equal(t.needsDownload(first), false, 'declining the restart keeps the download')
+  t.adopt(first)
+  assert.equal(t.needsDownload(first), false, 're-adopting the same handle keeps it')
+  // A re-check offers the same version on a new handle (the old one is
+  // closed, its bytes gone): install must download again.
+  const second = { version: '0.7.0' }
+  t.adopt(second)
+  assert.equal(t.handle, second)
+  assert.equal(t.needsDownload(second), true)
+  assert.equal(t.needsDownload(first), true, 'the replaced handle never counts as downloaded')
+  t.markDownloaded(first)
+  assert.equal(t.needsDownload(second), true, 'a late finish on the old handle does not mark the new one')
+  t.markDownloaded(second)
+  assert.equal(t.needsDownload(second), false)
+  t.adopt(null)
+  assert.equal(t.handle, null)
+  assert.equal(t.needsDownload(second), true, 'up to date: nothing is downloaded')
 })
