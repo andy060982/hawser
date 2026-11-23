@@ -218,7 +218,8 @@ fn dispatch_extension(name: &str) -> Option<String> {
 }
 
 /// Why `name` must not be handed to the default app, if it must not: it is
-/// not a known inert type (`INERT_EXTS`, or no extension at all), or any
+/// not a known inert type (`INERT_EXTS`; a name without an extension is never
+/// treated as inert), or any
 /// execute bit is set in one of `modes` (the remote file's, and on Unix the
 /// local copy's — an executable extensionless file is a program). The
 /// configured editor command opens anything and skips this check.
@@ -226,7 +227,15 @@ pub fn default_app_refusal(name: &str, modes: &[Option<u32>]) -> Option<String> 
     const FIX: &str = "To open it, set an editor command (for example code --wait) in Settings → \
                        Remote editing; Hawser then opens every file with that editor.";
     let shown = normalized_name(name);
-    if let Some(ext) = dispatch_extension(name).filter(|e| !INERT_EXTS.contains(&e.as_str())) {
+    // No extension: desktops pick the handler from the content (GIO/xdg-open
+    // sniff an HTML or script body), so it is not known to be inert.
+    let Some(ext) = dispatch_extension(name) else {
+        return Some(format!(
+            "{shown} has no file extension, so the system would choose an app from its contents, \
+             which could run it instead of opening it. {FIX}"
+        ));
+    };
+    if !INERT_EXTS.contains(&ext.as_str()) {
         return Some(format!(
             "{shown} is a .{ext} file, and only plain text and document types are opened with the \
              system's default app (its default app could run it instead of opening it). {FIX}"
@@ -1698,7 +1707,7 @@ mod tests {
         for name in [
             "nginx.conf", "notes.TXT", "app.log", "README.md", "x.yaml", "x.yml", "Cargo.toml", "a.ini",
             "a.cfg", "data.json", "pom.xml", "t.csv", "t.tsv", "prod.env", "app.properties", "fix.diff",
-            "fix.patch", "README", "Makefile", "notes.txt.", "notes.txt . ", "a.",
+            "fix.patch", "notes.txt.", "notes.txt . ",
         ] {
             assert!(ok(name), "{name} should open with the default app");
         }
@@ -1711,13 +1720,16 @@ mod tests {
             "app.js", "page.html", "page.htm", "a.svg",
             // Unknown types are not assumed safe.
             "a.zzz", "archive.tar.gz", "a.sh.txt.bin",
+            // No extension: the desktop sniffs the content (an HTML body opens
+            // in a browser), so these need the editor too.
+            "README", "Makefile", "payload", "a.",
         ] {
             assert!(!ok(name), "{name} must need the editor command");
         }
         // Any execute bit, on the server or here: an extensionless program.
         assert!(default_app_refusal("backup", &[Some(0o100755)]).is_some());
         assert!(default_app_refusal("backup", &[Some(0o100644), Some(0o100700)]).is_some());
-        assert!(default_app_refusal("backup", &[Some(0o100640), None]).is_none());
+        assert!(default_app_refusal("backup", &[Some(0o100640), None]).is_some());
         assert!(default_app_refusal("a.txt", &[Some(0o100755)]).is_some());
         // The message says how to fix it.
         let why = default_app_refusal("box.wsb", &[None]).unwrap();

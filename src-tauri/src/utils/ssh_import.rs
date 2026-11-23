@@ -483,6 +483,12 @@ impl Reader {
     /// component is looked at with symlink_metadata, and a symlink is
     /// followed only when its target (read, not followed) is itself inside
     /// home. Matches are capped while the directories are being read.
+    ///
+    /// Accepted residual: the walk keeps path names, not directory handles,
+    /// so a process already running as this user that swaps a checked folder
+    /// for a symlink between steps can make read_dir/symlink_metadata look
+    /// outside home before the final no-follow open refuses the file. Such a
+    /// process can read those files itself; nothing outside home is read.
     fn include_paths(&mut self, pat: &str) -> Result<Vec<Resolved>, String> {
         let canon = self.canon_home.clone().ok_or("your home folder could not be resolved")?;
         let comps = include_components(pat, &self.home, &canon)?;

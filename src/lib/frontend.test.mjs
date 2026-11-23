@@ -1258,3 +1258,17 @@ test('import route: a destination never loses its jump host to an unchecked or m
   assert.equal(forced.added, 0)
   assert.ok(forced.notes.some((n) => n.includes('orphan: not imported')))
 })
+
+test('import route: a duplicate multi-hop row still needs the route confirmation', async () => {
+  const { routeRowsToConfirm } = await import('./tree.ts')
+  const row = (index, status, scanned) => ({ index, status, scanned })
+  const rows = [
+    row(0, 'duplicate', { name: 'dup-multi', jumpHops: 2 }),
+    row(1, 'warning', { name: 'warn-unsupported', unsupportedRoute: true }),
+    row(2, 'duplicate', { name: 'dup-plain', jumpHops: 1 }),
+    row(3, 'new', { name: 'plain' }),
+  ]
+  const picked = routeRowsToConfirm(rows, new Set([0, 1, 2, 3])).map((r) => r.scanned.name)
+  assert.deepEqual(picked, ['dup-multi', 'warn-unsupported'])
+  assert.deepEqual(routeRowsToConfirm(rows, new Set([2, 3])), [])
+})

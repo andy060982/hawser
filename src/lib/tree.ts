@@ -940,7 +940,11 @@ export function importSelection(
 /** Checked rows whose ProxyJump chain is longer than Hawser's one jump
  *  host: importing them needs an explicit confirmation. */
 export function routeRowsToConfirm(rows: ImportRow[], checked: ReadonlySet<number>): ImportRow[] {
-  return rows.filter((r) => checked.has(r.index) && r.status === 'route')
+  // Judged from the route itself, not the displayed status: a duplicate (or
+  // warning) row can still carry a route Hawser would shorten.
+  return rows.filter(
+    (r) => checked.has(r.index) && (!!r.scanned.unsupportedRoute || (r.scanned.jumpHops ?? 0) > 1),
+  )
 }
 
 /** The confirmation text for `routeRowsToConfirm`. */
