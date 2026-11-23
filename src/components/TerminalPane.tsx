@@ -37,6 +37,38 @@ import {
  *  landing inside typed input). Chaining makes each write wait for the last. */
 const writeChains = new Map<string, Promise<unknown>>()
 
+/** Per-session PTY resize, latest wins. Resizes were fire-and-forget, so two
+ *  from one window drag could reach the remote out of order and leave the PTY
+ *  one step behind the grid. One resize is in flight at a time; sizes that
+ *  arrive meanwhile collapse into the newest, sent when it settles. */
+const resizeState = new Map<string, { pending: { cols: number; rows: number } | null }>()
+
+function queueResize(
+  sessionId: string,
+  cols: number,
+  rows: number,
+  onError: (e: unknown) => void,
+): void {
+  const st = resizeState.get(sessionId)
+  if (st) {
+    st.pending = { cols, rows }
+    return
+  }
+  const state = { pending: null as { cols: number; rows: number } | null }
+  resizeState.set(sessionId, state)
+  const send = (c: number, r: number) => {
+    void safeInvoke('ssh_resize', { sessionId, cols: c, rows: r })
+      .catch(onError)
+      .finally(() => {
+        const next = state.pending
+        state.pending = null
+        if (next) send(next.cols, next.rows)
+        else resizeState.delete(sessionId)
+      })
+  }
+  send(cols, rows)
+}
+
 function queueWrite(sessionId: string, data: number[]): Promise<unknown> {
   const prev = writeChains.get(sessionId) ?? Promise.resolve()
   const next = prev
@@ -405,12 +437,10 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
       // Do not swallow the rejection. If the PTY resize fails the remote keeps
       // drawing to the old geometry, which looks exactly like "the terminal
       // does not expand" while the local grid has in fact resized fine.
-      void safeInvoke('ssh_resize', { sessionId: session.id, cols, rows }).catch(
-        (e: unknown) => {
-          const msg = e instanceof Error ? e.message : String(e)
-          term.write(`\r\n\x1b[38;2;242;178;92m● PTY resize failed\x1b[0m ${msg}\r\n`)
-        },
-      )
+      queueResize(session.id, cols, rows, (e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e)
+        term.write(`\r\n\x1b[38;2;242;178;92m● PTY resize failed\x1b[0m ${msg}\r\n`)
+      })
     }
 
     const pushResize = () => {

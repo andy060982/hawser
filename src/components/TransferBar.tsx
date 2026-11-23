@@ -5,11 +5,14 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Info,
   RotateCw,
+  Square,
   TriangleAlert,
   X,
 } from 'lucide-react'
 import type { Transfer } from '../types'
+import { canRetry, isLive, retryableFailures } from '../lib/transfers'
 
 /** Global transfer status panel.
  *
@@ -27,13 +30,15 @@ export function TransferBar({
   transfers,
   onClear,
   onRetry,
+  onCancel,
 }: {
   transfers: Transfer[]
   onClear: () => void
   onRetry: (t: Transfer) => void
+  onCancel: (t: Transfer) => void
 }) {
   if (transfers.length === 0) return null
-  const active = transfers.filter((t) => t.status === 'active').length
+  const active = transfers.filter(isLive).length
   const failed = transfers.filter((t) => t.status === 'error' || (t.failures?.length ?? 0) > 0).length
 
   return (
@@ -56,7 +61,7 @@ export function TransferBar({
 
       <ul className="max-h-52 overflow-y-auto">
         {transfers.map((t) => (
-          <TransferRow key={t.id} transfer={t} onRetry={onRetry} />
+          <TransferRow key={t.id} transfer={t} onRetry={onRetry} onCancel={onCancel} />
         ))}
       </ul>
     </div>
@@ -72,7 +77,15 @@ const fmtBytes = (n: number) => {
   return `${v.toFixed(v < 10 ? 1 : 0)} ${units[u]}`
 }
 
-function TransferRow({ transfer: t, onRetry }: { transfer: Transfer; onRetry: (t: Transfer) => void }) {
+function TransferRow({
+  transfer: t,
+  onRetry,
+  onCancel,
+}: {
+  transfer: Transfer
+  onRetry: (t: Transfer) => void
+  onCancel: (t: Transfer) => void
+}) {
   const failures = t.failures ?? []
   const hasFailures = failures.length > 0
   // A row with failures opens by default so the problem is visible without a
@@ -87,7 +100,8 @@ function TransferRow({ transfer: t, onRetry }: { transfer: Transfer; onRetry: (t
   // indeterminate bar rather than inventing a denominator.
   const determinate = t.bytesTotal > 0
   const pct = determinate ? Math.min(100, (t.bytesDone / t.bytesTotal) * 100) : 0
-  const retryable = failures.filter((f) => f.local && f.remote).length
+  const retryable = retryableFailures(t).length
+  const notes = t.notes ?? []
 
   return (
     <li className="text-[11.5px] text-ink-dim">
@@ -120,6 +134,10 @@ function TransferRow({ transfer: t, onRetry }: { transfer: Transfer; onRetry: (t
           </span>
         )}
 
+        {t.status === 'queued' && (
+          <span className="font-mono text-[10.5px] text-ink-faint">queued</span>
+        )}
+
         {t.status === 'active' && (
           <>
             <span
@@ -142,13 +160,32 @@ function TransferRow({ transfer: t, onRetry }: { transfer: Transfer; onRetry: (t
           </>
         )}
 
+        {isLive(t) && (
+          <button
+            type="button"
+            onClick={() => onCancel(t)}
+            title="Cancel this transfer"
+            aria-label={`Cancel ${t.name}`}
+            className="grid h-5 w-5 shrink-0 place-items-center rounded text-ink-faint hover:bg-surface-3 hover:text-alert"
+          >
+            <Square size={9} aria-hidden />
+          </button>
+        )}
+
         {t.status === 'done' && !hasFailures && (
           <>
             <span className="font-mono text-[10.5px] tabular-nums text-ink-faint">
               {fmtBytes(t.bytesDone)}
             </span>
+            {notes.length > 0 && (
+              <Info size={12} className="shrink-0 text-warn" aria-label="notes" />
+            )}
             <Check size={12} className="shrink-0 text-ok" aria-label="complete" />
           </>
+        )}
+
+        {t.status === 'cancelled' && (
+          <span className="font-mono text-[10.5px] text-ink-faint">cancelled</span>
         )}
 
         {(t.status === 'error' || hasFailures) && (
@@ -159,13 +196,23 @@ function TransferRow({ transfer: t, onRetry }: { transfer: Transfer; onRetry: (t
         )}
       </div>
 
+      {notes.length > 0 && (
+        <ul className="border-t border-line/40 bg-surface-2/40 px-3 py-1 font-mono text-[10.5px] text-warn">
+          {notes.map((n, i) => (
+            <li key={i} className="break-words">
+              {n}
+            </li>
+          ))}
+        </ul>
+      )}
+
       {open && hasFailures && (
         <div className="border-t border-line/40 bg-surface-2/40 px-3 py-1.5">
           <div className="mb-1 flex items-center justify-between">
             <span className="text-[10.5px] text-ink-faint">
               {failures.length} item{failures.length === 1 ? '' : 's'} not transferred
             </span>
-            {retryable > 0 && (
+            {canRetry(t) && (
               <button
                 type="button"
                 onClick={() => onRetry(t)}

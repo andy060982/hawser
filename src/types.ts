@@ -152,30 +152,51 @@ export interface FileEntry {
 export interface DirListing {
   path: string
   entries: FileEntry[]
+  /** The server listed more entries than the backend keeps; this is a prefix. */
+  truncated?: boolean
 }
 
 export type PaneSide = 'local' | 'remote'
 
 export type TransferDirection = 'upload' | 'download'
 
+/** What a transfer may do to a file already at its destination. Mirrors
+ *  `Overwrite` in src-tauri/src/ssh.rs. `never` is enforced when each file is
+ *  committed, so a file that appears after the prompt is never clobbered;
+ *  `confirmed` means the user was asked about that existing file and agreed. */
+export type OverwritePolicy = 'never' | 'replace' | 'confirmed'
+
 export interface Transfer {
+  /** Also the backend's transfer id: progress and failure events carry it,
+   *  and `sftp_cancel` takes it. */
   id: string
-  /** Which session this transfer belongs to, so the global queue can attribute
-   *  progress events correctly when several sessions transfer at once. */
+  /** Which session this transfer belongs to. */
   sessionId: string
   direction: TransferDirection
   name: string
-  /** Full path, used to correlate `sftp://progress` events with this row. The
-   *  backend keys progress by path because it has no notion of our row ids. */
+  /** Full source path (display, and the job a retry rebuilds). */
   path: string
+  /** The other side, for rebuilding the job. */
+  dest: string
+  overwrite: OverwritePolicy
   bytesDone: number
   bytesTotal: number
-  status: 'active' | 'done' | 'error'
+  /** `queued`: waiting for an earlier job of the same batch. */
+  status: 'queued' | 'active' | 'done' | 'error' | 'cancelled'
   error?: string
+  /** Notes from a successful transfer (written through a symlink, a
+   *  non-atomic in-place fallback). */
+  notes?: string[]
   /** Per-file failures accumulated from `sftp://failure` events during a
    *  recursive (folder) transfer. Lets the UI show the FULL list — not just the
    *  first — and retry exactly the files that didn't make it. */
   failures?: TransferFailureItem[]
+}
+
+/** Result of `sftp_get`/`sftp_put`. Mirrors TransferOutcome in ssh.rs. */
+export interface TransferOutcome {
+  bytes: number
+  notes: string[]
 }
 
 /** One failed file inside a recursive transfer, with both sides retained so a
@@ -192,6 +213,8 @@ export interface TransferFailureItem {
  *  src-tauri/src/ssh.rs — change the two together. */
 export interface TransferProgressEvent {
   sessionId: string
+  /** The row's id (see Transfer.id). */
+  transferId: string
   /** The transfer's ROOT source path — the queue row's `path`. Equals
    *  `filePath` for a single file; for a folder it is the folder, and
    *  `bytesTransferred` is cumulative across the tree (with `totalBytes` 0). */
@@ -210,6 +233,8 @@ export interface TransferProgressEvent {
  *  source path, matching the queue row's `path`. */
 export interface TransferFailureEvent {
   sessionId: string
+  /** The row's id (see Transfer.id). */
+  transferId: string
   root: string
   name: string
   local: string

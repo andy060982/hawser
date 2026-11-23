@@ -9,6 +9,10 @@ interface State {
   entries: FileEntry[]
   loading: boolean
   error: string | null
+  /** The path whose read failed (the shown listing is still `path`'s). */
+  failedTarget: string | null
+  /** The backend capped the listing. */
+  truncated: boolean
 }
 
 /** Owns one pane's directory state: where it is, what is in it, and whether the
@@ -29,6 +33,8 @@ export function useDirectory(side: PaneSide, sessionId: string, initialPath: str
     entries: [],
     loading: true,
     error: null,
+    failedTarget: null,
+    truncated: false,
   })
   const seq = useRef(0)
   /** Last path asked for and last path actually shown, so an `initialPath`
@@ -36,29 +42,38 @@ export function useDirectory(side: PaneSide, sessionId: string, initialPath: str
    *  pane's path and feeds it in again) does not list the directory twice. */
   const requestedRef = useRef<string | null>(null)
   const committedRef = useRef<string | null>(null)
+  /** The target of the read in flight, if any. */
+  const pendingRef = useRef<string | null>(null)
 
   const read = useCallback(
     async (target: string) => {
       const ticket = ++seq.current
       requestedRef.current = target
-      setState((s) => ({ ...s, loading: true, error: null }))
+      pendingRef.current = target
+      setState((s) => ({ ...s, loading: true }))
       try {
         const listing = await listDirectory(side, sessionId, target)
         if (ticket !== seq.current) return // superseded
+        pendingRef.current = null
         committedRef.current = listing.path
         setState({
           path: listing.path,
           entries: listing.entries,
           loading: false,
           error: null,
+          failedTarget: null,
+          truncated: Boolean(listing.truncated),
         })
       } catch (e) {
         if (ticket !== seq.current) return
-        // Keep the previous path and entries; only surface the failure.
+        pendingRef.current = null
+        // Keep the previous path and entries (the pane still shows them); only
+        // surface the failure, and remember what failed so Retry retries it.
         setState((s) => ({
           ...s,
           loading: false,
           error: e instanceof Error ? e.message : String(e),
+          failedTarget: target,
         }))
       }
     },
@@ -92,7 +107,22 @@ export function useDirectory(side: PaneSide, sessionId: string, initialPath: str
 
   return {
     ...state,
-    refresh: useCallback(() => void read(state.path), [read, state.path]),
+    // A refresh (after a transfer, say) while a navigation is still loading
+    // re-reads where the user is GOING, not the old folder: otherwise it would
+    // supersede the navigation and strand the pane where it was.
+    refresh: useCallback(
+      () => void read(pendingRef.current ?? state.path),
+      [read, state.path],
+    ),
+    /** Retry the read that failed (not the folder still shown). */
+    retry: useCallback(
+      () => void read(state.failedTarget ?? state.path),
+      [read, state.failedTarget, state.path],
+    ),
+    dismissError: useCallback(
+      () => setState((s) => ({ ...s, error: null, failedTarget: null })),
+      [],
+    ),
     navigate: useCallback((p: string) => void read(p), [read]),
     open,
   }

@@ -276,23 +276,35 @@ async fn sftp_list(
         .map_err(|e| e.to_string())
 }
 
+/// A transfer's id: the frontend's, or a fresh one for a caller that sends
+/// none (it then cannot cancel, or match events to a row).
+fn transfer_id_or_new(id: Option<String>) -> String {
+    id.filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("t-{}", utils::artifacts::random_hex(8)))
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn sftp_get(
     app: AppHandle,
     registry: State<'_, Registry>,
     session_id: String,
     remote_path: String,
     local_path: String,
-) -> CmdResult<u64> {
+    transfer_id: Option<String>,
+    overwrite: Option<String>,
+) -> CmdResult<ssh::TransferOutcome> {
+    let policy = ssh::Overwrite::parse(overwrite.as_deref())?;
+    let transfer_id = transfer_id_or_new(transfer_id);
     let result = registry
-        .download(&app, &session_id, &remote_path, &local_path)
+        .download(&app, &session_id, &transfer_id, &remote_path, &local_path, policy)
         .await
         .map_err(|e| e.to_string());
     match &result {
-        Ok(bytes) => utils::audit::record(
+        Ok(out) => utils::audit::record(
             "sftp.get",
-            format!("downloaded {remote_path} ({bytes} bytes)"),
-            serde_json::json!({ "remote": remote_path, "local": local_path, "bytes": bytes, "ok": true }),
+            format!("downloaded {remote_path} ({} bytes)", out.bytes),
+            serde_json::json!({ "remote": remote_path, "local": local_path, "bytes": out.bytes, "overwrite": overwrite, "ok": true }),
         ),
         Err(e) => utils::audit::record(
             "sftp.get.fail",
@@ -304,22 +316,27 @@ async fn sftp_get(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn sftp_put(
     app: AppHandle,
     registry: State<'_, Registry>,
     session_id: String,
     local_path: String,
     remote_path: String,
-) -> CmdResult<u64> {
+    transfer_id: Option<String>,
+    overwrite: Option<String>,
+) -> CmdResult<ssh::TransferOutcome> {
+    let policy = ssh::Overwrite::parse(overwrite.as_deref())?;
+    let transfer_id = transfer_id_or_new(transfer_id);
     let result = registry
-        .upload(&app, &session_id, &local_path, &remote_path)
+        .upload(&app, &session_id, &transfer_id, &local_path, &remote_path, policy)
         .await
         .map_err(|e| e.to_string());
     match &result {
-        Ok(bytes) => utils::audit::record(
+        Ok(out) => utils::audit::record(
             "sftp.put",
-            format!("uploaded {remote_path} ({bytes} bytes)"),
-            serde_json::json!({ "local": local_path, "remote": remote_path, "bytes": bytes, "ok": true }),
+            format!("uploaded {remote_path} ({} bytes)", out.bytes),
+            serde_json::json!({ "local": local_path, "remote": remote_path, "bytes": out.bytes, "overwrite": overwrite, "ok": true }),
         ),
         Err(e) => utils::audit::record(
             "sftp.put.fail",
@@ -328,6 +345,14 @@ async fn sftp_put(
         ),
     }
     result
+}
+
+/// Cancel a running `sftp_get`/`sftp_put` by the id it was started with. Its
+/// staging files are removed on both sides; the destination is untouched.
+#[tauri::command]
+async fn sftp_cancel(registry: State<'_, Registry>, transfer_id: String) -> CmdResult<()> {
+    registry.transfer_cancel(&transfer_id);
+    Ok(())
 }
 
 /* ----------------------------------------------------------------- tunnels */
@@ -341,10 +366,20 @@ async fn forward_start(
     remote_host: String,
     remote_port: u16,
 ) -> CmdResult<ssh::ForwardInfo> {
-    registry
+    let result = registry
         .forward_start(&session_id, local_port, &remote_host, remote_port)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // A local listener that tunnels into the remote network is security-
+    // relevant: record where it points.
+    if let Ok(info) = &result {
+        utils::audit::record(
+            "tunnel.start",
+            format!("forwarded localhost:{} to {remote_host}:{remote_port}", info.local_port),
+            serde_json::json!({ "localPort": info.local_port, "remoteHost": remote_host, "remotePort": remote_port, "kind": "local", "ok": true }),
+        );
+    }
+    result
 }
 
 /// Start a SOCKS5 dynamic proxy (`ssh -D`) over an open session.
@@ -354,15 +389,28 @@ async fn forward_start_socks(
     session_id: String,
     local_port: u16,
 ) -> CmdResult<ssh::ForwardInfo> {
-    registry
+    let result = registry
         .forward_start_socks(&session_id, local_port)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    if let Ok(info) = &result {
+        utils::audit::record(
+            "tunnel.start",
+            format!("opened a SOCKS proxy on localhost:{}", info.local_port),
+            serde_json::json!({ "localPort": info.local_port, "kind": "socks", "ok": true }),
+        );
+    }
+    result
 }
 
 #[tauri::command]
 async fn forward_stop(registry: State<'_, Registry>, forward_id: String) -> CmdResult<()> {
     registry.forward_stop(&forward_id).await;
+    utils::audit::record(
+        "tunnel.stop",
+        format!("stopped forward {forward_id}"),
+        serde_json::json!({ "forwardId": forward_id, "ok": true }),
+    );
     Ok(())
 }
 
@@ -387,7 +435,13 @@ async fn path_exists(
         let sid = session_id.ok_or("session required for remote check")?;
         registry.sftp_exists(&sid, &path).await.map_err(|e| e.to_string())
     } else {
-        Ok(std::fs::metadata(&path).is_ok())
+        // Without following links (a symlink at the destination is "there"),
+        // and an error other than not-found is reported, not read as "free".
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("{path}: {e}")),
+        }
     }
 }
 
@@ -399,12 +453,17 @@ async fn sftp_rename(
     to: String,
 ) -> CmdResult<()> {
     let result = registry.sftp_rename(&session_id, &from, &to).await.map_err(|e| e.to_string());
-    if result.is_ok() {
-        utils::audit::record(
+    match &result {
+        Ok(()) => utils::audit::record(
             "sftp.rename",
             format!("renamed {from} to {to}"),
             serde_json::json!({ "from": from, "to": to, "ok": true }),
-        );
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.rename.fail",
+            format!("rename of {from} failed"),
+            serde_json::json!({ "from": from, "to": to, "ok": false, "error": e }),
+        ),
     }
     result
 }
@@ -439,12 +498,17 @@ async fn sftp_mkdir(
     path: String,
 ) -> CmdResult<()> {
     let result = registry.sftp_mkdir(&session_id, &path).await.map_err(|e| e.to_string());
-    if result.is_ok() {
-        utils::audit::record(
+    match &result {
+        Ok(()) => utils::audit::record(
             "sftp.mkdir",
             format!("created directory {path}"),
             serde_json::json!({ "path": path, "ok": true }),
-        );
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.mkdir.fail",
+            format!("creating directory {path} failed"),
+            serde_json::json!({ "path": path, "ok": false, "error": e }),
+        ),
     }
     result
 }
@@ -551,6 +615,7 @@ async fn local_list(path: String) -> CmdResult<DirListing> {
     Ok(DirListing {
         path: canonical,
         entries,
+        truncated: false,
     })
 }
 
@@ -829,7 +894,8 @@ async fn config_snapshot(
     // One resolution: the identity and the capture come from the same
     // connection, even if a reconnect replaces the tab's session meanwhile.
     let session = registry.session(&session_id).map_err(|e| e.to_string())?;
-    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?;
+    // stdout only: stderr noise (a login-shell warning) is not config.
+    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
     let endpoint = session.endpoint().to_string();
     if output.trim().is_empty() {
         return Err(
@@ -861,7 +927,8 @@ async fn config_check(
     // One resolution: the identity and the capture come from the same
     // connection, even if a reconnect replaces the tab's session meanwhile.
     let session = registry.session(&session_id).map_err(|e| e.to_string())?;
-    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?;
+    // stdout only: stderr noise (a login-shell warning) is not config.
+    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
     let endpoint = session.endpoint().to_string();
     if output.trim().is_empty() {
         return Err(
@@ -931,7 +998,8 @@ async fn capture_output(
     // One resolution: the identity and the capture come from the same
     // connection, even if a reconnect replaces the tab's session meanwhile.
     let session = registry.session(&session_id).map_err(|e| e.to_string())?;
-    let output = session.exec_capture(&command, 120).await.map_err(|e| e.to_string())?;
+    // A human-read capture keeps stderr, labelled apart from stdout.
+    let output = session.exec_capture(&command, 120).await.map_err(|e| e.to_string())?.labelled();
     let endpoint = session.endpoint().to_string();
     if output.trim().is_empty() {
         return Err(
@@ -1019,6 +1087,73 @@ async fn ssh_copy_id_cancel(registry: State<'_, Registry>, op_id: String) -> Cmd
     Ok(())
 }
 
+/// Write a new keypair into `dir` as `hawser_ed25519[_N]` and `.pub`, never
+/// clobbering anything: a keypair someone already deployed to twenty servers
+/// is irreplaceable, and so is an unrelated `.pub` whose private half moved.
+/// BOTH names are reserved with an exclusive create (O_EXCL), bumping the
+/// suffix while either is taken. A failed write removes both files, so no
+/// half-written key is left behind. Returns the private key's path.
+fn write_keypair(
+    dir: &std::path::Path,
+    private_pem: &[u8],
+    public_line: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let create = |p: &std::path::Path, mode: u32| {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Private key 0600 from the start (OpenSSH refuses group- or
+            // world-readable keys); the public half 0644.
+            o.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        o.open(p)
+    };
+    for n in 0..10_000u32 {
+        let path = if n == 0 {
+            dir.join("hawser_ed25519")
+        } else {
+            dir.join(format!("hawser_ed25519_{n}"))
+        };
+        let pub_path = path.with_extension("pub");
+        let mut private = match create(&path, 0o600) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let mut public = match create(&pub_path, 0o644) {
+            Ok(f) => f,
+            Err(e) => {
+                drop(private);
+                let _ = std::fs::remove_file(&path);
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+        let written = private
+            .write_all(private_pem)
+            .and_then(|_| private.sync_all())
+            .and_then(|_| public.write_all(format!("{public_line}\n").as_bytes()));
+        if let Err(e) = written {
+            drop((private, public));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&pub_path);
+            return Err(e);
+        }
+        return Ok(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free hawser_ed25519 key name in ~/.ssh",
+    ))
+}
+
 #[tauri::command]
 async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     use russh::keys::ssh_key::{self, getrandom::SysRng, rand_core::UnwrapErr, LineEnding};
@@ -1029,51 +1164,18 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     let dir = home.join(".ssh");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    // Never clobber an existing key: a keypair someone already deployed to
-    // twenty servers is irreplaceable. Reserve the name ATOMICALLY with an
-    // exclusive create (O_EXCL) and bump the suffix on collision — a plain
-    // exists()-then-write races two concurrent keygens onto the same path.
-    let mut path = dir.join("hawser_ed25519");
-    let mut n = 1;
-    let mut file = loop {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(f) => break f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                path = dir.join(format!("hawser_ed25519_{n}"));
-                n += 1;
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    // Private key file is 0600 on Unix (OpenSSH refuses group/world-readable keys).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-
     // ssh-key's RNG is fallible (SysRng: TryCryptoRng); UnwrapErr adapts it to
     // the infallible CryptoRng that PrivateKey::random requires.
     let mut rng = UnwrapErr(SysRng);
     let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
         .map_err(|e| e.to_string())?;
     key.set_comment(comment);
-
-    // Write into the handle we already hold, not a fresh path open — keeps the
-    // exclusive reservation intact.
-    {
-        use std::io::Write;
-        let pem = key.to_openssh(LineEnding::LF).map_err(|e| e.to_string())?;
-        file.write_all(pem.as_bytes()).map_err(|e| e.to_string())?;
-    }
-
+    let pem = key.to_openssh(LineEnding::LF).map_err(|e| e.to_string())?;
     let public = key
         .public_key()
         .to_openssh()
         .map_err(|e| e.to_string())?;
-    let pub_path = path.with_extension("pub");
-    std::fs::write(&pub_path, format!("{public}
-")).map_err(|e| e.to_string())?;
+    let path = write_keypair(&dir, pem.as_bytes(), &public).map_err(|e| e.to_string())?;
 
     utils::audit::record(
         "key.generate",
@@ -1292,6 +1394,7 @@ pub fn run() {
             sftp_list,
             sftp_get,
             sftp_put,
+            sftp_cancel,
             local_list,
             path_exists,
             sftp_rename,
@@ -1355,6 +1458,27 @@ pub fn run() {
 mod tests {
     use super::*;
     use utils::artifacts::dial_identity;
+
+    #[test]
+    fn keygen_never_clobbers_an_orphan_public_key() {
+        let d = std::env::temp_dir().join(format!("hawser-keygen-{}", utils::artifacts::random_hex(6)));
+        std::fs::create_dir_all(&d).unwrap();
+        // An unrelated .pub whose private half was moved away.
+        std::fs::write(d.join("hawser_ed25519.pub"), "ssh-ed25519 KEEP me\n").unwrap();
+        let p = write_keypair(&d, b"PRIVATE", "ssh-ed25519 NEW").unwrap();
+        assert_eq!(p, d.join("hawser_ed25519_1"));
+        assert_eq!(std::fs::read_to_string(d.join("hawser_ed25519.pub")).unwrap(), "ssh-ed25519 KEEP me\n");
+        assert!(!d.join("hawser_ed25519").exists(), "the probe reservation must be released");
+        assert_eq!(std::fs::read_to_string(d.join("hawser_ed25519_1.pub")).unwrap(), "ssh-ed25519 NEW\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // A second key takes the next free pair.
+        assert_eq!(write_keypair(&d, b"P2", "ssh-ed25519 N2").unwrap(), d.join("hawser_ed25519_2"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn ai_context_is_refused_when_the_live_dial_is_not_the_policy_endpoint() {

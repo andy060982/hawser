@@ -6,7 +6,11 @@ import {
 } from '../lib/tree'
 import { resolveStartupCommands } from '../lib/startupPresets'
 import { safeInvoke, safeListen } from '../lib/tauri'
-import { transfer as runTransfer } from '../lib/sftp'
+import { transfer as runTransfer, cancelTransfer } from '../lib/sftp'
+import {
+  applyFailure, applyProgress, canRetry, clearFinished, markActive, markCancelled, markDone,
+  markFailed, newTransferId, queuedRow, retryJobs, type TransferJob,
+} from '../lib/transfers'
 import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { policyFor, useSettings } from '../lib/settings'
 import { useDialogs } from '../lib/dialogs'
@@ -170,6 +174,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  switch — the bytes keep moving in Rust either way, and the queue should
    *  keep showing it. */
   const [transfers, setTransfers] = useState<Transfer[]>([])
+  /** Rows the user cancelled; a queued job checks this before it starts. */
+  const cancelledRef = useRef<Set<string>>(new Set())
   /** Bumped when any transfer completes, so the visible SFTP view can
    *  re-read both panes without the user hitting refresh. */
   const [transferTick, setTransferTick] = useState(0)
@@ -304,10 +310,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     if (loadedRef.current) void safeInvoke('hosts_save', { tree: next })
   }, [])
 
-  /* Byte-progress stream from Rust. Matches rows on (sessionId, path) — the
-     backend keys progress by the path it was handed and has no notion of our
-     row ids. Mounted once here, so it keeps updating even while SftpView is
-     unmounted in terminal view. */
+  /* Byte-progress and per-file failure streams from Rust, matched on the
+     transfer id each row was started with (see lib/transfers.ts). Mounted
+     once here, so they keep updating even while SftpView is unmounted in
+     terminal view. */
   useEffect(() => {
     const uns: (() => void)[] = []
     let dead = false
@@ -316,35 +322,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
 
     add(
       safeListen<TransferProgressEvent>('sftp://progress', (p) => {
-        // Matched on the transfer ROOT: a folder transfer's per-file events
-        // carry the child's path in filePath, which never equals the row.
-        const root = p.root ?? p.filePath
-        setTransfers((list) =>
-          list.map((t) =>
-            t.sessionId === p.sessionId && t.path === root && t.status === 'active'
-              ? { ...t, bytesDone: p.bytesTransferred, bytesTotal: p.totalBytes }
-              : t,
-          ),
-        )
+        setTransfers((list) => applyProgress(list, p))
       }),
     )
-    // Accumulate per-file failures onto the active folder transfer they belong
-    // to (matched by the transfer's source path == the failure's root).
     add(
       safeListen<TransferFailureEvent>('sftp://failure', (f) => {
-        setTransfers((list) =>
-          list.map((t) =>
-            t.sessionId === f.sessionId && t.path === f.root && t.status === 'active'
-              ? {
-                  ...t,
-                  failures: [
-                    ...(t.failures ?? []),
-                    { name: f.name, local: f.local, remote: f.remote, reason: f.reason },
-                  ],
-                }
-              : t,
-          ),
-        )
+        setTransfers((list) => applyFailure(list, f))
       }),
     )
     return () => {
@@ -355,69 +338,54 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
 
   /** Kick off one or more transfers. Runs them sequentially per call so a bulk
    *  selection does not open dozens of concurrent SFTP writes against one
-   *  connection — appliances in particular do not love that. */
+   *  connection — appliances in particular do not love that. Every job gets
+   *  its row (queued) at once, so any of them can be cancelled. */
   const startTransfer = useCallback(
-    async (
-      sessionId: string,
-      direction: 'upload' | 'download',
-      jobs: { name: string; local: string; remote: string }[],
-    ) => {
-      for (const job of jobs) {
-        // Progress is reported against the SOURCE path: local for upload,
-        // remote for download. Match the row on the same.
-        const path = direction === 'upload' ? job.local : job.remote
-        const id = `${direction}-${sessionId}-${path}-${performance.now()}`
-
-        setTransfers((t) => [
-          {
-            id,
-            sessionId,
-            direction,
-            name: job.name,
-            path,
-            bytesDone: 0,
-            bytesTotal: 0,
-            status: 'active',
-          },
-          ...t,
-        ])
-
+    async (sessionId: string, direction: 'upload' | 'download', jobs: TransferJob[]) => {
+      const rows = jobs.map((job) => ({ job, id: newTransferId() }))
+      setTransfers((t) => [
+        ...rows.map(({ job, id }) => queuedRow(id, sessionId, direction, job)).reverse(),
+        ...t,
+      ])
+      for (const { job, id } of rows) {
+        // Skipped if the user cancelled it while it waited.
+        if (cancelledRef.current.delete(id)) continue
+        setTransfers((t) => markActive(t, id))
         try {
-          await runTransfer(direction, sessionId, job.local, job.remote)
-          setTransfers((t) =>
-            t.map((x) =>
-              x.id === id ? { ...x, status: 'done', bytesDone: x.bytesTotal || x.bytesDone } : x,
-            ),
-          )
+          const out = await runTransfer(direction, sessionId, id, job)
+          setTransfers((t) => markDone(t, id, out))
           setTransferTick((n) => n + 1)
         } catch (e) {
-          setTransfers((t) =>
-            t.map((x) =>
-              x.id === id
-                ? { ...x, status: 'error', error: e instanceof Error ? e.message : String(e) }
-                : x,
-            ),
-          )
+          setTransfers((t) => markFailed(t, id, e instanceof Error ? e.message : String(e)))
         }
+        cancelledRef.current.delete(id)
       }
     },
     [],
   )
 
-  /** Clear finished rows, keep anything still moving. */
-  const clearTransfers = useCallback(
-    () => setTransfers((t) => t.filter((x) => x.status === 'active')),
-    [],
-  )
+  /** Clear finished rows, keep anything still moving or waiting. */
+  const clearTransfers = useCallback(() => setTransfers((t) => clearFinished(t)), [])
 
-  /** Re-run only the files that failed in a folder transfer. Drops the old
-   *  errored row and starts a fresh transfer for the retryable failures (those
-   *  with both paths — items skipped by name are not retryable). */
+  /** Cancel a queued or running transfer. A running one stops at its next
+   *  chunk and removes its staging files; its command then settles the row. */
+  const cancelOne = useCallback((t: Transfer) => {
+    if (t.status !== 'queued' && t.status !== 'active') return
+    cancelledRef.current.add(t.id)
+    // Sent for a queued row too: the loop may be starting it right now, and
+    // the backend remembers a cancel that overtakes its transfer.
+    void cancelTransfer(t.id).catch(() => {})
+    setTransfers((list) => markCancelled(list, t.id))
+  }, [])
+
+  /** Re-run only the files that failed in a folder transfer, with the
+   *  original overwrite policy. Offered only once that transfer has stopped
+   *  (see canRetry). Drops the old row and starts a fresh transfer for the
+   *  retryable failures (items skipped by name are not retryable). */
   const retryFailed = useCallback(
     (t: Transfer) => {
-      const jobs = (t.failures ?? [])
-        .filter((f) => f.local && f.remote)
-        .map((f) => ({ name: f.name, local: f.local, remote: f.remote }))
+      if (!canRetry(t)) return
+      const jobs = retryJobs(t)
       setTransfers((list) => list.filter((x) => x.id !== t.id))
       if (jobs.length > 0) void startTransfer(t.sessionId, t.direction, jobs)
     },
@@ -1667,7 +1635,7 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
         )}
       </div>
 
-      <TransferBar transfers={transfers} onClear={clearTransfers} onRetry={retryFailed} />
+      <TransferBar transfers={transfers} onClear={clearTransfers} onRetry={retryFailed} onCancel={cancelOne} />
 
       <StatusBar
         session={active}

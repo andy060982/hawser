@@ -15,8 +15,8 @@ use russh::client::{self, Handle};
 use crate::utils::known_hosts::{self, HostKeyStatus};
 use crate::utils::session_log::SessionLog;
 use russh::{ChannelMsg, ChannelWriteHalf};
-use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::FileType;
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileType, StatusCode};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,6 +59,20 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 const CHUNK: usize = 64 * 1024;
 
+/// A transfer step (one chunk read or written, one commit rename) that makes
+/// no progress for this long fails the file as stalled, so a black-holed link
+/// can never leave a row "active" forever. russh-sftp's own per-request
+/// timeout normally fires first; this also covers local I/O and the copy loop.
+const TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Opening the auxiliary raw SFTP channel (see `Registry::sftp`).
+const SFTP_AUX_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most entries one directory listing returns; the rest are reported as
+/// truncated. A broken or hostile server cannot grow client memory without
+/// limit by streaming READDIR batches forever.
+const MAX_LIST_ENTRIES: usize = 200_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
     #[error("no open session {0}")]
@@ -100,6 +114,12 @@ pub enum SshError {
     /// The tab that started this connect was closed before it finished.
     #[error("connection {0} was cancelled")]
     Cancelled(String),
+    /// A transfer stopped by `transfer_cancel`.
+    #[error("transfer cancelled")]
+    TransferCancelled,
+    /// A transfer step made no progress for `TRANSFER_STALL_TIMEOUT`.
+    #[error("transfer stalled: no progress for {0}s")]
+    TransferStalled(u64),
     #[error(transparent)]
     KnownHosts(#[from] crate::utils::known_hosts::KnownHostsError),
     #[error(transparent)]
@@ -140,12 +160,28 @@ pub struct FileEntry {
 pub struct DirListing {
     pub path: String,
     pub entries: Vec<FileEntry>,
+    /// The server listed more than `MAX_LIST_ENTRIES`; only that many are here.
+    pub truncated: bool,
+}
+
+/// What a finished `sftp_get`/`sftp_put` reports. Mirrors `TransferOutcome`
+/// in src/types.ts.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferOutcome {
+    pub bytes: u64,
+    /// Things the user should know although the transfer succeeded: a write
+    /// that went through a symlink, or a non-atomic in-place fallback.
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgress {
     pub session_id: String,
+    /// The frontend's id for this transfer: the queue row is matched on it,
+    /// so two transfers of the same source never update each other's row.
+    pub transfer_id: String,
     /// The transfer's ROOT source path — what the queue row is keyed on. Equal
     /// to `file_path` for a single file; for a folder, the folder, so per-file
     /// events land on the folder's row (bytes are then cumulative for the tree).
@@ -167,6 +203,8 @@ pub struct TransferProgress {
 #[serde(rename_all = "camelCase")]
 pub struct TransferFailure {
     pub session_id: String,
+    /// The transfer's id (see `TransferProgress::transfer_id`).
+    pub transfer_id: String,
     /// The transfer's ROOT source path (local for upload, remote for download) —
     /// the value the queue row is keyed on, so the UI attributes this correctly.
     pub root: String,
@@ -373,17 +411,43 @@ pub(crate) struct Kill(Arc<KillInner>);
 #[derive(Default)]
 struct KillInner {
     fired: AtomicBool,
+    /// One pair of wakers PER stream. A ProxyJump attempt wraps two streams
+    /// (the bastion's TCP socket and the target's direct-tcpip channel) in the
+    /// same switch, each polled by its own russh task; a single shared waker
+    /// kept only the last registrant, so `fire` could wake the target while
+    /// the bastion's parked flush slept on.
+    streams: std::sync::Mutex<Vec<Arc<StreamWakers>>>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct StreamWakers {
     read: futures_util::task::AtomicWaker,
     write: futures_util::task::AtomicWaker,
-    notify: tokio::sync::Notify,
 }
 
 impl Kill {
     pub(crate) fn fire(&self) {
         self.0.fired.store(true, Ordering::SeqCst);
-        self.0.read.wake();
-        self.0.write.wake();
+        let streams = match self.0.streams.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        for w in streams {
+            w.read.wake();
+            w.write.wake();
+        }
         self.0.notify.notify_waiters();
+    }
+
+    /// A fresh waker pair for one stream, woken by every later `fire`.
+    fn register_stream(&self) -> Arc<StreamWakers> {
+        let w = Arc::new(StreamWakers::default());
+        match self.0.streams.lock() {
+            Ok(mut g) => g.push(Arc::clone(&w)),
+            Err(p) => p.into_inner().push(Arc::clone(&w)),
+        }
+        w
     }
 
     pub(crate) fn fired(&self) -> bool {
@@ -441,11 +505,13 @@ impl Drop for KillGuard {
 pub(crate) struct Killable<S> {
     inner: S,
     kill: Kill,
+    wakers: Arc<StreamWakers>,
 }
 
 impl<S> Killable<S> {
     pub(crate) fn new(inner: S, kill: Kill) -> Self {
-        Self { inner, kill }
+        let wakers = kill.register_stream();
+        Self { inner, kill, wakers }
     }
 }
 
@@ -459,7 +525,7 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Killable<S> {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.kill.0.read.register(cx.waker());
+        self.wakers.read.register(cx.waker());
         if self.kill.fired() {
             return std::task::Poll::Ready(Err(killed_error()));
         }
@@ -473,7 +539,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Killable<S> {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.kill.0.write.register(cx.waker());
+        self.wakers.write.register(cx.waker());
         if self.kill.fired() {
             return std::task::Poll::Ready(Err(killed_error()));
         }
@@ -484,7 +550,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Killable<S> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.kill.0.write.register(cx.waker());
+        self.wakers.write.register(cx.waker());
         if self.kill.fired() {
             return std::task::Poll::Ready(Err(killed_error()));
         }
@@ -1123,8 +1189,8 @@ pub struct Session {
     /// the read half can be owned by a pump task while writes and window-change
     /// requests still work — `into_stream()` would consume the Channel and take
     /// `window_change` with it, leaving no way to resize.
-    shell: Mutex<Option<ChannelWriteHalf<client::Msg>>>,
-    sftp: Mutex<Option<Arc<SftpSession>>>,
+    shell: Arc<Mutex<Option<ChannelWriteHalf<client::Msg>>>>,
+    sftp: Mutex<Option<Arc<SftpConn>>>,
     /// The bastion connection, when this session rides a jump host. Held so it
     /// is not dropped (that closes the tunnel under the target session's feet),
     /// and disconnected explicitly on teardown.
@@ -1184,6 +1250,11 @@ pub struct Registry {
     /// registers under such an id stops before it dials. Pruned after
     /// `COPY_ID_CANCEL_TTL`.
     copy_id_cancels: DashMap<String, Instant>,
+    /// Running transfers, transfer id -> (registration seq, cancel sender).
+    transfers: DashMap<String, (u64, watch::Sender<bool>)>,
+    /// Cancels that arrived before their transfer registered (see
+    /// `transfer_cancel`), pruned after `COPY_ID_CANCEL_TTL`.
+    transfer_cancels: DashMap<String, Instant>,
 }
 
 /// How long an early `copy_id_cancel` is remembered (see `copy_id_cancels`).
@@ -1192,6 +1263,7 @@ const COPY_ID_CANCEL_TTL: Duration = Duration::from_secs(120);
 /// Generation counter for `Registry::connecting`.
 static CONNECT_SEQ: AtomicU64 = AtomicU64::new(1);
 static COPY_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+static TRANSFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Everything needed to tear a forward down *completely*.
 ///
@@ -1419,44 +1491,72 @@ fn early_output(early: &[ChannelMsg]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// The startup commands as the lines `send_startup` types, blanks dropped.
+fn startup_lines(commands: &[String]) -> Vec<String> {
+    commands
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{c}\n"))
+        .collect()
+}
+
+/// The shell writer, held exclusively. Taken by `connect` BEFORE the session
+/// is registered (so before any user keystroke can reach it) and handed to
+/// `send_startup`, so the first user input always lands after the startup
+/// lines, never ahead of a `tmux attach`.
+type ShellGuard = tokio::sync::OwnedMutexGuard<Option<ChannelWriteHalf<client::Msg>>>;
+
+/// Ctrl-U: discards the shell's current input line.
+const KILL_LINE: &[u8] = b"\x15";
+
 /// Send the startup commands as shell input. Called only once the output pump
 /// is reading: a shell that prints a lot at login (an MOTD, a tmux attach)
 /// fills russh's per-channel receive queue, and russh then blocks delivering
 /// that output — so it never processes the window adjustment that a write
 /// waiting for send credit needs. With nobody reading, connect hung forever.
 ///
-/// Holds the shell writer for the whole batch, so the user's first keystrokes
-/// land after the startup lines, and gives up after `limit` (the session stays
-/// up; only the remaining startup lines are skipped).
+/// Holds the shell writer (taken before registration, see `ShellGuard`) for
+/// the whole batch, and gives up after `limit` (the session stays up; only the
+/// remaining startup lines are skipped). A line cut off part-way is never left
+/// for the user's typing to extend: `report` is told first, then the writer is
+/// kept until a Ctrl-U has discarded the partial line (or the session ends).
 async fn send_startup(
-    shell: &Mutex<Option<ChannelWriteHalf<client::Msg>>>,
+    mut guard: ShellGuard,
     commands: &[String],
     limit: Duration,
+    report: impl FnOnce(&SshError),
 ) -> Result<(), SshError> {
-    let lines: Vec<String> = commands
-        .iter()
-        .map(|c| c.trim())
-        .filter(|c| !c.is_empty())
-        .map(|c| format!("{c}\n"))
-        .collect();
+    let lines = startup_lines(commands);
     if lines.is_empty() {
         return Ok(());
     }
-    let mut guard = shell.lock().await;
     let Some(w) = guard.as_mut() else { return Ok(()) };
+    let mut mid_line = false;
     let send = async {
         for line in &lines {
+            mid_line = true;
             w.data(line.as_bytes()).await?;
+            mid_line = false;
         }
         Ok::<(), SshError>(())
     };
-    match tokio::time::timeout(limit, send).await {
+    let r = match tokio::time::timeout(limit, send).await {
         Ok(r) => r,
         Err(_) => Err(SshError::Connect(format!(
             "the server took no input for {}s",
             limit.as_secs()
         ))),
+    };
+    if let Err(e) = &r {
+        report(e);
+        if mid_line {
+            // Unbounded on purpose: user input queued behind this lock would
+            // wait on the same send window anyway, and must not go out first.
+            let _ = w.data(KILL_LINE).await;
+        }
     }
+    r
 }
 
 /// One live session, resolved from the registry once. Its endpoint identity
@@ -1847,7 +1947,7 @@ impl Registry {
 
         let session = Arc::new(Session {
             handle,
-            shell: Mutex::new(Some(write_half)),
+            shell: Arc::new(Mutex::new(Some(write_half))),
             sftp: Mutex::new(None),
             jump: jump_handle,
             alive: AtomicBool::new(true),
@@ -1868,7 +1968,17 @@ impl Registry {
         // close the channel and look like a broken connection. Order is the
         // user's: a `tmux new-session` first means every later line runs
         // inside tmux, which is usually what is wanted.
+        //
+        // The writer is taken for the startup batch HERE, before registration
+        // exposes the session to `write`: nothing else can hold it yet (the
+        // session is not registered), and from the moment it is, a keystroke
+        // or paste queues behind the startup lines instead of racing them.
         let (go_tx, go_rx) = oneshot::channel::<Option<SessionLog>>();
+        let startup_guard = if startup_lines(&startup_commands).is_empty() {
+            None
+        } else {
+            Some(Arc::clone(&session.shell).lock_owned().await)
+        };
         let pump = tokio::spawn(run_pump(
             app.clone(),
             session_id.to_string(),
@@ -1879,6 +1989,7 @@ impl Registry {
             death,
             Arc::clone(&self.forwards),
             startup_commands,
+            startup_guard,
         ));
 
         // Register only while our ticket is still current, holding the
@@ -2003,7 +2114,13 @@ impl Registry {
     /// The SFTP subsystem rides the existing SSH connection rather than opening
     /// a second one, and starts lazily: a session that only uses the terminal
     /// never pays for it. Cached because channel setup costs a round trip.
-    async fn sftp(&self, session_id: &str) -> Result<Arc<SftpSession>, SshError> {
+    ///
+    /// Two subsystem channels: russh-sftp's high-level session (streaming file
+    /// I/O) and a raw one for what the high-level API cannot do — a listing
+    /// read batch by batch (so it can be capped) and `posix-rename@openssh.com`
+    /// (an atomic replace). A server that refuses the second channel still
+    /// gets every operation, without those two refinements.
+    async fn sftp(&self, session_id: &str) -> Result<Arc<SftpConn>, SshError> {
         let session = self.get(session_id)?;
         if !session.alive.load(Ordering::Relaxed) {
             return Err(SshError::Disconnected(session_id.to_string()));
@@ -2015,21 +2132,28 @@ impl Registry {
 
         let channel = session.handle.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
-        let sftp = Arc::new(SftpSession::new(channel.into_stream()).await?);
-        *guard = Some(Arc::clone(&sftp));
-        Ok(sftp)
+        let hi = SftpSession::new(channel.into_stream()).await?;
+        let (raw, posix_rename) =
+            match tokio::time::timeout(SFTP_AUX_TIMEOUT, open_raw_sftp(&session.handle)).await {
+                Ok(Ok((raw, posix))) => (Some(raw), posix),
+                _ => (None, false),
+            };
+        let conn = Arc::new(SftpConn { hi, raw, posix_rename });
+        *guard = Some(Arc::clone(&conn));
+        Ok(conn)
     }
 
     /// Forget the cached SFTP session if `r` failed because its channel is gone
-    /// (the sftp-server process exited or was killed while the SSH transport
-    /// stayed up). Without this every later file operation reuses the dead
-    /// session and fails until the whole tab is reconnected; with it the next
-    /// call reopens the subsystem.
+    /// or stopped answering (the sftp-server process exited, was killed or
+    /// hangs while the SSH transport stayed up). Without this every later file
+    /// operation reuses the dead session and fails until the whole tab is
+    /// reconnected; with it the next call reopens the subsystem.
     async fn check_sftp<T>(&self, session_id: &str, r: Result<T, SshError>) -> Result<T, SshError> {
-        use russh_sftp::client::error::Error as SftpErr;
-        if let Err(SshError::Sftp(SftpErr::UnexpectedBehavior(_) | SftpErr::IO(_))) = &r {
-            if let Ok(session) = self.get(session_id) {
-                *session.sftp.lock().await = None;
+        if let Err(e) = &r {
+            if sftp_dead(e) {
+                if let Ok(session) = self.get(session_id) {
+                    *session.sftp.lock().await = None;
+                }
             }
         }
         r
@@ -2037,7 +2161,7 @@ impl Registry {
 
     pub async fn list_dir(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
         let first = self.list_dir_once(session_id, path).await;
-        if matches!(first, Err(SshError::Sftp(_))) {
+        if matches!(&first, Err(e) if sftp_dead(e)) {
             // A dead cached channel is dropped by check_sftp; one retry then
             // runs on a fresh subsystem, so the pane recovers by itself.
             let cleared = match self.get(session_id) {
@@ -2052,61 +2176,33 @@ impl Registry {
     }
 
     async fn list_dir_once(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
-        let sftp = self.sftp(session_id).await?;
-        let r = self.list_dir_with(&sftp, path).await;
+        let r = match self.sftp(session_id).await {
+            Ok(sftp) => list_dir_with(&sftp, path).await,
+            Err(e) => Err(e),
+        };
         self.check_sftp(session_id, r).await
     }
 
-    async fn list_dir_with(&self, sftp: &SftpSession, path: &str) -> Result<DirListing, SshError> {
-        // Resolve first so the pane shows the real location: the server may
-        // return something different for ".", "~", or a symlinked directory.
-        let canonical = sftp
-            .canonicalize(path)
-            .await
-            .unwrap_or_else(|_| path.to_string());
-
-        let mut entries = vec![FileEntry {
-            name: "..".into(),
-            kind: "directory",
-            size: 0,
-            modified: None,
-            mode: String::new(),
-        }];
-
-        for entry in sftp.read_dir(&canonical).await? {
-            let meta = entry.metadata();
-            let kind = match entry.file_type() {
-                FileType::Dir => "directory",
-                FileType::Symlink => "symlink",
-                _ => "file",
-            };
-            entries.push(FileEntry {
-                name: entry.file_name(),
-                kind,
-                size: meta.size.unwrap_or(0),
-                modified: meta.mtime,
-                mode: mode_string(meta.permissions, kind),
-            });
-        }
-
-        Ok(DirListing {
-            path: canonical,
-            entries,
-        })
-    }
-
-    /// Whether a remote path exists — the overwrite guard asks before a
-    /// transfer clobbers something already there.
+    /// Whether anything is at a remote path — the overwrite guard asks before
+    /// a transfer clobbers something already there. LSTAT, so a symlink (even
+    /// a dangling one) counts as present. Only a definite "no such file" is
+    /// `false`; any other failure (a dead channel, a timeout, permission
+    /// denied) is an error, never a silent "not there".
     pub async fn sftp_exists(&self, session_id: &str, path: &str) -> Result<bool, SshError> {
         let sftp = self.sftp(session_id).await?;
-        Ok(sftp.metadata(path).await.is_ok())
+        let r = match sftp.hi.symlink_metadata(path).await {
+            Ok(_) => Ok(true),
+            Err(e) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => Ok(false),
+            Err(e) => Err(SshError::from(e)),
+        };
+        self.check_sftp(session_id, r).await
     }
 
     /// Rename a remote file or directory. SFTP rename is not a copy — it is
     /// the server's own rename, atomic where the filesystem allows.
     pub async fn sftp_rename(&self, session_id: &str, from: &str, to: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
-        let r = sftp.rename(from, to).await.map_err(SshError::from);
+        let r = sftp.hi.rename(from, to).await.map_err(SshError::from);
         self.check_sftp(session_id, r).await
     }
 
@@ -2119,9 +2215,9 @@ impl Registry {
     pub async fn sftp_delete(&self, session_id: &str, path: &str, is_dir: bool) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
         let r = if is_dir {
-            sftp.remove_dir(path).await
+            sftp.hi.remove_dir(path).await
         } else {
-            sftp.remove_file(path).await
+            sftp.hi.remove_file(path).await
         };
         self.check_sftp(session_id, r.map_err(SshError::from)).await
     }
@@ -2129,266 +2225,111 @@ impl Registry {
     /// Create a remote directory.
     pub async fn sftp_mkdir(&self, session_id: &str, path: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
-        let r = sftp.create_dir(path).await.map_err(SshError::from);
+        let r = sftp.hi.create_dir(path).await.map_err(SshError::from);
         self.check_sftp(session_id, r).await
     }
 
     /* ------------------------------------------------------------ phase 2 */
 
+    /// Register a transfer under the frontend's id so `transfer_cancel` can
+    /// reach it. A cancel that overtook this call (the user cancelled a row
+    /// whose command had not started yet) stops it before any byte moves.
+    fn transfer_begin(&self, transfer_id: &str) -> Result<(u64, watch::Receiver<bool>), SshError> {
+        let seq = TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = watch::channel(false);
+        match self.transfers.entry(transfer_id.to_string()) {
+            dashmap::Entry::Occupied(_) => {
+                return Err(SshError::PartialTransfer(format!(
+                    "transfer id {transfer_id} is already running"
+                )))
+            }
+            dashmap::Entry::Vacant(v) => {
+                if self.transfer_cancels.remove(transfer_id).is_some() {
+                    return Err(SshError::TransferCancelled);
+                }
+                v.insert((seq, tx));
+            }
+        }
+        Ok((seq, rx))
+    }
+
+    fn transfer_end(&self, transfer_id: &str, seq: u64) {
+        self.transfers.remove_if(transfer_id, |_, v| v.0 == seq);
+    }
+
+    /// Cancel a running transfer (`sftp_get`/`sftp_put` with the same id). Its
+    /// copy loop stops at the next chunk and removes its staging files on both
+    /// sides while the connection is still up. An id with no transfer
+    /// registered yet is remembered, so that transfer stops as it starts.
+    pub fn transfer_cancel(&self, transfer_id: &str) {
+        let now = Instant::now();
+        self.transfer_cancels
+            .retain(|_, at| now.duration_since(*at) < COPY_ID_CANCEL_TTL);
+        match self.transfers.get(transfer_id) {
+            Some(e) => {
+                let _ = e.value().1.send(true);
+            }
+            None => {
+                self.transfer_cancels.insert(transfer_id.to_string(), now);
+            }
+        }
+    }
+
     /// Download, streamed and reporting byte-accurate progress.
     ///
     /// Streaming rather than read-to-end is not only about memory: it is what
     /// makes progress reportable at all. Chunks are 64 KB; events are throttled
-    /// to one per PROGRESS_INTERVAL with a guaranteed final event so the UI
-    /// always lands on 100%.
+    /// to one per PROGRESS_INTERVAL across the whole transfer, with a
+    /// guaranteed final event so the UI always lands on 100%.
+    ///
+    /// `overwrite` is enforced when each file is committed, not only when the
+    /// user was asked: a file that appeared at the destination meanwhile is
+    /// never replaced under `Overwrite::Never`.
     pub async fn download(
         &self,
         app: &AppHandle,
         session_id: &str,
+        transfer_id: &str,
         remote: &str,
         local: &str,
-    ) -> Result<u64, SshError> {
-        let sftp = self.sftp(session_id).await?;
-
-        // A directory recurses; a file copies directly. Walking the tree
-        // iteratively (a worklist, not async recursion) keeps this a plain
-        // function with no Box::pin ceremony.
-        let is_dir = sftp
-            .metadata(remote)
-            .await
-            .map(|m| m.file_type().is_dir())
-            .unwrap_or(false);
-
-        // Single file: the frontend built `local` from the server's name, so
-        // verify its final component has not been used to escape the target.
-        let last = std::path::Path::new(local)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !safe_local_component(&last) {
-            return Err(SshError::PartialTransfer(format!(
-                "refusing to write unsafe filename: {last}"
-            )));
-        }
-        if !is_dir {
-            return copy_remote_file(&sftp, app, session_id, remote, local, ProgressCtx::single(remote))
-                .await;
-        }
-
-        // Everything from `local` downward is built from server-chosen names and
-        // is therefore untrusted; the folder that CONTAINS `local` is the one the
-        // user actually picked and is the trust boundary. Any pre-existing symlink
-        // or junction below it must not be followed. (`local` always has a parent
-        // here: `safe_local_component` above rejected an empty final component.)
-        let root = std::path::Path::new(local)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-
-        let mut total = 0u64;
-        let mut failed: Vec<String> = Vec::new();
-        // Bound the walk so a malicious or misconfigured server advertising a
-        // pathologically deep/wide tree cannot grow the worklist without limit.
-        const MAX_DIRS: usize = 50_000;
-        let mut visited = 0usize;
-        let mut dirs = vec![(remote.to_string(), local.to_string())];
-        while let Some((rdir, ldir)) = dirs.pop() {
-            visited += 1;
-            // The root failing is a real error; a subdirectory failing is one
-            // more item in the tally, like an unreadable file (see below).
-            let is_root = visited == 1;
-            if visited > MAX_DIRS {
-                let reason = format!(
-                    "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
-                );
-                // Empty paths: not retryable — a retry would re-run the whole tree.
-                emit_transfer_failure(app, session_id, remote, "(tree)", "", "", reason.clone(), "download");
-                failed.push(reason);
-                break;
+        overwrite: Overwrite,
+    ) -> Result<TransferOutcome, SshError> {
+        let (seq, cancel) = self.transfer_begin(transfer_id)?;
+        let r = match self.sftp(session_id).await {
+            Ok(sftp) => {
+                let mut p = Progress::new(app, session_id, transfer_id, remote, "download", cancel);
+                download_tree(&sftp, &mut p, remote, local, overwrite).await.map(|bytes| {
+                    TransferOutcome { bytes, notes: p.take_notes() }
+                })
             }
-            // Refuse to descend into (or create under) a linked ancestor before
-            // create_dir_all can follow it outside the destination.
-            if let Err(e) = reject_link_in_subtree(&root, std::path::Path::new(&ldir)) {
-                failed.push(format!("{ldir}: {e}"));
-                continue;
-            }
-            let dir_name = rdir.rsplit('/').next().unwrap_or(&rdir).to_string();
-            let listing = match tokio::fs::create_dir_all(&ldir).await {
-                Err(e) if is_root => return Err(e.into()),
-                Err(e) => Err(SshError::from(e)),
-                Ok(()) => sftp.read_dir(&rdir).await.map_err(SshError::from),
-            };
-            let listing = match listing {
-                Ok(l) => l,
-                Err(e) if is_root => return Err(e),
-                Err(e) => {
-                    emit_transfer_failure(app, session_id, remote, &dir_name, &ldir, &rdir, format!("{e}"), "download");
-                    failed.push(format!("{rdir}: {e}"));
-                    continue;
-                }
-            };
-            for entry in listing {
-                let name = entry.file_name();
-                let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
-                // The server chose this name; refuse anything that is not a
-                // plain component before it becomes a local path.
-                if !safe_local_component(&name) {
-                    let reason = format!("{name} (unsafe name, skipped)");
-                    emit_transfer_failure(app, session_id, remote, &name, "", &rpath, reason.clone(), "download");
-                    failed.push(reason);
-                    continue;
-                }
-                let lpath = std::path::Path::new(&ldir)
-                    .join(&name)
-                    .to_string_lossy()
-                    .to_string();
-                let ft = entry.file_type();
-                if ft.is_dir() {
-                    dirs.push((rpath, lpath));
-                } else if ft.is_symlink() {
-                    // A symlink in a tree walk is skipped, not followed: SFTP
-                    // open() on a dir-symlink fails, and following file links
-                    // can duplicate or even loop. Recorded so the user learns
-                    // it was left behind rather than silently missing it.
-                    // Emitted with an empty local path so it is NOT retryable:
-                    // a retry would copy it as a plain file, following the link
-                    // the walk deliberately refused to follow.
-                    let reason = format!("{rpath} (symlink, skipped)");
-                    emit_transfer_failure(app, session_id, remote, &name, "", &rpath, "symlink, skipped".into(), "download");
-                    failed.push(reason);
-                } else {
-                    // One unreadable file must not abort the other 499: keep
-                    // walking, collect what failed, report the tally at the end.
-                    let ctx = ProgressCtx { root: remote, base: total, tree: true };
-                    match copy_remote_file(&sftp, app, session_id, &rpath, &lpath, ctx).await {
-                        Ok(n) => total += n,
-                        Err(e) => {
-                            emit_transfer_failure(app, session_id, remote, &name, &lpath, &rpath, format!("{e}"), "download");
-                            failed.push(format!("{rpath}: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-        if failed.is_empty() {
-            Ok(total)
-        } else {
-            Err(SshError::PartialTransfer(format!(
-                "copied {} bytes; {} item(s) not transferred — first: {}",
-                total,
-                failed.len(),
-                failed[0]
-            )))
-        }
+            Err(e) => Err(e),
+        };
+        self.transfer_end(transfer_id, seq);
+        self.check_sftp(session_id, r).await
     }
 
-    /// Upload, same streaming and reporting contract, directory-aware.
+    /// Upload, same streaming, reporting and overwrite contract, directory-aware.
     pub async fn upload(
         &self,
         app: &AppHandle,
         session_id: &str,
+        transfer_id: &str,
         local: &str,
         remote: &str,
-    ) -> Result<u64, SshError> {
-        let sftp = self.sftp(session_id).await?;
-
-        let is_dir = tokio::fs::metadata(local)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-
-        if !is_dir {
-            return copy_local_file(&sftp, app, session_id, local, remote, ProgressCtx::single(local))
-                .await;
-        }
-
-        let mut total = 0u64;
-        let mut failed: Vec<String> = Vec::new();
-        const MAX_DIRS: usize = 50_000;
-        let mut visited = 0usize;
-        let mut dirs = vec![(local.to_string(), remote.to_string())];
-        while let Some((ldir, rdir)) = dirs.pop() {
-            visited += 1;
-            let is_root = visited == 1;
-            if visited > MAX_DIRS {
-                let reason = format!(
-                    "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
-                );
-                // Empty paths: not retryable — a retry would re-run the whole tree.
-                emit_transfer_failure(app, session_id, local, "(tree)", "", "", reason.clone(), "upload");
-                failed.push(reason);
-                break;
+        overwrite: Overwrite,
+    ) -> Result<TransferOutcome, SshError> {
+        let (seq, cancel) = self.transfer_begin(transfer_id)?;
+        let r = match self.sftp(session_id).await {
+            Ok(sftp) => {
+                let mut p = Progress::new(app, session_id, transfer_id, local, "upload", cancel);
+                upload_tree(&sftp, &mut p, local, remote, overwrite).await.map(|bytes| {
+                    TransferOutcome { bytes, notes: p.take_notes() }
+                })
             }
-            // create_dir on an existing directory is an error over SFTP; ignore
-            // it so re-uploading into a partially-present tree just works.
-            let _ = sftp.create_dir(&rdir).await;
-            // An unreadable SUBdirectory (another user's 0700 dir, a macOS
-            // TCC-protected folder) is one more failed item, not the end of the
-            // whole tree; only the root failing is fatal.
-            let dir_name = std::path::Path::new(&ldir)
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| ldir.clone());
-            let mut rd = match tokio::fs::read_dir(&ldir).await {
-                Ok(rd) => rd,
-                Err(e) if is_root => return Err(e.into()),
-                Err(e) => {
-                    emit_transfer_failure(app, session_id, local, &dir_name, &ldir, &rdir, format!("{e}"), "upload");
-                    failed.push(format!("{ldir}: {e}"));
-                    continue;
-                }
-            };
-            loop {
-                let entry = match rd.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => break,
-                    Err(e) => {
-                        failed.push(format!("{ldir}: {e}"));
-                        break;
-                    }
-                };
-                let name = entry.file_name().to_string_lossy().to_string();
-                let lpath = entry.path().to_string_lossy().to_string();
-                let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(e) => {
-                        emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, format!("{e}"), "upload");
-                        failed.push(format!("{lpath}: {e}"));
-                        continue;
-                    }
-                };
-                if ft.is_dir() {
-                    dirs.push((lpath, rpath));
-                } else if ft.is_symlink() {
-                    // Empty local path: NOT retryable. A retry would open the
-                    // path as a plain file and upload whatever the link points
-                    // at (e.g. ~/.ssh/id_ed25519) — the very thing the walk
-                    // refused to do.
-                    emit_transfer_failure(app, session_id, local, &name, "", &rpath, "symlink, skipped".into(), "upload");
-                    failed.push(format!("{lpath} (symlink, skipped)"));
-                } else {
-                    let ctx = ProgressCtx { root: local, base: total, tree: true };
-                    match copy_local_file(&sftp, app, session_id, &lpath, &rpath, ctx).await {
-                        Ok(n) => total += n,
-                        Err(e) => {
-                            emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, format!("{e}"), "upload");
-                            failed.push(format!("{lpath}: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-        if failed.is_empty() {
-            Ok(total)
-        } else {
-            Err(SshError::PartialTransfer(format!(
-                "copied {} bytes; {} item(s) not transferred — first: {}",
-                total,
-                failed.len(),
-                failed[0]
-            )))
-        }
+            Err(e) => Err(e),
+        };
+        self.transfer_end(transfer_id, seq);
+        self.check_sftp(session_id, r).await
     }
 }
 
@@ -2667,7 +2608,7 @@ impl SessionRef {
     ///
     /// On a `SessionRef` rather than the registry, so the output always comes
     /// from the connection whose identity the caller files it under.
-    pub async fn exec_capture(&self, command: &str, timeout_secs: u64) -> Result<String, SshError> {
+    pub async fn exec_capture(&self, command: &str, timeout_secs: u64) -> Result<ExecOutput, SshError> {
         let session = &self.session;
         if !session.alive.load(Ordering::Relaxed) {
             return Err(SshError::Disconnected(self.id.clone()));
@@ -2676,67 +2617,135 @@ impl SessionRef {
         let mut channel = session.handle.channel_open_session().await?;
         channel.exec(true, command).await?;
         let run = run_exec(&mut channel, 16 * 1024 * 1024, Duration::from_secs(timeout_secs)).await;
-
-        // Don't pass off a partial or failed capture as a valid snapshot:
-        //  - timed out   -> we have no idea if the config finished printing
-        //  - truncated   -> hit the size cap mid-dump
-        //  - unconfirmed -> the channel/transport ended before the server
-        //    confirmed the run (EOF, then a status or close)
-        //  - killed / exit != 0 -> the command itself reported failure (a
-        //    missing status after EOF + close is tolerated: much network gear
-        //    never sends one over exec)
-        if run.timed_out {
-            return Err(SshError::PartialTransfer(if run.eof {
-                format!(
-                    "device ended its output but never confirmed completion within \
-                     {timeout_secs}s; output discarded"
-                )
-            } else {
-                format!("capture timed out after {timeout_secs}s; output discarded")
-            }));
+        if !run.close_sent {
+            // The close did not get out within its grace (a full outbound
+            // queue). This is the user's live session, so the channel must not
+            // simply be dropped: russh would then never send its close, and the
+            // command (`tail -f`, a pager waiting for input) would keep running
+            // and hold a channel slot until the whole session ends. The close
+            // stays queued here and goes out as soon as the transport drains;
+            // it fails (and the task ends) when the session ends.
+            tokio::spawn(async move {
+                let _ = channel.close().await;
+            });
         }
-        if run.truncated {
-            return Err(SshError::PartialTransfer(
-                "capture exceeded 16 MiB; output discarded".into(),
-            ));
-        }
-        if !run.confirmed {
-            return Err(SshError::PartialTransfer(
-                "connection ended before the capture completed; output discarded".into(),
-            ));
-        }
-        if let Some(sig) = run.signal {
-            return Err(SshError::PartialTransfer(format!(
-                "capture command was killed by signal {sig}"
-            )));
-        }
-        if let Some(code) = run.exit_status {
-            if code != 0 {
-                return Err(SshError::PartialTransfer(format!(
-                    "capture command exited with status {code}"
-                )));
-            }
-        }
-        let out = run.out;
-
-        let (clean, _) = crate::utils::session_log::strip_ansi(&out);
-        Ok(String::from_utf8_lossy(&clean).to_string())
+        exec_verdict(run, timeout_secs)
     }
 }
 
+/// What a capture printed, the two streams kept apart: stderr (a login-shell
+/// `setlocale` warning, MOTD noise) must never become part of a saved config.
+#[derive(Debug, Default)]
+pub struct ExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ExecOutput {
+    /// Both streams for a human-read capture file, stderr labelled.
+    pub fn labelled(&self) -> String {
+        if self.stderr.trim().is_empty() {
+            return self.stdout.clone();
+        }
+        let sep = if self.stdout.is_empty() || self.stdout.ends_with('\n') { "" } else { "\n" };
+        format!("{}{sep}--- stderr ---\n{}", self.stdout, self.stderr)
+    }
+}
+
+/// A short stderr excerpt for an error message, or "".
+fn stderr_hint(err: &[u8]) -> String {
+    let (clean, _) = crate::utils::session_log::strip_ansi(err);
+    let text = String::from_utf8_lossy(&clean);
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let short: String = text.chars().take(300).collect();
+    format!(": {short}")
+}
+
+/// Judge a finished exec run (see `exec_capture`).
+///
+/// Don't pass off a partial or failed capture as a valid snapshot:
+///  - refused     -> the server answered the exec request with a failure
+///  - timed out   -> we have no idea if the config finished printing
+///  - truncated   -> hit the size cap mid-dump
+///  - unconfirmed -> the channel/transport ended before the server confirmed
+///    the run (EOF, then a status or close)
+///  - killed / exit != 0 -> the command itself reported failure (a missing
+///    status after EOF + close is tolerated: much network gear never sends one
+///    over exec)
+fn exec_verdict(run: ExecRun, timeout_secs: u64) -> Result<ExecOutput, SshError> {
+    if run.refused {
+        return Err(SshError::PartialTransfer(
+            "the device refused to run the command over an exec channel (it may only \
+             support interactive shells)"
+                .into(),
+        ));
+    }
+    if run.timed_out {
+        return Err(SshError::PartialTransfer(if run.eof {
+            format!(
+                "device ended its output but never confirmed completion within \
+                 {timeout_secs}s; output discarded"
+            )
+        } else {
+            format!("capture timed out after {timeout_secs}s; output discarded")
+        }));
+    }
+    if run.truncated {
+        return Err(SshError::PartialTransfer(
+            "capture exceeded 16 MiB; output discarded".into(),
+        ));
+    }
+    if !run.confirmed {
+        return Err(SshError::PartialTransfer(
+            "connection ended before the capture completed; output discarded".into(),
+        ));
+    }
+    if let Some(sig) = run.signal {
+        return Err(SshError::PartialTransfer(format!(
+            "capture command was killed by signal {sig}{}",
+            stderr_hint(&run.err)
+        )));
+    }
+    if let Some(code) = run.exit_status {
+        if code != 0 {
+            return Err(SshError::PartialTransfer(format!(
+                "capture command exited with status {code}{}",
+                stderr_hint(&run.err)
+            )));
+        }
+    }
+    let (out, _) = crate::utils::session_log::strip_ansi(&run.out);
+    let (err, _) = crate::utils::session_log::strip_ansi(&run.err);
+    Ok(ExecOutput {
+        stdout: String::from_utf8_lossy(&out).to_string(),
+        stderr: String::from_utf8_lossy(&err).to_string(),
+    })
+}
+
 /// How an exec channel's run ended, as far as the server confirmed it.
+#[derive(Default)]
 struct ExecRun {
+    /// stdout.
     out: Vec<u8>,
+    /// stderr (extended data), kept apart from stdout.
+    err: Vec<u8>,
     exit_status: Option<u32>,
     /// Name of the signal that killed the command (`exit-signal`).
     signal: Option<String>,
     eof: bool,
     truncated: bool,
     timed_out: bool,
+    /// The server answered the exec request with CHANNEL_FAILURE.
+    refused: bool,
     /// The server confirmed the run finished: EOF, then an exit status/signal
     /// or a channel close (in either order). A transport that drops, or a
     /// close with no EOF first, is NOT confirmation.
     confirmed: bool,
+    /// Our CHANNEL_CLOSE went out within `EXEC_CLOSE_GRACE`.
+    close_sent: bool,
 }
 
 /// Collect an exec channel's output under `deadline`, then close the channel.
@@ -2746,20 +2755,16 @@ struct ExecRun {
 /// second of {EOF, status/signal} arrives, or on close after EOF. No short
 /// post-EOF grace: that passed off a command that closed its output and then
 /// failed as success. A device that EOFs but never confirms now times out.
+///
+/// The exec request must have been sent with want_reply: a CHANNEL_FAILURE
+/// reply (the device refuses exec but leaves the channel open) ends the run at
+/// once as `refused` instead of waiting out the deadline.
 async fn run_exec(
     channel: &mut russh::Channel<client::Msg>,
     cap: usize,
     deadline: Duration,
 ) -> ExecRun {
-    let mut run = ExecRun {
-        out: Vec::new(),
-        exit_status: None,
-        signal: None,
-        eof: false,
-        truncated: false,
-        timed_out: false,
-        confirmed: false,
-    };
+    let mut run = ExecRun::default();
     let collect = async {
         // These commands read no stdin. Send our EOF (like `ssh host cmd
         // </dev/null`) so stacks that wait for the peer's EOF before closing
@@ -2768,18 +2773,15 @@ async fn run_exec(
         let _ = channel.eof().await;
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                    run.out.extend_from_slice(data);
-                    // A runaway command (`tail -f`) must not eat RAM until the
-                    // deadline.
-                    if run.out.len() > cap {
-                        run.truncated = true;
-                        return;
-                    }
-                }
+                ChannelMsg::Data { ref data } => run.out.extend_from_slice(data),
+                ChannelMsg::ExtendedData { ref data, .. } => run.err.extend_from_slice(data),
                 ChannelMsg::ExitStatus { exit_status } => run.exit_status = Some(exit_status),
                 ChannelMsg::ExitSignal { signal_name, .. } => {
                     run.signal = Some(format!("{signal_name:?}"))
+                }
+                ChannelMsg::Failure if !run.eof && run.out.is_empty() => {
+                    run.refused = true;
+                    return;
                 }
                 ChannelMsg::Eof => run.eof = true,
                 ChannelMsg::Close => {
@@ -2787,6 +2789,12 @@ async fn run_exec(
                     return;
                 }
                 _ => {}
+            }
+            // A runaway command (`tail -f`) must not eat RAM until the
+            // deadline.
+            if run.out.len() + run.err.len() > cap {
+                run.truncated = true;
+                return;
             }
             if run.eof && (run.exit_status.is_some() || run.signal.is_some()) {
                 run.confirmed = true;
@@ -2798,8 +2806,12 @@ async fn run_exec(
     run.timed_out = tokio::time::timeout(deadline, collect).await.is_err();
     // A plain russh Channel sends no CHANNEL_CLOSE on drop; without this a
     // timed-out exec would leak a channel on the user's live session. Bounded
-    // like the rest: a stalled transport must not hold the caller past it.
-    let _ = tokio::time::timeout(EXEC_CLOSE_GRACE, channel.close()).await;
+    // like the rest: a stalled transport must not hold the caller past it
+    // (`exec_capture` then keeps the close queued; see there).
+    run.close_sent = matches!(
+        tokio::time::timeout(EXEC_CLOSE_GRACE, channel.close()).await,
+        Ok(Ok(()))
+    );
     run
 }
 
@@ -3297,6 +3309,64 @@ async fn request_auth_answers(
 /// config and are out of scope here — the UI offers the copyable command for
 /// those.
 #[allow(clippy::too_many_arguments)]
+/// Validate a public key for `copy_id` and return its single trimmed line.
+///
+/// It must parse as one OpenSSH public key line (so an empty paste, a private
+/// key or arbitrary text is refused), and it must be safe inside the
+/// single-quoted remote script: no quote, no line break, no control
+/// character, and no leading '-' (which `grep` would take as an option).
+fn validate_public_key(public_key: &str) -> Result<String, String> {
+    let key = public_key.trim();
+    if key.is_empty() {
+        return Err("no public key given".into());
+    }
+    if key.contains('\n') || key.contains('\r') {
+        return Err("the public key must be a single line".into());
+    }
+    if key.starts_with('-') {
+        return Err("the public key cannot start with '-'".into());
+    }
+    if key.contains('\'') || key.chars().any(|c| c.is_control()) {
+        return Err("public key contains illegal characters".into());
+    }
+    russh::keys::ssh_key::PublicKey::from_openssh(key)
+        .map_err(|e| format!("not an OpenSSH public key line ({e})"))?;
+    Ok(key.to_string())
+}
+
+/// Quote `s` as one POSIX-shell single-quoted word.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The remote key-install command for a key already passed through
+/// `validate_public_key`.
+///
+/// The script is POSIX sh, and it is run as `exec sh -c '<script>'` the way
+/// OpenSSH's ssh-copy-id does: the exec request goes through the account's
+/// LOGIN shell, and fish or csh/tcsh cannot parse brace groups or `$(…)`. The
+/// script is a single line (csh refuses a newline inside quotes), and `-e`
+/// keeps grep from reading the key as an option.
+///
+/// grep -qxF: only append if the exact line is not already present, so running
+/// this twice does not duplicate the key. The append is BRACE-GROUPED so the
+/// whole chain is conjunctive: HAWSER_KEY_OK is printed only if every step —
+/// including the append — actually succeeded. A file whose last line has no
+/// trailing newline gets one first (as ssh-copy-id does); otherwise the key is
+/// glued onto that line, grep never sees it as its own line, and "success" is
+/// reported for a key sshd cannot parse.
+fn copy_id_command(key: &str) -> String {
+    let k = sh_single_quote(key);
+    let script = format!(
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys \
+         && {{ [ ! -s ~/.ssh/authorized_keys ] || [ -z \"$(tail -c 1 ~/.ssh/authorized_keys)\" ] \
+               || printf '\\n' >> ~/.ssh/authorized_keys; }} \
+         && {{ grep -qxF -e {k} ~/.ssh/authorized_keys || printf '%s\\n' {k} >> ~/.ssh/authorized_keys; }} \
+         && chmod 600 ~/.ssh/authorized_keys && echo HAWSER_KEY_OK"
+    );
+    format!("exec sh -c {}", sh_single_quote(&script))
+}
+
 async fn copy_id(
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
@@ -3309,14 +3379,10 @@ async fn copy_id(
     password: zeroize::Zeroizing<String>,
     public_key: &str,
 ) -> Result<(), SshError> {
-    let key = public_key.trim();
-    // The key is wrapped in single quotes in the remote command; a quote in it
-    // would break out. Generated keys never contain one, but guard anyway.
-    if key.contains('\'') || key.contains('\n') {
-        return Err(SshError::AuthFailed(
-            "public key contains illegal characters".into(),
-        ));
-    }
+    // Checked before anything dials: an empty, multi-line or non-key text
+    // would otherwise be appended to authorized_keys and reported "installed".
+    let key = validate_public_key(public_key).map_err(SshError::AuthFailed)?;
+    let key = key.as_str();
 
     // Same stage deadlines as a normal connect; the host-key check and any
     // keyboard-interactive challenge pause them while the user reads.
@@ -3378,13 +3444,7 @@ async fn copy_id(
     // OpenSSH's ssh-copy-id does); otherwise the key is glued onto that line,
     // grep never sees it as its own line, and "success" is reported for a key
     // sshd cannot parse.
-    let cmd = format!(
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys \
-         && {{ [ ! -s ~/.ssh/authorized_keys ] || [ -z \"$(tail -c 1 ~/.ssh/authorized_keys)\" ] \
-               || printf '\\n' >> ~/.ssh/authorized_keys; }} \
-         && {{ grep -qxF '{key}' ~/.ssh/authorized_keys || printf '%s\n' '{key}' >> ~/.ssh/authorized_keys; }} \
-         && chmod 600 ~/.ssh/authorized_keys && echo HAWSER_KEY_OK"
-    );
+    let cmd = copy_id_command(key);
 
     let mut channel = within(
         &wait,
@@ -3400,7 +3460,9 @@ async fn copy_id(
     // whatever partial output happened to arrive before the clock ran out.
     let run = run_exec(&mut channel, 1024 * 1024, Duration::from_secs(20)).await;
     let completed = !run.timed_out && !run.truncated && run.confirmed && run.signal.is_none();
-    let (out, exit_status) = (run.out, run.exit_status);
+    let exit_status = run.exit_status;
+    let mut out = run.out;
+    out.extend_from_slice(&run.err);
 
     // Three signals must agree before we claim the key is installed:
     //   - the command actually finished within the timeout,
@@ -3563,27 +3625,6 @@ fn agent_error(e: russh::AgentAuthError, tried: usize) -> SshError {
     }
 }
 
-/// Reject a remote-supplied name that could escape the local target directory.
-///
-/// A malicious or compromised server controls the filenames it lists, and on
-/// download those names become LOCAL path components. A name like
-/// `..\Windows\evil` — or an absolute path, which `Path::join` uses to
-/// REPLACE the base entirely — would write outside the folder the user chose.
-/// This is the scp/zip-slip class; the defense is to accept only plain file
-/// names as path components.
-fn safe_local_component(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        // Drive letters / alternate data streams are a Windows hazard only; on
-        // macOS/Linux ':' is an ordinary filename character (timestamped logs).
-        && !(cfg!(windows) && name.contains(':'))
-        && !name.contains('\0')
-        && !is_windows_reserved(name)
-}
-
 /// True if `meta` describes a symlink or (on Windows) any reparse point such as
 /// a junction or mount point. `symlink_metadata().is_symlink()` alone misses
 /// NTFS junctions, which are reparse points but not "symlinks" — and a junction
@@ -3659,41 +3700,863 @@ fn is_windows_reserved(name: &str) -> bool {
     RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
 }
 
-/// Push one per-file failure to the UI so a recursive transfer can report the
-/// full list and offer a retry. Best-effort — a dropped event only costs detail.
-#[allow(clippy::too_many_arguments)]
-fn emit_transfer_failure(
-    app: &AppHandle,
-    session_id: &str,
-    root: &str,
-    name: &str,
+/* ------------------------------------------------------------ sftp plumbing */
+
+/// A session's SFTP channels (see `Registry::sftp`).
+pub struct SftpConn {
+    hi: SftpSession,
+    /// Raw channel for capped listings and `posix-rename`, when the server
+    /// granted a second subsystem channel.
+    raw: Option<RawSftpSession>,
+    /// The server advertised `posix-rename@openssh.com` version 1.
+    posix_rename: bool,
+}
+
+/// Open the auxiliary raw SFTP channel and learn whether the server speaks
+/// `posix-rename@openssh.com`.
+async fn open_raw_sftp(handle: &Handle<ClientHandler>) -> Result<(RawSftpSession, bool), SshError> {
+    let channel = handle.channel_open_session().await?;
+    channel.request_subsystem(true, "sftp").await?;
+    let raw = RawSftpSession::new(channel.into_stream());
+    let version = raw.init().await?;
+    let posix = version
+        .extensions
+        .get(POSIX_RENAME)
+        .is_some_and(|v| v == "1");
+    Ok((raw, posix))
+}
+
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
+
+/// The SFTP status code inside `e`, if it is a status reply.
+fn sftp_status(e: &russh_sftp::client::error::Error) -> Option<StatusCode> {
+    match e {
+        russh_sftp::client::error::Error::Status(st) => Some(st.status_code),
+        _ => None,
+    }
+}
+
+/// Whether `e` means the SFTP channel itself is gone or not answering (rather
+/// than one operation failing), so the cached session must be reopened and a
+/// tree walk must stop instead of timing out on every remaining file.
+fn sftp_dead(e: &SshError) -> bool {
+    use russh_sftp::client::error::Error as SftpErr;
+    fn dead(e: &SftpErr) -> bool {
+        matches!(e, SftpErr::UnexpectedBehavior(_) | SftpErr::IO(_) | SftpErr::Timeout)
+    }
+    match e {
+        SshError::Sftp(s) => dead(s),
+        SshError::TransferStalled(_) => true,
+        // Errors from an SFTP `File` (AsyncRead/AsyncWrite) arrive as io::Error
+        // carrying the SFTP error inside.
+        SshError::Io(io) => {
+            io.kind() == std::io::ErrorKind::TimedOut
+                || io
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<SftpErr>())
+                    .is_some_and(dead)
+        }
+        _ => false,
+    }
+}
+
+/// Read one remote directory, at most `cap` entries ("." and ".." left out).
+/// Returns the entries and whether the listing was cut off.
+async fn read_dir_capped(
+    sftp: &SftpConn,
+    path: &str,
+    cap: usize,
+) -> Result<(Vec<(String, russh_sftp::protocol::FileAttributes)>, bool), SshError> {
+    let Some(raw) = sftp.raw.as_ref() else {
+        // No raw channel: the high-level call buffers the whole listing; cap
+        // what is kept at least.
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for e in sftp.hi.read_dir(path).await? {
+            if out.len() >= cap {
+                truncated = true;
+                break;
+            }
+            out.push((e.file_name(), e.metadata()));
+        }
+        return Ok((out, truncated));
+    };
+    let handle = raw.opendir(path).await?.handle;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    let result = loop {
+        match raw.readdir(handle.as_str()).await {
+            Ok(name) => {
+                for f in name.files {
+                    if f.filename == "." || f.filename == ".." {
+                        continue;
+                    }
+                    if out.len() >= cap {
+                        truncated = true;
+                        break;
+                    }
+                    out.push((f.filename, f.attrs));
+                }
+                if truncated {
+                    break Ok(());
+                }
+            }
+            Err(e) if sftp_status(&e) == Some(StatusCode::Eof) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = raw.close(handle).await;
+    result?;
+    Ok((out, truncated))
+}
+
+async fn list_dir_with(sftp: &SftpConn, path: &str) -> Result<DirListing, SshError> {
+    // Resolve first so the pane shows the real location: the server may
+    // return something different for ".", "~", or a symlinked directory.
+    let canonical = sftp
+        .hi
+        .canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_string());
+
+    let mut entries = vec![FileEntry {
+        name: "..".into(),
+        kind: "directory",
+        size: 0,
+        modified: None,
+        mode: String::new(),
+    }];
+
+    let (listed, truncated) = read_dir_capped(sftp, &canonical, MAX_LIST_ENTRIES).await?;
+    for (name, meta) in listed {
+        let kind = match meta.file_type() {
+            FileType::Dir => "directory",
+            FileType::Symlink => "symlink",
+            _ => "file",
+        };
+        entries.push(FileEntry {
+            name,
+            kind,
+            size: meta.size.unwrap_or(0),
+            modified: meta.mtime,
+            mode: mode_string(meta.permissions, kind),
+        });
+    }
+
+    Ok(DirListing { path: canonical, entries, truncated })
+}
+
+/// `posix-rename@openssh.com`: rename that atomically REPLACES an existing
+/// target (POSIX rename(2) semantics), unlike SFTPv3 RENAME.
+async fn posix_rename(raw: &RawSftpSession, from: &str, to: &str) -> Result<(), SshError> {
+    fn put(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+    let mut data = Vec::with_capacity(8 + from.len() + to.len());
+    put(&mut data, from);
+    put(&mut data, to);
+    match raw.extended(POSIX_RENAME, data).await? {
+        russh_sftp::protocol::Packet::Status(st) if st.status_code == StatusCode::Ok => Ok(()),
+        russh_sftp::protocol::Packet::Status(st) => {
+            Err(SshError::Sftp(russh_sftp::client::error::Error::Status(st)))
+        }
+        _ => Err(SshError::Sftp(russh_sftp::client::error::Error::UnexpectedPacket)),
+    }
+}
+
+/* ---------------------------------------------------------- transfer policy */
+
+/// What a transfer may do to a file already at its destination. Chosen by the
+/// frontend's overwrite prompt, carried through IPC (retries included), and
+/// enforced when each file is COMMITTED: a destination that appears after the
+/// prompt is never clobbered under `Never`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overwrite {
+    /// Refuse to replace anything (the default, and the choice for a
+    /// destination that did not exist when the user was asked).
+    Never,
+    /// Replace an existing file.
+    Replace,
+    /// The user was asked about this existing destination and agreed.
+    Confirmed,
+}
+
+impl Overwrite {
+    /// Parse the IPC value; a missing value is `Never`.
+    pub fn parse(v: Option<&str>) -> Result<Self, String> {
+        match v.unwrap_or("never") {
+            "never" => Ok(Self::Never),
+            "replace" => Ok(Self::Replace),
+            "confirmed" => Ok(Self::Confirmed),
+            other => Err(format!("unknown overwrite policy: {other}")),
+        }
+    }
+
+    fn allows_replace(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
+fn already_exists(path: &str) -> SshError {
+    SshError::PartialTransfer(format!("{path} already exists; not overwriting it"))
+}
+
+/// Run one transfer step under the transfer's cancel switch and the stall
+/// deadline.
+async fn step<T, E: Into<SshError>>(
+    cancel: &watch::Receiver<bool>,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, SshError> {
+    let mut rx = cancel.clone();
+    if *rx.borrow() {
+        return Err(SshError::TransferCancelled);
+    }
+    let cancelled = async move {
+        loop {
+            if rx.changed().await.is_err() {
+                // Sender gone: nobody can cancel any more.
+                std::future::pending::<()>().await;
+            }
+            if *rx.borrow() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancelled => Err(SshError::TransferCancelled),
+        r = tokio::time::timeout(TRANSFER_STALL_TIMEOUT, fut) => match r {
+            Ok(r) => r.map_err(Into::into),
+            Err(_) => Err(SshError::TransferStalled(TRANSFER_STALL_TIMEOUT.as_secs())),
+        },
+    }
+}
+
+/* ------------------------------------------------------------- progress */
+
+/// Throttled progress for one whole transfer (a file, or every file of a
+/// tree). One clock for the whole transfer: a 100k-file tree must not send
+/// two IPC events per file.
+struct Progress<'a> {
+    app: &'a AppHandle,
+    payload: TransferProgress,
+    last: Option<Instant>,
+    /// Bytes of files already completed in this transfer.
+    base: u64,
+    /// The current file's size (single-file transfers only).
+    file_total: u64,
+    /// Part of a folder transfer: the row's total is unknown, so never report
+    /// one file's size (or completion) as the tree's.
+    tree: bool,
+    cancel: watch::Receiver<bool>,
+    notes: Vec<String>,
+    notes_dropped: usize,
+}
+
+const MAX_NOTES: usize = 20;
+
+impl<'a> Progress<'a> {
+    fn new(
+        app: &'a AppHandle,
+        session_id: &str,
+        transfer_id: &str,
+        root: &str,
+        direction: &'static str,
+        cancel: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            app,
+            payload: TransferProgress {
+                session_id: session_id.to_string(),
+                transfer_id: transfer_id.to_string(),
+                root: root.to_string(),
+                file_path: root.to_string(),
+                bytes_transferred: 0,
+                total_bytes: 0,
+                direction,
+                done: false,
+            },
+            last: None,
+            base: 0,
+            file_total: 0,
+            tree: false,
+            cancel,
+            notes: Vec::new(),
+            notes_dropped: 0,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    fn emit(&mut self) {
+        self.last = Some(Instant::now());
+        let _ = self.app.emit("sftp://progress", self.payload.clone());
+    }
+
+    /// A file starts. A single file emits at once, so the row gets its
+    /// denominator; a tree file does not (see the struct comment).
+    fn start_file(&mut self, file_path: &str, total: u64) {
+        self.payload.file_path = file_path.to_string();
+        self.file_total = total;
+        self.payload.total_bytes = if self.tree { 0 } else { total };
+        self.payload.bytes_transferred = self.base;
+        if !self.tree {
+            self.emit();
+        }
+    }
+
+    fn tick(&mut self, file_bytes: u64) {
+        if self.last.is_some_and(|t| t.elapsed() < PROGRESS_INTERVAL) {
+            return;
+        }
+        self.payload.bytes_transferred = self.base + file_bytes;
+        self.emit();
+    }
+
+    /// A file completed. A single file always emits its final event, so the
+    /// UI never stalls at 97%; a tree file only counts toward the total.
+    fn finish_file(&mut self, file_bytes: u64) {
+        self.base += file_bytes;
+        if self.tree {
+            self.tick(0);
+            return;
+        }
+        self.payload.bytes_transferred = self.base;
+        if self.payload.total_bytes == 0 {
+            self.payload.total_bytes = file_bytes;
+        }
+        self.payload.done = true;
+        self.emit();
+    }
+
+    /// The tree finished: one unthrottled event with the final count.
+    fn finish_tree(&mut self) {
+        self.payload.bytes_transferred = self.base;
+        self.emit();
+    }
+
+    fn note(&mut self, text: String) {
+        if self.notes.len() < MAX_NOTES {
+            self.notes.push(text);
+        } else {
+            self.notes_dropped += 1;
+        }
+    }
+
+    fn take_notes(&mut self) -> Vec<String> {
+        let mut notes = std::mem::take(&mut self.notes);
+        if self.notes_dropped > 0 {
+            notes.push(format!("…and {} more like these", self.notes_dropped));
+        }
+        notes
+    }
+
+    fn failure(&self, name: &str, local: &str, remote: &str, reason: String) {
+        let _ = self.app.emit(
+            "sftp://failure",
+            TransferFailure {
+                session_id: self.payload.session_id.clone(),
+                transfer_id: self.payload.transfer_id.clone(),
+                root: self.payload.root.clone(),
+                name: name.to_string(),
+                local: local.to_string(),
+                remote: remote.to_string(),
+                reason,
+                direction: self.payload.direction,
+            },
+        );
+    }
+}
+
+/* ------------------------------------------------------------ tree walks */
+
+fn partial_summary(total: u64, failed: &[String]) -> SshError {
+    SshError::PartialTransfer(format!(
+        "copied {} bytes; {} item(s) not transferred — first: {}",
+        total,
+        failed.len(),
+        failed[0]
+    ))
+}
+
+async fn download_tree(
+    sftp: &SftpConn,
+    p: &mut Progress<'_>,
+    remote: &str,
+    local: &str,
+    overwrite: Overwrite,
+) -> Result<u64, SshError> {
+    // A directory recurses; a file copies directly. Walking the tree
+    // iteratively (a worklist, not async recursion) keeps this a plain
+    // function with no Box::pin ceremony.
+    let is_dir = step(&p.cancel, sftp.hi.metadata(remote))
+        .await
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+
+    // Single file: the frontend built `local` from the server's name, so
+    // verify its final component has not been used to escape the target.
+    let last = std::path::Path::new(local)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !safe_local_component(&last) {
+        return Err(SshError::PartialTransfer(format!(
+            "refusing to write unsafe filename: {last}"
+        )));
+    }
+    if !is_dir {
+        p.tree = false;
+        return copy_remote_file(sftp, p, remote, local, overwrite).await;
+    }
+    p.tree = true;
+
+    // Everything from `local` downward is built from server-chosen names and
+    // is therefore untrusted; the folder that CONTAINS `local` is the one the
+    // user actually picked and is the trust boundary. Any pre-existing symlink
+    // or junction below it must not be followed. (`local` always has a parent
+    // here: `safe_local_component` above rejected an empty final component.)
+    let root = std::path::Path::new(local)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+
+    let mut failed: Vec<String> = Vec::new();
+    // Bound the walk so a malicious or misconfigured server advertising a
+    // pathologically deep/wide tree cannot grow the worklist without limit.
+    const MAX_DIRS: usize = 50_000;
+    let mut visited = 0usize;
+    let mut dirs = vec![(remote.to_string(), local.to_string())];
+    'walk: while let Some((rdir, ldir)) = dirs.pop() {
+        if p.cancelled() {
+            return Err(SshError::TransferCancelled);
+        }
+        visited += 1;
+        // The root failing is a real error; a subdirectory failing is one
+        // more item in the tally, like an unreadable file (see below).
+        let is_root = visited == 1;
+        if visited > MAX_DIRS {
+            let reason = format!(
+                "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
+            );
+            // Empty paths: not retryable — a retry would re-run the whole tree.
+            p.failure("(tree)", "", "", reason.clone());
+            failed.push(reason);
+            break;
+        }
+        // Refuse to descend into (or create under) a linked ancestor before
+        // create_dir_all can follow it outside the destination.
+        if let Err(e) = reject_link_in_subtree(&root, std::path::Path::new(&ldir)) {
+            failed.push(format!("{ldir}: {e}"));
+            continue;
+        }
+        let dir_name = rdir.rsplit('/').next().unwrap_or(&rdir).to_string();
+        let listing = match tokio::fs::create_dir_all(&ldir).await {
+            Err(e) if is_root => return Err(e.into()),
+            Err(e) => Err(SshError::from(e)),
+            Ok(()) => step(&p.cancel, read_dir_capped(sftp, &rdir, MAX_LIST_ENTRIES)).await,
+        };
+        let (listing, truncated) = match listing {
+            Ok(l) => l,
+            Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+            Err(e) if is_root || sftp_dead(&e) => return Err(e),
+            Err(e) => {
+                p.failure(&dir_name, &ldir, &rdir, format!("{e}"));
+                failed.push(format!("{rdir}: {e}"));
+                continue;
+            }
+        };
+        if truncated {
+            let reason = format!("listing cut off at {MAX_LIST_ENTRIES} entries; the rest was skipped");
+            p.failure(&dir_name, "", &rdir, reason.clone());
+            failed.push(format!("{rdir}: {reason}"));
+        }
+        for (name, meta) in listing {
+            let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
+            // The server chose this name; refuse anything that is not a
+            // plain component before it becomes a local path.
+            if !safe_local_component(&name) {
+                let reason = format!("{name} (unsafe name, skipped)");
+                p.failure(&name, "", &rpath, reason.clone());
+                failed.push(reason);
+                continue;
+            }
+            let lpath = std::path::Path::new(&ldir)
+                .join(&name)
+                .to_string_lossy()
+                .to_string();
+            let ft = meta.file_type();
+            if ft.is_dir() {
+                dirs.push((rpath, lpath));
+            } else if ft.is_symlink() {
+                // A symlink in a tree walk is skipped, not followed: SFTP
+                // open() on a dir-symlink fails, and following file links
+                // can duplicate or even loop. Recorded so the user learns
+                // it was left behind rather than silently missing it.
+                // Emitted with an empty local path so it is NOT retryable:
+                // a retry would copy it as a plain file, following the link
+                // the walk deliberately refused to follow.
+                p.failure(&name, "", &rpath, "symlink, skipped".into());
+                failed.push(format!("{rpath} (symlink, skipped)"));
+            } else {
+                // One unreadable file must not abort the other 499: keep
+                // walking, collect what failed, report the tally at the end.
+                match copy_remote_file(sftp, p, &rpath, &lpath, overwrite).await {
+                    Ok(_) => {}
+                    Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+                    Err(e) => {
+                        p.failure(&name, &lpath, &rpath, format!("{e}"));
+                        failed.push(format!("{rpath}: {e}"));
+                        if sftp_dead(&e) {
+                            // Every remaining file would wait out the same
+                            // timeout on a channel that is gone.
+                            failed.push("the SFTP session stopped responding; the rest was skipped".into());
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    p.finish_tree();
+    if failed.is_empty() {
+        Ok(p.base)
+    } else {
+        Err(partial_summary(p.base, &failed))
+    }
+}
+
+async fn upload_tree(
+    sftp: &SftpConn,
+    p: &mut Progress<'_>,
     local: &str,
     remote: &str,
-    reason: String,
-    direction: &'static str,
-) {
-    let _ = app.emit(
-        "sftp://failure",
-        TransferFailure {
-            session_id: session_id.to_string(),
-            root: root.to_string(),
-            name: name.to_string(),
-            local: local.to_string(),
-            remote: remote.to_string(),
-            reason,
-            direction,
-        },
-    );
+    overwrite: Overwrite,
+) -> Result<u64, SshError> {
+    let is_dir = tokio::fs::metadata(local)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+
+    if !is_dir {
+        p.tree = false;
+        return copy_local_file(sftp, p, local, remote, overwrite).await;
+    }
+    p.tree = true;
+
+    let mut failed: Vec<String> = Vec::new();
+    const MAX_DIRS: usize = 50_000;
+    let mut visited = 0usize;
+    let mut dirs = vec![(local.to_string(), remote.to_string())];
+    'walk: while let Some((ldir, rdir)) = dirs.pop() {
+        if p.cancelled() {
+            return Err(SshError::TransferCancelled);
+        }
+        visited += 1;
+        let is_root = visited == 1;
+        if visited > MAX_DIRS {
+            let reason = format!(
+                "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
+            );
+            // Empty paths: not retryable — a retry would re-run the whole tree.
+            p.failure("(tree)", "", "", reason.clone());
+            failed.push(reason);
+            break;
+        }
+        // create_dir on an existing directory is an error over SFTP; ignore
+        // it so re-uploading into a partially-present tree just works.
+        match step(&p.cancel, sftp.hi.create_dir(rdir.clone())).await {
+            Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+            Err(e) if sftp_dead(&e) => return Err(e),
+            _ => {}
+        }
+        // An unreadable SUBdirectory (another user's 0700 dir, a macOS
+        // TCC-protected folder) is one more failed item, not the end of the
+        // whole tree; only the root failing is fatal.
+        let dir_name = std::path::Path::new(&ldir)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| ldir.clone());
+        let mut rd = match tokio::fs::read_dir(&ldir).await {
+            Ok(rd) => rd,
+            Err(e) if is_root => return Err(e.into()),
+            Err(e) => {
+                p.failure(&dir_name, &ldir, &rdir, format!("{e}"));
+                failed.push(format!("{ldir}: {e}"));
+                continue;
+            }
+        };
+        loop {
+            let entry = match rd.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    failed.push(format!("{ldir}: {e}"));
+                    break;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lpath = entry.path().to_string_lossy().to_string();
+            let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
+            let ft = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(e) => {
+                    p.failure(&name, &lpath, &rpath, format!("{e}"));
+                    failed.push(format!("{lpath}: {e}"));
+                    continue;
+                }
+            };
+            if ft.is_dir() {
+                dirs.push((lpath, rpath));
+            } else if ft.is_symlink() {
+                // Empty local path: NOT retryable. A retry would open the
+                // path as a plain file and upload whatever the link points
+                // at (e.g. ~/.ssh/id_ed25519) — the very thing the walk
+                // refused to do.
+                p.failure(&name, "", &rpath, "symlink, skipped".into());
+                failed.push(format!("{lpath} (symlink, skipped)"));
+            } else {
+                match copy_local_file(sftp, p, &lpath, &rpath, overwrite).await {
+                    Ok(_) => {}
+                    Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+                    Err(e) => {
+                        p.failure(&name, &lpath, &rpath, format!("{e}"));
+                        failed.push(format!("{lpath}: {e}"));
+                        if sftp_dead(&e) {
+                            failed.push("the SFTP session stopped responding; the rest was skipped".into());
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    p.finish_tree();
+    if failed.is_empty() {
+        Ok(p.base)
+    } else {
+        Err(partial_summary(p.base, &failed))
+    }
 }
+
+/* ------------------------------------------------------------ local names */
+
+/// Reject a remote-supplied name that could escape the local target directory.
+///
+/// A malicious or compromised server controls the filenames it lists, and on
+/// download those names become LOCAL path components. A name like
+/// `..\Windows\evil` — or an absolute path, which `Path::join` uses to
+/// REPLACE the base entirely — would write outside the folder the user chose.
+/// This is the scp/zip-slip class; the defense is to accept only plain file
+/// names as path components.
+///
+/// The Windows-only hazards are checked on Windows only: on macOS and Linux
+/// `aux.c`, `con.h` or `report.` are ordinary, legal names.
+fn safe_local_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !(cfg!(windows) && !windows_name_ok(name))
+}
+
+/// The Windows rules: no ':' (drive letters, alternate data streams), no
+/// reserved device name, and no trailing '.' or ' ' — Win32 strips those, so
+/// `report` and `report.` in one server tree would silently write one file.
+fn windows_name_ok(name: &str) -> bool {
+    !name.contains(':')
+        && !is_windows_reserved(name)
+        && !name.ends_with('.')
+        && !name.ends_with(' ')
+}
+
+/// The longest file name (in bytes) the staging names below may produce.
+const NAME_MAX: usize = 255;
+
+/// A hidden staging name beside `name`: `.<name>.<tag><suffix>`, with `name`
+/// shortened (at a character boundary) so the whole stays within `NAME_MAX`
+/// bytes — a 250-byte file name must still transfer.
+fn staging_name(name: &str, tag: &str, suffix: &str) -> String {
+    let room = NAME_MAX.saturating_sub(2 + tag.len() + suffix.len());
+    let mut end = name.len().min(room);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(".{}.{tag}{suffix}", &name[..end])
+}
+
+const PART_SUFFIX: &str = ".hawserpart";
+const BAK_SUFFIX: &str = ".hawserbak";
+
+/// The remote sibling `dir/<staging name>` for `remote`.
+fn remote_staging(remote: &str, suffix: &str) -> String {
+    let (dir, name) = match remote.rfind('/') {
+        Some(i) => (&remote[..=i], &remote[i + 1..]),
+        None => ("", remote),
+    };
+    format!("{dir}{}", staging_name(name, &crate::utils::artifacts::random_hex(6), suffix))
+}
+
+/// Create a fresh local staging file beside `dest`: exclusive (an existing
+/// file or a planted symlink at that name fails the create instead of being
+/// followed), with a random name, and owner-only (0600) on Unix while it
+/// streams. Created in the folder that will hold `dest`, so the commit is a
+/// same-directory rename.
+async fn create_local_staging(
+    dest: &std::path::Path,
+) -> Result<(std::path::PathBuf, tokio::fs::File), SshError> {
+    let dir = match dest.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut last_err = None;
+    for _ in 0..8 {
+        let tmp = dir.join(staging_name(&name, &crate::utils::artifacts::random_hex(6), PART_SUFFIX));
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        match opts.open(&tmp).await {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last_err.map(SshError::from).unwrap_or_else(|| {
+        SshError::PartialTransfer("could not create a staging file".into())
+    }))
+}
+
+/* ------------------------------------------------------- download commit */
+
+/// The file operations `commit_download` uses, so tests can fail any one.
+trait CommitFs {
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>;
+    fn rename_noreplace(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>;
+    fn remove(&self, p: &std::path::Path) -> std::io::Result<()>;
+    fn exists(&self, p: &std::path::Path) -> bool;
+}
+
+struct RealFs;
+
+impl CommitFs for RealFs {
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+    fn rename_noreplace(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        crate::utils::artifacts::rename_noreplace(from, to)
+    }
+    fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+        std::fs::remove_file(p)
+    }
+    fn exists(&self, p: &std::path::Path) -> bool {
+        std::fs::symlink_metadata(p).is_ok()
+    }
+}
+
+/// Move a finished download from its staging file `tmp` to `dest`.
+///
+/// Never destroys both copies: on every failure either the original is still
+/// at `dest` or the error says where it went, and the downloaded copy stays at
+/// `tmp` (named in the error) unless the policy refused it.
+///
+/// - `replace == false`: an atomic no-replace rename. A file at `dest` (even
+///   one created after the user was asked) is never clobbered; the staged
+///   copy is then removed.
+/// - `replace == true`: an atomic rename over `dest`. If the platform refuses
+///   (Windows: something holds the file open), the original is moved aside to
+///   `bak`, the new copy put in place, and the backup dropped; if putting the
+///   new copy in place fails, the original is moved back.
+fn commit_download(
+    fs: &dyn CommitFs,
+    tmp: &std::path::Path,
+    dest: &std::path::Path,
+    bak: &std::path::Path,
+    replace: bool,
+) -> Result<(), String> {
+    let (t, d) = (tmp.display(), dest.display());
+    if !replace {
+        return match fs.rename_noreplace(tmp, dest) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs.remove(tmp);
+                Err(format!("{d} already exists; not overwriting it"))
+            }
+            Err(e) => {
+                // No atomic no-replace rename here (an old kernel, exFAT, a
+                // network share). Check, then rename: the window is a few
+                // microseconds, versus refusing every download on such disks.
+                if fs.exists(dest) {
+                    let _ = fs.remove(tmp);
+                    return Err(format!("{d} already exists; not overwriting it"));
+                }
+                fs.rename(tmp, dest).map_err(|e2| {
+                    format!(
+                        "could not move the download into place ({e}; {e2}); the downloaded \
+                         copy was kept at {t}"
+                    )
+                })
+            }
+        };
+    }
+    let e1 = match fs.rename(tmp, dest) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !fs.exists(dest) {
+        return Err(format!(
+            "could not move the download into place ({e1}); the downloaded copy was kept at {t}"
+        ));
+    }
+    if let Err(e2) = fs.rename_noreplace(dest, bak).or_else(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            Err(e)
+        } else {
+            fs.rename(dest, bak)
+        }
+    }) {
+        return Err(format!(
+            "could not replace {d} ({e1}; moving it aside failed: {e2}); the original is \
+             untouched and the downloaded copy was kept at {t}"
+        ));
+    }
+    match fs.rename(tmp, dest) {
+        Ok(()) => {
+            let _ = fs.remove(bak);
+            Ok(())
+        }
+        Err(e3) => match fs.rename(bak, dest) {
+            Ok(()) => Err(format!(
+                "could not replace {d} ({e3}); the original was restored and the downloaded \
+                 copy was kept at {t}"
+            )),
+            Err(e4) => Err(format!(
+                "could not replace {d} ({e3}) or restore it ({e4}): the original is at {} and \
+                 the downloaded copy at {t}",
+                bak.display()
+            )),
+        },
+    }
+}
+
+/* ---------------------------------------------------------- file copies */
 
 /// Copy one remote file to a local path, streaming with progress.
 async fn copy_remote_file(
-    sftp: &SftpSession,
-    app: &AppHandle,
-    session_id: &str,
+    sftp: &SftpConn,
+    p: &mut Progress<'_>,
     remote: &str,
     local: &str,
-    ctx: ProgressCtx<'_>,
+    overwrite: Overwrite,
 ) -> Result<u64, SshError> {
     // Never write THROUGH an existing symlink at the destination: a
     // server-controlled tree must not use a pre-placed link to redirect a
@@ -3705,67 +4568,97 @@ async fn copy_remote_file(
                 "refusing to overwrite a symlink: {local}"
             )));
         }
+        if meta.is_dir() {
+            return Err(SshError::PartialTransfer(format!(
+                "{local} is a folder here; refusing to replace it with a file"
+            )));
+        }
+        if !overwrite.allows_replace() {
+            return Err(already_exists(local));
+        }
     }
 
-    let total = sftp.metadata(remote).await.ok().and_then(|m| m.size).unwrap_or(0);
-    let mut src = sftp.open(remote).await?;
+    let rmeta = step(&p.cancel, sftp.hi.metadata(remote)).await.ok();
+    let total = rmeta.as_ref().and_then(|m| m.size).unwrap_or(0);
+    let mut src = step(&p.cancel, sftp.hi.open(remote)).await?;
 
-    // Stream to a unique temp file beside the destination, then atomically
-    // rename over it. A failed/cancelled/interrupted transfer therefore never
-    // destroys the existing file or leaves a truncated partial in its place.
-    let tmp = temp_sibling(local);
+    // Stream to a fresh staging file beside the destination, then commit it
+    // with a rename. A failed, cancelled or interrupted transfer therefore
+    // never destroys the existing file or leaves a truncated partial in its
+    // place.
+    let dest = std::path::PathBuf::from(local);
+    let staged = create_local_staging(&dest).await;
+    let (tmp, mut dst) = match staged {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = src.close().await;
+            return Err(e);
+        }
+    };
+    p.start_file(remote, total);
     let copy_result: Result<u64, SshError> = async {
-        let mut dst = tokio::fs::File::create(&tmp).await?;
-        let mut reporter = Reporter::new(app, session_id, remote, total, "download", ctx);
         let mut buf = vec![0u8; CHUNK];
         let mut done = 0u64;
         loop {
-            let n = src.read(&mut buf).await?;
+            let n = step(&p.cancel, src.read(&mut buf)).await?;
             if n == 0 {
                 break;
             }
-            dst.write_all(&buf[..n]).await?;
+            step(&p.cancel, dst.write_all(&buf[..n])).await?;
             done += n as u64;
-            reporter.tick(done);
+            p.tick(done);
         }
-        dst.flush().await?;
-        reporter.finish(done);
+        step(&p.cancel, dst.flush()).await?;
         Ok(done)
     }
     .await;
+    drop(dst);
 
     // Close the remote read handle explicitly. Dropping the SFTP `File` does NOT
     // send SSH_FXP_CLOSE, so a recursive download of a large tree would leak one
-    // server-side handle per file and eventually exhaust the server's limit —
-    // the download-side twin of the upload handle leak. Best-effort: a close
-    // failure must not fail an otherwise-complete transfer.
-    let _ = src.close().await;
+    // server-side handle per file and eventually exhaust the server's limit.
+    // Best-effort and bounded: a close failure must not fail an otherwise-
+    // complete transfer.
+    let _ = tokio::time::timeout(TRANSFER_STALL_TIMEOUT, src.close()).await;
 
-    match copy_result {
-        Ok(done) => {
-            // The temp was created with default permissions; an overwritten file
-            // keeps the mode it had (a 0600 secret must not come back 0644).
-            if let Some(meta) = existing.as_ref().filter(|m| m.is_file()) {
-                let _ = tokio::fs::set_permissions(&tmp, meta.permissions()).await;
-            }
-            // Atomic replace. std::fs::rename replaces an existing file on both
-            // Unix and Windows; if the platform refuses (e.g. dest locked),
-            // fall back to remove-then-rename rather than lose the new content.
-            if tokio::fs::rename(&tmp, local).await.is_err() {
-                let _ = tokio::fs::remove_file(local).await;
-                if let Err(e) = tokio::fs::rename(&tmp, local).await {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(e.into());
-                }
-            }
-            Ok(done)
-        }
+    let done = match copy_result {
+        Ok(done) => done,
         Err(e) => {
-            // Leave the original untouched; drop the partial temp.
+            // Leave the original untouched; drop the partial staging file.
             let _ = tokio::fs::remove_file(&tmp).await;
-            Err(e)
+            return Err(e);
         }
+    };
+
+    // The staging file is 0600 while it streams. It ends with the mode of
+    // the file it replaces (a 0600 secret stays 0600), or for a new file the
+    // remote file's permission bits (setuid/setgid/sticky dropped), as `scp
+    // -p` would. Unix only: Windows has no POSIX mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = existing
+            .as_ref()
+            .filter(|m| m.is_file())
+            .map(|m| m.permissions().mode() & 0o7777)
+            .or_else(|| rmeta.as_ref().and_then(|m| m.permissions).map(|m| m & 0o777))
+            .unwrap_or(0o644);
+        let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await;
     }
+
+    let bak = dest.with_file_name(staging_name(
+        &dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        &crate::utils::artifacts::random_hex(6),
+        BAK_SUFFIX,
+    ));
+    let replace = overwrite.allows_replace();
+    let (t2, d2) = (tmp.clone(), dest.clone());
+    let committed = tokio::task::spawn_blocking(move || commit_download(&RealFs, &t2, &d2, &bak, replace))
+        .await
+        .map_err(|e| SshError::PartialTransfer(format!("download commit failed: {e}")))?;
+    committed.map_err(SshError::PartialTransfer)?;
+    p.finish_file(done);
+    Ok(done)
 }
 
 /// The local file's permission bits, for a new remote file. Unix only — the
@@ -3783,281 +4676,345 @@ fn local_mode(meta: Option<&std::fs::Metadata>) -> Option<u32> {
     }
 }
 
-/// A unique sibling path for atomic writes: `<name>.<n>.hawserpart`. The counter
-/// makes concurrent transfers to the same directory collision-free.
-fn temp_sibling(path: &str) -> String {
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{path}.{n}.hawserpart")
+/// What is at an upload's destination before it starts.
+enum RemoteDest {
+    Missing,
+    /// STAT was refused (write-only drop boxes): it may or may not exist.
+    Unknown,
+    File(russh_sftp::protocol::FileAttributes),
+}
+
+/// How a staged upload's commit ended when it did not succeed atomically.
+enum UploadCommit {
+    Done,
+    /// The server would not rename the staged copy into place, and the
+    /// original (if any) is still at the destination: write in place instead.
+    InPlace,
+}
+
+/// Stream the local file into an already-open remote handle.
+async fn stream_up(
+    p: &mut Progress<'_>,
+    src: &mut tokio::fs::File,
+    dst: &mut russh_sftp::client::fs::File,
+) -> Result<u64, SshError> {
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    loop {
+        let n = step(&p.cancel, src.read(&mut buf)).await?;
+        if n == 0 {
+            break;
+        }
+        step(&p.cancel, dst.write_all(&buf[..n])).await?;
+        done += n as u64;
+        p.tick(done);
+    }
+    Ok(done)
 }
 
 /// Copy one local file to a remote path, streaming with progress.
+///
+/// The normal path writes a hidden staging file beside the destination and
+/// renames it into place (`posix-rename@openssh.com` when the server has it:
+/// an atomic replace with no moment where the file is missing). Two fallbacks
+/// write the destination IN PLACE, non-atomically, with a note to the user:
+/// the folder is not writable (only the file is), or the server will not
+/// rename. In place keeps the file's owner, ACLs and hard links; the price is
+/// that an interrupted transfer leaves it truncated.
 async fn copy_local_file(
-    sftp: &SftpSession,
-    app: &AppHandle,
-    session_id: &str,
+    sftp: &SftpConn,
+    p: &mut Progress<'_>,
     local: &str,
     remote: &str,
-    ctx: ProgressCtx<'_>,
+    overwrite: Overwrite,
 ) -> Result<u64, SshError> {
+    use russh_sftp::protocol::{FileAttributes, OpenFlags};
     let local_meta = tokio::fs::metadata(local).await.ok();
     let total = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let mut src = tokio::fs::File::open(local).await?;
 
-    // The temp-and-rename below replaces the remote inode, so its mode must be
-    // carried over explicitly: an overwritten file keeps its own permissions (a
-    // 0600 secret must not become 0644, a deploy script must keep +x); a new
-    // file takes the local file's mode where the platform has one. Refuse up
-    // front to replace a remote DIRECTORY with a file.
-    // Only a definite "no such file" means the destination is new. Permission
-    // denied (write-only dropboxes: SFTPGo upload-only users, ProFTPD
-    // <Limit READ>) leaves it UNKNOWN: still upload, but never replace an
-    // existing file whose mode we could not read — see `no_clobber` below. Any
-    // other STAT failure aborts.
-    use russh_sftp::protocol::StatusCode;
-    let mut no_clobber = false;
-    let remote_meta = match sftp.metadata(remote).await {
-        Ok(m) => Some(m),
-        Err(russh_sftp::client::error::Error::Status(st))
-            if st.status_code == StatusCode::NoSuchFile =>
-        {
-            None
-        }
-        Err(russh_sftp::client::error::Error::Status(st))
-            if st.status_code == StatusCode::PermissionDenied =>
-        {
-            no_clobber = true;
-            None
-        }
-        Err(e) => {
-            return Err(SshError::PartialTransfer(format!(
-                "could not check whether {remote} already exists ({e}); not overwriting it"
-            )))
+    // What is there now. LSTAT, so a symlink is seen as one: renaming over a
+    // link would replace the LINK with a plain file and never update what it
+    // points at. Only a definite "no such file" means new; a refused STAT
+    // (write-only drop boxes: SFTPGo upload-only users, ProFTPD <Limit READ>,
+    // appliances answering a generic failure) leaves it UNKNOWN: still upload,
+    // but never replace. Any other failure aborts.
+    let lstat = step(&p.cancel, sftp.hi.symlink_metadata(remote)).await;
+    let classify = |r: Result<FileAttributes, SshError>, path: &str| -> Result<RemoteDest, SshError> {
+        match r {
+            Ok(m) if m.file_type().is_dir() => Err(SshError::PartialTransfer(format!(
+                "{path} is a directory on the server; refusing to replace it with a file"
+            ))),
+            Ok(m) => Ok(RemoteDest::File(m)),
+            Err(SshError::Sftp(e)) => match sftp_status(&e) {
+                Some(StatusCode::NoSuchFile) => Ok(RemoteDest::Missing),
+                Some(StatusCode::PermissionDenied | StatusCode::Failure | StatusCode::OpUnsupported) => {
+                    Ok(RemoteDest::Unknown)
+                }
+                _ => Err(SshError::PartialTransfer(format!(
+                    "could not check whether {path} already exists ({e}); not overwriting it"
+                ))),
+            },
+            Err(e) => Err(e),
         }
     };
-    if remote_meta.as_ref().is_some_and(|m| m.file_type().is_dir()) {
-        return Err(SshError::PartialTransfer(format!(
-            "{remote} is a directory on the server; refusing to replace it with a file"
-        )));
-    }
-    let mode = remote_meta
-        .as_ref()
-        .and_then(|m| m.permissions)
-        .map(|p| p & 0o7777)
-        .or_else(|| local_mode(local_meta.as_ref()))
-        // Destination unknown: take the server's default rather than impose
-        // the local mode on what may be an existing file.
-        .filter(|_| !no_clobber);
-    // Overwriting a file whose mode we know: it MUST survive the replace. A new
-    // file's mode is only a best effort (the server's umask may trim it).
-    let preserve_required = remote_meta.as_ref().and_then(|m| m.permissions).is_some();
-
-    // Stream to a unique temp file beside the destination, then rename over it,
-    // exactly as the download does. `sftp.create` truncates, so writing straight
-    // to `remote` would destroy the existing file the moment the transfer began:
-    // a connection drop, disk-full, or cancel would then leave a truncated
-    // remote file with the original gone.
-    let tmp = temp_sibling(remote);
-    let copy_result: Result<u64, SshError> = async {
-        // Created WITH the mode, so a secret is never briefly world-readable in
-        // the temp; set again after the write because the server's umask may
-        // have trimmed it at create time.
-        let attrs = russh_sftp::protocol::FileAttributes {
-            permissions: mode,
-            ..Default::default()
-        };
-        let mut dst = sftp
-            .open_with_flags_and_attributes(
-                tmp.clone(),
-                russh_sftp::protocol::OpenFlags::CREATE
-                    | russh_sftp::protocol::OpenFlags::TRUNCATE
-                    | russh_sftp::protocol::OpenFlags::WRITE,
-                attrs,
-            )
-            .await?;
-        let mut reporter = Reporter::new(app, session_id, local, total, "upload", ctx);
-        let mut buf = vec![0u8; CHUNK];
-        let mut done = 0u64;
-        loop {
-            let n = src.read(&mut buf).await?;
-            if n == 0 {
-                break;
+    let (target, dest) = match lstat {
+        Ok(m) if m.file_type().is_symlink() => {
+            // Write THROUGH the link, as `cp` does — but only with the user's
+            // say-so: the frontend asked about this name (a link, even a
+            // dangling one, counts as existing).
+            if !overwrite.allows_replace() {
+                return Err(already_exists(remote));
             }
-            dst.write_all(&buf[..n]).await?;
-            done += n as u64;
-            reporter.tick(done);
+            let real = step(&p.cancel, sftp.hi.canonicalize(remote)).await.map_err(|e| {
+                SshError::PartialTransfer(format!(
+                    "{remote} is a symlink whose target could not be resolved ({e}); not \
+                     replacing it"
+                ))
+            })?;
+            let dest = classify(step(&p.cancel, sftp.hi.metadata(real.clone())).await, &real)?;
+            if matches!(dest, RemoteDest::Missing) {
+                return Err(SshError::PartialTransfer(format!(
+                    "{remote} is a symlink to {real}, which does not exist; not replacing it"
+                )));
+            }
+            p.note(format!("{remote} is a symlink: wrote through it to {real}"));
+            (real, dest)
         }
+        other => (remote.to_string(), classify(other, remote)?),
+    };
+    if matches!(dest, RemoteDest::File(_)) && !overwrite.allows_replace() {
+        return Err(already_exists(&target));
+    }
+    let replace = matches!(dest, RemoteDest::File(_)) && overwrite.allows_replace();
+
+    // The rename replaces the remote inode, so its mode must be carried over
+    // explicitly: an overwritten file keeps its own permissions (a 0600 secret
+    // must not become 0644, a deploy script must keep +x); a new file takes the
+    // local file's mode where the platform has one; an unknown destination
+    // takes the server's default.
+    let (mode, preserve_required) = match &dest {
+        RemoteDest::File(m) => (m.permissions.map(|p| p & 0o7777), m.permissions.is_some()),
+        RemoteDest::Missing => (local_mode(local_meta.as_ref()), false),
+        RemoteDest::Unknown => (None, false),
+    };
+
+    let mut src = tokio::fs::File::open(local).await?;
+    p.start_file(local, total);
+
+    // Stage. EXCLUDE: never open something already at the staging name.
+    let tmp = remote_staging(&target, PART_SUFFIX);
+    let attrs = FileAttributes { permissions: mode, ..Default::default() };
+    let opened = step(
+        &p.cancel,
+        sftp.hi.open_with_flags_and_attributes(
+            tmp.clone(),
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            attrs,
+        ),
+    )
+    .await;
+    let mut dst = match opened {
+        Ok(f) => f,
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::PermissionDenied) => {
+            // The folder is not writable, only (perhaps) the file.
+            let done = write_in_place(sftp, p, &mut src, &target, replace, mode).await?;
+            p.note(format!(
+                "{target}: the folder is not writable, so the file was written in place \
+                 (not atomic: an interrupted transfer would leave it incomplete)"
+            ));
+            p.finish_file(done);
+            return Ok(done);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let staged: Result<u64, SshError> = async {
+        let done = stream_up(p, &mut src, &mut dst).await?;
         if let Some(m) = mode {
-            let set = dst
-                .set_metadata(russh_sftp::protocol::FileAttributes {
-                    permissions: Some(m),
-                    ..Default::default()
-                })
-                .await;
+            let set = step(
+                &p.cancel,
+                dst.set_metadata(FileAttributes { permissions: Some(m), ..Default::default() }),
+            )
+            .await;
             // FSETSTAT may be denied or unsupported. Retry by path (SETSTAT; the
-            // temp is our own unique sibling), then accept it if the permission
-            // bits match. Otherwise, for an overwrite, fail BEFORE the rename so
-            // the original (and its permissions) stays. Special bits are not
+            // staging file is our own), then accept it if the permission bits
+            // match. Otherwise, for an overwrite, fail BEFORE the rename so the
+            // original (and its permissions) stays. Special bits are not
             // compared: servers/kernels routinely strip setuid/setgid.
             if set.is_err() && preserve_required {
-                let _ = sftp
-                    .set_metadata(
+                let _ = step(
+                    &p.cancel,
+                    sftp.hi.set_metadata(
                         tmp.clone(),
-                        russh_sftp::protocol::FileAttributes {
-                            permissions: Some(m),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let actual = sftp
-                    .metadata(tmp.clone())
+                        FileAttributes { permissions: Some(m), ..Default::default() },
+                    ),
+                )
+                .await;
+                let actual = step(&p.cancel, sftp.hi.metadata(tmp.clone()))
                     .await
                     .ok()
                     .and_then(|md| md.permissions)
                     .map(|p| p & 0o777);
                 if actual != Some(m & 0o777) {
-                    // Close explicitly so it completes before the temp is
-                    // removed (some servers cannot delete an open file).
-                    let _ = dst.shutdown().await;
                     return Err(SshError::PartialTransfer(format!(
-                        "could not preserve the permissions ({m:o}) of {remote}; left it unchanged"
+                        "could not preserve the permissions ({m:o}) of {target}; left it unchanged"
                     )));
                 }
             }
         }
         // shutdown (not just flush) closes the remote handle, which must happen
         // before the rename and also avoids leaking the SFTP handle.
-        dst.shutdown().await?;
-        reporter.finish(done);
+        step(&p.cancel, dst.shutdown()).await?;
         Ok(done)
     }
     .await;
 
-    match copy_result {
-        Ok(done) => {
-            // Atomic replace. SSH_FXP_RENAME does not universally replace an
-            // existing target, so if the direct rename fails, move the existing
-            // file ASIDE to a backup (never delete it) before putting the new
-            // one in place — so a second failure or a dropped connection cannot
-            // destroy the original with nothing to recover.
-            if let Err(e) = sftp.rename(tmp.clone(), remote.to_string()).await {
-                // Existence/mode unknown: SFTPv3 RENAME does not overwrite, so a
-                // failure likely means a file is there. Leave it alone.
-                if no_clobber {
-                    let _ = sftp.remove_file(tmp).await;
-                    return Err(SshError::PartialTransfer(format!(
-                        "{remote} may already exist and its permissions could not be read; \
-                         not overwriting it ({e})"
-                    )));
-                }
-                let bak = format!("{tmp}.bak");
-                let _ = sftp.remove_file(bak.clone()).await; // clear any stale backup
-                let moved = sftp.rename(remote.to_string(), bak.clone()).await.is_ok();
-                match sftp.rename(tmp.clone(), remote.to_string()).await {
-                    Ok(()) => {
-                        if moved {
-                            let _ = sftp.remove_file(bak).await;
-                        }
-                    }
-                    Err(e) => {
-                        // Restore the original rather than leave nothing behind.
-                        if moved {
-                            let _ = sftp.rename(bak, remote.to_string()).await;
-                        }
-                        let _ = sftp.remove_file(tmp).await;
-                        return Err(e.into());
-                    }
-                }
-            }
+    let done = match staged {
+        Ok(done) => done,
+        Err(e) => {
+            // Close explicitly so it completes before the staging file is
+            // removed (some servers cannot delete an open file). Leave the
+            // original untouched; drop the partial staging file. Bounded, and
+            // run even after a cancel: the connection is still up.
+            let _ = tokio::time::timeout(TRANSFER_STALL_TIMEOUT, dst.shutdown()).await;
+            let _ = tokio::time::timeout(TRANSFER_STALL_TIMEOUT, sftp.hi.remove_file(tmp)).await;
+            return Err(e);
+        }
+    };
+
+    match commit_upload(sftp, &p.cancel, &tmp, &target, replace).await {
+        Ok(UploadCommit::Done) => {
+            p.finish_file(done);
+            Ok(done)
+        }
+        Ok(UploadCommit::InPlace) => {
+            let _ = tokio::time::timeout(TRANSFER_STALL_TIMEOUT, sftp.hi.remove_file(tmp)).await;
+            use tokio::io::AsyncSeekExt;
+            step(&p.cancel, src.seek(std::io::SeekFrom::Start(0))).await?;
+            p.start_file(local, total);
+            let done = write_in_place(sftp, p, &mut src, &target, replace, mode).await?;
+            p.note(format!(
+                "{target}: the server would not rename the uploaded copy into place, so the \
+                 file was written in place (not atomic)"
+            ));
+            p.finish_file(done);
             Ok(done)
         }
         Err(e) => {
-            // Leave the original untouched; drop the partial temp.
-            let _ = sftp.remove_file(tmp).await;
+            let _ = tokio::time::timeout(TRANSFER_STALL_TIMEOUT, sftp.hi.remove_file(tmp)).await;
             Err(e)
         }
     }
 }
 
-/* ------------------------------------------------------------- progress */
-
-/// Throttled progress emitter. Kept as a small struct so both transfer
-/// directions share one policy instead of duplicating the timing logic.
-struct Reporter<'a> {
-    app: &'a AppHandle,
-    payload: TransferProgress,
-    last: Instant,
-    /// Bytes already moved by earlier files of the same tree.
-    base: u64,
-    /// Part of a folder transfer: the row's total is unknown, so never report
-    /// one file's size (or completion) as the tree's.
-    tree: bool,
-}
-
-/// Where a single file copy sits in its transfer, for progress reporting.
-#[derive(Clone, Copy)]
-struct ProgressCtx<'a> {
-    root: &'a str,
-    base: u64,
-    tree: bool,
-}
-
-impl<'a> ProgressCtx<'a> {
-    fn single(path: &'a str) -> Self {
-        Self { root: path, base: 0, tree: false }
-    }
-}
-
-impl<'a> Reporter<'a> {
-    fn new(
-        app: &'a AppHandle,
-        session_id: &str,
-        file_path: &str,
-        total_bytes: u64,
-        direction: &'static str,
-        ctx: ProgressCtx<'_>,
-    ) -> Self {
-        let payload = TransferProgress {
-            session_id: session_id.to_string(),
-            root: ctx.root.to_string(),
-            file_path: file_path.to_string(),
-            bytes_transferred: ctx.base,
-            total_bytes: if ctx.tree { 0 } else { total_bytes },
-            direction,
-            done: false,
+/// Put a staged upload at `target`. See `copy_local_file`.
+async fn commit_upload(
+    sftp: &SftpConn,
+    cancel: &watch::Receiver<bool>,
+    tmp: &str,
+    target: &str,
+    replace: bool,
+) -> Result<UploadCommit, SshError> {
+    if !replace {
+        // SFTPv3 RENAME fails if the target exists (draft-ietf-secsh-filexfer
+        // -02 §6.5; OpenSSH links then unlinks), so this is the no-clobber
+        // commit: a file that appeared since the check is never replaced.
+        return match step(cancel, sftp.hi.rename(tmp, target)).await {
+            Ok(()) => Ok(UploadCommit::Done),
+            Err(SshError::TransferCancelled) => Err(SshError::TransferCancelled),
+            Err(e) if sftp_dead(&e) => Err(e),
+            Err(_) => match step(cancel, sftp.hi.symlink_metadata(target)).await {
+                Ok(_) => Err(already_exists(target)),
+                Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => {
+                    Ok(UploadCommit::InPlace)
+                }
+                Err(e) => Err(e),
+            },
         };
-        // Emit once immediately so the row appears with a denominator rather
-        // than sitting blank until the first interval elapses.
-        let _ = app.emit("sftp://progress", payload.clone());
-        Self {
-            app,
-            payload,
-            last: Instant::now(),
-            base: ctx.base,
-            tree: ctx.tree,
-        }
     }
-
-    fn tick(&mut self, bytes: u64) {
-        if self.last.elapsed() < PROGRESS_INTERVAL {
-            return;
-        }
-        self.last = Instant::now();
-        self.payload.bytes_transferred = self.base + bytes;
-        let _ = self.app.emit("sftp://progress", self.payload.clone());
-    }
-
-    /// Always emitted, regardless of throttling, so the UI never stalls at 97%.
-    fn finish(&mut self, bytes: u64) {
-        self.payload.bytes_transferred = self.base + bytes;
-        if !self.tree {
-            if self.payload.total_bytes == 0 {
-                self.payload.total_bytes = bytes;
+    if sftp.posix_rename {
+        if let Some(raw) = sftp.raw.as_ref() {
+            match step(cancel, posix_rename(raw, tmp, target)).await {
+                Ok(()) => return Ok(UploadCommit::Done),
+                Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+                Err(e) if sftp_dead(&e) => return Err(e),
+                // Refused (a policy, a filesystem quirk): try the portable way.
+                Err(_) => {}
             }
-            self.payload.done = true;
         }
-        let _ = self.app.emit("sftp://progress", self.payload.clone());
     }
+    // Some servers' RENAME does replace. Where it does not, move the existing
+    // file ASIDE (never delete it) before putting the new one in place, so a
+    // second failure or a dropped connection cannot destroy the original with
+    // nothing to recover.
+    if step(cancel, sftp.hi.rename(tmp, target)).await.is_ok() {
+        return Ok(UploadCommit::Done);
+    }
+    let bak = remote_staging(target, BAK_SUFFIX);
+    match step(cancel, sftp.hi.rename(target, bak.clone())).await {
+        Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+        Err(e) if sftp_dead(&e) => return Err(e),
+        // Cannot even move the original: the server does not rename here.
+        Err(_) => return Ok(UploadCommit::InPlace),
+        Ok(()) => {}
+    }
+    // From here the original is at `bak`: no cancel until it is back in place
+    // or replaced.
+    let never = watch::channel(false).1;
+    match step(&never, sftp.hi.rename(tmp, target)).await {
+        Ok(()) => {
+            let _ = step(&never, sftp.hi.remove_file(bak)).await;
+            Ok(UploadCommit::Done)
+        }
+        Err(e) => match step(&never, sftp.hi.rename(bak.clone(), target)).await {
+            Ok(()) if !sftp_dead(&e) => Ok(UploadCommit::InPlace),
+            Ok(()) => Err(e),
+            Err(e2) => Err(SshError::PartialTransfer(format!(
+                "could not replace {target} ({e}) or restore it ({e2}); the original is at {bak}"
+            ))),
+        },
+    }
+}
+
+/// The non-atomic fallback: write `target` itself. `replace` truncates an
+/// existing file; otherwise the create is exclusive, so an existing file is
+/// never touched.
+async fn write_in_place(
+    sftp: &SftpConn,
+    p: &mut Progress<'_>,
+    src: &mut tokio::fs::File,
+    target: &str,
+    replace: bool,
+    mode: Option<u32>,
+) -> Result<u64, SshError> {
+    use russh_sftp::protocol::{FileAttributes, OpenFlags};
+    let (flags, attrs) = if replace {
+        // An existing file keeps its own mode, owner and ACLs.
+        (OpenFlags::WRITE | OpenFlags::TRUNCATE, FileAttributes::default())
+    } else {
+        (
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            FileAttributes { permissions: mode, ..Default::default() },
+        )
+    };
+    let mut dst = match step(&p.cancel, sftp.hi.open_with_flags_and_attributes(target, flags, attrs)).await {
+        Ok(f) => f,
+        Err(SshError::Sftp(e))
+            if !replace && sftp_status(&e) == Some(StatusCode::Failure) =>
+        {
+            // OpenSSH reports EEXIST on an exclusive create as a generic
+            // failure; say what it most likely means.
+            return Err(SshError::PartialTransfer(format!(
+                "could not create {target} ({e}); it may already exist, so it was not overwritten"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let r = stream_up(p, src, &mut dst).await;
+    let closed = step(&p.cancel, dst.shutdown()).await;
+    let done = r?;
+    closed?;
+    Ok(done)
 }
 
 /// One SOCKS5 CONNECT conversation, then a bidirectional pump.
@@ -4153,25 +5110,27 @@ async fn run_pump(
     death: DeathNote,
     forwards: Arc<DashMap<String, Forward>>,
     startup: Vec<String>,
+    startup_guard: Option<ShellGuard>,
 ) {
     let Ok(mut log) = go.await else { return };
     let topic = format!("ssh://{sid}");
     // Startup input goes out concurrently with this loop, never before it:
     // see `send_startup`. Aborted with the pump (the guard's drop), so it
     // never outlives the session's reader.
-    let _startup = AbortOnDrop({
+    let _startup = startup_guard.map(|guard| {
         let session = Arc::clone(&session);
         let (app, topic) = (app.clone(), topic.clone());
-        tokio::spawn(async move {
-            if let Err(e) = send_startup(&session.shell, &startup, CHANNEL_SETUP_TIMEOUT).await {
+        AbortOnDrop(tokio::spawn(async move {
+            let report = |e: &SshError| {
                 if session.alive.load(Ordering::SeqCst) {
                     let _ = app.emit(
                         &topic,
                         format!("\x1b[38;2;242;178;92mstartup commands not sent: {e}\x1b[0m\r\n"),
                     );
                 }
-            }
-        })
+            };
+            let _ = send_startup(guard, &startup, CHANNEL_SETUP_TIMEOUT, report).await;
+        }))
     });
     // Incomplete UTF-8 tails carried to the next chunk, one per stream: a
     // packet boundary can split a multi-byte character, and decoding each chunk
@@ -4510,12 +5469,14 @@ mod tests {
 
     #[test]
     fn rejects_windows_reserved_names() {
-        assert!(!safe_local_component("CON"));
-        assert!(!safe_local_component("nul")); // case-insensitive
-        assert!(!safe_local_component("NUL.txt")); // extension ignored
-        assert!(!safe_local_component("COM1"));
-        assert!(!safe_local_component("LPT9"));
-        // Names that merely start with a reserved stem are fine.
+        assert!(is_windows_reserved("CON"));
+        assert!(is_windows_reserved("nul")); // case-insensitive
+        assert!(is_windows_reserved("NUL.txt")); // extension ignored
+        assert!(is_windows_reserved("COM1"));
+        assert!(is_windows_reserved("LPT9"));
+        // Refused as download names on Windows only (see the test below).
+        assert_eq!(safe_local_component("CON"), !cfg!(windows));
+        // Names that merely start with a reserved stem are fine everywhere.
         assert!(safe_local_component("console.log"));
         assert!(safe_local_component("com10"));
         assert!(safe_local_component("nullable.rs"));
@@ -5141,7 +6102,7 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
 
         let h = test_session(ShellMode::Flood, 4096).await;
         let (mut read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
-        let shell = Mutex::new(Some(write));
+        let shell = Arc::new(Mutex::new(Some(write)));
         let reader = tokio::spawn(async move {
             let mut n = 0usize;
             while let Some(m) = read.wait().await {
@@ -5151,7 +6112,8 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
             }
             n
         });
-        send_startup(&shell, &commands, Duration::from_secs(10))
+        let guard = Arc::clone(&shell).lock_owned().await;
+        send_startup(guard, &commands, Duration::from_secs(10), |_| {})
             .await
             .expect("startup input stalled although output was being read");
         reader.abort();
@@ -5159,11 +6121,332 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
         // Control: the same, with the output left unread, deadlocks.
         let h = test_session(ShellMode::Flood, 4096).await;
         let (_read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
-        let shell = Mutex::new(Some(write));
+        let shell = Arc::new(Mutex::new(Some(write)));
+        let guard = Arc::clone(&shell).lock_owned().await;
+        // A Ctrl-U that cannot go out either: bound the whole call.
+        let r = tokio::time::timeout(
+            Duration::from_secs(4),
+            send_startup(guard, &commands, Duration::from_secs(2), |_| {}),
+        )
+        .await;
         assert!(
-            send_startup(&shell, &commands, Duration::from_secs(2)).await.is_err(),
+            !matches!(r, Ok(Ok(()))),
             "expected the unread session to block the startup input"
         );
+    }
+
+    /// The writer is taken before the session is exposed (here: before the
+    /// "user" task starts), so a keystroke cannot overtake the startup lines;
+    /// and a line cut off by the deadline keeps the writer until a Ctrl-U has
+    /// gone out after it, so the user's typing never extends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_holds_the_writer_and_never_leaves_a_partial_line() {
+        let h = test_session(ShellMode::Flood, 4096).await;
+        let (mut read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
+        let shell = Arc::new(Mutex::new(Some(write)));
+        let guard = Arc::clone(&shell).lock_owned().await;
+        // Nobody reads the flood yet: one long line stalls part-way.
+        let commands = vec![format!("echo {}", "z".repeat(256 * 1024))];
+        let reported = Arc::new(AtomicBool::new(false));
+        let rep = Arc::clone(&reported);
+        let startup = tokio::spawn(async move {
+            send_startup(guard, &commands, Duration::from_millis(500), move |_| {
+                rep.store(true, Ordering::SeqCst)
+            })
+            .await
+        });
+        // "User input" queued right after registration must wait.
+        let user_shell = Arc::clone(&shell);
+        let user = tokio::spawn(async move {
+            let g = user_shell.lock().await;
+            drop(g);
+            Instant::now()
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(reported.load(Ordering::SeqCst), "the timeout was not reported");
+        assert!(!user.is_finished(), "user input got the writer mid-line");
+        // Output drains: the window opens, the Ctrl-U goes out, the writer frees.
+        let reader = tokio::spawn(async move { while read.wait().await.is_some() {} });
+        let r = tokio::time::timeout(Duration::from_secs(10), startup).await.unwrap().unwrap();
+        assert!(r.is_err());
+        tokio::time::timeout(Duration::from_secs(5), user).await.unwrap().unwrap();
+        reader.abort();
+    }
+
+    /// Two streams on one switch (a ProxyJump attempt: bastion socket and the
+    /// target's channel), each with a write parked on a full pipe in its own
+    /// task: firing must wake BOTH.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_switch_wakes_every_parked_stream() {
+        let kill = Kill::default();
+        let mut tasks = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (a, b) = tokio::io::duplex(16);
+            peers.push(b); // never read: writes park once 16 bytes are queued
+            let mut s = Killable::new(a, kill.clone());
+            tasks.push(tokio::spawn(async move {
+                let r = s.write_all(&[0u8; 4096]).await;
+                let f = s.flush().await;
+                (r, f)
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(tasks.iter().all(|t| !t.is_finished()), "writes should be parked");
+        kill.fire();
+        for t in tasks {
+            let (r, _) = tokio::time::timeout(Duration::from_secs(2), t)
+                .await
+                .expect("a parked stream was not woken by the kill switch")
+                .unwrap();
+            assert!(r.is_err());
+        }
+        drop(peers);
+    }
+
+    #[test]
+    fn exec_refusal_and_stderr_are_reported_apart() {
+        let refused = ExecRun { refused: true, ..Default::default() };
+        let e = exec_verdict(refused, 60).unwrap_err().to_string();
+        assert!(e.contains("refused"), "{e}");
+
+        let ok = ExecRun {
+            out: b"hostname r1\n".to_vec(),
+            err: b"setlocale: LC_ALL: cannot change locale\n".to_vec(),
+            eof: true,
+            confirmed: true,
+            exit_status: Some(0),
+            ..Default::default()
+        };
+        let out = exec_verdict(ok, 60).unwrap();
+        assert_eq!(out.stdout, "hostname r1\n");
+        assert!(!out.stdout.contains("setlocale"));
+        assert!(out.labelled().contains("--- stderr ---\nsetlocale"));
+
+        let failed = ExecRun {
+            err: b"% Invalid input\n".to_vec(),
+            eof: true,
+            confirmed: true,
+            exit_status: Some(1),
+            ..Default::default()
+        };
+        let e = exec_verdict(failed, 60).unwrap_err().to_string();
+        assert!(e.contains("status 1") && e.contains("Invalid input"), "{e}");
+    }
+
+    const TEST_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB+/n96rvl1Y2SBn57bwTmXu97HnHY2TsdHXejQUPbo7 hawser test";
+
+    #[test]
+    fn public_key_is_validated_before_install() {
+        assert_eq!(validate_public_key(&format!("  {TEST_PUB}\n")).unwrap(), TEST_PUB);
+        assert!(validate_public_key("").is_err());
+        assert!(validate_public_key("   ").is_err());
+        assert!(validate_public_key(&format!("{TEST_PUB}\n{TEST_PUB}")).is_err());
+        assert!(validate_public_key(&format!("-{TEST_PUB}")).is_err());
+        assert!(validate_public_key(&format!("{TEST_PUB} it's")).is_err());
+        assert!(validate_public_key("-----BEGIN OPENSSH PRIVATE KEY-----").is_err());
+        assert!(validate_public_key("hello world").is_err());
+    }
+
+    /// The install command, run for real by the login shells it must survive:
+    /// it installs once, is idempotent, and fixes a missing final newline.
+    #[cfg(unix)]
+    #[test]
+    fn copy_id_command_installs_through_posix_and_csh_login_shells() {
+        let cmd = copy_id_command(TEST_PUB);
+        assert!(cmd.starts_with("exec sh -c '"));
+        assert!(!cmd.contains('\n'), "csh refuses a newline inside quotes");
+        for shell in ["/bin/sh", "/bin/csh", "/bin/tcsh"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let home = std::env::temp_dir().join(format!(
+                "hawser-copyid-{}-{}",
+                std::process::id(),
+                crate::utils::artifacts::random_hex(4)
+            ));
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            std::fs::write(home.join(".ssh/authorized_keys"), "ssh-rsa AAAA old").unwrap();
+            for _ in 0..2 {
+                let out = std::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(&cmd)
+                    .env("HOME", &home)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains("HAWSER_KEY_OK"), "{shell}: {text} {}", String::from_utf8_lossy(&out.stderr));
+            }
+            let ak = std::fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+            assert_eq!(ak, format!("ssh-rsa AAAA old\n{TEST_PUB}\n"), "{shell}");
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
+    fn staging_names_fit_name_max_and_are_hidden() {
+        let long = "a".repeat(255);
+        let n = staging_name(&long, "0123456789ab", PART_SUFFIX);
+        assert!(n.len() <= NAME_MAX, "{}", n.len());
+        assert!(n.starts_with('.') && n.ends_with(PART_SUFFIX));
+        // A multi-byte name is cut at a character boundary.
+        let wide = "é".repeat(200);
+        let n = staging_name(&wide, "0123456789ab", BAK_SUFFIX);
+        assert!(n.len() <= NAME_MAX);
+        assert!(std::str::from_utf8(n.as_bytes()).is_ok());
+        assert_eq!(staging_name("f.txt", "t", PART_SUFFIX), ".f.txt.t.hawserpart");
+        assert_eq!(remote_staging("/etc/f", PART_SUFFIX).len(), "/etc/.f.".len() + 12 + PART_SUFFIX.len());
+    }
+
+    #[test]
+    fn windows_only_name_rules_stay_on_windows() {
+        // Legal on macOS/Linux, refused on Windows.
+        for name in ["aux.c", "con.h", "NUL", "com1.log", "report.", "notes "] {
+            assert_eq!(safe_local_component(name), !cfg!(windows), "{name}");
+        }
+    }
+
+    #[test]
+    fn overwrite_policy_parses_and_defaults_to_never() {
+        assert_eq!(Overwrite::parse(None).unwrap(), Overwrite::Never);
+        assert_eq!(Overwrite::parse(Some("confirmed")).unwrap(), Overwrite::Confirmed);
+        assert!(Overwrite::parse(Some("replace")).unwrap().allows_replace());
+        assert!(!Overwrite::Never.allows_replace());
+        assert!(Overwrite::parse(Some("yes")).is_err());
+    }
+
+    /// Real file operations, with chosen calls made to fail.
+    struct FailFs {
+        /// Fail the Nth call (0-based) of each kind, by kind name.
+        fail: Vec<(&'static str, usize)>,
+        calls: std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
+    }
+
+    impl FailFs {
+        fn new(fail: &[(&'static str, usize)]) -> Self {
+            Self { fail: fail.to_vec(), calls: Default::default() }
+        }
+        fn hit(&self, kind: &'static str) -> std::io::Result<()> {
+            let mut c = self.calls.lock().unwrap();
+            let n = c.entry(kind).or_insert(0);
+            let this = *n;
+            *n += 1;
+            if self.fail.contains(&(kind, this)) {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("injected {kind}#{this}")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl CommitFs for FailFs {
+        fn rename(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            self.hit("rename")?;
+            std::fs::rename(a, b)
+        }
+        fn rename_noreplace(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            self.hit("noreplace")?;
+            RealFs.rename_noreplace(a, b)
+        }
+        fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+            self.hit("remove")?;
+            std::fs::remove_file(p)
+        }
+        fn exists(&self, p: &std::path::Path) -> bool {
+            RealFs.exists(p)
+        }
+    }
+
+    fn commit_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "hawser-commit-{tag}-{}-{}",
+            std::process::id(),
+            crate::utils::artifacts::random_hex(4)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn read(p: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(p).ok()
+    }
+
+    #[test]
+    fn download_commit_never_destroys_both_copies() {
+        // Each case: injected failures -> (dest content, tmp kept?, bak content).
+        let cases: &[(&[(&str, usize)], bool, Option<&str>, bool, Option<&str>)] = &[
+            // ok?, dest,        tmp kept, bak
+            (&[], true, Some("new"), false, None),
+            // Atomic replace refused, aside+in works.
+            (&[("rename", 0)], true, Some("new"), false, None),
+            // Cannot move the original aside: original untouched, new kept.
+            (&[("rename", 0), ("noreplace", 0), ("rename", 1)], false, Some("old"), true, None),
+            // New copy cannot go in: original restored, new kept.
+            (&[("rename", 0), ("rename", 1)], false, Some("old"), true, None),
+            // ...and the restore fails too: original at bak, new kept.
+            (&[("rename", 0), ("rename", 1), ("rename", 2)], false, None, true, Some("old")),
+        ];
+        for (i, (fail, ok, dest_c, tmp_kept, bak_c)) in cases.iter().enumerate() {
+            let d = commit_dir(&format!("r{i}"));
+            let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+            std::fs::write(&tmp, "new").unwrap();
+            std::fs::write(&dest, "old").unwrap();
+            let fs = FailFs::new(fail);
+            let r = commit_download(&fs, &tmp, &dest, &bak, true);
+            assert_eq!(r.is_ok(), *ok, "case {i}: {r:?}");
+            assert_eq!(read(&dest).as_deref(), *dest_c, "case {i} dest");
+            assert_eq!(tmp.exists(), *tmp_kept, "case {i} tmp");
+            assert_eq!(read(&bak).as_deref(), *bak_c, "case {i} bak");
+            if let Err(e) = &r {
+                assert!(e.contains(&tmp.display().to_string()), "case {i}: error must name the kept copy: {e}");
+            }
+            // Never: one of the two contents survives somewhere.
+            let survivors = [read(&dest), read(&tmp), read(&bak)];
+            assert!(survivors.contains(&Some("new".into())), "case {i}: new copy lost");
+            assert!(*ok || survivors.contains(&Some("old".into())), "case {i}: original lost");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn download_commit_no_clobber_is_enforced_at_commit() {
+        let d = commit_dir("nc");
+        let (tmp, dest, bak) = (d.join(".g.x.hawserpart"), d.join("g"), d.join(".g.x.hawserbak"));
+        // Free destination: lands.
+        std::fs::write(&tmp, "new").unwrap();
+        commit_download(&RealFs, &tmp, &dest, &bak, false).unwrap();
+        assert_eq!(read(&dest).as_deref(), Some("new"));
+        // A file appeared there "after the prompt": never replaced.
+        std::fs::write(&dest, "theirs").unwrap();
+        std::fs::write(&tmp, "new").unwrap();
+        let e = commit_download(&RealFs, &tmp, &dest, &bak, false).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(read(&dest).as_deref(), Some("theirs"));
+        assert!(!tmp.exists());
+        // Without an atomic no-replace rename the fallback still refuses.
+        std::fs::write(&tmp, "new").unwrap();
+        let fs = FailFs::new(&[("noreplace", 0)]);
+        assert!(commit_download(&fs, &tmp, &dest, &bak, false).is_err());
+        assert_eq!(read(&dest).as_deref(), Some("theirs"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn local_staging_is_exclusive_private_and_in_the_destination_folder() {
+        let d = commit_dir("stage");
+        let dest = d.join("x".repeat(250));
+        let (a, _fa) = create_local_staging(&dest).await.unwrap();
+        let (b, _fb) = create_local_staging(&dest).await.unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(d.as_path()));
+        assert!(a.file_name().unwrap().len() <= NAME_MAX);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // The pump that awaits forward teardown can be aborted by a reconnect or a

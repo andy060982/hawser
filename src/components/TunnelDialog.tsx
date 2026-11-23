@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowRight, Cable, Plus, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
+import { validateForward } from '../lib/transfers'
 
 interface ForwardInfo {
   id: string
@@ -38,10 +39,14 @@ export function TunnelDialog({
   const [busy, setBusy] = useState(false)
 
   const refresh = useCallback(() => {
-    void safeInvoke<ForwardInfo[]>('forwards_list', { sessionId }).then((l) =>
-      setForwards(l ?? []),
-    )
+    void safeInvoke<ForwardInfo[]>('forwards_list', { sessionId })
+      .then((l) => setForwards(l ?? []))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [sessionId])
+
+  /** Synchronous guard: `busy` is render-time state, so a double Enter (or a
+   *  click plus Enter) could start two forwards before it re-rendered. */
+  const busyRef = useRef(false)
 
   useEffect(refresh, [refresh])
 
@@ -52,26 +57,25 @@ export function TunnelDialog({
   }, [onClose])
 
   const add = async () => {
-    const rp = Number(remotePort)
-    if (mode === 'local' && (!remoteHost.trim() || !rp || rp < 1 || rp > 65535)) {
-      setError('Remote host and port are required.')
+    if (busyRef.current) return
+    const req = validateForward(mode, localPort, remoteHost, remotePort)
+    if (typeof req === 'string') {
+      setError(req)
       return
     }
+    busyRef.current = true
     setBusy(true)
     setError(null)
     try {
-      // Empty local port = 0 = "pick a free one"; the result shows what bound.
+      // Local port 0 = "pick a free one"; the result shows what bound.
       if (mode === 'socks') {
-        await safeInvoke('forward_start_socks', {
-          sessionId,
-          localPort: Number(localPort) || 0,
-        })
+        await safeInvoke('forward_start_socks', { sessionId, localPort: req.localPort })
       } else {
         await safeInvoke('forward_start', {
           sessionId,
-          localPort: Number(localPort) || 0,
-          remoteHost: remoteHost.trim(),
-          remotePort: rp,
+          localPort: req.localPort,
+          remoteHost: req.remoteHost,
+          remotePort: req.remotePort,
         })
       }
       setLocalPort('')
@@ -80,12 +84,15 @@ export function TunnelDialog({
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
   }
 
   const stop = (id: string) => {
-    void safeInvoke('forward_stop', { forwardId: id }).then(refresh)
+    void safeInvoke('forward_stop', { forwardId: id })
+      .catch((e) => setError(`Could not stop the forward: ${e instanceof Error ? e.message : String(e)}`))
+      .finally(refresh)
   }
 
   return (
@@ -191,7 +198,7 @@ export function TunnelDialog({
               <input
                 value={remotePort}
                 onChange={(e) => setRemotePort(e.target.value.replace(/\D/g, ''))}
-                onKeyDown={(e) => e.key === 'Enter' && void add()}
+                onKeyDown={(e) => e.key === 'Enter' && !busy && void add()}
                 placeholder="443"
                 className="h-7 w-full rounded border border-line bg-surface-0 px-2 font-mono text-[12px] text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
               />

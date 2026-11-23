@@ -1,3 +1,4 @@
+import type { TransferJob } from '../lib/transfers'
 import { FolderTree, Radio, ServerOff, SplitSquareHorizontal, SplitSquareVertical, SquareTerminal, Unlink } from 'lucide-react'
 import type { Session, WorkspaceView } from '../types'
 import { TerminalDeck } from './TerminalDeck'
@@ -25,7 +26,7 @@ interface Props {
   onStartTransfer: (
     sessionId: string,
     direction: 'upload' | 'download',
-    jobs: { name: string; local: string; remote: string }[],
+    jobs: TransferJob[],
   ) => void
   sftpPaths: Record<string, { local?: string; remote?: string }>
   onSftpPathsChange: (

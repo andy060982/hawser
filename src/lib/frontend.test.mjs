@@ -6,6 +6,10 @@ import { fold, foldMatches } from './foldMatch.ts'
 import { isDangerousCommand, planInsert } from './dangerous.ts'
 import { scanForSecrets } from './secretScan.ts'
 import { endpointKey, hopIdentity } from './endpoint.ts'
+import {
+  applyFailure, applyProgress, canRetry, clearFinished, markActive, markCancelled, markDone,
+  markFailed, netTargetError, parsePort, policyFor, queuedRow, retryJobs, validateForward,
+} from './transfers.ts'
 
 const deferred = () => {
   let resolve, reject
@@ -221,4 +225,90 @@ test('a private key body is flagged even without its BEGIN line', () => {
   assert.ok(reasons(`fw# cat key\n${body}\n-----END OPENSSH PRIVATE KEY-----`).some((r) => r.includes('base64')))
   // Never shows the secret itself.
   assert.ok(scanForSecrets(body).every((h) => !h.preview.includes('AAAA')))
+})
+
+/* ----------------------------------------------------------- transfers */
+
+const job = (name, overwrite = 'never') => ({ name, local: `/l/${name}`, remote: `/r/${name}`, overwrite })
+const prog = (transferId, bytes) => ({
+  sessionId: 's', transferId, root: '/r/dir', filePath: '/r/dir/a', bytesTransferred: bytes,
+  totalBytes: 0, direction: 'download', done: false,
+})
+const fail = (transferId, name) => ({
+  sessionId: 's', transferId, root: '/r/dir', name, local: `/l/${name}`, remote: `/r/${name}`,
+  reason: 'denied', direction: 'download',
+})
+
+test('two transfers of the same source never update each other', () => {
+  let list = [queuedRow('a', 's', 'download', job('dir')), queuedRow('b', 's', 'download', job('dir'))]
+  list = markActive(markActive(list, 'a'), 'b')
+  list = applyProgress(list, prog('b', 500))
+  assert.equal(list.find((t) => t.id === 'a').bytesDone, 0)
+  assert.equal(list.find((t) => t.id === 'b').bytesDone, 500)
+  list = applyFailure(list, fail('a', 'x'))
+  assert.equal(list.find((t) => t.id === 'b').failures, undefined)
+})
+
+test('a failure that arrives after the row settled is still counted', () => {
+  let list = markActive([queuedRow('a', 's', 'download', job('dir'))], 'a')
+  list = markFailed(list, 'a', 'copied 0 bytes; 2 item(s) not transferred')
+  list = applyFailure(list, fail('a', 'late'))
+  assert.equal(list[0].failures.length, 1)
+  // ...but a late progress event does not rewind a settled row.
+  const done = markDone(markActive([queuedRow('c', 's', 'upload', job('f'))], 'c'), 'c', { bytes: 9, notes: [] })
+  assert.equal(applyProgress(done, prog('c', 1))[0].bytesDone, 9)
+})
+
+test('retry is offered only once the transfer stopped, with its policy', () => {
+  let list = markActive([queuedRow('a', 's', 'download', job('dir', 'confirmed'))], 'a')
+  list = applyFailure(list, fail('a', 'x'))
+  assert.equal(canRetry(list[0]), false, 'not while still running')
+  list = markFailed(list, 'a', 'partial')
+  assert.equal(canRetry(list[0]), true)
+  assert.deepEqual(retryJobs(list[0]), [{ name: 'x', local: '/l/x', remote: '/r/x', overwrite: 'confirmed' }])
+  // Unretryable items (skipped symlinks, unsafe names) carry an empty side.
+  const skipped = applyFailure(markFailed(markActive([queuedRow('b', 's', 'download', job('d'))], 'b'), 'b', 'p'),
+    { ...fail('b', 'link'), local: '' })
+  assert.equal(canRetry(skipped[0]), false)
+})
+
+test('cancel settles queued and running rows, and survives clear', () => {
+  let list = [queuedRow('a', 's', 'upload', job('f1')), queuedRow('b', 's', 'upload', job('f2'))]
+  list = markActive(list, 'a')
+  list = markCancelled(list, 'b')
+  assert.equal(list[1].status, 'cancelled')
+  assert.equal(clearFinished(list).map((t) => t.id).join(), 'a')
+  // The running row's command then rejects with the backend's cancel text.
+  list = markFailed(list, 'a', 'transfer cancelled')
+  assert.equal(list[0].status, 'cancelled')
+  assert.equal(list[0].error, undefined)
+})
+
+test('overwrite policy follows the existence check, a failed check never clobbers', () => {
+  assert.equal(policyFor(false, false), 'never')
+  assert.equal(policyFor(null, false), 'never')
+  assert.equal(policyFor(true, true), 'confirmed')
+  assert.equal(policyFor(true, false), null)
+})
+
+test('ports and forwards are validated before IPC', () => {
+  assert.equal(parsePort('', 0), 0)
+  assert.equal(parsePort('8022', null), 8022)
+  assert.equal(parsePort('70000', null), null)
+  assert.equal(parsePort('0', null), null)
+  assert.equal(parsePort('1e3', null), null)
+  assert.match(validateForward('local', '70000', 'h', '22'), /Local port/)
+  assert.match(validateForward('local', '', '', '22'), /Remote host/)
+  assert.match(validateForward('local', '', 'h', ''), /Remote port/)
+  assert.deepEqual(validateForward('local', '', ' 10.0.0.5 ', '443'), { localPort: 0, remoteHost: '10.0.0.5', remotePort: 443 })
+  assert.deepEqual(validateForward('socks', '1080', '', ''), { localPort: 1080, remoteHost: '', remotePort: 0 })
+})
+
+test('network tool targets mirror the backend rule', () => {
+  assert.equal(netTargetError('fw-01.lab'), null)
+  assert.equal(netTargetError('2001:db8::1'), null)
+  assert.ok(netTargetError(''))
+  assert.ok(netTargetError('-f'))
+  assert.ok(netTargetError('a b'))
+  assert.ok(netTargetError('x;rm'))
 })

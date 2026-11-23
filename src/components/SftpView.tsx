@@ -4,6 +4,7 @@ import type { FileEntry, PaneSide, Session } from '../types'
 import { FilePane } from './FilePane'
 import { ResizeHandle } from './ResizeHandle'
 import { joinPath } from '../lib/sftp'
+import { policyFor, type TransferJob } from '../lib/transfers'
 import { useDialogs } from '../lib/dialogs'
 import { onFileDrop, safeInvoke } from '../lib/tauri'
 import { ContextMenu, type MenuState } from './ContextMenu'
@@ -54,7 +55,7 @@ export function SftpView({
   onStartTransfer: (
     sessionId: string,
     direction: 'upload' | 'download',
-    jobs: { name: string; local: string; remote: string }[],
+    jobs: TransferJob[],
   ) => void
   /** Paths this session last browsed, restored so a terminal round-trip does
    *  not reset both panes to root. */
@@ -120,6 +121,21 @@ export function SftpView({
       .catch((e) => void alert(e instanceof Error ? e.message : String(e)))
   }
 
+  /** Create a folder in a pane's current directory. Also on the pane toolbar,
+   *  so an empty directory (whose only row, "..", has no menu) gets one too. */
+  const newFolder = async (side: PaneSide) => {
+    const base = side === 'local' ? localPath : remotePath
+    const name = (await prompt('Folder name', { title: 'New folder' }))?.trim()
+    if (!name) return
+    if (/[\\/]/.test(name) || name === '.' || name === '..') {
+      void alert('Names cannot contain slashes or be "." or "..".')
+      return
+    }
+    const target = joinPath(side, base, name)
+    runOp(side, safeInvoke(side === 'local' ? 'local_mkdir' : 'sftp_mkdir',
+      side === 'local' ? { path: target } : { sessionId: session.id, path: target }))
+  }
+
   const openRowMenu = (side: PaneSide) => (entry: FileEntry, x: number, y: number) => {
     const base = side === 'local' ? localPath : remotePath
     const full = joinPath(side, base, entry.name)
@@ -149,17 +165,7 @@ export function SftpView({
         },
         {
           label: 'New folder here…',
-          onSelect: async () => {
-            const name = (await prompt('Folder name', { title: 'New folder' }))?.trim()
-            if (!name) return
-            if (/[\\/]/.test(name)) {
-              void alert('Names cannot contain slashes.')
-              return
-            }
-            const target = joinPath(side, base, name)
-            runOp(side, safeInvoke(side === 'local' ? 'local_mkdir' : 'sftp_mkdir',
-              side === 'local' ? { path: target } : { sessionId: session.id, path: target }))
-          },
+          onSelect: () => void newFolder(side),
         },
         {
           label: 'Properties…',
@@ -289,7 +295,7 @@ export function SftpView({
     void onFileDrop((paths) => {
       const jobs = paths.map((p) => {
         const name = p.split(/[\\/]/).filter(Boolean).pop() ?? p
-        return { name, local: p, remote: joinPath('remote', remoteRef.current, name) }
+        return { name, local: p, remote: joinPath('remote', remoteRef.current, name), overwrite: 'never' as const }
       })
       // Route through the shared guard so an Explorer drop honours the same
       // overwrite prompt and unsafe-name check as an in-app transfer.
@@ -310,7 +316,7 @@ export function SftpView({
   // skip the unsafe-name check or silently clobber a file.
   const confirmAndTransfer = async (
     direction: 'upload' | 'download',
-    jobs: { name: string; local: string; remote: string }[],
+    jobs: TransferJob[],
   ) => {
     // A download turns a server-chosen name into a LOCAL path. Reject any name
     // that is not a plain component — EITHER separator (`\` is the traversal
@@ -337,12 +343,13 @@ export function SftpView({
     // Overwrite guard: check whether each name already exists at the
     // destination and confirm before clobbering. Silent overwrite on a tool
     // that touches production configs is exactly the surprise to avoid. The
-    // check is best-effort — if it errors we proceed rather than block a
-    // legitimate transfer.
-    const kept: typeof jobs = []
+    // answer becomes the job's overwrite policy, which the backend enforces
+    // when the file is committed: a destination that was free here and is
+    // taken by then is never replaced, and neither is one whose check failed.
+    const kept: TransferJob[] = []
     for (const job of jobs) {
       const destPath = direction === 'upload' ? job.remote : job.local
-      let exists = false
+      let exists: boolean | null
       try {
         exists = Boolean(
           await safeInvoke<boolean>('path_exists', {
@@ -352,29 +359,29 @@ export function SftpView({
           }),
         )
       } catch {
-        exists = false
+        exists = null
       }
-      if (
-        exists &&
-        !(await confirm(`${job.name} already exists at the destination. Overwrite it?`, {
+      const agreed =
+        exists === true &&
+        (await confirm(`${job.name} already exists at the destination. Overwrite it?`, {
           title: 'Overwrite?',
           confirmLabel: 'Overwrite',
           danger: true,
         }))
-      ) {
-        continue
-      }
-      kept.push(job)
+      const overwrite = policyFor(exists, agreed)
+      if (overwrite === null) continue
+      kept.push({ ...job, overwrite })
     }
     if (kept.length > 0) onStartTransfer(session.id, direction, kept)
   }
 
   const start = (side: PaneSide, names: string[]) => {
     const direction = side === 'local' ? 'upload' : 'download'
-    const jobs = names.map((name) => ({
+    const jobs: TransferJob[] = names.map((name) => ({
       name,
       local: joinPath('local', localPath, name),
       remote: joinPath('remote', remotePath, name),
+      overwrite: 'never',
     }))
     void confirmAndTransfer(direction, jobs)
   }
@@ -397,6 +404,7 @@ export function SftpView({
             onTransfer={(names) => start('local', names)}
             onDragCandidate={armDrag('local')}
             onRowMenu={openRowMenu('local')}
+            onNewFolder={() => void newFolder('local')}
             refreshSignal={refreshLocal}
           />
         </div>
@@ -424,6 +432,7 @@ export function SftpView({
             onTransfer={(names) => start('remote', names)}
             onDragCandidate={armDrag('remote')}
             onRowMenu={openRowMenu('remote')}
+            onNewFolder={() => void newFolder('remote')}
             refreshSignal={refreshRemote}
           />
         </div>

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowDownToLine, ArrowUpFromLine, ArrowUp, ChevronDown, ChevronUp,
-  Loader2, RefreshCw, TriangleAlert,
+  FolderPlus, Loader2, RefreshCw, TriangleAlert, X,
 } from 'lucide-react'
 import type { FileEntry, PaneSide } from '../types'
 import { iconFor } from '../lib/fileIcons'
@@ -43,11 +43,13 @@ interface Props {
   /** Bump to force a directory re-read after an external mutation (rename,
    *  delete, mkdir happen in the parent, which owns the full paths). */
   refreshSignal: number
+  /** Create a folder in this pane's current directory. */
+  onNewFolder: () => void
 }
 
 export function FilePane({
   side, sessionId, initialPath, focused, onFocus, onTransfer, onPathChange,
-  onDragCandidate, onRowMenu, refreshSignal,
+  onDragCandidate, onRowMenu, refreshSignal, onNewFolder,
 }: Props) {
   const dir = useDirectory(side, sessionId, initialPath)
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -180,6 +182,16 @@ export function FilePane({
 
         <button
           type="button"
+          aria-label="New folder"
+          title="New folder here"
+          onClick={onNewFolder}
+          className="grid h-6 w-6 shrink-0 place-items-center rounded border border-line text-ink-dim hover:bg-surface-3 hover:text-ink"
+        >
+          <FolderPlus size={12} />
+        </button>
+
+        <button
+          type="button"
           aria-label="Refresh"
           title="Refresh"
           onClick={dir.refresh}
@@ -197,24 +209,46 @@ export function FilePane({
         <span>{isLocal ? 'Attr' : 'Mode'}</span>
       </div>
 
+      {/* A failed read is shown ABOVE the listing it left in place: the
+          folder the pane is still in stays usable, and Retry retries the
+          target that failed, not this folder. */}
+      {dir.error && (
+        <div role="alert" className="flex shrink-0 items-start gap-2 border-b border-alert/30 bg-alert/10 px-3 py-2 text-[12px] text-alert">
+          <TriangleAlert size={14} className="mt-px shrink-0" aria-hidden />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              Could not read {dir.failedTarget && dir.failedTarget !== dir.path ? (
+                <span className="selectable font-mono">{dir.failedTarget}</span>
+              ) : 'directory'}
+            </p>
+            <p className="selectable mt-0.5 break-words text-ink-dim">{dir.error}</p>
+          </div>
+          <button
+            type="button"
+            onClick={dir.retry}
+            className="shrink-0 rounded border border-line px-2 py-0.5 text-ink-dim hover:bg-surface-3 hover:text-ink"
+          >
+            Retry
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={dir.dismissError}
+            className="grid h-5 w-5 shrink-0 place-items-center rounded text-ink-faint hover:bg-surface-3 hover:text-ink"
+          >
+            <X size={11} />
+          </button>
+        </div>
+      )}
+      {dir.truncated && (
+        <p className="shrink-0 border-b border-line bg-warn/10 px-3 py-1 text-[11px] text-warn">
+          This folder has more entries than can be listed; only the first ones are shown.
+        </p>
+      )}
+
       {/* --------------------------------------------------------------- rows */}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {dir.error ? (
-          <div className="flex items-start gap-2 px-3 py-4 text-[12px] text-alert">
-            <TriangleAlert size={14} className="mt-px shrink-0" aria-hidden />
-            <div className="min-w-0">
-              <p className="font-medium">Could not read directory</p>
-              <p className="selectable mt-0.5 break-words text-ink-dim">{dir.error}</p>
-              <button
-                type="button"
-                onClick={dir.refresh}
-                className="mt-2 rounded border border-line px-2 py-0.5 text-ink-dim hover:bg-surface-3 hover:text-ink"
-              >
-                Retry
-              </button>
-            </div>
-          </div>
-        ) : rows.length === 0 && !dir.loading ? (
+        {rows.length === 0 && !dir.loading && !dir.error ? (
           <p className="px-3 py-6 text-center text-[12px] text-ink-faint">Empty directory</p>
         ) : (
           rows.map((entry) => (
