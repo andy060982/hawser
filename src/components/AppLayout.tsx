@@ -667,6 +667,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       oneShotPassword: oneShotPassword ?? null,
       // Names the transcript; see lib/endpoint.
       endpoint: endpointFor(host),
+      // Shown in host-key and password prompts; the backend adds the dialled
+      // user@host:port and bastion itself.
+      label: host.name,
+      // Quick-connect hosts are not in the catalogue: never offer to save a
+      // typed password for them (no UI could ever delete it again).
+      ephemeral: ephemeralHostsRef.current.has(host.id),
       // ProxyJump: resolve the bastion's connection details from the
       // catalogue at dial time, so editing the bastion updates every host
       // that rides it. Self-reference and missing hosts degrade to direct.
@@ -683,6 +689,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           username: j.username,
           auth: j.auth,
           keyPath: j.keyPath ?? null,
+          name: j.name,
         }
       })(),
     })

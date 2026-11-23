@@ -129,17 +129,45 @@ pub fn ensure_store() -> Result<PathBuf, KnownHostsError> {
     Ok(path)
 }
 
-/// Check a presented key against the store.
+/// Key algorithms already pinned for `host:port`, in file order, deduplicated.
 ///
-/// A missing or unreadable store is reported as `Unknown` rather than an error:
-/// a first run has no file, and that must lead to a prompt, not a failure.
-/// Genuine IO problems still surface when `trust` tries to write.
-pub fn check(host: &str, port: u16, key: &PublicKey) -> Result<HostKeyStatus, KnownHostsError> {
-    let path = ensure_store()?;
-    classify(host, port, key, &path)
+/// Offered to the server first during negotiation, as OpenSSH does: a host
+/// pinned as ECDSA that later also offers Ed25519 must keep signing with the
+/// pinned ECDSA key, or the classification below sees "no matching key" and
+/// refuses it as CHANGED although the pinned key is still valid. An unreadable
+/// store yields an empty list; the check itself then fails closed.
+pub fn pinned_algorithms(host: &str, port: u16) -> Vec<russh::keys::Algorithm> {
+    match store_path() {
+        Ok(path) if path.exists() => pinned_algorithms_at(host, port, &path),
+        _ => Vec::new(),
+    }
 }
 
-fn classify(
+pub(crate) fn pinned_algorithms_at(host: &str, port: u16, path: &Path) -> Vec<russh::keys::Algorithm> {
+    let mut out: Vec<russh::keys::Algorithm> = Vec::new();
+    let mut push = |k: &PublicKey| {
+        let alg = k.algorithm();
+        if !out.contains(&alg) {
+            out.push(alg);
+        }
+    };
+    if let Ok(entries) = host_entries(host, port, path) {
+        for k in entries.iter().filter(|e| e.trust_entry).filter_map(|e| e.key.as_ref()) {
+            push(k);
+        }
+    }
+    if let Ok(hashed) = known_host_keys_path(&host.to_ascii_lowercase(), port, path) {
+        for (_, k) in &hashed {
+            push(k);
+        }
+    }
+    out
+}
+
+/// Check a presented key against the store at `path` (from `ensure_store`, so
+/// a first run's empty file reads as `Unknown`). A store that exists but cannot
+/// be read or parsed is an error, never `Unknown`.
+pub(crate) fn classify(
     host: &str,
     port: u16,
     key: &PublicKey,
@@ -327,16 +355,44 @@ fn host_entries(host: &str, port: u16, path: &Path) -> Result<Vec<HostEntry>, Kn
     Ok(out)
 }
 
-/// Append a host's public key to the store, creating the directory and file if
-/// needed. Called only after a human has accepted the fingerprint.
+/// Serialises trust decisions inside this process. The re-classification and
+/// the append must be one step: two sessions approving different unknown keys
+/// for the same host could otherwise both see `Unknown` and both append, and
+/// russh then refuses BOTH keys (it reports any same-algorithm mismatch as
+/// KeyChanged, even when another line matches), locking the user out.
+static TRUST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Append a host's public key to the store at `path`. Called only after a
+/// human has accepted the fingerprint.
 ///
 /// Refuses to append over a *changed* key: re-recording one would leave two
 /// conflicting entries and make every later check ambiguous. Replacing a
-/// changed key is a deliberate, manual act.
-pub fn trust(host: &str, port: u16, key: &PublicKey) -> Result<(), KnownHostsError> {
-    let path = ensure_store()?;
+/// changed key is a deliberate, manual act. A key that is already trusted
+/// (another session pinned the same key while this prompt was open) is a
+/// no-op, not a duplicate line. The re-check and the append run under one
+/// lock, so two sessions approving different keys pin exactly one.
+pub(crate) fn trust_at(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+) -> Result<(), KnownHostsError> {
+    let _guard = TRUST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Another Hawser instance shares the store, so the process lock alone is
+    // not enough. A sidecar file rather than the store itself: Windows locks are
+    // mandatory, and the append below goes through a separate handle.
+    let lock_path = path.with_file_name("known_hosts.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| KnownHostsError::Io { path: lock_path.clone(), source })?;
+    lock_file
+        .lock()
+        .map_err(|source| KnownHostsError::Io { path: lock_path.clone(), source })?;
 
-    match classify(host, port, key, &path)? {
+    match classify(host, port, key, path)? {
         HostKeyStatus::Changed { line } => {
             return Err(KnownHostsError::Parse(format!(
                 "{host}:{port} already has a different key on line {line}; \
@@ -349,19 +405,21 @@ pub fn trust(host: &str, port: u16, key: &PublicKey) -> Result<(), KnownHostsErr
                  refusing to trust it"
             )))
         }
-        HostKeyStatus::Trusted | HostKeyStatus::Unknown => {}
+        HostKeyStatus::Trusted => return Ok(()),
+        HostKeyStatus::Unknown => {}
     }
 
     // russh handles the details that are easy to get wrong: appending a leading
     // newline when the file does not end in one, and the [host]:port form for
     // non-default ports.
-    learn_known_hosts_path(host, port, key, &path).map_err(|e| match e {
+    learn_known_hosts_path(host, port, key, path).map_err(|e| match e {
         russh::keys::Error::IO(source) => KnownHostsError::Io {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         },
         other => KnownHostsError::Parse(other.to_string()),
     })
+    // The file lock is released when `lock_file` drops.
 }
 
 #[cfg(test)]
@@ -455,6 +513,87 @@ mod tests {
         // Absent host: unknown.
         assert_eq!(classify("other.corp", 22, &k1, &path).unwrap(), HostKeyStatus::Unknown);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const ED_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1EeRn1nUZ6oQiaSmrlPONbjg1FxJtr35MXzTndFYIe";
+    const ED_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHveLo5tgiTjyNgc98zwmigaaw1vJ/1IN9KDWqa0Z43a";
+
+    fn temp_store(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "hawser-kh-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        std::fs::write(&path, "").unwrap();
+        (dir, path)
+    }
+
+    fn lines_for(path: &Path, needle: &str) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.split_whitespace().next() == Some(needle))
+            .count()
+    }
+
+    // Two sessions approving DIFFERENT unknown keys for one host at the same
+    // moment must end with exactly one pinned key: the loser sees the winner's
+    // line on its re-check and is refused as changed.
+    #[test]
+    fn concurrent_trusts_of_different_keys_pin_one() {
+        let (dir, path) = temp_store("race");
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        let kb = PublicKey::from_openssh(ED_B).unwrap();
+        for _ in 0..20 {
+            std::fs::write(&path, "").unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let spawn = |k: PublicKey| {
+                let (b, p) = (std::sync::Arc::clone(&barrier), path.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    trust_at("race.example", 22, &k, &p).is_ok()
+                })
+            };
+            let (a, b) = (spawn(ka.clone()), spawn(kb.clone()));
+            let oks = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(oks.iter().filter(|o| **o).count(), 1, "exactly one trust wins");
+            assert_eq!(lines_for(&path, "race.example"), 1, "exactly one key pinned");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Trusting a key that is already pinned (a second tab approved the same
+    // fingerprint) is a no-op, not a duplicate line.
+    #[test]
+    fn trusting_an_already_trusted_key_is_a_noop() {
+        let (dir, path) = temp_store("noop");
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        trust_at("dup.example", 2222, &ka, &path).unwrap();
+        trust_at("dup.example", 2222, &ka, &path).unwrap();
+        assert_eq!(lines_for(&path, "[dup.example]:2222"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pinned_algorithms_lists_trust_entries_only() {
+        let (dir, path) = temp_store("algs");
+        const ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBI/gPg4KkOG52SzCdcnggcQk7DG6z1OLSfSAi2LTGk4OFnDnYrkNsxVIWtt/KArpW70Gac7c1im2IEx4u8Bs0MI=";
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        std::fs::write(
+            &path,
+            format!("fw01 {ECDSA}\n@revoked fw01 {ED_A}\nother {ED_A}\n"),
+        )
+        .unwrap();
+        let algs = pinned_algorithms_at("FW01", 22, &path);
+        assert_eq!(algs, vec![PublicKey::from_openssh(ECDSA).unwrap().algorithm()]);
+        assert!(pinned_algorithms_at("nobody", 22, &path).is_empty());
+        assert_ne!(algs[0], ka.algorithm());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

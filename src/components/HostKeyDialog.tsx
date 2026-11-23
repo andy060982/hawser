@@ -5,8 +5,16 @@ import { safeInvoke, safeListen } from '../lib/tauri'
 interface HostKeyRequest {
   requestId: string
   host: string
+  /** Peer address the socket actually connected to. Empty when the connection
+   *  rides a jump host: the bastion resolved and dialled the name (see `via`). */
   ip: string
   port: number
+  /** Catalogue name of the host, when it has one (a label only). */
+  hostName?: string | null
+  /** `user@host:port` the backend dialled. */
+  target: string
+  /** Bastion this connection rides, if any. */
+  via?: string | null
   keyType: string
   /** OpenSSH-style SHA256 fingerprint, identical to `ssh-keygen -lf` output. */
   fingerprint: string
@@ -160,16 +168,35 @@ export function HostKeyDialog() {
 
         {/* Identity block */}
         <dl className="mx-5 grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1.5 rounded border border-line bg-surface-1 px-4 py-3 text-[12.5px]">
-          <dt className="text-ink-faint">Hostname</dt>
-          <dd className="selectable truncate font-mono text-ink" title={request.host}>
-            {request.host}
+          {request.hostName && (
+            <>
+              <dt className="text-ink-faint">Host</dt>
+              <dd className="truncate text-ink" title={request.hostName}>
+                {request.hostName}
+              </dd>
+            </>
+          )}
+
+          <dt className="text-ink-faint">Connecting</dt>
+          <dd className="selectable truncate font-mono text-ink" title={request.target}>
+            {request.target}
           </dd>
 
           <dt className="text-ink-faint">Address</dt>
-          <dd className="selectable font-mono text-ink-dim">
-            {request.ip}
-            <span className="text-ink-faint">:{request.port}</span>
-          </dd>
+          {request.via ? (
+            <dd className="selectable font-mono text-ink-dim" title={request.via}>
+              <span className="text-ink-faint">via </span>
+              {request.via}
+              <span className="block font-sans text-[11px] text-ink-faint">
+                The bastion resolved and dialled {request.host}:{request.port}.
+              </span>
+            </dd>
+          ) : (
+            <dd className="selectable font-mono text-ink-dim">
+              {request.ip.includes(':') ? `[${request.ip}]` : request.ip}
+              <span className="text-ink-faint">:{request.port}</span>
+            </dd>
+          )}
 
           <dt className="text-ink-faint">Key type</dt>
           <dd className="font-mono uppercase text-ink-dim">{request.keyType}</dd>

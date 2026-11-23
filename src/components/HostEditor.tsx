@@ -69,6 +69,16 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
   const installPwRef = useRef(installPw)
   installPwRef.current = installPw
   const firstRef = useRef<HTMLInputElement>(null)
+  /** Op id of a key install still in flight, so closing the editor cancels it
+   *  (and closes any host-key or password prompt it raised). */
+  const installOpRef = useRef<string | null>(null)
+  useEffect(
+    () => () => {
+      const op = installOpRef.current
+      if (op) void safeInvoke('ssh_copy_id_cancel', { opId: op })
+    },
+    [],
+  )
 
   /** The vault entry this host actually uses: a borrowed one when "Same as …"
    *  is chosen. Connect reads the vault by this id, so status and saves must
@@ -809,18 +819,24 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 setInstallPw(null)
                 setBusy(true)
                 setError(null)
+                const opId = `install-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+                installOpRef.current = opId
                 void safeInvoke('ssh_copy_id', {
                   host: draft.hostname,
                   port: draft.port,
                   username: draft.username,
                   password: pw,
                   publicKey: generatedPub,
+                  opId,
                 })
                   .then(() =>
                     setError('✓ Key installed on the host. Save and connect with key auth.'),
                   )
                   .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-                  .finally(() => setBusy(false))
+                  .finally(() => {
+                    if (installOpRef.current === opId) installOpRef.current = null
+                    setBusy(false)
+                  })
               }}
               className={`${inputCls} font-mono`}
             />

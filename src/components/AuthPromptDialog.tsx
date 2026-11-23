@@ -13,6 +13,14 @@ interface AuthPromptRequest {
   name: string
   instruction: string
   prompts: AuthPromptField[]
+  /** Which connection is asking, from the backend's dial parameters (the
+   *  name is the catalogue label). Shown apart from the server's own text. */
+  hostName?: string | null
+  target: string
+  via?: string | null
+  /** 'password': Hawser's own up-front password prompt (carries no server
+   *  text). 'challenge': a keyboard-interactive round the server wrote. */
+  kind?: 'password' | 'challenge'
   /** When true, offer a "save to the OS vault" checkbox (up-front password
    *  prompt only — never for a single-use server challenge). */
   offerSave?: boolean
@@ -142,20 +150,56 @@ export function AuthPromptDialog() {
           </div>
           <div className="min-w-0">
             <h2 id="ap-title" className="text-[14px] font-medium text-ink">
-              Additional authentication
+              {request.kind === 'password' ? 'Password required' : 'Additional authentication'}
             </h2>
-            <p className="mt-0.5 text-[12.5px] text-ink-dim">
-              {request.name.trim() || 'The server is asking for another factor.'}
-            </p>
           </div>
         </header>
 
-        {request.instruction.trim() && (
-          <p className="mx-5 mb-1 whitespace-pre-wrap text-[12px] leading-relaxed text-ink-faint">
-            {request.instruction}
+        {/* Who is asking. From the backend's dial parameters, never from the
+            server, so a server cannot word its prompt as another host's. */}
+        <dl className="mx-5 mb-2 grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1 rounded border border-line bg-surface-1 px-3 py-2 text-[12px]">
+          {request.hostName && (
+            <>
+              <dt className="text-ink-faint">Host</dt>
+              <dd className="truncate text-ink" title={request.hostName}>
+                {request.hostName}
+              </dd>
+            </>
+          )}
+          <dt className="text-ink-faint">Account</dt>
+          <dd className="selectable truncate font-mono text-ink" title={request.target}>
+            {request.target}
+          </dd>
+          {request.via && (
+            <>
+              <dt className="text-ink-faint">Via</dt>
+              <dd className="selectable truncate font-mono text-ink-dim" title={request.via}>
+                {request.via}
+              </dd>
+            </>
+          )}
+        </dl>
+
+        {request.kind !== 'password' && !request.name.trim() && !request.instruction.trim() && (
+          <p className="mx-5 mb-1 text-[12.5px] text-ink-dim">
+            The server is asking for another factor.
           </p>
         )}
-
+        {request.kind !== 'password' && (request.name.trim() || request.instruction.trim()) && (
+          <div className="mx-5 mb-1">
+            <p className="text-[10.5px] uppercase tracking-wider text-ink-faint">
+              Message from the server
+            </p>
+            {request.name.trim() && (
+              <p className="mt-0.5 whitespace-pre-wrap text-[12.5px] text-ink-dim">{request.name}</p>
+            )}
+            {request.instruction.trim() && (
+              <p className="mt-0.5 whitespace-pre-wrap text-[12px] leading-relaxed text-ink-faint">
+                {request.instruction}
+              </p>
+            )}
+          </div>
+        )}
         <div className="mx-5 mt-2 space-y-3">
           {request.prompts.map((p, i) => (
             <label key={i} className="block">

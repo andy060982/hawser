@@ -29,6 +29,26 @@ use crate::credentials;
 /// not pin a connection task forever.
 const HOST_KEY_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Connect-stage deadlines. Each bounds machine time only: a stage's clock is
+/// paused while a host-key or password dialog waits for the human (see
+/// `HumanWait`), so a slow reader is never cut off by them.
+///
+/// TCP connect: the SYN/ACK round trip (per address tried by the resolver), or
+/// for a jump target the bastion's own connect to it (direct-tcpip open).
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The server's SSH identification line plus the whole key exchange. A port
+/// that accepts TCP but never speaks SSH (a TLS service, a tarpit) ends here.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Every authentication round trip together (password, keyboard-interactive
+/// rounds, each agent identity).
+const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Opening the session channel and the server's replies to the PTY and shell
+/// requests.
+const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// After the shell's EOF, how long to wait for its exit status or channel close
+/// before treating the shell as gone. OpenSSH sends both at once.
+const SHELL_EOF_GRACE: Duration = Duration::from_secs(2);
+
 /// Minimum gap between progress events for one transfer. At 64 KB chunks an
 /// unthrottled emit would fire ~16k times per gigabyte; the IPC bridge and
 /// React would both spend more time on bookkeeping than on the transfer.
@@ -58,6 +78,17 @@ pub enum SshError {
     ChangedHostKey { host: String, line: usize },
     #[error("{0}")]
     PartialTransfer(String),
+    /// A connect stage ran past its deadline (see the `*_TIMEOUT` constants).
+    #[error("{host}: {stage} timed out after {secs}s")]
+    Timeout { host: String, stage: &'static str, secs: u64 },
+    /// The server answered the shell request with a refusal.
+    #[error(
+        "{host} refused to start a shell (the account may be SFTP-only or have no login \
+         shell)"
+    )]
+    ShellRefused { host: String },
+    #[error("{0}")]
+    Connect(String),
     /// The tab that started this connect was closed before it finished.
     #[error("connection {0} was cancelled")]
     Cancelled(String),
@@ -151,8 +182,16 @@ pub struct SessionStatusEvent {
 pub struct HostKeyRequest {
     pub request_id: String,
     pub host: String,
+    /// The peer address the socket actually connected to, for a direct
+    /// connection. Empty when the connection rides a jump host: the bastion
+    /// resolved and dialled the name, so no local address is meaningful (see
+    /// `via`).
     pub ip: String,
     pub port: u16,
+    /// Who is asking (catalogue name, user@host:port, bastion). Backend-derived
+    /// from the dial, except the display name.
+    #[serde(flatten)]
+    pub origin: PromptOrigin,
     pub key_type: String,
     /// OpenSSH-style SHA256 fingerprint — the exact string `ssh-keygen -lf`
     /// prints, so it can be compared against an out-of-band source verbatim.
@@ -182,6 +221,216 @@ pub struct JumpParams {
     pub username: String,
     pub auth: String,
     pub key_path: Option<String>,
+    /// Catalogue display name, for prompts only.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Which connection a prompt belongs to, shown in the host-key and auth
+/// dialogs apart from anything the server wrote. `target` and `via` come from
+/// the parameters actually dialled; only `name` is the frontend's label.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptOrigin {
+    /// Catalogue name of the host, when it has one.
+    pub host_name: Option<String>,
+    /// `user@host:port` of the machine asking.
+    pub target: String,
+    /// `user@host:port` (or name) of the bastion this connection rides, if any.
+    pub via: Option<String>,
+}
+
+impl PromptOrigin {
+    fn new(name: Option<&str>, username: &str, host: &str, port: u16, via: Option<String>) -> Self {
+        let name = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        PromptOrigin { host_name: name, target: endpoint_label(username, host, port), via }
+    }
+}
+
+/// `user@host:port`, bracketing an IPv6 literal.
+fn endpoint_label(username: &str, host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("{username}@[{host}]:{port}")
+    } else {
+        format!("{username}@{host}:{port}")
+    }
+}
+
+/* ---------------------------------------------------------------- deadlines */
+
+/// Time spent waiting on a human (host-key or auth dialog) during one connect
+/// attempt. Stage deadlines subtract it, so they bound only machine time.
+#[derive(Clone, Default)]
+pub(crate) struct HumanWait(Arc<std::sync::Mutex<HumanWaitState>>);
+
+#[derive(Default)]
+struct HumanWaitState {
+    open: u32,
+    since: Option<Instant>,
+    total: Duration,
+}
+
+/// Held while a dialog is open; dropping it resumes the stage clocks.
+pub(crate) struct HumanWaitGuard(HumanWait);
+
+impl HumanWait {
+    pub(crate) fn enter(&self) -> HumanWaitGuard {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if s.open == 0 {
+            s.since = Some(Instant::now());
+        }
+        s.open += 1;
+        drop(s);
+        HumanWaitGuard(self.clone())
+    }
+
+    /// (total waited so far, including an open wait; whether one is open now)
+    fn waited(&self) -> (Duration, bool) {
+        let s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let open = s.since.map(|t| t.elapsed()).unwrap_or_default();
+        (s.total + open, s.open > 0)
+    }
+}
+
+impl Drop for HumanWaitGuard {
+    fn drop(&mut self) {
+        let mut s = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        s.open = s.open.saturating_sub(1);
+        if s.open == 0 {
+            if let Some(t) = s.since.take() {
+                s.total += t.elapsed();
+            }
+        }
+    }
+}
+
+/// Run `fut` under `limit` of machine time: the clock does not run while a
+/// human prompt is open (`wait`). Times out with a `Timeout` naming the stage.
+async fn within<F: std::future::Future>(
+    wait: &HumanWait,
+    limit: Duration,
+    host: &str,
+    stage: &'static str,
+    fut: F,
+) -> Result<F::Output, SshError> {
+    let start = Instant::now();
+    tokio::pin!(fut);
+    loop {
+        let (waited, open) = wait.waited();
+        let wake = if open {
+            // Re-check periodically; the deadline moves out while a human reads.
+            Instant::now() + Duration::from_millis(250)
+        } else {
+            start + limit + waited
+        };
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            _ = tokio::time::sleep_until(wake.into()) => {
+                let (waited, open) = wait.waited();
+                if !open && Instant::now() >= start + limit + waited {
+                    return Err(SshError::Timeout {
+                        host: host.to_string(),
+                        stage,
+                        secs: limit.as_secs(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Host-key algorithms to offer, pinned ones first (as OpenSSH orders them):
+/// a host pinned as ECDSA that later also offers Ed25519 keeps signing with the
+/// pinned key instead of being refused as CHANGED. Only algorithms russh
+/// implements are offered; an RSA pin covers all three RSA signature names.
+fn preferred_host_key_order(pinned: &[russh::keys::Algorithm]) -> Vec<russh::keys::Algorithm> {
+    use russh::keys::{Algorithm, HashAlg};
+    let defaults: &[Algorithm] = &russh::Preferred::DEFAULT.key;
+    let mut out: Vec<Algorithm> = Vec::with_capacity(defaults.len());
+    let mut push = |a: Algorithm| {
+        if defaults.contains(&a) && !out.contains(&a) {
+            out.push(a);
+        }
+    };
+    for alg in pinned {
+        if matches!(alg, Algorithm::Rsa { .. }) {
+            push(Algorithm::Rsa { hash: Some(HashAlg::Sha512) });
+            push(Algorithm::Rsa { hash: Some(HashAlg::Sha256) });
+            push(Algorithm::Rsa { hash: None });
+        } else {
+            push(alg.clone());
+        }
+    }
+    for alg in defaults {
+        push(alg.clone());
+    }
+    out
+}
+
+/// Client config for one hop: keepalives (what makes a dropped link
+/// detectable: three missed 15s keepalives end it after ~45s) and the host-key
+/// algorithm order for that host.
+fn hop_config(host: &str, port: u16) -> Arc<client::Config> {
+    let pinned = known_hosts::pinned_algorithms(host, port);
+    let mut preferred = russh::Preferred::default();
+    preferred.key = std::borrow::Cow::Owned(preferred_host_key_order(&pinned));
+    Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
+        nodelay: true,
+        preferred,
+        ..client::Config::default()
+    })
+}
+
+/// Dial TCP under `TCP_CONNECT_TIMEOUT` and return the stream with the peer
+/// address it actually connected to (the resolver may try several).
+async fn dial_tcp(host: &str, port: u16) -> Result<(tokio::net::TcpStream, String), SshError> {
+    let stream = match tokio::time::timeout(
+        TCP_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(SshError::Connect(format!("could not connect to {host}:{port}: {e}")))
+        }
+        Err(_) => {
+            return Err(SshError::Timeout {
+                host: format!("{host}:{port}"),
+                stage: "TCP connect",
+                secs: TCP_CONNECT_TIMEOUT.as_secs(),
+            })
+        }
+    };
+    let _ = stream.set_nodelay(true);
+    let ip = stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| host.to_string());
+    Ok((stream, ip))
+}
+
+/// SSH identification + key exchange over `stream`, under `HANDSHAKE_TIMEOUT`.
+async fn handshake<S>(
+    config: Arc<client::Config>,
+    stream: S,
+    handler: ClientHandler,
+    wait: &HumanWait,
+) -> Result<Handle<ClientHandler>, SshError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let host = format!("{}:{}", handler.host, handler.port);
+    within(
+        wait,
+        HANDSHAKE_TIMEOUT,
+        &host,
+        "SSH handshake (no SSH banner, or the key exchange stalled)",
+        client::connect_stream(config, stream, handler),
+    )
+    .await?
 }
 
 /* -------------------------------------------------------------- host keys */
@@ -193,9 +442,11 @@ pub struct JumpParams {
 /// is handed back by the `host_key_respond` command.
 #[derive(Default)]
 pub struct HostKeyPrompts {
-    /// request id -> (owning session id, answer channel). The session id lets a
-    /// closed tab drop its own prompts instead of leaving them on screen.
-    pending: DashMap<String, (String, oneshot::Sender<bool>)>,
+    /// request id -> (owning session id + connect generation, answer channel).
+    /// The session id lets a closed tab drop its own prompts instead of leaving
+    /// them on screen; the generation lets a newer connect for the same tab
+    /// drop only the prompts of the attempt it superseded.
+    pending: DashMap<String, (PromptOwner, oneshot::Sender<bool>)>,
 }
 
 impl HostKeyPrompts {
@@ -216,24 +467,32 @@ impl HostKeyPrompts {
     /// the UI can be told to close them. Dropping the sender rejects the key,
     /// which aborts that in-flight connect.
     pub fn cancel_session(&self, session_id: &str) -> Vec<String> {
-        cancel_for_session(&self.pending, session_id)
+        cancel_matching(&self.pending, |o| o.0 == session_id)
+    }
+
+    fn cancel_attempt(&self, session_id: &str, ticket: u64) -> Vec<String> {
+        cancel_matching(&self.pending, |o| o.0 == session_id && o.1 == ticket)
     }
 }
 
-/// Remove all pending prompts owned by `session_id` from a prompt map.
-fn cancel_for_session<T>(
-    pending: &DashMap<String, (String, oneshot::Sender<T>)>,
-    session_id: &str,
+/// (session id, connect generation) that raised a prompt.
+type PromptOwner = (String, u64);
+
+/// Remove all pending prompts whose owner matches from a prompt map,
+/// returning their request ids.
+fn cancel_matching<T>(
+    pending: &DashMap<String, (PromptOwner, oneshot::Sender<T>)>,
+    matches: impl Fn(&PromptOwner) -> bool,
 ) -> Vec<String> {
     let ids: Vec<String> = pending
         .iter()
-        .filter(|e| e.value().0 == session_id)
+        .filter(|e| matches(&e.value().0))
         .map(|e| e.key().clone())
         .collect();
-    for id in &ids {
-        pending.remove(id);
-    }
-    ids
+    // remove_if: an id is never reused, but stay exact anyway.
+    ids.into_iter()
+        .filter(|id| pending.remove_if(id, |_, v| matches(&v.0)).is_some())
+        .collect()
 }
 
 /// Register a prompt and show it, atomically with respect to
@@ -250,16 +509,14 @@ fn cancel_for_session<T>(
 /// Returns `None` (with nothing left registered) when cancelled or when the
 /// emit fails. `emit` must not touch `pending`.
 fn register_and_emit<T>(
-    pending: &DashMap<String, (String, oneshot::Sender<T>)>,
+    pending: &DashMap<String, (PromptOwner, oneshot::Sender<T>)>,
     request_id: &str,
-    session_id: &str,
+    owner: PromptOwner,
     cancelled: impl FnOnce() -> bool,
     emit: impl FnOnce() -> bool,
 ) -> Option<oneshot::Receiver<T>> {
     let (tx, rx) = oneshot::channel();
-    let guard = pending
-        .entry(request_id.to_string())
-        .insert((session_id.to_string(), tx));
+    let guard = pending.entry(request_id.to_string()).insert((owner, tx));
     let shown = !cancelled() && emit();
     drop(guard);
     if shown {
@@ -308,6 +565,12 @@ pub struct AuthPromptRequest {
     pub name: String,
     pub instruction: String,
     pub prompts: Vec<AuthPromptField>,
+    /// Which connection is asking, apart from the server-written text above.
+    #[serde(flatten)]
+    pub origin: PromptOrigin,
+    /// "password" for Hawser's own up-front password prompt (no server text),
+    /// "challenge" for a keyboard-interactive round written by the server.
+    pub kind: &'static str,
     /// When true, the dialog offers a "save to the OS vault" checkbox. Only set
     /// for the up-front "no saved password" prompt — never for a live server
     /// challenge (an OTP or token code is single-use and must not be stored).
@@ -318,7 +581,7 @@ pub struct AuthPromptRequest {
 /// plus whether they asked to save the password to the OS vault.
 #[derive(Debug, Default)]
 pub struct AuthAnswer {
-    pub answers: Vec<String>,
+    pub answers: Vec<zeroize::Zeroizing<String>>,
     pub save: bool,
 }
 
@@ -328,12 +591,17 @@ pub struct AuthAnswer {
 #[derive(Default)]
 pub struct AuthPrompts {
     /// request id -> (owning session id, answer channel); see HostKeyPrompts.
-    pending: DashMap<String, (String, oneshot::Sender<AuthAnswer>)>,
+    pending: DashMap<String, (PromptOwner, oneshot::Sender<AuthAnswer>)>,
 }
 
 impl AuthPrompts {
     /// Resolve a pending auth prompt with the user's typed answers and save choice.
-    pub fn respond(&self, request_id: &str, answers: Vec<String>, save: bool) -> bool {
+    pub fn respond(
+        &self,
+        request_id: &str,
+        answers: Vec<zeroize::Zeroizing<String>>,
+        save: bool,
+    ) -> bool {
         match self.pending.remove(request_id) {
             Some((_, (_, tx))) => tx.send(AuthAnswer { answers, save }).is_ok(),
             None => false,
@@ -343,7 +611,11 @@ impl AuthPrompts {
     /// Drop every prompt raised for `session_id` (see HostKeyPrompts). The
     /// waiting auth then fails as cancelled, so nothing is sent.
     pub fn cancel_session(&self, session_id: &str) -> Vec<String> {
-        cancel_for_session(&self.pending, session_id)
+        cancel_matching(&self.pending, |o| o.0 == session_id)
+    }
+
+    fn cancel_attempt(&self, session_id: &str, ticket: u64) -> Vec<String> {
+        cancel_matching(&self.pending, |o| o.0 == session_id && o.1 == ticket)
     }
 
     /// Drop the pending sender for a request. The waiting `request_auth_answers`
@@ -373,25 +645,115 @@ const AUTH_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 ///     record the answer in known_hosts on acceptance (trust on first use).
 struct ClientHandler {
     host: String,
-    /// Resolved peer address, shown alongside the hostname so the user can see
-    /// *which* machine answered — the distinction that matters when a name
-    /// resolves somewhere unexpected.
+    /// The peer address the TCP socket connected to, shown alongside the
+    /// hostname so the user can see *which* machine answered. Empty for a
+    /// target reached through a jump host (the bastion dialled it; see
+    /// `origin.via`).
     ip: String,
     port: u16,
+    /// Who is asking, for the dialog (name, user@host:port, bastion).
+    origin: PromptOrigin,
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
-    /// The tab this connection belongs to, so closing it can drop the prompt.
-    session_id: String,
+    /// The tab and connect generation this connection belongs to, so closing
+    /// the tab (or a newer connect for it) can drop the prompt.
+    owner: PromptOwner,
     /// Closes (sender dropped) when the tab is closed mid-connect. Host-key
     /// checks run in russh's own session task, which outlives the cancelled
     /// connect future, so the handler must look itself before prompting.
-    /// `None` for connections with no tab (copy_id).
-    cancel: Option<watch::Receiver<()>>,
+    cancel: watch::Receiver<()>,
+    /// Pauses the connect-stage deadlines while the dialog is open.
+    wait: HumanWait,
+    /// Why the transport ended, filled by `disconnected` for the output pump.
+    death: DeathNote,
 }
+
+/// Where `ClientHandler::disconnected` leaves the reason a transport died.
+type DeathNote = Arc<std::sync::Mutex<Option<String>>>;
 
 impl ClientHandler {
     fn cancelled(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|rx| rx.has_changed().is_err())
+        self.cancel.has_changed().is_err()
+    }
+}
+
+/// The key a host-key decision is made on. Hawser pins plain public keys; a
+/// certificate is judged by the key it embeds, exactly as that raw key would
+/// be (the CA signature earns no extra trust and no exemption).
+fn presented_key(presented: &russh::keys::PublicKeyOrCertificate) -> russh::keys::PublicKey {
+    match presented {
+        russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
+        russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
+            russh::keys::ssh_key::PublicKey::new(cert.public_key().clone(), "")
+        }
+    }
+}
+
+/// What to do with a presented host key, before any human is involved.
+#[derive(Debug)]
+enum KeyVerdict {
+    /// Pinned and matching: accept silently.
+    Accept,
+    /// Changed, revoked, or the store could not be read: refuse, never prompt.
+    Refuse(SshError),
+    /// First use: ask a human.
+    Ask,
+}
+
+/// The tri-state mapping that is the whole security property:
+///   Trusted -> accept silently
+///   Changed / Revoked -> refuse, never prompt
+///   Unknown -> ask a human
+///   store error -> refuse (fail closed, not a trust prompt)
+fn key_verdict(host: &str, port: u16, key: &russh::keys::PublicKey, store: &std::path::Path) -> KeyVerdict {
+    match known_hosts::classify(host, port, key, store) {
+        Ok(HostKeyStatus::Trusted) => KeyVerdict::Accept,
+        Ok(HostKeyStatus::Changed { line }) | Ok(HostKeyStatus::Revoked { line }) => {
+            KeyVerdict::Refuse(SshError::ChangedHostKey { host: host.to_string(), line })
+        }
+        Ok(HostKeyStatus::Unknown) => KeyVerdict::Ask,
+        Err(e) => KeyVerdict::Refuse(SshError::KnownHosts(e)),
+    }
+}
+
+/// How a host-key dialog ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptEnd {
+    Accepted,
+    Rejected,
+    /// The sender was dropped: the tab closed, or a newer connect swept it.
+    Dropped,
+    TimedOut,
+}
+
+async fn await_host_key_answer(rx: oneshot::Receiver<bool>, limit: Duration) -> PromptEnd {
+    match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(true)) => PromptEnd::Accepted,
+        Ok(Ok(false)) => PromptEnd::Rejected,
+        Ok(Err(_)) => PromptEnd::Dropped,
+        Err(_) => PromptEnd::TimedOut,
+    }
+}
+
+/// Turn a dialog's end into the handler's answer. Only an explicit accept
+/// trusts the key, and only after the store re-check in `trust_at` (under its
+/// lock) still sees the host as unknown or already pinned to this key.
+fn settle_host_key(
+    end: &PromptEnd,
+    host: &str,
+    port: u16,
+    key: &russh::keys::PublicKey,
+    store: &std::path::Path,
+) -> Result<bool, SshError> {
+    match end {
+        PromptEnd::Accepted => {
+            known_hosts::trust_at(host, port, key, store)?;
+            Ok(true)
+        }
+        PromptEnd::Rejected | PromptEnd::Dropped => {
+            Err(SshError::HostKeyRejected { host: host.to_string() })
+        }
+        PromptEnd::TimedOut => Err(SshError::HostKeyTimeout { host: host.to_string() }),
     }
 }
 
@@ -402,35 +764,13 @@ impl client::Handler for ClientHandler {
         &mut self,
         presented: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // russh 0.63 hands us a key-or-certificate. Hawser pins the plain public
-        // key; for a certificate we pin the embedded key. Either way the trust
-        // decision below runs against a concrete PublicKey.
-        let server_public_key = match presented {
-            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
-            russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
-                russh::keys::ssh_key::PublicKey::new(cert.public_key().clone(), "")
-            }
-        };
+        let server_public_key = presented_key(presented);
         let server_public_key = &server_public_key;
-        // Tri-state, and the mapping is the whole security property:
-        //   Trusted -> accept silently
-        //   Changed -> refuse, never prompt
-        //   Unknown -> ask a human
-        match known_hosts::check(&self.host, self.port, server_public_key) {
-            Ok(HostKeyStatus::Trusted) => return Ok(true),
-            Ok(HostKeyStatus::Changed { line }) | Ok(HostKeyStatus::Revoked { line }) => {
-                // Both refuse outright and never prompt: a different key for a
-                // known host, or one explicitly revoked, is exactly the case a
-                // trust dialog must never appear for.
-                return Err(SshError::ChangedHostKey {
-                    host: self.host.clone(),
-                    line,
-                })
-            }
-            Ok(HostKeyStatus::Unknown) => { /* fall through and ask */ }
-            // A read/parse failure of the store fails CLOSED (refuse), rather
-            // than routing to a first-use trust prompt.
-            Err(e) => return Err(SshError::KnownHosts(e)),
+        let store = known_hosts::ensure_store()?;
+        match key_verdict(&self.host, self.port, server_public_key, &store) {
+            KeyVerdict::Accept => return Ok(true),
+            KeyVerdict::Refuse(e) => return Err(e),
+            KeyVerdict::Ask => {}
         }
 
         let request_id = format!(
@@ -447,6 +787,7 @@ impl client::Handler for ClientHandler {
             host: self.host.clone(),
             ip: self.ip.clone(),
             port: self.port,
+            origin: self.origin.clone(),
             key_type: server_public_key.algorithm().to_string(),
             fingerprint,
         };
@@ -454,7 +795,7 @@ impl client::Handler for ClientHandler {
         let rx = register_and_emit(
             &self.prompts.pending,
             &request_id,
-            &self.session_id,
+            self.owner.clone(),
             || {
                 was_cancelled = self.cancelled();
                 was_cancelled
@@ -463,41 +804,72 @@ impl client::Handler for ClientHandler {
         );
         let Some(rx) = rx else {
             return Err(if was_cancelled {
-                SshError::Cancelled(self.session_id.clone())
+                SshError::Cancelled(self.owner.0.clone())
             } else {
                 SshError::HostKeyRejected { host: self.host.clone() }
             });
         };
 
-        match tokio::time::timeout(HOST_KEY_PROMPT_TIMEOUT, rx).await {
-            Ok(Ok(true)) => {
-                // Trust on first use, recorded so the next connection is silent.
-                // Same store the check above reads — writing anywhere else would
-                // mean re-prompting forever.
-                known_hosts::trust(&self.host, self.port, server_public_key)?;
-                Ok(true)
-            }
-            Ok(Ok(false)) => Err(SshError::HostKeyRejected {
-                host: self.host.clone(),
-            }),
-            // Sender dropped: the tab was closed (or the session swept). The
+        let end = {
+            let _human = self.wait.enter();
+            await_host_key_answer(rx, HOST_KEY_PROMPT_TIMEOUT).await
+        };
+        match end {
+            // Sender dropped: the tab was closed (or the attempt swept). The
             // sweep already emitted prompt-closed after our prompt; repeat it
             // so a close always follows the prompt even on a path that missed
             // it (the UI ignores a close for an id it no longer holds).
-            Ok(Err(_)) => {
-                emit_prompt_closed(&self.app, &request_id);
-                Err(SshError::HostKeyRejected {
-                    host: self.host.clone(),
-                })
-            }
-            Err(_) => {
+            PromptEnd::Dropped => emit_prompt_closed(&self.app, &request_id),
+            PromptEnd::TimedOut => {
                 self.prompts.cancel(&request_id);
                 emit_prompt_closed(&self.app, &request_id);
-                Err(SshError::HostKeyTimeout {
-                    host: self.host.clone(),
-                })
             }
+            PromptEnd::Accepted | PromptEnd::Rejected => {}
         }
+        // Trust on first use, recorded so the next connection is silent. Same
+        // store the check above read — writing anywhere else would mean
+        // re-prompting forever.
+        settle_host_key(&end, &self.host, self.port, server_public_key, &store)
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let (note, out) = match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                let msg = info.message.trim();
+                (
+                    if msg.is_empty() {
+                        "the server closed the connection".to_string()
+                    } else {
+                        format!("the server closed the connection: {msg}")
+                    },
+                    Ok(()),
+                )
+            }
+            client::DisconnectReason::Error(e) => (death_reason(&e), Err(e)),
+        };
+        if let Ok(mut slot) = self.death.lock() {
+            slot.get_or_insert(note);
+        }
+        out
+    }
+}
+
+/// User-facing wording for a transport that ended with an error.
+fn death_reason(e: &SshError) -> String {
+    match e {
+        SshError::Russh(russh::Error::KeepaliveTimeout) => {
+            "no reply to keepalives for 45s (the network path or VPN dropped)".into()
+        }
+        SshError::Russh(russh::Error::InactivityTimeout) => "closed after inactivity".into(),
+        SshError::Russh(russh::Error::IO(io)) => format!("connection lost: {io}"),
+        SshError::Io(io) => format!("connection lost: {io}"),
+        SshError::Russh(russh::Error::HUP) | SshError::Russh(russh::Error::Disconnect) => {
+            "the connection was closed".into()
+        }
+        other => format!("connection lost: {other}"),
     }
 }
 
@@ -511,29 +883,49 @@ pub struct Session {
     /// `window_change` with it, leaving no way to resize.
     shell: Mutex<Option<ChannelWriteHalf<client::Msg>>>,
     sftp: Mutex<Option<Arc<SftpSession>>>,
-    /// The bastion connection, when this session rides a jump host. Held only
-    /// so it is not dropped: dropping the jump Handle closes the tunnel under
-    /// the target session's feet.
-    _jump: Option<Handle<ClientHandler>>,
-    /// Cleared by the output pump when the channel ends. Checked before every
-    /// write so input into a dead session fails loudly instead of vanishing
-    /// into a closed channel.
+    /// The bastion connection, when this session rides a jump host. Held so it
+    /// is not dropped (that closes the tunnel under the target session's feet),
+    /// and disconnected explicitly on teardown.
+    jump: Option<Handle<ClientHandler>>,
+    /// Cleared when the shell or transport ends. Checked before every write so
+    /// input into a dead session fails loudly instead of vanishing into a
+    /// closed channel, and by `forward_start` to refuse a dead transport.
     alive: AtomicBool,
     /// Endpoint identity derived from what this connection actually dialled
     /// (see `utils::artifacts::dial_identity`). Keys the transcript, and every
     /// config, capture and AI-context lookup made for this session.
     endpoint: String,
+    /// The connect that produced this session. Forwards record it so that the
+    /// end of this session tears down its own forwards and never a newer
+    /// connection's for the same tab.
+    generation: u64,
+}
+
+impl Session {
+    /// Mark the session dead and send SSH_MSG_DISCONNECT on the target and then
+    /// the bastion. Best-effort: on a link that is already gone each send errors
+    /// harmlessly. This closes the transport and every channel on it, including
+    /// an in-flight SFTP transfer, whose next read or write then fails.
+    async fn close(&self, why: &str) {
+        self.alive.store(false, Ordering::SeqCst);
+        let _ = self.handle.disconnect(russh::Disconnect::ByApplication, why, "").await;
+        if let Some(jh) = self.jump.as_ref() {
+            let _ = jh.disconnect(russh::Disconnect::ByApplication, why, "").await;
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct Registry {
-    sessions: DashMap<String, Arc<Session>>,
+    /// Shared with the output pumps, which end their own generation's forwards
+    /// when the shell or transport ends.
+    sessions: Arc<DashMap<String, Arc<Session>>>,
     /// Output-pump task per session, so disconnect can stop it — otherwise the
     /// pump keeps an Arc<Session> (hence the SSH Handle) alive and blocks on
     /// `read_half.wait()` forever after the tab is "closed".
     pumps: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Active local/SOCKS forwards, keyed by forward id. See `Forward`.
-    forwards: DashMap<String, Forward>,
+    forwards: Arc<DashMap<String, Forward>>,
     /// Connects still in flight, session id -> generation. `remove` deletes the
     /// entry, which is how closing a tab mid-connect cancels it: the connect
     /// checks its generation at each step and before registering, and tears its
@@ -543,20 +935,25 @@ pub struct Registry {
     /// drops it, which interrupts the connect at whatever await it is parked on
     /// (see `connect`) and tells the russh handlers to stop prompting.
     connecting: DashMap<String, (u64, watch::Sender<()>)>,
+    /// In-flight key installs (`copy_id`), op id -> cancel sender.
+    copy_ids: DashMap<String, (u64, watch::Sender<()>)>,
 }
 
 /// Generation counter for `Registry::connecting`.
-static CONNECT_SEQ: AtomicU64 = AtomicU64::new(0);
+static CONNECT_SEQ: AtomicU64 = AtomicU64::new(1);
+static COPY_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Everything needed to tear a forward down *completely*.
 ///
 /// Aborting only the listener stops new connections but leaves already-
 /// established tunnels carrying traffic — a user who "stopped" a forward would
-/// still be leaking through the live ones. So each forward also owns the abort
+/// still be leaking through the live ones. So each forward also owns the
 /// handles of the per-connection tunnel tasks it has spawned; tearing the
-/// forward down aborts those too.
+/// forward down ends those too.
 struct Forward {
     info: ForwardInfo,
+    /// `Session::generation` of the transport this forward tunnels over.
+    generation: u64,
     listener: tokio::task::JoinHandle<()>,
     tunnels: TunnelHandles,
 }
@@ -595,12 +992,133 @@ fn track_tunnel(tunnels: &TunnelHandles, handle: tokio::task::JoinHandle<()>) {
 }
 
 /// Remove and return all currently-tracked tunnel handles, so the caller can
-/// abort (and optionally await) them without holding the lock across `.await`.
+/// abort and await them without holding the lock across `.await`.
 fn take_tunnels(tunnels: &TunnelHandles) -> Vec<tokio::task::JoinHandle<()>> {
     match tunnels.lock() {
         Ok(mut v) => std::mem::take(&mut *v),
         Err(_) => Vec::new(),
     }
+}
+
+/// Tear one forward down, in the only order that leaves nothing behind: stop
+/// the listener and WAIT for it, so it can no longer accept and register a new
+/// tunnel; only then take, abort and await every tunnel it registered.
+async fn teardown_forward(fw: Forward) {
+    fw.listener.abort();
+    let _ = fw.listener.await;
+    let tunnels = take_tunnels(&fw.tunnels);
+    for h in &tunnels {
+        h.abort();
+    }
+    for h in tunnels {
+        let _ = h.await;
+    }
+}
+
+/// Remove every forward that matches from the map, for teardown.
+fn take_forwards(
+    forwards: &DashMap<String, Forward>,
+    matches: impl Fn(&Forward) -> bool,
+) -> Vec<Forward> {
+    let ids: Vec<String> = forwards
+        .iter()
+        .filter(|e| matches(e.value()))
+        .map(|e| e.key().clone())
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| forwards.remove_if(&id, |_, f| matches(f)).map(|(_, f)| f))
+        .collect()
+}
+
+/// Everything a connect needs, as the frontend asked for it.
+pub struct ConnectSpec {
+    pub session_id: String,
+    /// Vault id of the credential (the host's own id, or the one it borrows).
+    pub host_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub cols: u32,
+    pub rows: u32,
+    pub startup_commands: Vec<String>,
+    pub auth: String,
+    pub key_path: Option<String>,
+    pub jump: Option<JumpParams>,
+    /// A quick-connect password, used once and wiped on drop.
+    pub one_shot_password: Option<zeroize::Zeroizing<String>>,
+    /// The frontend's computed endpoint identity. Only its catalogue ids are
+    /// used; destinations come from the dial (utils::artifacts::dial_identity).
+    pub endpoint: Option<String>,
+    /// Catalogue display name, for prompts only.
+    pub label: Option<String>,
+    /// A quick-connect host that is not in the catalogue: never offer to save
+    /// a typed password for it (nothing could ever delete that vault entry).
+    pub ephemeral: bool,
+}
+
+/// Prompt context shared by one hop's authentication.
+struct PromptCtx<'a> {
+    app: &'a AppHandle,
+    auth_prompts: &'a Arc<AuthPrompts>,
+    owner: PromptOwner,
+    origin: PromptOrigin,
+    wait: HumanWait,
+    /// Offer "save to the vault" on the up-front password prompt.
+    offer_save: bool,
+}
+
+/// One hop's authentication parameters.
+struct AuthSpec<'a> {
+    host_id: &'a str,
+    host: &'a str,
+    port: u16,
+    username: &'a str,
+    auth: &'a str,
+    key_path: Option<&'a str>,
+    /// The ONE secret snapshot `authorize_stored_password` read and authorized
+    /// for this destination (or the one-shot password). `authenticate` never
+    /// reads the vault again, so what was checked is exactly what is sent.
+    secret: Option<zeroize::Zeroizing<String>>,
+}
+
+/// Open the shell channel, ask for a PTY and a shell, and wait for the
+/// server's replies to both. russh's request calls only enqueue; the replies
+/// arrive on the channel as Success/Failure, in request order. Anything else
+/// that arrives first is returned for the pump to replay.
+///
+/// A refused PTY is reported (the shell may still work, as with OpenSSH's
+/// "PTY allocation request failed"); a refused shell is an error.
+async fn open_shell(
+    handle: &Handle<ClientHandler>,
+    host: &str,
+    cols: u32,
+    rows: u32,
+) -> Result<(russh::ChannelReadHalf, ChannelWriteHalf<client::Msg>, Vec<ChannelMsg>, bool), SshError>
+{
+    let channel = handle.channel_open_session().await?;
+    let (mut read_half, write_half) = channel.split();
+    write_half
+        .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+        .await?;
+    write_half.request_shell(true).await?;
+    let mut early = Vec::new();
+    let mut replies: Vec<bool> = Vec::with_capacity(2);
+    while replies.len() < 2 {
+        match read_half.wait().await {
+            Some(ChannelMsg::Success) => replies.push(true),
+            Some(ChannelMsg::Failure) => replies.push(false),
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                return Err(SshError::Connect(format!(
+                    "{host} closed the session before the shell started"
+                )))
+            }
+            Some(other) => early.push(other),
+        }
+    }
+    if !replies[1] {
+        return Err(SshError::ShellRefused { host: host.to_string() });
+    }
+    Ok((read_half, write_half, early, replies[0]))
 }
 
 impl Registry {
@@ -616,69 +1134,42 @@ impl Registry {
             .ok_or_else(|| SshError::NoSession(id.to_string()))
     }
 
-    /// Tear a session down for real: stop the pump, send an SSH disconnect so
-    /// the transport actually closes (Handle's Drop does NOT close it), and
-    /// sweep the session's forwards. Without the explicit disconnect the
-    /// authenticated connection and remote shell keep running after the user
-    /// thinks they have closed the tab.
-    ///
-    /// Teardown is awaited to completion before returning: `abort()` only
-    /// *requests* cancellation, so a caller that returned as soon as abort was
-    /// issued could report "disconnected" while the pump was still mid-poll,
-    /// still holding its `Arc<Session>` (and thus the SSH `Handle`). Awaiting the
-    /// aborted `JoinHandle`s makes "disconnected" mean the tasks have actually
-    /// stopped and their session references are gone.
+    /// Close a tab's connection: cancel a connect still in flight for it, then
+    /// tear down whatever is registered (see `teardown_registered`).
     pub async fn remove(&self, id: &str) {
         // Cancel a connect that has not registered yet (see `connecting`).
         self.connecting.remove(id);
+        self.teardown_registered(id).await;
+    }
+
+    /// Tear a registered session down for real: stop the pump, send an SSH
+    /// disconnect to the target and the bastion so the transports actually
+    /// close (Handle's Drop does NOT close them), and sweep the session's
+    /// forwards. Leaves `connecting` alone, so a reconnect can hold its ticket
+    /// across this teardown (a tab closed meanwhile then cancels it).
+    ///
+    /// Teardown is awaited to completion before returning: `abort()` only
+    /// *requests* cancellation, so returning as soon as abort was issued could
+    /// report "disconnected" while the pump was still mid-poll, still holding
+    /// its `Arc<Session>`.
+    async fn teardown_registered(&self, id: &str) {
         let session = self.sessions.remove(id).map(|(_, s)| s);
 
         // Stop the output pump first, and WAIT for it to unwind, so it has
-        // dropped its Arc<Session> before we send the disconnect below — then
-        // the only remaining Handle reference is ours. An aborted JoinHandle
-        // resolves promptly (the pump blocks on a cancel-safe `read_half.wait()`)
-        // with a cancellation error, which we discard.
+        // dropped its Arc<Session> before we send the disconnect below.
         if let Some((_, pump)) = self.pumps.remove(id) {
             pump.abort();
             let _ = pump.await;
         }
 
         if let Some(session) = session {
-            session.alive.store(false, Ordering::Relaxed);
-            // Send SSH_MSG_DISCONNECT. Best-effort: if the link is already gone
-            // this errors harmlessly. This closes the transport and, with it,
-            // every channel — including any in-flight SFTP transfer, whose next
-            // read/write then fails and unwinds rather than continuing against a
-            // connection the user believes is closed.
-            let _ = session
-                .handle
-                .disconnect(russh::Disconnect::ByApplication, "closed by user", "")
-                .await;
+            session.close("closed by user").await;
         }
 
         // A forward's transport is this session; with it gone the listener
-        // would sit accepting connections it can never tunnel, forever. Sweep
-        // them here so closing a tab tears down its tunnels too, and await each
-        // aborted listener so teardown is complete before we return.
-        let doomed: Vec<String> = self
-            .forwards
-            .iter()
-            .filter(|e| e.value().info.session_id == id)
-            .map(|e| e.key().clone())
-            .collect();
-        for fid in doomed {
-            if let Some((_, fw)) = self.forwards.remove(&fid) {
-                // Abort AND await every live tunnel, then the listener, so
-                // "disconnected" means the per-connection tunnel tasks have
-                // actually unwound and dropped their channels — not merely that
-                // cancellation was requested.
-                for h in take_tunnels(&fw.tunnels) {
-                    h.abort();
-                    let _ = h.await;
-                }
-                fw.listener.abort();
-                let _ = fw.listener.await;
-            }
+        // would sit accepting connections it can never tunnel, forever.
+        for fw in take_forwards(&self.forwards, |f| f.info.session_id == id) {
+            teardown_forward(fw).await;
         }
     }
 
@@ -690,188 +1181,187 @@ impl Registry {
 
     /// Open a connection, authenticate, and start an interactive shell.
     ///
-    /// The password is read from the Windows Credential Manager here, held in a
-    /// zeroizing buffer, and dropped as soon as authentication returns. It is
-    /// never a parameter, never logged, and never sent to the webview.
-    #[allow(clippy::too_many_arguments)]
+    /// A stored password is read from the OS vault once, authorized for this
+    /// destination, held in a zeroizing buffer, and dropped as soon as
+    /// authentication returns. It is never a parameter, never logged, and never
+    /// sent to the webview.
     pub async fn connect(
         &self,
         app: AppHandle,
         prompts: Arc<HostKeyPrompts>,
         auth_prompts: Arc<AuthPrompts>,
-        session_id: &str,
-        host_id: &str,
-        host: &str,
-        port: u16,
-        username: &str,
-        cols: u32,
-        rows: u32,
-        startup_commands: &[String],
-        auth: &str,
-        key_path: Option<&str>,
-        jump: Option<JumpParams>,
-        one_shot_password: Option<&str>,
-        // The frontend's computed endpoint identity. Only its catalogue ids are
-        // used; destinations come from the dial (utils::artifacts::dial_identity).
-        endpoint: Option<&str>,
+        spec: ConnectSpec,
     ) -> Result<(), SshError> {
-        // A reconnect reuses the session id. Tear the previous connection down
-        // first: replacing the map entry alone would leave its transport alive
-        // (forward listeners hold their own Arc<Session>) and its forwards still
-        // listed under this id.
-        if self.sessions.contains_key(session_id) || self.pumps.contains_key(session_id) {
-            self.remove(session_id).await;
-        }
+        let session_id = spec.session_id.clone();
         let ticket = CONNECT_SEQ.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(());
-        self.connecting.insert(session_id.to_string(), (ticket, cancel_tx));
-        let mut closed = cancel_rx.clone();
-        let (sweep_hk, sweep_auth) = (Arc::clone(&prompts), Arc::clone(&auth_prompts));
-        let sweep_app = app.clone();
-        // Race the whole connect against cancellation. `still_wanted` checks
-        // between stages are not enough: a disconnect during the TCP/kex
-        // handshake or authentication must stop it there, before a password is
-        // sent or a new prompt raised. Dropping the future drops every Handle it
-        // owns, which ends those transports.
-        let result = tokio::select! {
-            biased;
-            _ = closed.changed() => Err(SshError::Cancelled(session_id.to_string())),
-            r = self.connect_inner(
-                app, prompts, auth_prompts, session_id, host_id, host, port, username, cols,
-                rows, startup_commands, auth, key_path, jump, one_shot_password, ticket,
-                cancel_rx, endpoint,
-            ) => r,
+        // Take the ticket FIRST, before tearing down the previous connection:
+        // a tab closed during that teardown then removes our ticket and this
+        // connect stops before it dials, instead of prompting for a closed tab.
+        let superseded = self.connecting.insert(session_id.clone(), (ticket, cancel_tx));
+        let sweep = |owner_ticket: u64| {
+            let closed = prompts
+                .cancel_attempt(&session_id, owner_ticket)
+                .into_iter()
+                .chain(auth_prompts.cancel_attempt(&session_id, owner_ticket));
+            for request_id in closed {
+                emit_prompt_closed(&app, &request_id);
+            }
+        };
+        // Dropping the superseded attempt's sender cancels it; its prompts (a
+        // host-key check parks in russh's own task, which outlives that
+        // attempt) are dropped here so they do not linger beside ours.
+        if let Some((old_ticket, _old_tx)) = superseded {
+            sweep(old_ticket);
+        }
+
+        // A reconnect reuses the session id. Tear the previous connection down:
+        // replacing the map entry alone would leave its transport alive
+        // (forward listeners hold their own Arc<Session>) and its forwards
+        // still listed under this id. Not raced against cancellation: a
+        // teardown cut off half-way would drop a session without disconnecting.
+        if self.sessions.contains_key(&session_id) || self.pumps.contains_key(&session_id) {
+            self.teardown_registered(&session_id).await;
+        }
+
+        let result = if !self.still_wanted(&session_id, ticket) {
+            Err(SshError::Cancelled(session_id.clone()))
+        } else {
+            let mut closed = cancel_rx.clone();
+            // Race the whole connect against cancellation. `still_wanted`
+            // checks between stages are not enough: a disconnect during the
+            // TCP/kex handshake or authentication must stop it there, before a
+            // password is sent or a new prompt raised. Dropping the future
+            // drops every Handle it owns, which ends those transports.
+            tokio::select! {
+                biased;
+                _ = closed.changed() => Err(SshError::Cancelled(session_id.clone())),
+                r = self.connect_inner(
+                    app.clone(), Arc::clone(&prompts), Arc::clone(&auth_prompts), spec, ticket,
+                    cancel_rx,
+                ) => r,
+            }
         };
         // Clear our in-flight marker, but only if it is still ours.
-        self.connecting.remove_if(session_id, |_, g| g.0 == ticket);
-        // Cancelled mid-connect: a prompt registered in the poll that raced the
-        // caller's sweep (or a cancel by a newer connect, which sweeps nothing)
-        // would be orphaned — its timeout cleanup lived in the dropped future.
-        // Sweep here too, unless a newer connect now owns this id and its
-        // prompts.
-        if matches!(result, Err(SshError::Cancelled(_)))
-            && !self.connecting.contains_key(session_id)
-        {
-            let closed = sweep_hk
-                .cancel_session(session_id)
-                .into_iter()
-                .chain(sweep_auth.cancel_session(session_id));
-            for request_id in closed {
-                emit_prompt_closed(&sweep_app, &request_id);
-            }
+        self.connecting.remove_if(&session_id, |_, g| g.0 == ticket);
+        // A failed or cancelled attempt leaves no prompt behind: one registered
+        // in the poll that raced a sweep would otherwise be orphaned (its
+        // timeout cleanup lived in the dropped future). Swept by generation,
+        // so a newer connect's prompts for this tab are left alone.
+        if result.is_err() {
+            sweep(ticket);
         }
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn connect_inner(
         &self,
         app: AppHandle,
         prompts: Arc<HostKeyPrompts>,
         auth_prompts: Arc<AuthPrompts>,
-        session_id: &str,
-        host_id: &str,
-        host: &str,
-        port: u16,
-        username: &str,
-        cols: u32,
-        rows: u32,
-        startup_commands: &[String],
-        auth: &str,
-        key_path: Option<&str>,
-        jump: Option<JumpParams>,
-        one_shot_password: Option<&str>,
+        spec: ConnectSpec,
         ticket: u64,
         cancel: watch::Receiver<()>,
-        endpoint: Option<&str>,
     ) -> Result<(), SshError> {
+        let ConnectSpec {
+            session_id,
+            host_id,
+            host,
+            port,
+            username,
+            cols,
+            rows,
+            startup_commands,
+            auth,
+            key_path,
+            jump,
+            one_shot_password,
+            endpoint,
+            label,
+            ephemeral,
+        } = spec;
+        let (session_id, host, username) = (session_id.as_str(), host.as_str(), username.as_str());
+
         // Before dialing anything, refuse to send a saved password to a
         // destination the catalogue never bound it to (both the target and any
         // jump host). This fails fast, before we even connect to the requested
         // host, so a compromised frontend cannot use the connection itself as an
-        // exfiltration channel for another host's stored secret.
-        authorize_stored_password(auth, host_id, host, port, username, one_shot_password)?;
-        if let Some(j) = jump.as_ref() {
-            authorize_stored_password(&j.auth, &j.host_id, &j.host, j.port, &j.username, None)?;
-        }
-
-        // Resolve first so the prompt can show which machine actually answered.
-        // Best-effort: a failure here is not fatal, the connect below will
-        // produce a better error than we could.
-        let ip = tokio::net::lookup_host((host, port))
-            .await
-            .ok()
-            .and_then(|mut addrs| addrs.next())
-            .map(|a| a.ip().to_string())
-            .unwrap_or_else(|| host.to_string());
-
-        // Keepalives are what make a dropped link *detectable*. Without them a
-        // VPN drop or an idle firewall timeout leaves the socket open forever:
-        // the read half never returns, so nothing ever reports a disconnect and
-        // the UI keeps showing a live session. Three missed 15s keepalives tears
-        // the connection down after ~45s.
-        let config = Arc::new(client::Config {
-            keepalive_interval: Some(Duration::from_secs(15)),
-            keepalive_max: 3,
-            nodelay: true,
-            ..client::Config::default()
-        });
-        let self_prompts = Arc::clone(&prompts);
-        let handler = ClientHandler {
-            host: host.to_string(),
-            ip,
-            port,
-            app: app.clone(),
-            prompts,
-            session_id: session_id.to_string(),
-            cancel: Some(cancel.clone()),
+        // exfiltration channel for another host's stored secret. The snapshot
+        // it authorized is what authentication later uses.
+        let target_secret = match one_shot_password {
+            Some(p) => {
+                authorize_stored_password(&auth, &host_id, host, port, username, true)?;
+                Some(p)
+            }
+            None => authorize_stored_password(&auth, &host_id, host, port, username, false)?,
         };
+        let jump_secret = match jump.as_ref() {
+            Some(j) => authorize_stored_password(&j.auth, &j.host_id, &j.host, j.port, &j.username, false)?,
+            None => None,
+        };
+
+        // Endpoint identity from the parameters actually dialled below, not
+        // from the claim: the claim only says which catalogue entries these are.
+        let endpoint = crate::utils::artifacts::dial_identity(
+            endpoint.as_deref(),
+            (username, host, port),
+            jump.as_ref().map(|j| (j.username.as_str(), j.host.as_str(), j.port)),
+        );
+
+        let owner: PromptOwner = (session_id.to_string(), ticket);
+        let wait = HumanWait::default();
+        let death: DeathNote = Arc::default();
+        let via = jump.as_ref().map(|j| {
+            let ep = endpoint_label(&j.username, &j.host, j.port);
+            match j.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                Some(n) => format!("{n} ({ep})"),
+                None => ep,
+            }
+        });
+        let target_origin = PromptOrigin::new(label.as_deref(), username, host, port, via);
 
         // With a jump host: dial the bastion, authenticate there, then open a
         // direct-tcpip channel to the real target and run the SSH handshake
         // over that stream — exactly what OpenSSH's ProxyJump does. The
         // bastion's own host key is checked and prompted like any other.
-        // Endpoint identity from the parameters actually dialled below, not
-        // from the claim: the claim only says which catalogue entries these are.
-        // (Derived here, before `jump` is consumed by the dial.)
-        // The identity comes from the dial parameters, not from the claim: the
-        // claim only says which catalogue entries these are.
-        let endpoint = crate::utils::artifacts::dial_identity(
-            endpoint,
-            (username, host, port),
-            jump.as_ref().map(|j| (j.username.as_str(), j.host.as_str(), j.port)),
-        );
-
         let (mut handle, jump_handle) = match jump {
             Some(j) => {
-                let jump_config = Arc::new(client::Config {
-                    keepalive_interval: Some(Duration::from_secs(15)),
-                    keepalive_max: 3,
-                    nodelay: true,
-                    ..client::Config::default()
-                });
-                let jump_ip = tokio::net::lookup_host((j.host.as_str(), j.port))
-                    .await
-                    .ok()
-                    .and_then(|mut a| a.next())
-                    .map(|a| a.ip().to_string())
-                    .unwrap_or_else(|| j.host.clone());
+                let (tcp, jump_ip) = dial_tcp(&j.host, j.port).await?;
+                let jump_origin =
+                    PromptOrigin::new(j.name.as_deref(), &j.username, &j.host, j.port, None);
                 let jump_handler = ClientHandler {
                     host: j.host.clone(),
                     ip: jump_ip,
                     port: j.port,
+                    origin: jump_origin.clone(),
                     app: app.clone(),
-                    prompts: Arc::clone(&self_prompts),
-                    session_id: session_id.to_string(),
-                    cancel: Some(cancel.clone()),
+                    prompts: Arc::clone(&prompts),
+                    owner: owner.clone(),
+                    cancel: cancel.clone(),
+                    wait: wait.clone(),
+                    death: Arc::default(),
                 };
-                let mut jh =
-                    client::connect(jump_config, (j.host.as_str(), j.port), jump_handler).await?;
-                authenticate(
-                    &mut jh, &j.host_id, &j.host, j.port, &j.username, &j.auth,
-                    j.key_path.as_deref(), None, &app, &auth_prompts, session_id,
-                )
-                .await?;
+                let mut jh = handshake(hop_config(&j.host, j.port), tcp, jump_handler, &wait).await?;
+                let jctx = PromptCtx {
+                    app: &app,
+                    auth_prompts: &auth_prompts,
+                    owner: owner.clone(),
+                    origin: jump_origin,
+                    wait: wait.clone(),
+                    offer_save: true,
+                };
+                let jspec = AuthSpec {
+                    host_id: &j.host_id,
+                    host: &j.host,
+                    port: j.port,
+                    username: &j.username,
+                    auth: &j.auth,
+                    key_path: j.key_path.as_deref(),
+                    secret: jump_secret,
+                };
+                let jlabel = format!("{}:{}", j.host, j.port);
+                within(&wait, AUTH_TIMEOUT, &jlabel, "authentication", authenticate(&mut jh, jspec, &jctx))
+                    .await??;
                 if !self.still_wanted(session_id, ticket) {
                     let _ = jh
                         .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
@@ -879,33 +1369,80 @@ impl Registry {
                     return Err(SshError::Cancelled(session_id.to_string()));
                 }
 
-                let tunnel = jh
-                    .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
-                    .await?;
-                let h =
-                    client::connect_stream(config, tunnel.into_stream(), handler).await?;
+                // The bastion resolves and dials the target itself, so there
+                // is no local address to show; the prompt says "via" instead.
+                let tunnel = within(
+                    &wait,
+                    TCP_CONNECT_TIMEOUT,
+                    &format!("{host}:{port}"),
+                    "the bastion's connection to the target",
+                    jh.channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0),
+                )
+                .await??;
+                let handler = ClientHandler {
+                    host: host.to_string(),
+                    ip: String::new(),
+                    port,
+                    origin: target_origin.clone(),
+                    app: app.clone(),
+                    prompts,
+                    owner: owner.clone(),
+                    cancel: cancel.clone(),
+                    wait: wait.clone(),
+                    death: Arc::clone(&death),
+                };
+                let h = handshake(hop_config(host, port), tunnel.into_stream(), handler, &wait).await?;
                 (h, Some(jh))
             }
-            None => (
-                client::connect(config, (host, port), handler).await?,
-                None,
-            ),
+            None => {
+                let (tcp, ip) = dial_tcp(host, port).await?;
+                let handler = ClientHandler {
+                    host: host.to_string(),
+                    ip,
+                    port,
+                    origin: target_origin.clone(),
+                    app: app.clone(),
+                    prompts,
+                    owner: owner.clone(),
+                    cancel: cancel.clone(),
+                    wait: wait.clone(),
+                    death: Arc::clone(&death),
+                };
+                (handshake(hop_config(host, port), tcp, handler, &wait).await?, None)
+            }
         };
 
-        authenticate(
-            &mut handle, host_id, host, port, username, auth, key_path, one_shot_password,
-            &app, &auth_prompts, session_id,
+        let ctx = PromptCtx {
+            app: &app,
+            auth_prompts: &auth_prompts,
+            owner,
+            origin: target_origin,
+            wait: wait.clone(),
+            offer_save: !ephemeral,
+        };
+        let aspec = AuthSpec {
+            host_id: &host_id,
+            host,
+            port,
+            username,
+            auth: &auth,
+            key_path: key_path.as_deref(),
+            secret: target_secret,
+        };
+        let hlabel = format!("{host}:{port}");
+        within(&wait, AUTH_TIMEOUT, &hlabel, "authentication", authenticate(&mut handle, aspec, &ctx))
+            .await??;
+
+        // Interactive shell on its own channel. "Connected" only once the
+        // server has accepted the shell request.
+        let (read_half, write_half, early, pty_ok) = within(
+            &wait,
+            CHANNEL_SETUP_TIMEOUT,
+            &hlabel,
+            "shell setup",
+            open_shell(&handle, host, cols, rows),
         )
-        .await?;
-
-        // Interactive shell on its own channel.
-        let channel = handle.channel_open_session().await?;
-        let (mut read_half, write_half) = channel.split();
-
-        write_half
-            .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
-            .await?;
-        write_half.request_shell(true).await?;
+        .await??;
 
         // The tab may have been closed during any of the awaits above (a slow
         // handshake, a host-key or password dialog). Stop before the startup
@@ -930,113 +1467,37 @@ impl Registry {
         // Order matters and is the user's: a `tmux new-session` first means every
         // later line runs *inside* tmux, which is usually what is wanted.
         for cmd in startup_commands.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
-            let line = format!("{cmd}
-");
+            let line = format!("{cmd}\n");
             write_half.data(line.as_bytes()).await?;
         }
 
-        // Output pump. Emits on the per-session topic TerminalPane subscribes
-        // to. stderr (ExtendedData) is interleaved into the same stream, which
-        // is what a real terminal does — separating it would reorder output.
-        let pump_app = app.clone();
-        let topic = format!("ssh://{session_id}");
-
-        // Transcript. Opened here rather than inside the task so a failure is
-        // visible immediately, and degraded to None rather than propagated:
-        // losing a log must never take down a working connection.
-        let mut log = SessionLog::create_for(Some(&endpoint), host, username).ok();
-        if let Some(l) = log.as_ref() {
-            let _ = pump_app.emit(
-                &topic,
-                format!(
-                    "\x1b[38;5;244mlogging to {}\x1b[0m\r\n",
-                    l.path().display()
-                ),
-            );
-        }
-
-        // The pump holds its own Arc so it can clear the liveness flag when the
-        // channel ends. Registration in the maps happens below, atomically with
-        // the cancellation check.
         let session = Arc::new(Session {
             handle,
             shell: Mutex::new(Some(write_half)),
             sftp: Mutex::new(None),
-            _jump: jump_handle,
+            jump: jump_handle,
             alive: AtomicBool::new(true),
             endpoint,
+            generation: ticket,
         });
 
-        let pump_session = Arc::clone(&session);
-        let sid = session_id.to_string();
+        // Output pump. Spawned now so its JoinHandle can be registered
+        // atomically below, but it emits nothing until it is handed its
+        // transcript, which happens only after a successful registration: a
+        // cancelled or superseded attempt creates no transcript file and
+        // writes nothing into a tab a newer connect owns.
+        let (go_tx, go_rx) = oneshot::channel::<Option<SessionLog>>();
+        let pump = tokio::spawn(run_pump(
+            app.clone(),
+            session_id.to_string(),
+            Arc::clone(&session),
+            read_half,
+            early,
+            go_rx,
+            death,
+            Arc::clone(&self.forwards),
+        ));
 
-        let pump = tokio::spawn(async move {
-            // Distinguishes a clean logout from a link that died under us. The
-            // difference matters to the user: one is expected, the other means
-            // "your VPN dropped" or "the firewall timed you out".
-            let mut reason = "connection closed by remote";
-            // Incomplete UTF-8 tails carried to the next chunk, one per stream:
-            // a packet boundary can split a multi-byte character, and decoding
-            // each chunk alone would print two U+FFFD for one real character.
-            let mut pending_out: Vec<u8> = Vec::new();
-            let mut pending_err: Vec<u8> = Vec::new();
-
-            while let Some(msg) = read_half.wait().await {
-                match msg {
-                    ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                        // Logged before display, so anything that reaches the
-                        // screen is already durable if the app dies next.
-                        if let Some(l) = log.as_mut() {
-                            l.append(data);
-                        }
-
-                        let pending = if matches!(msg, ChannelMsg::Data { .. }) {
-                            &mut pending_out
-                        } else {
-                            &mut pending_err
-                        };
-                        let text = decode_utf8_stream(pending, data);
-                        if !text.is_empty() {
-                            let _ = pump_app.emit(&topic, text);
-                        }
-                    }
-                    ChannelMsg::Eof | ChannelMsg::Close => {
-                        reason = "session closed";
-                        break;
-                    }
-                    ChannelMsg::ExitStatus { exit_status } => {
-                        reason = if exit_status == 0 {
-                            "shell exited"
-                        } else {
-                            "shell exited with an error"
-                        };
-                    }
-                    _ => {}
-                }
-            }
-
-            // Reaching here with no Eof/Close means `wait()` returned None: the
-            // transport itself went away — keepalive failure, reset, or a
-            // dropped route. That is the case the UI most needs told about.
-            pump_session.alive.store(false, Ordering::Relaxed);
-
-            if let Some(l) = log.as_mut() {
-                l.footer(reason);
-            }
-
-            let _ = pump_app.emit(
-                &topic,
-                format!("\r\n\x1b[38;2;242;178;92m\u{25cf} disconnected\x1b[0m {reason}\r\n"),
-            );
-            let _ = pump_app.emit(
-                "ssh://status",
-                SessionStatusEvent {
-                    session_id: sid,
-                    status: "disconnected",
-                    detail: reason.to_string(),
-                },
-            );
-        });
         // Register only while our ticket is still current, holding the
         // `connecting` entry (a shard lock, no await) so a concurrent
         // `remove()` — which deletes that entry first — either runs before us
@@ -1060,24 +1521,35 @@ impl Registry {
             // Superseded or cancelled: tear down only this attempt's own
             // resources. Detached, because the cancel that brought us here also
             // makes `connect`'s select drop this future at its next await — an
-            // inline teardown would be cut off half-way.
+            // inline teardown would be cut off half-way. The pump never got its
+            // go signal, so it has emitted nothing.
             if let Some(p) = pump.take() {
                 p.abort();
             }
-            session.alive.store(false, Ordering::Relaxed);
-            tokio::spawn(async move {
-                let _ = session
-                    .handle
-                    .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
-                    .await;
-                if let Some(jh) = session._jump.as_ref() {
-                    let _ = jh
-                        .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
-                        .await;
-                }
-            });
+            session.alive.store(false, Ordering::SeqCst);
+            tokio::spawn(async move { session.close("cancelled").await });
             return Err(SshError::Cancelled(session_id.to_string()));
         }
+
+        // Transcript. Degraded to None rather than propagated: losing a log
+        // must never take down a working connection.
+        let topic = format!("ssh://{session_id}");
+        let log = SessionLog::create_for(Some(&session.endpoint), host, username).ok();
+        if let Some(l) = log.as_ref() {
+            let _ = app.emit(
+                &topic,
+                format!("\x1b[38;5;244mlogging to {}\x1b[0m\r\n", l.path().display()),
+            );
+        }
+        if !pty_ok {
+            let _ = app.emit(
+                &topic,
+                "\x1b[38;2;242;178;92mthe server refused a terminal (PTY); line editing and \
+                 full-screen programs may not work\x1b[0m\r\n"
+                    .to_string(),
+            );
+        }
+        let _ = go_tx.send(log);
 
         Ok(())
     }
@@ -1586,34 +2058,55 @@ impl Registry {
             }
         });
 
-        self.insert_forward(Forward {
+        self.insert_forward(&session, Forward {
             info: info.clone(),
+            generation: session.generation,
             listener: task,
             tunnels,
-        });
+        })
+        .await?;
         Ok(info)
     }
 
-    /// Register a forward. Ids are `<kind>-<session>-<port>`, so re-creating a
-    /// forward on a port whose old listener died yields the same id; tear the
-    /// old entry down rather than let `insert` silently detach its tunnels.
-    fn insert_forward(&self, fw: Forward) {
-        if let Some(old) = self.forwards.insert(fw.info.id.clone(), fw) {
-            for h in take_tunnels(&old.tunnels) {
-                h.abort();
-            }
-            old.listener.abort();
+    /// Register a forward, then make sure its session is still the live one.
+    ///
+    /// The bind above awaits, and the tab can close (or the shell end) meanwhile:
+    /// that teardown swept this session's forwards before ours existed, so a
+    /// forward inserted now would hold its port and stay listed forever. The
+    /// teardowns clear the session (map entry or `alive`) BEFORE sweeping, so
+    /// re-checking after the insert is enough: either we see it gone and roll
+    /// back, or the sweep runs after our insert and takes this forward too.
+    ///
+    /// Ids are `<kind>-<session>-<port>`, so re-creating a forward on a port
+    /// whose old listener died yields the same id; tear the old entry down
+    /// rather than let `insert` silently detach its tunnels.
+    async fn insert_forward(&self, session: &Arc<Session>, fw: Forward) -> Result<(), SshError> {
+        let id = fw.info.id.clone();
+        let sid = fw.info.session_id.clone();
+        if let Some(old) = self.forwards.insert(id.clone(), fw) {
+            teardown_forward(old).await;
         }
+        let live = self
+            .sessions
+            .get(&sid)
+            .is_some_and(|s| Arc::ptr_eq(s.value(), session))
+            && session.alive.load(Ordering::SeqCst);
+        if !live {
+            if let Some((_, ours)) =
+                self.forwards.remove_if(&id, |_, f| f.generation == session.generation)
+            {
+                teardown_forward(ours).await;
+            }
+            return Err(SshError::Disconnected(sid));
+        }
+        Ok(())
     }
 
-    /// Stop one forward: abort its live tunnels AND its listener, so no traffic
-    /// keeps flowing after the user stops it — not just the listener.
-    pub fn forward_stop(&self, forward_id: &str) {
+    /// Stop one forward: its listener first, then every live tunnel, so no
+    /// traffic keeps flowing after the user stops it (see `teardown_forward`).
+    pub async fn forward_stop(&self, forward_id: &str) {
         if let Some((_, fw)) = self.forwards.remove(forward_id) {
-            for h in take_tunnels(&fw.tunnels) {
-                h.abort();
-            }
-            fw.listener.abort();
+            teardown_forward(fw).await;
         }
     }
 
@@ -1662,11 +2155,13 @@ impl Registry {
             }
         });
 
-        self.insert_forward(Forward {
+        self.insert_forward(&session, Forward {
             info: info.clone(),
+            generation: session.generation,
             listener: task,
             tunnels,
-        });
+        })
+        .await?;
         Ok(info)
     }
 
@@ -1676,6 +2171,56 @@ impl Registry {
             .map(|e| e.value().info.clone())
             .filter(|f| session_id.is_none_or(|sid| f.session_id == sid))
             .collect()
+    }
+
+    /// Install a public key (ssh-copy-id) over a throwaway connection, under
+    /// the same stage deadlines as a connect, and cancellable by `op_id` with
+    /// `copy_id_cancel` (the editor closed, or the user gave up). A cancelled
+    /// install leaves no prompt behind.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_id_run(
+        &self,
+        app: AppHandle,
+        prompts: Arc<HostKeyPrompts>,
+        auth_prompts: Arc<AuthPrompts>,
+        op_id: Option<&str>,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: zeroize::Zeroizing<String>,
+        public_key: &str,
+    ) -> Result<(), SshError> {
+        let seq = COPY_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        let session_id = format!("install-key-{seq}");
+        let op = op_id.map(str::to_string).unwrap_or_else(|| session_id.clone());
+        let (tx, rx) = watch::channel(());
+        // A second install under the same op id supersedes (cancels) the first.
+        self.copy_ids.insert(op.clone(), (seq, tx));
+        let mut closed = rx.clone();
+        let result = tokio::select! {
+            biased;
+            _ = closed.changed() => Err(SshError::Cancelled(op.clone())),
+            r = copy_id(
+                app.clone(), Arc::clone(&prompts), Arc::clone(&auth_prompts), &session_id, rx,
+                host, port, username, password, public_key,
+            ) => r,
+        };
+        self.copy_ids.remove_if(&op, |_, v| v.0 == seq);
+        if result.is_err() {
+            let swept = prompts
+                .cancel_session(&session_id)
+                .into_iter()
+                .chain(auth_prompts.cancel_session(&session_id));
+            for request_id in swept {
+                emit_prompt_closed(&app, &request_id);
+            }
+        }
+        result
+    }
+
+    /// Cancel an in-flight `copy_id_run`. Unknown ids are ignored.
+    pub fn copy_id_cancel(&self, op_id: &str) {
+        self.copy_ids.remove(op_id);
     }
 }
 
@@ -1827,27 +2372,28 @@ async fn run_exec(
     run
 }
 
-/// Authenticate an open handle by the host's configured method.
-///
-/// Refuse to send a *stored password* to a destination the saved catalogue
-/// never bound it to.
+/// Read the vault slot for `host_id` and authorize what it holds for this
+/// destination. Returns the ONE snapshot that `authenticate` will use, so the
+/// secret that was checked is exactly the secret that is sent: re-reading at
+/// send time let a password saved during the handshake (after a NotFound
+/// here) go to an unchecked destination.
 ///
 /// Only stored password auth transmits the vault secret to the server. Key auth
 /// uses the vault entry as a local key passphrase (it decrypts the key here and
 /// is never sent), and agent auth / a one-shot password carry no stored secret —
-/// so those are exempt. When a stored password exists for `host_id`, the
-/// destination must match a connection the user actually saved for that
-/// credential (its own record, or one that borrows it via `credentialId`);
-/// otherwise a compromised frontend could pair the id with an attacker's host
-/// and read the secret off the wire.
+/// so those are exempt from the binding check. When a stored password exists
+/// for `host_id`, the destination must match a connection the user actually
+/// saved for that credential (its own record, or one that borrows it via
+/// `credentialId`); otherwise a compromised frontend could pair the id with an
+/// attacker's host and read the secret off the wire.
 fn authorize_stored_password(
     auth: &str,
     host_id: &str,
     host: &str,
     port: u16,
     username: &str,
-    one_shot_password: Option<&str>,
-) -> Result<(), SshError> {
+    one_shot: bool,
+) -> Result<Option<zeroize::Zeroizing<String>>, SshError> {
     // Ids in a reserved vault namespace (the AI provider key lives at `ai:…`)
     // are never host credentials: refuse them for every auth method, so no
     // host id can address — and send, or use as a passphrase — that secret.
@@ -1856,21 +2402,24 @@ fn authorize_stored_password(
             "refusing to use '{host_id}' as a host credential: it is a reserved vault id"
         )));
     }
-    if one_shot_password.is_some() || matches!(auth, "key" | "agent") {
-        return Ok(());
+    if one_shot || auth == "agent" {
+        return Ok(None);
     }
-    // No saved secret for this id → nothing to leak; a bare password attempt
-    // simply fails later if the server demands one. Only a definite NotFound
-    // counts as "no secret": any other vault error (a locked keyring, a
-    // dismissed unlock prompt) fails CLOSED, since the later read in
-    // `authenticate` could succeed and send the secret unchecked.
-    match credentials::read_secret(host_id) {
-        Err(credentials::CredError::NotFound(_)) => return Ok(()),
-        Err(e) => return Err(e.into()),
-        Ok(_) => {}
+    // No saved secret for this id → nothing to leak (a password is then asked
+    // for). Only a definite NotFound counts as "no secret": any other vault
+    // error (a locked keyring, a dismissed unlock prompt) fails CLOSED and is
+    // reported as the vault problem it is.
+    let secret = match credentials::read_secret(host_id) {
+        Err(credentials::CredError::NotFound(_)) => return Ok(None),
+        Err(e) => return Err(vault_error(host_id, e)),
+        Ok(s) => s,
+    };
+    if auth == "key" {
+        // A local passphrase: never transmitted, so no destination binding.
+        return Ok(Some(secret));
     }
     if crate::utils::hosts::binding_is_authorized(host_id, host, port, username) {
-        Ok(())
+        Ok(Some(secret))
     } else {
         Err(SshError::AuthFailed(format!(
             "refusing to send the saved credential '{host_id}' to {host}:{port} as {username}: \
@@ -1879,57 +2428,99 @@ fn authorize_stored_password(
     }
 }
 
+/// A vault read that failed for a reason other than "nothing saved".
+fn vault_error(host_id: &str, e: credentials::CredError) -> SshError {
+    SshError::Connect(format!(
+        "could not read the saved credential for '{host_id}' from the OS vault (it may be \
+         locked, or the unlock prompt was dismissed): {e}"
+    ))
+}
+
+/// The RSA signature hash to use, asked of the server only when an RSA key is
+/// actually offered: russh waits up to 1s for EXT_INFO, which much network gear
+/// never sends, and every non-RSA login used to pay that.
+///
+/// Returns (hash, retry with SHA-1 on failure). With no EXT_INFO the server's
+/// support is unknown, so rsa-sha2-256 is tried first (modern OpenSSH refuses
+/// SHA-1) and ssh-rsa second (old stacks only know SHA-1), as russh's docs
+/// suggest. A server that sent EXT_INFO without rsa-sha2 gets SHA-1 directly.
+#[derive(Default)]
+struct RsaHash(Option<(Option<russh::keys::HashAlg>, bool)>);
+
+impl RsaHash {
+    async fn get(
+        &mut self,
+        handle: &Handle<ClientHandler>,
+    ) -> Result<(Option<russh::keys::HashAlg>, bool), SshError> {
+        if let Some(v) = self.0 {
+            return Ok(v);
+        }
+        let v = match handle.best_supported_rsa_hash().await? {
+            Some(h) => (h, false),
+            None => (Some(russh::keys::HashAlg::Sha256), true),
+        };
+        self.0 = Some(v);
+        Ok(v)
+    }
+}
+
 /// Shared between the target connection and a jump-host connection so the
 /// bastion supports the same three methods as any other host.
-#[allow(clippy::too_many_arguments)]
 async fn authenticate(
     handle: &mut Handle<ClientHandler>,
-    host_id: &str,
-    host: &str,
-    port: u16,
-    username: &str,
-    auth: &str,
-    key_path: Option<&str>,
-    one_shot_password: Option<&str>,
-    app: &AppHandle,
-    auth_prompts: &Arc<AuthPrompts>,
-    session_id: &str,
+    spec: AuthSpec<'_>,
+    ctx: &PromptCtx<'_>,
 ) -> Result<(), SshError> {
+    let AuthSpec { host_id, host, port, username, auth, key_path, secret } = spec;
     let authed = match auth {
-        // Private key file. The Credential Manager entry for this host, if
-        // present, is used as the key's passphrase — one vault slot per host,
-        // meaning either "password" or "key passphrase" depending on the auth
-        // method, never both.
+        // Private key file. The vault entry for this host, if present, is the
+        // key's passphrase — one vault slot per host, meaning either
+        // "password" or "key passphrase" depending on the auth method.
         "key" => {
             let path = key_path.ok_or_else(|| {
                 SshError::AuthFailed(format!("{username}: no key file configured"))
             })?;
-            let passphrase = credentials::read_secret(host_id).ok();
-            let key = russh::keys::load_secret_key(path, passphrase.as_ref().map(|p| p.as_str()))
+            let key = russh::keys::load_secret_key(path, secret.as_ref().map(|p| p.as_str()))
                 .map_err(|e| SshError::AuthFailed(format!("could not load key {path}: {e}")))?;
-            // RSA needs the strongest hash the server advertises; rsa-sha1 is
-            // refused by modern OpenSSH. Non-RSA ignores it.
-            let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
-            let key = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
-            handle.authenticate_publickey(username, key).await?
-        }
-
-        // Running SSH agent: the OpenSSH agent service pipe, then Pageant.
-        // Keys never leave the agent; it only signs.
-        "agent" => {
-            let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
-            match agent_auth(handle, username, hash_alg).await? {
-                Some(result) => result,
-                None => {
-                    return Err(SshError::AuthFailed(format!(
-                        "{username}: no SSH agent reachable (tried the OpenSSH agent                          pipe and Pageant), or the agent holds no accepted keys"
-                    )))
+            drop(secret);
+            let key = Arc::new(key);
+            if key.algorithm().is_rsa() {
+                // RSA needs the strongest hash the server advertises.
+                let (hash, retry_sha1) = RsaHash::default().get(handle).await?;
+                let first = handle
+                    .authenticate_publickey(
+                        username,
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::clone(&key), hash),
+                    )
+                    .await?;
+                if retry_sha1 && !matches!(first, russh::client::AuthResult::Success) {
+                    handle
+                        .authenticate_publickey(
+                            username,
+                            russh::keys::PrivateKeyWithHashAlg::new(key, None),
+                        )
+                        .await?
+                } else {
+                    first
                 }
+            } else {
+                handle
+                    .authenticate_publickey(
+                        username,
+                        russh::keys::PrivateKeyWithHashAlg::new(key, None),
+                    )
+                    .await?
             }
         }
 
-        // Password (default). A one-shot password (quick connect, never saved)
-        // takes precedence over the vault; it lives only for this call.
+        // Running SSH agent(s). Keys never leave the agent; it only signs.
+        "agent" => match agent_auth(handle, username).await? {
+            Some(result) => result,
+            None => return Err(SshError::AuthFailed(format!("{username}: {NO_AGENT}"))),
+        },
+
+        // Password (default): the one-shot password or the authorized vault
+        // snapshot, else asked for.
         //
         // On failure, keyboard-interactive is tried with the same secret.
         // That fallback is what makes TACACS+-fronted network gear work:
@@ -1937,47 +2528,34 @@ async fn authenticate(
         // single hidden "Password:" question. Users should not need to know
         // which of the two dances their firewall does.
         _ => {
-            // Hold the working copy in Zeroizing so it is wiped on EVERY exit
-            // path: the old code copied the secret into a plain String and only
-            // wiped it after both awaits succeeded, so a failed `?` between them
-            // (or a cancellation) left the plaintext in the heap. read_secret
-            // already returns Zeroizing; a one-shot password is wrapped to match.
-            // The previous `unsafe { as_mut_vec().fill(0) }` is gone — fill(0) is
-            // not a guaranteed zeroization primitive, and Zeroizing::drop is.
+            // Held in Zeroizing so it is wiped on EVERY exit path, including a
+            // failed `?` or a cancellation.
             // A password the user typed AND asked to save, held until we know it
             // actually authenticated — never persist a wrong guess.
             let mut save_typed: Option<zeroize::Zeroizing<String>> = None;
-            let pw: zeroize::Zeroizing<String> = match one_shot_password {
-                Some(p) => zeroize::Zeroizing::new(p.to_string()),
-                None => match credentials::read_secret(host_id) {
-                    Ok(secret) => secret,
-                    // No saved password and none supplied for this connect: ask
-                    // the user for it interactively rather than failing outright
-                    // with "no saved credential". The prompt is hidden (masked),
-                    // and the typed password comes INWARD via auth_prompt_respond
-                    // — no stored secret is ever emitted outward, so the
-                    // "secrets never cross IPC outward" invariant holds.
-                    Err(credentials::CredError::NotFound(_)) => {
-                        let answer = request_auth_answers(
-                            app,
-                            auth_prompts,
-                            session_id,
-                            "Password required",
-                            &format!("Enter the password for {username}"),
-                            vec![AuthPromptField { prompt: "Password:".into(), echo: false }],
-                            true,
-                        )
-                        .await?;
-                        let typed = zeroize::Zeroizing::new(
-                            answer.answers.into_iter().next().unwrap_or_default(),
-                        );
-                        if answer.save {
-                            save_typed = Some(typed.clone());
-                        }
-                        typed
+            let pw: zeroize::Zeroizing<String> = match secret {
+                Some(s) => s,
+                // No saved password and none supplied for this connect: ask
+                // for it. The prompt is hidden (masked), and the typed password
+                // comes INWARD via auth_prompt_respond — no stored secret is
+                // ever emitted outward.
+                None => {
+                    let offer_save = ctx.offer_save && !host_id.is_empty();
+                    let answer = request_auth_answers(
+                        ctx,
+                        "password",
+                        "",
+                        "",
+                        vec![AuthPromptField { prompt: "Password:".into(), echo: false }],
+                        offer_save,
+                    )
+                    .await?;
+                    let typed = answer.answers.into_iter().next().unwrap_or_default();
+                    if answer.save && offer_save {
+                        save_typed = Some(typed.clone());
                     }
-                    Err(e) => return Err(e.into()),
-                },
+                    typed
+                }
             };
             let first = handle.authenticate_password(username, pw.as_str()).await?;
             let result = if matches!(first, russh::client::AuthResult::Success) {
@@ -1996,9 +2574,7 @@ async fn authenticate(
                     username,
                     pw.as_str(),
                     password_accepted,
-                    app,
-                    auth_prompts,
-                    session_id,
+                    ctx,
                 )
                 .await?
             };
@@ -2017,8 +2593,7 @@ async fn authenticate(
                         // If it fails to persist, a saved secret with no binding is
                         // refused by the anti-exfiltration guard on the very next
                         // connect — fail-closed but confusing. Roll the secret back
-                        // so the user is simply prompted again next time instead of
-                        // hitting an inexplicable "not an authorized destination".
+                        // so the user is simply prompted again next time.
                         eprintln!(
                             "hawser: could not bind saved credential {host_id}: {e}; \
                              rolling back the saved password"
@@ -2029,8 +2604,6 @@ async fn authenticate(
                 }
             }
             result
-            // `pw` (Zeroizing) drops here — or at any `?` above — wiping its
-            // buffer on every exit path; no manual fill, no plain-String copy.
         }
     };
 
@@ -2039,6 +2612,13 @@ async fn authenticate(
     }
     Ok(())
 }
+
+#[cfg(windows)]
+const NO_AGENT: &str = "no SSH agent reachable (tried the Windows OpenSSH agent service and \
+                        Pageant), or no key it holds was accepted";
+#[cfg(not(windows))]
+const NO_AGENT: &str = "no SSH agent reachable through $SSH_AUTH_SOCK, or no key it holds \
+                        was accepted";
 
 /// True if a keyboard-interactive prompt's text asks for the account password
 /// (as opposed to an OTP / verification code, which PAM also sends hidden).
@@ -2132,9 +2712,7 @@ async fn keyboard_interactive_with_password(
     username: &str,
     password: &str,
     password_accepted: bool,
-    app: &AppHandle,
-    auth_prompts: &Arc<AuthPrompts>,
-    session_id: &str,
+    ctx: &PromptCtx<'_>,
 ) -> Result<russh::client::AuthResult, SshError> {
     use russh::client::KeyboardInteractiveAuthResponse as Kb;
 
@@ -2182,12 +2760,10 @@ async fn keyboard_interactive_with_password(
                 let mut typed = if ask.is_empty() {
                     Vec::new().into_iter()
                 } else {
-                    request_auth_answers(
-                        app, auth_prompts, session_id, &name, &instructions, ask, false,
-                    )
-                    .await?
-                    .answers
-                    .into_iter()
+                    request_auth_answers(ctx, "challenge", &name, &instructions, ask, false)
+                        .await?
+                        .answers
+                        .into_iter()
                 };
                 // Merge back in prompt order: password slots get the password,
                 // the rest take the user's answers in the order they were shown.
@@ -2197,7 +2773,7 @@ async fn keyboard_interactive_with_password(
                         if *auto {
                             password.to_string()
                         } else {
-                            typed.next().unwrap_or_default()
+                            typed.next().map(|t| t.to_string()).unwrap_or_default()
                         }
                     })
                     .collect();
@@ -2217,14 +2793,14 @@ async fn keyboard_interactive_with_password(
 /// answer are sent out; the returned vector is one typed answer per prompt
 /// shown, in order.
 async fn request_auth_answers(
-    app: &AppHandle,
-    auth_prompts: &Arc<AuthPrompts>,
-    session_id: &str,
+    ctx: &PromptCtx<'_>,
+    kind: &'static str,
     name: &str,
     instruction: &str,
     fields: Vec<AuthPromptField>,
     offer_save: bool,
 ) -> Result<AuthAnswer, SshError> {
+    let (app, auth_prompts, session_id) = (ctx.app, ctx.auth_prompts, ctx.owner.0.as_str());
     let request_id = format!(
         "auth-{}-{}",
         session_id,
@@ -2236,6 +2812,8 @@ async fn request_auth_answers(
         name: name.to_string(),
         instruction: instruction.to_string(),
         prompts: fields,
+        origin: ctx.origin.clone(),
+        kind,
         offer_save,
     };
     // No cancellation check here: this runs inside the connect future, which
@@ -2245,7 +2823,7 @@ async fn request_auth_answers(
     let Some(rx) = register_and_emit(
         &auth_prompts.pending,
         &request_id,
-        session_id,
+        ctx.owner.clone(),
         || false,
         || app.emit("ssh://auth-prompt", request).is_ok(),
     ) else {
@@ -2256,6 +2834,8 @@ async fn request_auth_answers(
         ));
     };
 
+    // The stage deadlines do not run while the human types.
+    let _human = ctx.wait.enter();
     match tokio::time::timeout(AUTH_PROMPT_TIMEOUT, rx).await {
         Ok(Ok(answer)) => Ok(answer),
         // Sender dropped (dialog cancelled, or the tab's prompts swept) —
@@ -2285,14 +2865,16 @@ async fn request_auth_answers(
 /// config and are out of scope here — the UI offers the copyable command for
 /// those.
 #[allow(clippy::too_many_arguments)]
-pub async fn copy_id(
+async fn copy_id(
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
     auth_prompts: Arc<AuthPrompts>,
+    session_id: &str,
+    cancel: watch::Receiver<()>,
     host: &str,
     port: u16,
     username: &str,
-    password: &str,
+    password: zeroize::Zeroizing<String>,
     public_key: &str,
 ) -> Result<(), SshError> {
     let key = public_key.trim();
@@ -2304,36 +2886,48 @@ pub async fn copy_id(
         ));
     }
 
-    let ip = tokio::net::lookup_host((host, port))
-        .await
-        .ok()
-        .and_then(|mut a| a.next())
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|| host.to_string());
-
-    let config = Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(15)),
-        nodelay: true,
-        ..client::Config::default()
-    });
+    // Same stage deadlines as a normal connect; the host-key check and any
+    // keyboard-interactive challenge pause them while the user reads.
+    let wait = HumanWait::default();
+    let owner: PromptOwner = (session_id.to_string(), 0);
+    let origin = PromptOrigin::new(None, username, host, port, None);
+    let (tcp, ip) = dial_tcp(host, port).await?;
     let handler = ClientHandler {
         host: host.to_string(),
         ip,
         port,
+        origin: origin.clone(),
         app: app.clone(),
         prompts,
-        session_id: "install-key".to_string(),
-        cancel: None,
+        owner: owner.clone(),
+        cancel,
+        wait: wait.clone(),
+        death: Arc::default(),
     };
-    let mut handle = client::connect(config, (host, port), handler).await?;
+    let mut handle = handshake(hop_config(host, port), tcp, handler, &wait).await?;
 
     // Password (with keyboard-interactive fallback), one-shot. host_id "" is
     // never consulted because the one-shot password is supplied.
-    authenticate(
-        &mut handle, "", host, port, username, "password", None, Some(password),
-        &app, &auth_prompts, "install-key",
-    )
-    .await?;
+    let ctx = PromptCtx {
+        app: &app,
+        auth_prompts: &auth_prompts,
+        owner,
+        origin,
+        wait: wait.clone(),
+        offer_save: false,
+    };
+    let spec = AuthSpec {
+        host_id: "",
+        host,
+        port,
+        username,
+        auth: "password",
+        key_path: None,
+        secret: Some(password),
+    };
+    let hlabel = format!("{host}:{port}");
+    within(&wait, AUTH_TIMEOUT, &hlabel, "authentication", authenticate(&mut handle, spec, &ctx))
+        .await??;
 
     // grep -qxF: only append if the exact line is not already present, so
     // running this twice does not duplicate the key. The append is BRACE-GROUPED
@@ -2354,7 +2948,14 @@ pub async fn copy_id(
          && chmod 600 ~/.ssh/authorized_keys && echo HAWSER_KEY_OK"
     );
 
-    let mut channel = handle.channel_open_session().await?;
+    let mut channel = within(
+        &wait,
+        CHANNEL_SETUP_TIMEOUT,
+        &hlabel,
+        "opening a session channel",
+        handle.channel_open_session(),
+    )
+    .await??;
     channel.exec(true, cmd).await?;
     // A timeout is a failure, not a silent success: don't judge the run by
     // whatever partial output happened to arrive before the clock ran out.
@@ -2373,6 +2974,10 @@ pub async fn copy_id(
     // run be reported as success.
     let marker = String::from_utf8_lossy(&out).contains("HAWSER_KEY_OK");
     let exit_ok = exit_status.map_or(true, |code| code == 0);
+    // A throwaway connection: close it properly rather than just dropping it.
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "key installed", "")
+        .await;
     if completed && exit_ok && marker {
         Ok(())
     } else {
@@ -2383,37 +2988,42 @@ pub async fn copy_id(
     }
 }
 
-/// Try every identity a running SSH agent offers.
+/// Try every identity each reachable SSH agent offers.
 ///
 /// Returns `Ok(None)` when no agent is reachable or no key was accepted —
 /// distinct from an SSH-level error, so the caller can produce a message that
 /// says what to actually do (start the agent, add a key) rather than a generic
-/// failure. Tries the Windows OpenSSH agent service first because it is the
-/// one Windows ships; Pageant second for the PuTTY crowd.
+/// failure. An error from one agent does not stop the next being tried.
+/// Windows tries the OpenSSH agent service first (the one Windows ships), then
+/// Pageant for the PuTTY crowd; elsewhere the one agent is $SSH_AUTH_SOCK.
 async fn agent_auth(
     handle: &mut Handle<ClientHandler>,
     username: &str,
-    hash_alg: Option<russh::keys::HashAlg>,
 ) -> Result<Option<russh::client::AuthResult>, SshError> {
     use russh::keys::agent::client::AgentClient;
 
-    // Windows ships the OpenSSH agent on a fixed pipe; Pageant serves the PuTTY
-    // crowd. On Unix the one agent socket is named by $SSH_AUTH_SOCK.
+    let mut rsa = RsaHash::default();
+    let mut tried = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
     #[cfg(windows)]
     {
         if let Ok(mut agent) =
             AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await
         {
-            if let Some(r) = try_agent_identities(&mut agent, handle, username, hash_alg, "agent").await? {
-                return Ok(Some(r));
+            match try_agent_identities(&mut agent, handle, username, &mut rsa, &mut tried).await {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("OpenSSH agent: {e}")),
             }
         }
-
-        // Pageant (PuTTY). russh 0.63 makes connect_pageant fallible; a missing
-        // Pageant is just "no agent", so skip on Err and fall through.
+        // russh makes connect_pageant fallible; a missing Pageant is just "no
+        // agent".
         if let Ok(mut pageant) = AgentClient::connect_pageant().await {
-            if let Some(r) = try_agent_identities(&mut pageant, handle, username, hash_alg, "pageant").await? {
-                return Ok(Some(r));
+            match try_agent_identities(&mut pageant, handle, username, &mut rsa, &mut tried).await {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("Pageant: {e}")),
             }
         }
     }
@@ -2422,45 +3032,80 @@ async fn agent_auth(
     {
         // $SSH_AUTH_SOCK — set by ssh-agent, gnome-keyring, 1Password, etc.
         if let Ok(mut agent) = AgentClient::connect_env().await {
-            if let Some(r) = try_agent_identities(&mut agent, handle, username, hash_alg, "agent").await? {
-                return Ok(Some(r));
+            match try_agent_identities(&mut agent, handle, username, &mut rsa, &mut tried).await {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("agent: {e}")),
             }
         }
     }
 
-    Ok(None)
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(SshError::AuthFailed(format!("{username}: {}", errors.join("; "))))
+    }
 }
 
 /// Offer each identity a connected agent holds to the server, signing with the
 /// agent. Returns `Ok(Some(..))` on the first accepted key, `Ok(None)` if the
-/// agent is unreachable or holds no accepted key. `label` names the agent in
-/// the error message so "agent signing failed" vs "pageant signing failed"
-/// still tells the user which one balked.
+/// agent is unreachable or holds no accepted key. `tried` counts attempts
+/// across agents, for the MaxAuthTries hint.
 async fn try_agent_identities(
     agent: &mut russh::keys::agent::client::AgentClient<
         impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     >,
     handle: &mut Handle<ClientHandler>,
     username: &str,
-    hash_alg: Option<russh::keys::HashAlg>,
-    label: &str,
+    rsa: &mut RsaHash,
+    tried: &mut usize,
 ) -> Result<Option<russh::client::AuthResult>, SshError> {
     let Ok(identities) = agent.request_identities().await else {
         return Ok(None);
     };
     for identity in identities {
-        // russh 0.63 yields AgentIdentity (key or certificate); publickey auth
-        // wants the underlying PublicKey.
+        // AgentIdentity is a key or a certificate; publickey auth wants the
+        // underlying PublicKey.
         let key = identity.public_key().into_owned();
-        let result = handle
-            .authenticate_publickey_with(username, key, hash_alg, agent)
-            .await
-            .map_err(|e| SshError::AuthFailed(format!("{label} signing failed: {e}")))?;
-        if matches!(result, russh::client::AuthResult::Success) {
-            return Ok(Some(result));
+        let (hashes, is_rsa): (Vec<Option<russh::keys::HashAlg>>, bool) =
+            if key.algorithm().is_rsa() {
+                let (h, retry_sha1) = rsa.get(handle).await?;
+                (if retry_sha1 { vec![h, None] } else { vec![h] }, true)
+            } else {
+                (vec![None], false)
+            };
+        for hash in hashes {
+            *tried += 1;
+            let result = handle
+                .authenticate_publickey_with(username, key.clone(), hash, agent)
+                .await
+                .map_err(|e| agent_error(e, *tried))?;
+            if matches!(result, russh::client::AuthResult::Success) {
+                return Ok(Some(result));
+            }
+            if !is_rsa {
+                break;
+            }
         }
     }
     Ok(None)
+}
+
+/// Wording for an agent-auth error. A server that drops the connection mid-way
+/// has almost always hit its MaxAuthTries limit with a well-stocked agent.
+fn agent_error(e: russh::AgentAuthError, tried: usize) -> SshError {
+    let text = e.to_string();
+    // `Send`: the session task is gone, i.e. the server hung up.
+    let dropped = matches!(&e, russh::AgentAuthError::Send(_));
+    if dropped {
+        SshError::AuthFailed(format!(
+            "the server closed the connection after {tried} key attempts (it probably limits \
+             attempts, MaxAuthTries). Remove keys from the agent, or use a key file for this \
+             host"
+        ))
+    } else {
+        SshError::AuthFailed(format!("agent signing failed: {text}"))
+    }
 }
 
 /// Reject a remote-supplied name that could escape the local target directory.
@@ -3034,6 +3679,156 @@ async fn socks5_serve(
     Ok(())
 }
 
+/// The shell's output pump: emits on the per-session topic TerminalPane
+/// subscribes to, appends to the transcript, and — when the shell or the
+/// transport ends — reports why and ends this session generation (its forwards
+/// and its transport), so nothing keeps tunnelling over a session the tab shows
+/// as disconnected. stderr (ExtendedData) is interleaved into the same stream,
+/// which is what a real terminal does — separating it would reorder output.
+///
+/// Waits for `go` before emitting anything: see `connect_inner`.
+#[allow(clippy::too_many_arguments)]
+async fn run_pump(
+    app: AppHandle,
+    sid: String,
+    session: Arc<Session>,
+    mut read_half: russh::ChannelReadHalf,
+    early: Vec<ChannelMsg>,
+    go: oneshot::Receiver<Option<SessionLog>>,
+    death: DeathNote,
+    forwards: Arc<DashMap<String, Forward>>,
+) {
+    let Ok(mut log) = go.await else { return };
+    let topic = format!("ssh://{sid}");
+    // Incomplete UTF-8 tails carried to the next chunk, one per stream: a
+    // packet boundary can split a multi-byte character, and decoding each chunk
+    // alone would print two U+FFFD for one real character.
+    let mut pending_out: Vec<u8> = Vec::new();
+    let mut pending_err: Vec<u8> = Vec::new();
+    let mut early = early.into_iter();
+    let mut eof = false;
+    let mut exit: Option<String> = None;
+    let mut transport_gone = false;
+
+    loop {
+        let msg = match early.next() {
+            Some(m) => m,
+            None => {
+                // After EOF, OpenSSH sends the exit status and the close at
+                // once; a stack that sends neither must not leave the tab
+                // looking connected to a shell that is gone.
+                let next = if eof {
+                    match tokio::time::timeout(SHELL_EOF_GRACE, read_half.wait()).await {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    }
+                } else {
+                    read_half.wait().await
+                };
+                match next {
+                    Some(m) => m,
+                    None => {
+                        // The transport itself went away — keepalive failure,
+                        // reset, a dropped route — unless the shell had ended.
+                        transport_gone = !eof && exit.is_none();
+                        break;
+                    }
+                }
+            }
+        };
+        match msg {
+            ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                // Logged before display, so anything that reaches the screen is
+                // already durable if the app dies next.
+                if let Some(l) = log.as_mut() {
+                    l.append(data);
+                }
+                let pending = if matches!(msg, ChannelMsg::Data { .. }) {
+                    &mut pending_out
+                } else {
+                    &mut pending_err
+                };
+                let text = decode_utf8_stream(pending, data);
+                if !text.is_empty() {
+                    let _ = app.emit(&topic, text);
+                }
+            }
+            // EOF alone is not the end: the exit status usually follows it.
+            ChannelMsg::Eof => {
+                eof = true;
+                if exit.is_some() {
+                    break;
+                }
+            }
+            ChannelMsg::Close => break,
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit = Some(if exit_status == 0 {
+                    "shell exited".to_string()
+                } else {
+                    format!("shell exited with status {exit_status}")
+                });
+                if eof {
+                    break;
+                }
+            }
+            ChannelMsg::ExitSignal { signal_name, .. } => {
+                exit = Some(format!("shell was killed by signal {signal_name:?}"));
+                if eof {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    session.alive.store(false, Ordering::SeqCst);
+
+    // Distinguishes a clean logout from a link that died under us: one is
+    // expected, the other means "your VPN dropped" or "the firewall timed you
+    // out". The cause of a dead transport is recorded by the handler's
+    // `disconnected`, which runs in russh's task; give it a moment to land.
+    let reason = if transport_gone {
+        let mut note = None;
+        for _ in 0..10 {
+            note = death.lock().ok().and_then(|mut d| d.take());
+            if note.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        note.unwrap_or_else(|| "connection lost".to_string())
+    } else {
+        exit.unwrap_or_else(|| "session closed".to_string())
+    };
+
+    if let Some(l) = log.as_mut() {
+        l.footer(&reason);
+    }
+    let _ = app.emit(
+        &topic,
+        format!("\r\n\x1b[38;2;242;178;92m\u{25cf} disconnected\x1b[0m {reason}\r\n"),
+    );
+    let _ = app.emit(
+        "ssh://status",
+        SessionStatusEvent {
+            session_id: sid.clone(),
+            status: "disconnected",
+            detail: reason,
+        },
+    );
+
+    // The shell is gone, so the session is over (as with `ssh`): end THIS
+    // generation's forwards — never a newer connection's for the same tab —
+    // and its transport. The registry entry stays (dead) until the tab is
+    // closed or reconnected, so later calls fail as "disconnected".
+    let generation = session.generation;
+    for fw in take_forwards(&forwards, |f| f.info.session_id == sid && f.generation == generation) {
+        teardown_forward(fw).await;
+    }
+    session.close("session ended").await;
+}
+
+
 /// Streaming UTF-8 decode: append `data` to `pending`, return every complete
 /// character, and keep an incomplete trailing sequence (at most 3 bytes) in
 /// `pending` for the next chunk. Only genuinely invalid bytes become U+FFFD.
@@ -3105,7 +3900,7 @@ fn mode_string(permissions: Option<u32>, kind: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{reject_link_in_subtree, safe_local_component};
+    use super::*;
 
     #[test]
     fn rejects_traversal_and_absolute_names() {
@@ -3199,31 +3994,34 @@ mod tests {
     // cancellation seen at registration leaves nothing registered.
     #[test]
     fn prompt_registration_is_atomic_with_cancel_sweep() {
-        use super::{cancel_for_session, register_and_emit};
+        use super::{cancel_matching, register_and_emit, PromptOwner};
         use dashmap::{try_result::TryResult, DashMap};
         use tokio::sync::oneshot;
 
-        let pending: DashMap<String, (String, oneshot::Sender<bool>)> = DashMap::new();
+        let pending: DashMap<String, (PromptOwner, oneshot::Sender<bool>)> = DashMap::new();
+        let owner = |t: u64| -> PromptOwner { ("s1".to_string(), t) };
         let mut locked_during_emit = false;
-        let rx = register_and_emit(&pending, "hk-1", "s1", || false, || {
+        let rx = register_and_emit(&pending, "hk-1", owner(1), || false, || {
             locked_during_emit = matches!(pending.try_get_mut("hk-1"), TryResult::Locked);
             true
         });
         assert!(locked_during_emit, "sweep could interleave between check and emit");
         assert!(rx.is_some());
         // A sweep after the emit removes it (and the caller emits prompt-closed).
-        assert_eq!(cancel_for_session(&pending, "s1"), vec!["hk-1".to_string()]);
+        // A superseded attempt's sweep (generation 2) leaves generation 1 alone.
+        assert!(cancel_matching(&pending, |o| o.0 == "s1" && o.1 == 2).is_empty());
+        assert_eq!(cancel_matching(&pending, |o| o.0 == "s1"), vec!["hk-1".to_string()]);
 
         // Cancelled at registration: never emitted, nothing left behind.
         let mut emitted = false;
-        let rx = register_and_emit(&pending, "hk-2", "s1", || true, || {
+        let rx = register_and_emit(&pending, "hk-2", owner(1), || true, || {
             emitted = true;
             true
         });
         assert!(rx.is_none() && !emitted && pending.is_empty());
 
         // Emit failure also leaves nothing registered.
-        assert!(register_and_emit(&pending, "hk-3", "s1", || false, || false).is_none());
+        assert!(register_and_emit(&pending, "hk-3", owner(1), || false, || false).is_none());
         assert!(pending.is_empty());
     }
 
@@ -3268,5 +4066,258 @@ mod tests {
         assert!(reject_link_in_subtree(&root, &outside.join("x")).is_err());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /* ---------------------------------------------- host-key policy (W2) */
+
+    const ED_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1EeRn1nUZ6oQiaSmrlPONbjg1FxJtr35MXzTndFYIe";
+    const ED_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHveLo5tgiTjyNgc98zwmigaaw1vJ/1IN9KDWqa0Z43a";
+    const ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBI/gPg4KkOG52SzCdcnggcQk7DG6z1OLSfSAi2LTGk4OFnDnYrkNsxVIWtt/KArpW70Gac7c1im2IEx4u8Bs0MI=";
+    /// The raw host key a CA signed into `HOST_CERT` (ssh-keygen -s ca -h).
+    const CERT_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN9i5YuRG3Q+ur8Jb5GHlc8PHma3/lZIDJ8w28uSpVEx";
+    const HOST_CERT: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIB+h46eQH0FJHc7hx2tNtaxZ1fDOJGco3BuHG1HzpT/HAAAAIN9i5YuRG3Q+ur8Jb5GHlc8PHma3/lZIDJ8w28uSpVExAAAAAAAAAAAAAAACAAAAC2hhd3Nlci10ZXN0AAAAEAAAAAxjZXJ0LmV4YW1wbGUAAAAAAAAAAP//////////AAAAAAAAAAAAAAAAAAAAMwAAAAtzc2gtZWQyNTUxOQAAACA8sSKaRahTgUwI22aO8wihmUdkNFGaozzeUvs1SAGyjgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXQZ2JLfK29r9OIjDZKy3ubiIfFzB4005BDVGGpMoKFgo1PrvBFHsynEvqzl4NeGZ1hBNNelCdUanRtM5aPjIAA==";
+
+    fn key(s: &str) -> russh::keys::PublicKey {
+        russh::keys::PublicKey::from_openssh(s).unwrap()
+    }
+
+    fn raw(s: &str) -> russh::keys::PublicKeyOrCertificate {
+        russh::keys::PublicKeyOrCertificate::PublicKey { key: key(s), hash_alg: None }
+    }
+
+    fn cert() -> russh::keys::PublicKeyOrCertificate {
+        russh::keys::PublicKeyOrCertificate::Certificate(
+            russh::keys::Certificate::from_openssh(HOST_CERT).unwrap(),
+        )
+    }
+
+    /// A known_hosts file holding `body`, in a directory unique to the test.
+    struct Store(std::path::PathBuf);
+    impl Store {
+        fn new(tag: &str, body: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("hawser-ssh-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("known_hosts"), body).unwrap();
+            Store(dir)
+        }
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("known_hosts")
+        }
+        fn verdict(&self, host: &str, presented: &russh::keys::PublicKeyOrCertificate) -> KeyVerdict {
+            key_verdict(host, 22, &presented_key(presented), &self.path())
+        }
+        fn text(&self) -> String {
+            std::fs::read_to_string(self.path()).unwrap()
+        }
+    }
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn trusted_key_connects_silently() {
+        let store = Store::new("trusted", &format!("fw01 {ED_A}\n"));
+        assert!(matches!(store.verdict("fw01", &raw(ED_A)), KeyVerdict::Accept));
+        // Host names are case-insensitive.
+        assert!(matches!(store.verdict("FW01", &raw(ED_A)), KeyVerdict::Accept));
+    }
+
+    #[test]
+    fn changed_or_revoked_key_is_refused_without_a_prompt() {
+        // Same algorithm, different key.
+        let store = Store::new("changed", &format!("fw01 {ED_B}\n"));
+        assert!(matches!(
+            store.verdict("fw01", &raw(ED_A)),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { line: 1, .. })
+        ));
+        // Different algorithm for a pinned host is CHANGED too, not first use.
+        let store = Store::new("changed-alg", &format!("# pinned\nfw01 {ECDSA}\n"));
+        assert!(matches!(
+            store.verdict("fw01", &raw(ED_A)),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { line: 2, .. })
+        ));
+        // Revoked beats a matching trust line.
+        let store = Store::new("revoked", &format!("fw01 {ED_A}\n@revoked * {ED_A}\n"));
+        assert!(matches!(
+            store.verdict("fw01", &raw(ED_A)),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { line: 2, .. })
+        ));
+        // An unreadable store fails closed rather than prompting.
+        let missing = key_verdict(
+            "fw01",
+            22,
+            &key(ED_A),
+            std::path::Path::new("/nonexistent/hawser/known_hosts"),
+        );
+        assert!(matches!(missing, KeyVerdict::Refuse(SshError::KnownHosts(_))));
+    }
+
+    #[tokio::test]
+    async fn unknown_key_rejected_timed_out_or_cancelled_is_refused() {
+        let store = Store::new("unknown", "");
+        let k = key(ED_A);
+        assert!(matches!(store.verdict("new01", &raw(ED_A)), KeyVerdict::Ask));
+
+        // Rejected by the user.
+        let (tx, rx) = oneshot::channel();
+        tx.send(false).unwrap();
+        let end = await_host_key_answer(rx, Duration::from_secs(5)).await;
+        assert_eq!(end, PromptEnd::Rejected);
+        assert!(matches!(
+            settle_host_key(&end, "new01", 22, &k, &store.path()),
+            Err(SshError::HostKeyRejected { .. })
+        ));
+
+        // Cancelled: the tab closed, so the sender was dropped.
+        let (tx, rx) = oneshot::channel::<bool>();
+        drop(tx);
+        let end = await_host_key_answer(rx, Duration::from_secs(5)).await;
+        assert_eq!(end, PromptEnd::Dropped);
+        assert!(matches!(
+            settle_host_key(&end, "new01", 22, &k, &store.path()),
+            Err(SshError::HostKeyRejected { .. })
+        ));
+
+        // Nobody answered in time.
+        let (_tx, rx) = oneshot::channel::<bool>();
+        let end = await_host_key_answer(rx, Duration::from_millis(20)).await;
+        assert_eq!(end, PromptEnd::TimedOut);
+        assert!(matches!(
+            settle_host_key(&end, "new01", 22, &k, &store.path()),
+            Err(SshError::HostKeyTimeout { .. })
+        ));
+
+        // None of those recorded anything: the host is still unknown.
+        assert_eq!(store.text(), "");
+        assert!(matches!(store.verdict("new01", &raw(ED_A)), KeyVerdict::Ask));
+
+        // Only an explicit accept pins it, after which it connects silently.
+        let (tx, rx) = oneshot::channel();
+        tx.send(true).unwrap();
+        let end = await_host_key_answer(rx, Duration::from_secs(5)).await;
+        assert!(settle_host_key(&end, "new01", 22, &k, &store.path()).unwrap());
+        assert!(matches!(store.verdict("new01", &raw(ED_A)), KeyVerdict::Accept));
+    }
+
+    #[test]
+    fn certificate_follows_the_raw_key_policy() {
+        let c = cert();
+        // Its embedded key is what is judged.
+        assert_eq!(presented_key(&c).key_data(), key(CERT_HOST_KEY).key_data());
+
+        let pinned = Store::new("cert-pinned", &format!("cert.example {CERT_HOST_KEY}\n"));
+        assert!(matches!(pinned.verdict("cert.example", &c), KeyVerdict::Accept));
+
+        let changed = Store::new("cert-changed", &format!("cert.example {ED_A}\n"));
+        assert!(matches!(
+            changed.verdict("cert.example", &c),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { .. })
+        ));
+
+        let revoked = Store::new(
+            "cert-revoked",
+            &format!("cert.example {CERT_HOST_KEY}\n@revoked * {CERT_HOST_KEY}\n"),
+        );
+        assert!(matches!(
+            revoked.verdict("cert.example", &c),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { .. })
+        ));
+
+        // The CA signature earns no trust: unknown is still a prompt.
+        let unknown = Store::new("cert-unknown", "");
+        assert!(matches!(unknown.verdict("cert.example", &c), KeyVerdict::Ask));
+    }
+
+    // Two tabs approving DIFFERENT unknown keys for one host at once, through
+    // the handler's own settle path: exactly one is pinned, the other refused.
+    #[test]
+    fn concurrent_trusts_of_different_keys_leave_one_pinned_key() {
+        for round in 0..10 {
+            let store = Store::new(&format!("race-{round}"), "");
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let spawn = |k: &'static str| {
+                let (b, p) = (Arc::clone(&barrier), store.path());
+                std::thread::spawn(move || {
+                    b.wait();
+                    settle_host_key(&PromptEnd::Accepted, "race01", 22, &key(k), &p).is_ok()
+                })
+            };
+            let (a, b) = (spawn(ED_A), spawn(ED_B));
+            let oks = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(oks.iter().filter(|o| **o).count(), 1);
+            let lines = store.text().lines().filter(|l| l.starts_with("race01 ")).count();
+            assert_eq!(lines, 1, "exactly one key pinned");
+        }
+    }
+
+    #[test]
+    fn pinned_host_key_algorithms_are_offered_first() {
+        use russh::keys::{Algorithm, EcdsaCurve, HashAlg};
+        let defaults: Vec<Algorithm> = russh::Preferred::DEFAULT.key.to_vec();
+
+        // Nothing pinned: russh's own order.
+        assert_eq!(preferred_host_key_order(&[]), defaults);
+
+        // ECDSA pinned: offered before Ed25519, every default still offered once.
+        let p256 = Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 };
+        let order = preferred_host_key_order(&[p256.clone()]);
+        assert_eq!(order[0], p256);
+        assert_eq!(order[1], Algorithm::Ed25519);
+        assert_eq!(order.len(), defaults.len());
+
+        // An RSA pin covers all three RSA signature names, strongest first.
+        let order = preferred_host_key_order(&[Algorithm::Rsa { hash: None }]);
+        assert_eq!(
+            &order[..3],
+            &[
+                Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+                Algorithm::Rsa { hash: Some(HashAlg::Sha256) },
+                Algorithm::Rsa { hash: None },
+            ]
+        );
+
+        // Something russh does not implement is never advertised.
+        let order = preferred_host_key_order(&[Algorithm::Dsa, Algorithm::Ed25519]);
+        assert!(!order.contains(&Algorithm::Dsa));
+        assert_eq!(order[0], Algorithm::Ed25519);
+
+        // From the store: the pinned ECDSA key comes first.
+        let store = Store::new("algs", &format!("fw01 {ECDSA}\n"));
+        let pinned = known_hosts::pinned_algorithms_at("fw01", 22, &store.path());
+        assert_eq!(preferred_host_key_order(&pinned)[0], p256);
+    }
+
+    #[tokio::test]
+    async fn stage_deadline_excludes_time_waiting_on_a_human() {
+        // Machine time alone runs out.
+        let wait = HumanWait::default();
+        let r = within(&wait, Duration::from_millis(50), "h", "stage", tokio::time::sleep(Duration::from_millis(400))).await;
+        assert!(matches!(r, Err(SshError::Timeout { stage: "stage", .. })));
+
+        // The same work with a dialog open for most of it finishes in time.
+        let wait = HumanWait::default();
+        let guard = wait.enter();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(guard);
+        });
+        let r = within(&wait, Duration::from_millis(150), "h", "stage", tokio::time::sleep(Duration::from_millis(350))).await;
+        assert!(r.is_ok(), "prompt time counted against the deadline");
+        release.await.unwrap();
+    }
+
+    #[test]
+    fn prompt_origin_names_the_dialled_endpoint() {
+        let o = PromptOrigin::new(Some(" fw-prod "), "admin", "10.0.0.1", 22, Some("bastion".into()));
+        assert_eq!(o.host_name.as_deref(), Some("fw-prod"));
+        assert_eq!(o.target, "admin@10.0.0.1:22");
+        assert_eq!(o.via.as_deref(), Some("bastion"));
+        assert_eq!(PromptOrigin::new(Some(""), "u", "::1", 2222, None).target, "u@[::1]:2222");
     }
 }

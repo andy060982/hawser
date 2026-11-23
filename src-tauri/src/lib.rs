@@ -37,26 +37,30 @@ async fn ssh_connect(
     jump: Option<ssh::JumpParams>,
     one_shot_password: Option<String>,
     endpoint: Option<String>,
+    label: Option<String>,
+    ephemeral: Option<bool>,
 ) -> CmdResult<()> {
+    // Wrapped at once, so the IPC-owned buffer itself is wiped on drop.
+    let one_shot_password = one_shot_password.map(zeroize::Zeroizing::new);
+    let spec = ssh::ConnectSpec {
+        session_id,
+        host_id,
+        host: host.clone(),
+        port,
+        username: username.clone(),
+        cols,
+        rows,
+        startup_commands: startup_commands.unwrap_or_default(),
+        auth: auth.unwrap_or_else(|| "password".into()),
+        key_path,
+        jump,
+        one_shot_password,
+        endpoint,
+        label,
+        ephemeral: ephemeral.unwrap_or(false),
+    };
     let result = registry
-        .connect(
-            app,
-            Arc::clone(&prompts),
-            Arc::clone(&auth_prompts),
-            &session_id,
-            &host_id,
-            &host,
-            port,
-            &username,
-            cols,
-            rows,
-            &startup_commands.unwrap_or_default(),
-            auth.as_deref().unwrap_or("password"),
-            key_path.as_deref(),
-            jump,
-            one_shot_password.as_deref(),
-            endpoint.as_deref(),
-        )
+        .connect(app, Arc::clone(&prompts), Arc::clone(&auth_prompts), spec)
         .await
         .map_err(|e| e.to_string());
     // Audit the authentication outcome. host/port/user are not secret; the error
@@ -104,6 +108,8 @@ async fn auth_prompt_respond(
     answers: Vec<String>,
     #[allow(non_snake_case)] save: Option<bool>,
 ) -> CmdResult<()> {
+    // Each typed answer is wiped when the auth that consumes it is done.
+    let answers = answers.into_iter().map(zeroize::Zeroizing::new).collect();
     auth_prompts.respond(&request_id, answers, save.unwrap_or(false));
     Ok(())
 }
@@ -353,7 +359,7 @@ async fn forward_start_socks(
 
 #[tauri::command]
 async fn forward_stop(registry: State<'_, Registry>, forward_id: String) -> CmdResult<()> {
-    registry.forward_stop(&forward_id);
+    registry.forward_stop(&forward_id).await;
     Ok(())
 }
 
@@ -947,6 +953,7 @@ async fn capture_output(
 #[tauri::command]
 async fn ssh_copy_id(
     app: AppHandle,
+    registry: State<'_, Registry>,
     prompts: State<'_, Arc<HostKeyPrompts>>,
     auth_prompts: State<'_, Arc<AuthPrompts>>,
     host: String,
@@ -954,19 +961,23 @@ async fn ssh_copy_id(
     username: String,
     password: String,
     public_key: String,
+    op_id: Option<String>,
 ) -> CmdResult<()> {
-    let result = ssh::copy_id(
-        app,
-        std::sync::Arc::clone(&prompts),
-        std::sync::Arc::clone(&auth_prompts),
-        &host,
-        port,
-        &username,
-        &password,
-        &public_key,
-    )
-    .await
-    .map_err(|e| e.to_string());
+    let password = zeroize::Zeroizing::new(password);
+    let result = registry
+        .copy_id_run(
+            app,
+            std::sync::Arc::clone(&prompts),
+            std::sync::Arc::clone(&auth_prompts),
+            op_id.as_deref(),
+            &host,
+            port,
+            &username,
+            password,
+            &public_key,
+        )
+        .await
+        .map_err(|e| e.to_string());
     // The key is logged by fingerprint (its comment is free text); the password
     // used for the one-shot login is never logged.
     match &result {
@@ -984,6 +995,14 @@ async fn ssh_copy_id(
         ),
     }
     result
+}
+
+/// Abandon an in-flight `ssh_copy_id` started with the same `op_id` (the host
+/// editor closed). Its connection is dropped and any prompt it raised closed.
+#[tauri::command]
+async fn ssh_copy_id_cancel(registry: State<'_, Registry>, op_id: String) -> CmdResult<()> {
+    registry.copy_id_cancel(&op_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1284,6 +1303,7 @@ pub fn run() {
             config_read,
             ssh_keygen,
             ssh_copy_id,
+            ssh_copy_id_cancel,
             ai_chat,
             ai_cancel,
             ai_key_save,
