@@ -37,10 +37,8 @@ fn captures_dir(endpoint: &str, label: &str) -> Result<PathBuf, KnownHostsError>
 /// never open the file.
 pub fn save_capture(endpoint: &str, label: &str, content: &str) -> Result<CaptureResult, KnownHostsError> {
     let dir = captures_dir(endpoint, label)?;
-    std::fs::create_dir_all(&dir).map_err(|source| KnownHostsError::Io {
-        path: dir.clone(),
-        source,
-    })?;
+    // Every component a real folder, never through a planted link.
+    artifacts::verified_dir(&dir, true)?;
     // A captured config dump can hold secrets (SNMP communities, PSKs); keep the
     // per-host directory owner-only.
     super::platform::restrict_perms(&dir, 0o700);

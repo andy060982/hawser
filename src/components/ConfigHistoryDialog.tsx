@@ -65,9 +65,12 @@ export function ConfigHistoryDialog({
   onClose,
 }: {
   host: Host
-  /** Endpoint identity of `host` (lib/endpoint); keys the snapshot folder. */
+  /** Endpoint identity of `host` (lib/endpoint); keys the snapshot folder
+   *  when no session to it is connected. */
   endpoint: string
-  /** A connected session to this host, if any — required for Snapshot now. */
+  /** A connected session to this host, if any — required for Snapshot now.
+   *  While there is one, every lookup uses that session's own dialled
+   *  identity (the backend's), not `endpoint`. */
   liveSessionId: string | null
   /** Snapshots to open with — two of them opens straight into their diff (used
    *  by the "config changed since last visit" chip). */
@@ -83,13 +86,13 @@ export function ConfigHistoryDialog({
   const captureCommand = host.configCommand?.trim() ?? ''
 
   const refresh = useCallback(() => {
-    void safeInvoke<SnapshotInfo[]>('config_list', { endpoint, host: host.hostname })
+    void safeInvoke<SnapshotInfo[]>('config_list', { sessionId: liveSessionId, endpoint, host: host.hostname })
       .then((l) => setSnaps(l ?? []))
       .catch((e: unknown) => {
         setSnaps([])
         setNotice(`Could not list snapshots: ${e instanceof Error ? e.message : String(e)}`)
       })
-  }, [endpoint, host.hostname])
+  }, [liveSessionId, endpoint, host.hostname])
 
   useEffect(refresh, [refresh])
 
@@ -110,19 +113,25 @@ export function ConfigHistoryDialog({
     }
     setContent('')
     if (selected.length === 1) {
-      void safeInvoke<string>('config_read', { endpoint, host: host.hostname, name: selected[0] })
+      void safeInvoke<string>('config_read', { sessionId: liveSessionId, endpoint, host: host.hostname, name: selected[0] })
         .then((c) => show(c ?? ''))
         .catch((e) => show(String(e)))
     } else if (selected.length === 2) {
       const [a, b] = [...selected].sort(snapshotOrder) // oldest first
-      void safeInvoke<string>('config_diff', { endpoint, host: host.hostname, older: a, newer: b })
+      void safeInvoke<string>('config_diff', {
+        sessionId: liveSessionId,
+        endpoint,
+        host: host.hostname,
+        older: a,
+        newer: b,
+      })
         .then((c) => show(c || '(no differences)'))
         .catch((e) => show(String(e)))
     }
     return () => {
       stale = true
     }
-  }, [selected, endpoint, host.hostname])
+  }, [selected, liveSessionId, endpoint, host.hostname])
 
   const toggle = (name: string) =>
     setSelected((cur) =>
@@ -138,7 +147,6 @@ export function ConfigHistoryDialog({
     try {
       const r = await safeInvoke<SnapshotResult>('config_snapshot', {
         sessionId: liveSessionId,
-        endpoint,
         host: host.hostname,
         command: captureCommand,
       })

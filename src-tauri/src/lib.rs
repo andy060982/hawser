@@ -576,8 +576,49 @@ async fn sessions_save(list: serde_json::Value) -> CmdResult<()> {
 /// Endpoint-keyed rather than session-keyed: session ids are per-connection, and
 /// the point is to bridge ACROSS connections. Not hostname-keyed either: two
 /// entries sharing an address must never see each other's output.
+/// The endpoint identity a lookup should use: the live session's own (derived
+/// from what it dialled) whenever `session_id` names one, else the identity
+/// the frontend computed for a host with no live session (the replay before a
+/// dial, or the history of a host that is not connected).
+fn lookup_endpoint(
+    registry: &Registry,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+) -> CmdResult<String> {
+    if let Some(ep) = session_id.as_deref().and_then(|sid| registry.endpoint_of(sid).ok()) {
+        return Ok(ep);
+    }
+    endpoint.ok_or_else(|| "no live session and no endpoint identity given".to_string())
+}
+
+/// Refuse a live session's history when it dialled another endpoint than the
+/// one its caller's policy check was made for.
+fn check_same_endpoint(live: &str, claimed: &str) -> CmdResult<()> {
+    if live == claimed {
+        Ok(())
+    } else {
+        Err("This tab is still connected to the host's previous address, account or bastion (the host was edited after it connected), so its output is not shared. Reconnect the tab first.".into())
+    }
+}
+
 #[tauri::command]
-async fn session_history(endpoint: String, max_bytes: usize) -> CmdResult<Option<String>> {
+async fn session_history(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    max_bytes: usize,
+) -> CmdResult<Option<String>> {
+    // `endpoint` is the identity whose AI policy the caller checked (the
+    // catalogue entry as it stands now). If the live session dialled
+    // something else (the entry or its bastion was edited after it
+    // connected), its transcript comes from an endpoint that policy was never
+    // evaluated for, so it is refused rather than returned.
+    if let (Some(sid), Some(claimed)) = (session_id.as_deref(), endpoint.as_deref()) {
+        if let Ok(live) = registry.endpoint_of(sid) {
+            check_same_endpoint(&live, claimed)?;
+        }
+    }
+    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
     tauri::async_runtime::spawn_blocking(move || {
         utils::session_log::latest_transcript(&endpoint, max_bytes)
     })
@@ -754,16 +795,18 @@ async fn blocking<T: Send + 'static>(
 
 /// Capture a device's config over a fresh exec channel and store a snapshot.
 ///
-/// `endpoint` is the connection's identity (see utils::artifacts) and keys the
-/// snapshot folder; `host` is only the readable label.
+/// The snapshot folder is keyed by the session's own endpoint identity (what
+/// it dialled; see utils::artifacts); `host` is only the readable label.
 #[tauri::command]
 async fn config_snapshot(
     registry: State<'_, Registry>,
     session_id: String,
-    endpoint: String,
     host: String,
     command: String,
 ) -> CmdResult<utils::configs::SnapshotResult> {
+    // The snapshot belongs to what this session actually dialled, never to a
+    // key the webview supplies next to the session id.
+    let endpoint = registry.endpoint_of(&session_id).map_err(|e| e.to_string())?;
     let output = registry
         .exec_capture(&session_id, &command, 60)
         .await
@@ -792,10 +835,10 @@ async fn config_snapshot(
 async fn config_check(
     registry: State<'_, Registry>,
     session_id: String,
-    endpoint: String,
     host: String,
     command: String,
 ) -> CmdResult<utils::configs::ConfigCheck> {
+    let endpoint = registry.endpoint_of(&session_id).map_err(|e| e.to_string())?;
     let output = registry
         .exec_capture(&session_id, &command, 60)
         .await
@@ -818,17 +861,38 @@ async fn config_check(
 }
 
 #[tauri::command]
-async fn config_list(endpoint: String, host: String) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
+async fn config_list(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    host: String,
+) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
+    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
     blocking(move || utils::configs::list_snapshots(&endpoint, &host)).await
 }
 
 #[tauri::command]
-async fn config_diff(endpoint: String, host: String, older: String, newer: String) -> CmdResult<String> {
+async fn config_diff(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    host: String,
+    older: String,
+    newer: String,
+) -> CmdResult<String> {
+    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
     blocking(move || utils::configs::diff_snapshots(&endpoint, &host, &older, &newer)).await
 }
 
 #[tauri::command]
-async fn config_read(endpoint: String, host: String, name: String) -> CmdResult<String> {
+async fn config_read(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    host: String,
+    name: String,
+) -> CmdResult<String> {
+    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
     blocking(move || utils::configs::read_snapshot(&endpoint, &host, &name)).await
 }
 
@@ -841,10 +905,10 @@ async fn config_read(endpoint: String, host: String, name: String) -> CmdResult<
 async fn capture_output(
     registry: State<'_, Registry>,
     session_id: String,
-    endpoint: String,
     host: String,
     command: String,
 ) -> CmdResult<utils::captures::CaptureResult> {
+    let endpoint = registry.endpoint_of(&session_id).map_err(|e| e.to_string())?;
     let output = registry
         .exec_capture(&session_id, &command, 120)
         .await
@@ -1251,4 +1315,24 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utils::artifacts::dial_identity;
+
+    #[test]
+    fn ai_context_is_refused_when_the_live_dial_is_not_the_policy_endpoint() {
+        // The tab dialled 10.0.0.1; the entry was then repointed at 10.0.0.2
+        // (and, say, AI enabled for it). The panel's policy is for the new
+        // identity, the transcript comes from the old one.
+        let live = dial_identity(Some("host:h-1"), ("admin", "10.0.0.1", 22), None);
+        let now = dial_identity(Some("host:h-1"), ("admin", "10.0.0.2", 22), None);
+        assert!(check_same_endpoint(&live, &now).is_err());
+        assert!(check_same_endpoint(&live, &live).is_ok());
+        // Editing the bastion's account counts the same way.
+        let via = |user: &str| dial_identity(Some("host:h-1|via:host:b-1"), ("admin", "10.0.0.1", 22), Some((user, "bastion", 22)));
+        assert!(check_same_endpoint(&via("ops"), &via("root")).is_err());
+    }
 }

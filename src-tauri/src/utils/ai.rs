@@ -24,6 +24,9 @@
 //! config, no settings sources (so no hooks or allow rules), no session
 //! persistence, in a fresh empty working directory. If the installed CLI does
 //! not offer those flags, the run is refused rather than started unrestricted.
+//! Managed (organisation) policy survives every flag, so the run is also
+//! refused when managed settings on disk define hooks or MCP servers; see
+//! "managed policy" below for what that check cannot see.
 //!
 //! API keys live in the OS credential vault under `hawser:ai:<profile>`,
 //! write-only from the UI like every other secret in this app.
@@ -118,6 +121,20 @@ fn load_ai_origins() -> Result<serde_json::Value, String> {
     }
 }
 
+/// Serialises every reader and writer of the (key, origin) pair.
+///
+/// The key lives in the OS vault and its origin in `ai_origins.json`: two
+/// stores that cannot be written atomically together. Saving a new key for a
+/// new provider writes one and then the other, so a chat that read them
+/// independently could pair the NEW key with the OLD origin and send it there.
+/// Holding this lock across the save (both writes, and the rollback when the
+/// second fails) and across the chat's read of both means a chat only ever
+/// sees a matching pair: entirely before the save, or entirely after it.
+fn binding_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn write_ai_origins(map: &serde_json::Value) -> Result<(), String> {
     // Through the shared atomic writer (unique temp, serialised, never deletes
     // the original before the replacement is in place).
@@ -168,6 +185,7 @@ pub fn migrate_ai_origins() {
     if marker.exists() {
         return;
     }
+    let _binding = binding_lock();
     // One "default" profile today; extend the list if profiles become plural.
     for profile in ["default"] {
         if !key_exists(profile) {
@@ -195,6 +213,7 @@ pub fn migrate_ai_origins() {
 /// or no key), so a failed save never leaves a new key bound to an old origin
 /// or an unbound key behind.
 pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
+    let _binding = binding_lock();
     let slot = vault_profile(profile);
     let previous = credentials::read_secret(&slot).ok();
     credentials::write_secret(&slot, "api-key", key).map_err(|e| e.to_string())?;
@@ -215,6 +234,7 @@ pub fn key_exists(profile: &str) -> bool {
 /// Remove a profile's key and its origin binding. A missing key is not an
 /// error — the end state the user asked for already holds.
 pub fn delete_key(profile: &str) -> Result<(), String> {
+    let _binding = binding_lock();
     match credentials::delete_secret(&vault_profile(profile)) {
         Ok(()) | Err(credentials::CredError::NotFound(_)) => {}
         Err(e) => return Err(e.to_string()),
@@ -286,13 +306,107 @@ fn endpoint_url(base: &Url, suffix: &str) -> Url {
     u
 }
 
-/// Remove the active key from provider-controlled text before it reaches the
-/// webview: an error body or a hostile proxy can echo the Authorization value.
-fn scrub(msg: &str, key: Option<&str>) -> String {
-    match key.map(str::trim).filter(|k| k.len() >= 4) {
-        Some(k) => msg.replace(k, "[redacted]"),
-        None => msg.to_string(),
+/// HTTP client for one provider request. Never follows redirects (a 3xx could
+/// bounce the key and the session context to an arbitrary host, defeating the
+/// origin checks). For a loopback destination it also ignores proxy settings:
+/// reqwest honours `HTTP_PROXY`/`ALL_PROXY` by default, and with no loopback
+/// exclusion a "local" Ollama request, context and any Authorization header
+/// included, would travel in cleartext to that proxy.
+fn http_client(url: &Url) -> Result<reqwest::Client, String> {
+    let mut b = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT);
+    if is_loopback(url) {
+        b = b.no_proxy();
     }
+    b.build().map_err(|e| e.to_string())
+}
+
+/// Keys shorter than this cannot be scrubbed reliably (a two-character key
+/// matches all over ordinary text, and a partial echo is indistinguishable
+/// from prose), so errors are not shown verbatim at all with such a key.
+const MIN_SCRUBBABLE_KEY: usize = 8;
+/// Longest provider-error excerpt shown to the user, in characters.
+const MAX_ERROR_CHARS: usize = 400;
+
+/// Whether `c` can be part of an opaque token (API key, JWT segment, bearer).
+fn token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '=')
+}
+
+/// Replace every token-like run (20+ token characters mixing letters and
+/// digits) with `[redacted]`. Catches credentials this app does not know:
+/// another provider's key in an inherited environment, a bearer echoed by a
+/// proxy, a session token in a CLI diagnostic.
+fn redact_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        let letters = run.chars().any(|c| c.is_ascii_alphabetic());
+        let digits = run.chars().any(|c| c.is_ascii_digit());
+        if run.chars().count() >= 20 && letters && digits {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in s.chars() {
+        if token_char(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// Remove the active key from provider-controlled text: the whole key
+/// wherever it appears, and a trailing fragment of it (4+ characters) where
+/// the text was already cut short by a capped read.
+fn scrub(msg: &str, key: &str) -> String {
+    let mut out = msg.replace(key, "[redacted]");
+    let max = key.len().min(out.len());
+    for n in (4..=max).rev() {
+        if key.is_char_boundary(n) && out.ends_with(&key[..n]) {
+            out.truncate(out.len() - n);
+            out.push_str("[redacted]");
+            break;
+        }
+    }
+    out
+}
+
+/// The first `max` characters of `s`, never splitting one.
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// What a provider error may show the user. Order matters: scrub the key and
+/// token-like strings out of the FULL text, strip control characters, and
+/// only then truncate, so a cut can never preserve half a secret. With a key
+/// too short to scrub reliably, the text is not shown at all.
+fn sanitize_error(msg: &str, key: Option<&str>) -> String {
+    let key = key.map(str::trim).filter(|k| !k.is_empty());
+    if let Some(k) = key {
+        if k.chars().count() < MIN_SCRUBBABLE_KEY {
+            return "The provider returned an error. Details are hidden because the saved API key is too short to be removed from them reliably; check the key in AI settings.".into();
+        }
+    }
+    let scrubbed = match key {
+        Some(k) => scrub(msg, k),
+        None => msg.to_string(),
+    };
+    let clean: String = redact_tokens(&scrubbed)
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect();
+    truncate_chars(clean.trim(), MAX_ERROR_CHARS)
 }
 
 /* ------------------------------------------------------------- lifecycle */
@@ -375,11 +489,16 @@ async fn run(
     if cfg.kind == CLI_KIND {
         return run_cli(&emit, cli_prompt(system_context, &messages)).await;
     }
-    let key = credentials::read_secret(&vault_profile(profile)).ok();
+    // Key and origin read as one unit, under the lock a key save holds (see
+    // binding_lock), so they always belong together.
+    let (key, origin) = {
+        let _binding = binding_lock();
+        (credentials::read_secret(&vault_profile(profile)).ok(), saved_origin(profile))
+    };
     let scrub_with = key.clone();
-    run_http(&emit, cfg, profile, system_context, messages, key)
+    run_http(&emit, cfg, system_context, messages, key, origin)
         .await
-        .map_err(|e| scrub(&e, scrub_with.as_ref().map(|k| k.as_str())))
+        .map_err(|e| sanitize_error(&e, scrub_with.as_ref().map(|k| k.as_str())))
 }
 
 /* ------------------------------------------------------------------ http */
@@ -387,10 +506,11 @@ async fn run(
 async fn run_http(
     emit: &(dyn Fn(String) + Sync),
     cfg: ProviderConfig,
-    profile: &str,
     system_context: &str,
     messages: Vec<ChatMessage>,
     key: Option<zeroize::Zeroizing<String>>,
+    // The origin the key is bound to, read together with the key.
+    origin: Option<(String, String)>,
 ) -> Result<(), String> {
     let caller_url = parse_base_url(&cfg.base_url)?;
     let caller_loopback = is_loopback(&caller_url);
@@ -419,7 +539,7 @@ async fn run_http(
     // anything else asks for the key to be re-saved.
     let (kind, url, key) = match key {
         None => (cfg.kind.clone(), caller_url, None),
-        Some(k) => match saved_origin(profile) {
+        Some(k) => match origin {
             Some((kind, base_url)) if !base_url.is_empty() => {
                 if same_origin(&kind, &base_url, &cfg.kind, &cfg.base_url) {
                     let url = parse_base_url(&base_url).map_err(|e| {
@@ -457,11 +577,7 @@ async fn run_http(
     // Do NOT follow redirects: a 3xx could bounce the request — API key and
     // session context included — to an arbitrary host, defeating the origin
     // checks above.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client(&url)?;
 
     let system = format!("{SYSTEM_PROMPT}\n\n{system_context}");
     let request = if kind == "anthropic" {
@@ -522,8 +638,10 @@ async fn run_http(
             }
         })
         .await;
-        let snippet: String = String::from_utf8_lossy(&body).chars().take(400).collect();
-        return Err(format!("{status}: {snippet}"));
+        // Not truncated here: `sanitize_error` scrubs the key out of the WHOLE
+        // text first and only then shortens it, so a key straddling the cut
+        // can never leave its first half behind.
+        return Err(format!("{status}: {}", String::from_utf8_lossy(&body)));
     }
 
     // SSE parsing shared by both dialects: split on newlines, take `data:`
@@ -575,7 +693,8 @@ async fn run_http(
                     .and_then(|m| m.as_str())
                     .map(str::to_string)
                     .unwrap_or_else(|| err.to_string());
-                return Err(format!("provider error: {}", msg.chars().take(400).collect::<String>()));
+                // Truncated only after scrubbing, in `sanitize_error`.
+                return Err(format!("provider error: {msg}"));
             }
 
             let delta = if kind == "anthropic" {
@@ -903,6 +1022,7 @@ async fn run_cli(emit: &(dyn Fn(String) + Sync), prompt: String) -> Result<(), S
     let claude = resolve_claude().await.ok_or_else(|| {
         "Could not find the Claude Code CLI (`claude`) on PATH, in ~/.local/bin, /opt/homebrew/bin or /usr/local/bin, or via your login shell. Is Claude Code installed?".to_string()
     })?;
+    check_managed_policy().await?;
     let path_env = child_path(&claude);
     let sandbox = Sandbox::new().map_err(|e| format!("could not create a private working directory: {e}"))?;
     let features = cli_features(&claude, &path_env, &sandbox.work()).await?;
@@ -944,21 +1064,245 @@ async fn run_cli(emit: &(dyn Fn(String) + Sync), prompt: String) -> Result<(), S
         emit(String::from_utf8_lossy(&out).trim().to_string());
         return Ok(());
     }
-    let err = String::from_utf8_lossy(&err);
-    let err = err.trim();
+    Err(cli_failure(&status.to_string(), &String::from_utf8_lossy(&err)))
+}
+
+/// Longest stderr excerpt shown for a failed CLI run, in characters.
+const MAX_CLI_EXCERPT: usize = 200;
+
+/// The message for a failed CLI run. Raw stderr is never forwarded: it can
+/// carry diagnostics from an inherited credential or provider configuration
+/// (an `ANTHROPIC_API_KEY` echoed in an auth error, a proxy URL with a
+/// password). The user gets a generic message with the likely fix, plus a
+/// short excerpt that has token-like strings redacted and control characters
+/// removed before it is cut.
+fn cli_failure(status: &str, stderr: &str) -> String {
+    let err = stderr.trim();
     // The most common failure is an unauthenticated CLI, which often exits
     // non-zero with little or no stderr. Give the actual fix rather than a
     // bare "exited 1".
     let lower = err.to_lowercase();
     let looks_unauthed = err.is_empty() || lower.contains("login") || lower.contains("auth") || lower.contains("not logged");
-    Err(if looks_unauthed {
-        format!(
-            "Claude CLI exited {status}. It may not be logged in — run `claude` in a terminal once to authenticate, then retry.{}",
-            if err.is_empty() { String::new() } else { format!(" (details: {})", err.chars().take(200).collect::<String>()) }
-        )
+    let head = if looks_unauthed {
+        format!("Claude CLI exited {status}. It may not be logged in — run `claude` in a terminal once to authenticate, then retry.")
     } else {
-        format!("claude CLI exited {status}: {}", err.chars().take(300).collect::<String>())
-    })
+        format!("Claude CLI exited {status}.")
+    };
+    if err.is_empty() {
+        return head;
+    }
+    let excerpt: String = redact_tokens(err)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    format!("{head} (excerpt: {})", truncate_chars(excerpt.trim(), MAX_CLI_EXCERPT))
+}
+
+/* ------------------------------------------------------- managed policy */
+
+// Residual limit of the CLI lockdown, documented here because no flag closes
+// it. `--tools ""`, `--strict-mcp-config` with an empty config and
+// `--setting-sources ""` remove the built-in tools and every user, project and
+// local setting (their hooks and plugins included). They do NOT remove
+// MANAGED settings: Anthropic documents that managed policy (the system
+// managed-settings.json and its managed-settings.d drop-ins, an MDM plist or
+// HKLM/HKCU registry value, and server-managed settings fetched from
+// claude.ai) applies above every flag. `--safe-mode` and `--restricted` say so
+// explicitly, and `--bare` is not an option: it stops OAuth from being read,
+// which is the whole point of this provider (the user's subscription). A
+// managed `SessionStart` hook would therefore run a local command during a
+// Hawser request, and a deployed `managed-mcp.json` makes the CLI load (or
+// refuse to start without) its servers.
+//
+// So before every run the documented on-disk managed sources are inspected,
+// and the CLI is refused when any of them defines hooks or MCP servers, or
+// cannot be read (fail closed). What this cannot see: server-managed settings,
+// which the CLI fetches from claude.ai at startup and which exist nowhere on
+// disk beforehand; command-running keys other than hooks (`apiKeyHelper`,
+// `awsAuthRefresh` and the like are credential helpers an organisation deploys
+// for authentication, and are left alone); and a policy deployed between this
+// check and the CLI's own read of it. Organisations that push hooks from the
+// claude.ai console should use an HTTP provider instead.
+
+/// Managed-policy keys whose presence means the CLI would run something
+/// beyond a text completion.
+const POLICY_KEYS: [(&str, &str); 2] = [("hooks", "hooks"), ("managedMcpServers", "MCP servers")];
+
+/// Whether a JSON value is "set" in a way that does something: a non-empty
+/// object or array, a non-empty string, or `true`.
+fn json_is_set(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => !m.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(_) => true,
+        serde_json::Value::Null => false,
+    }
+}
+
+/// What a managed settings document enables that the lockdown cannot remove.
+fn policy_blockers(doc: &serde_json::Value) -> Vec<&'static str> {
+    POLICY_KEYS
+        .iter()
+        .filter(|(k, _)| doc.get(*k).is_some_and(json_is_set))
+        .map(|(_, what)| *what)
+        .collect()
+}
+
+/// A managed MCP file defines servers when its `mcpServers` is non-empty (or
+/// it is not the documented shape, which is treated as defining some).
+fn mcp_file_defines_servers(doc: &serde_json::Value) -> bool {
+    match doc.get("mcpServers") {
+        Some(v) => json_is_set(v),
+        None => doc.as_object().is_none_or(|m| !m.is_empty()),
+    }
+}
+
+/// Inspect one managed-settings directory (file-based delivery): the
+/// settings file, its drop-ins and the managed MCP file. Err names what would
+/// stay active, or which document could not be read.
+fn scan_managed_dir(dir: &Path) -> Result<(), String> {
+    let read = |p: &Path| -> Result<Option<serde_json::Value>, String> {
+        match std::fs::read(p) {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map(Some)
+                .map_err(|_| format!("{} could not be parsed", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{} could not be read ({e})", p.display())),
+        }
+    };
+    let mut docs: Vec<(PathBuf, serde_json::Value)> = Vec::new();
+    let main = dir.join("managed-settings.json");
+    if let Some(v) = read(&main)? {
+        docs.push((main, v));
+    }
+    let dropins = dir.join("managed-settings.d");
+    match std::fs::read_dir(&dropins) {
+        Ok(rd) => {
+            for e in rd {
+                let e = e.map_err(|e| format!("{} could not be read ({e})", dropins.display()))?;
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "json") {
+                    if let Some(v) = read(&p)? {
+                        docs.push((p, v));
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{} could not be read ({e})", dropins.display())),
+    }
+    for (p, doc) in &docs {
+        let what = policy_blockers(doc);
+        if !what.is_empty() {
+            return Err(format!("{} defines {}", p.display(), what.join(" and ")));
+        }
+    }
+    let mcp = dir.join("managed-mcp.json");
+    if let Some(v) = read(&mcp)? {
+        if mcp_file_defines_servers(&v) {
+            return Err(format!("{} defines MCP servers", mcp.display()));
+        }
+    }
+    Ok(())
+}
+
+/// The system directory of file-based managed settings on this OS.
+fn managed_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/ClaudeCode")
+    }
+    #[cfg(windows)]
+    {
+        let pf = std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+        PathBuf::from(pf).join("ClaudeCode")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        PathBuf::from("/etc/claude-code")
+    }
+}
+
+/// MDM delivery on macOS: the `com.anthropic.claudecode` managed preferences
+/// domain, machine-wide or per user, read through `plutil` (it may be binary).
+#[cfg(target_os = "macos")]
+async fn scan_os_policy() -> Result<(), String> {
+    let mut plists = vec![PathBuf::from("/Library/Managed Preferences/com.anthropic.claudecode.plist")];
+    if let Some(user) = std::env::var_os("USER").filter(|u| !u.is_empty()) {
+        plists.push(PathBuf::from("/Library/Managed Preferences").join(user).join("com.anthropic.claudecode.plist"));
+    }
+    for p in plists {
+        if std::fs::symlink_metadata(&p).is_err() {
+            continue;
+        }
+        let mut cmd = tokio::process::Command::new("/usr/bin/plutil");
+        cmd.arg("-convert").arg("json").arg("-o").arg("-").arg(&p).stdin(std::process::Stdio::null()).kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+            .await
+            .map_err(|_| format!("{} could not be read", p.display()))?
+            .map_err(|e| format!("{} could not be read ({e})", p.display()))?;
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|_| format!("{} could not be parsed", p.display()))?;
+        let what = policy_blockers(&doc);
+        if !what.is_empty() {
+            return Err(format!("the managed profile {} defines {}", p.display(), what.join(" and ")));
+        }
+    }
+    Ok(())
+}
+
+/// Registry delivery on Windows: the `Settings` value under
+/// `HKLM\SOFTWARE\Policies\ClaudeCode`, and its HKCU fallback.
+#[cfg(windows)]
+async fn scan_os_policy() -> Result<(), String> {
+    for root in ["HKLM", "HKCU"] {
+        let key = format!(r"{root}\SOFTWARE\Policies\ClaudeCode");
+        let mut cmd = tokio::process::Command::new("reg");
+        cmd.args(["query", &key, "/v", "Settings"]).stdin(std::process::Stdio::null()).kill_on_drop(true);
+        hide_console(&mut cmd);
+        let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+            .await
+            .map_err(|_| format!("{key} could not be read"))?
+            .map_err(|e| format!("{key} could not be read ({e})"))?;
+        if !out.status.success() {
+            continue; // no such value
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let json = text
+            .lines()
+            .find_map(|l| l.split_once("REG_EXPAND_SZ").or_else(|| l.split_once("REG_SZ")).map(|(_, v)| v.trim().to_string()))
+            .ok_or_else(|| format!("{key}\\Settings could not be parsed"))?;
+        let doc: serde_json::Value =
+            serde_json::from_str(&json).map_err(|_| format!("{key}\\Settings could not be parsed"))?;
+        let what = policy_blockers(&doc);
+        if !what.is_empty() {
+            return Err(format!("the policy {key} defines {}", what.join(" and ")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn scan_os_policy() -> Result<(), String> {
+    Ok(())
+}
+
+/// Refuse the CLI provider when managed policy on this machine would keep
+/// hooks or MCP servers active despite the lockdown flags (see above).
+async fn check_managed_policy() -> Result<(), String> {
+    let refuse = |why: String| {
+        format!(
+            "Hawser will not run the Claude Code CLI on this machine: managed Claude Code policy ({why}) stays active whatever flags are passed, so the CLI could run hooks or MCP servers during a request. Choose an HTTP provider (Anthropic API, OpenAI or a local model) instead."
+        )
+    };
+    let dir = managed_dir();
+    tauri::async_runtime::spawn_blocking(move || scan_managed_dir(&dir))
+        .await
+        .map_err(|e| refuse(e.to_string()))?
+        .map_err(refuse)?;
+    scan_os_policy().await.map_err(refuse)
 }
 
 #[cfg(test)]
@@ -1022,8 +1366,110 @@ mod tests {
     fn provider_errors_never_echo_the_key() {
         let key = "sk-ant-secret-123456";
         let msg = format!("401: invalid x-api-key {key} for org");
-        assert_eq!(scrub(&msg, Some(key)), "401: invalid x-api-key [redacted] for org");
-        assert_eq!(scrub("plain", None), "plain");
+        assert_eq!(sanitize_error(&msg, Some(key)), "401: invalid x-api-key [redacted] for org");
+        assert_eq!(sanitize_error("plain", None), "plain");
+    }
+
+    #[test]
+    fn errors_are_scrubbed_before_they_are_cut() {
+        // The key straddles the 400-character cut: truncating first kept its
+        // first half. Use a key redact_tokens would not catch on its own.
+        let key = "abcdefghijklmnopqrstuvwxyzABCDEF";
+        let msg = format!("{}{key} tail", "x ".repeat(195));
+        let out = sanitize_error(&msg, Some(key));
+        assert!(!out.contains("abcdefgh"), "{out}");
+        // A capped read that ends inside the key loses the fragment too.
+        let cut = format!("403: bad key {}", &key[..12]);
+        assert_eq!(sanitize_error(&cut, Some(key)), "403: bad key [redacted]");
+        // Multi-byte text at the cut never panics.
+        let wide = "é".repeat(1000);
+        assert!(sanitize_error(&wide, Some(key)).chars().count() <= MAX_ERROR_CHARS + 1);
+    }
+
+    #[test]
+    fn short_keys_hide_the_provider_error_entirely() {
+        for key in ["k", "abc", "1234567"] {
+            let out = sanitize_error(&format!("401 bad key {key}"), Some(key));
+            assert!(!out.contains("bad key"), "{out}");
+        }
+        assert!(sanitize_error("401 bad key 12345678", Some("12345678")).contains("[redacted]"));
+    }
+
+    #[test]
+    fn token_like_strings_are_redacted() {
+        let out = redact_tokens("auth failed for sk-proj-AbC123dEf456GhI789 (Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOjEyMzR9.x)");
+        assert!(!out.contains("AbC123"), "{out}");
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "{out}");
+        // Ordinary words and short ids survive.
+        assert_eq!(redact_tokens("model not_found: claude-x 404"), "model not_found: claude-x 404");
+    }
+
+    #[test]
+    fn cli_stderr_is_never_forwarded_raw() {
+        let stderr = "Error: invalid x-api-key sk-ant-api03-ZZZ999yyy888xxx777www\nhint\x1b[31m";
+        let out = cli_failure("exit status: 1", stderr);
+        assert!(out.starts_with("Claude CLI exited exit status: 1."), "{out}");
+        assert!(!out.contains("ZZZ999"), "{out}");
+        assert!(!out.contains('\x1b') && !out.contains('\n'), "{out}");
+        let long = "e".repeat(5000);
+        assert!(cli_failure("1", &long).chars().count() < 400);
+        assert!(cli_failure("1", "").contains("may not be logged in"));
+    }
+
+    #[test]
+    fn loopback_requests_bypass_proxies() {
+        // reqwest exposes no getter for the proxy list, so this checks the
+        // decision that selects `no_proxy`, and that both clients build.
+        let local = parse_base_url("http://localhost:11434/v1").unwrap();
+        let remote = parse_base_url("https://api.openai.com/v1").unwrap();
+        assert!(is_loopback(&local) && !is_loopback(&remote));
+        assert!(http_client(&local).is_ok() && http_client(&remote).is_ok());
+    }
+
+    #[test]
+    fn managed_policy_with_hooks_or_mcp_blocks_the_cli() {
+        let d = std::env::temp_dir().join(format!("hawser-managed-{}", crate::utils::artifacts::random_hex(8)));
+        std::fs::create_dir_all(&d).unwrap();
+        // Nothing deployed: fine.
+        assert!(scan_managed_dir(&d).is_ok());
+        // A policy without hooks or MCP: fine.
+        std::fs::write(d.join("managed-settings.json"), r#"{"permissions":{"deny":["Bash"]},"hooks":{}}"#).unwrap();
+        assert!(scan_managed_dir(&d).is_ok());
+        // Hooks in a drop-in: refused.
+        std::fs::create_dir_all(d.join("managed-settings.d")).unwrap();
+        std::fs::write(
+            d.join("managed-settings.d/10-hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(scan_managed_dir(&d).unwrap_err().contains("hooks"));
+        std::fs::remove_file(d.join("managed-settings.d/10-hooks.json")).unwrap();
+        // A managed MCP file with servers: refused; an empty one: fine.
+        std::fs::write(d.join("managed-mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        assert!(scan_managed_dir(&d).is_ok());
+        std::fs::write(d.join("managed-mcp.json"), r#"{"mcpServers":{"x":{"command":"y"}}}"#).unwrap();
+        assert!(scan_managed_dir(&d).unwrap_err().contains("MCP"));
+        // Unparseable: fail closed.
+        std::fs::write(d.join("managed-mcp.json"), "{oops").unwrap();
+        assert!(scan_managed_dir(&d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(policy_blockers(&json!({"managedMcpServers":[{"name":"a"}]})), vec!["MCP servers"]);
+    }
+
+    #[test]
+    fn key_and_origin_are_read_as_one_unit() {
+        // While a save holds the binding lock, a chat's read of the pair waits
+        // for it rather than seeing the new key with the old origin.
+        let guard = binding_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _g = binding_lock();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "reader got in during a save");
+        drop(guard);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        t.join().unwrap();
     }
 
     #[test]

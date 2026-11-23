@@ -119,15 +119,22 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [configChanges, setConfigChanges] = useState<
     Record<string, { hostId: string; added: number; removed: number; previous: string; name: string }>
   >({})
-  /** hostId → when its config was last checked, so split panes and quick
-   *  reconnects to one box don't each run the capture command again. */
+  /** Endpoint identity → when its config was last checked, so split panes and
+   *  quick reconnects to one box don't each run the capture command again. */
   const configCheckedRef = useRef(new Map<string, number>())
   /** Latest config check per session. Every (re)connect invalidates it, so a
    *  reply from before a redial — or for a closed tab — is ignored. */
   const configReplies = useRef(new ReplyGuard())
-  /** hostId → a "changed" result whose reply arrived after its tab was closed
-   *  or redialled. The backend had already saved it as the new baseline, so
-   *  dropping it lost the change for good; it is shown on the next connect. */
+  /** Endpoint identity → a "changed" result whose reply arrived after its tab
+   *  was closed or redialled. The backend had already saved it as the new
+   *  baseline, so dropping it lost the change for good; it is shown on the
+   *  next connect. Keyed by identity (lib/endpoint), not host id: once the
+   *  entry is repointed at another device, a late result about the old one
+   *  must not be reported as this device's change.
+   *
+   *  In memory only: an app exit after the backend saved the change but
+   *  before the reply was delivered still loses the notice (the snapshot
+   *  itself is on disk and shows in Config history). */
   const undeliveredChangeRef = useRef(new Map<string, ConfigCheckResult>())
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
@@ -556,25 +563,26 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // A change found by a check whose tab went away is reported here, in
     // place of a new check: one would only compare against the snapshot that
     // change already saved and say "unchanged".
-    const missed = undeliveredChangeRef.current.get(host.id)
+    const ep = endpointFor(host)
+    const missed = undeliveredChangeRef.current.get(ep)
     if (missed) {
-      undeliveredChangeRef.current.delete(host.id)
-      configCheckedRef.current.set(host.id, Date.now())
+      undeliveredChangeRef.current.delete(ep)
+      configCheckedRef.current.set(ep, Date.now())
       report(sessionId, missed)
       return
     }
 
-    const last = configCheckedRef.current.get(host.id)
+    const last = configCheckedRef.current.get(ep)
     if (last !== undefined && Date.now() - last < 120_000) return
-    configCheckedRef.current.set(host.id, Date.now())
+    configCheckedRef.current.set(ep, Date.now())
     const latest = configReplies.current.begin(sessionId)
     /* Only the latest check for a tab that still exists may write anything:
        a late reply must not print into (or badge) a closed or redialled tab. */
     const current = () => latest() && sessionsRef.current.some((s) => s.id === sessionId)
 
+    // The backend keys the snapshot by this session's own dialled identity.
     void safeInvoke<ConfigCheckResult>('config_check', {
       sessionId,
-      endpoint: endpointFor(host),
       host: host.hostname,
       command,
     })
@@ -587,11 +595,17 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           // next connect. Anything else is simply re-checked next time
           // instead of being throttled.
           if (r.status === 'changed') {
-            const live = sessionsRef.current.find((s) => s.hostId === host.id && s.status === 'connected')
+            // Only a tab whose host STILL resolves to the identity that was
+            // checked; a repointed entry is another endpoint now.
+            const live = sessionsRef.current.find((s) => {
+              if (s.status !== 'connected') return false
+              const h = lookupHost(s.hostId)
+              return !!h && endpointFor(h) === ep
+            })
             if (live) report(live.id, r)
-            else undeliveredChangeRef.current.set(host.id, r)
+            else undeliveredChangeRef.current.set(ep, r)
           } else {
-            configCheckedRef.current.delete(host.id)
+            configCheckedRef.current.delete(ep)
           }
           return
         }
@@ -599,12 +613,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       })
       .catch((e: unknown) => {
         if (!current()) {
-          configCheckedRef.current.delete(host.id)
+          configCheckedRef.current.delete(ep)
           return
         }
         note(sessionId, `config check failed: ${e instanceof Error ? e.message : String(e)}`)
       })
-  }, [endpointFor])
+  }, [endpointFor, lookupHost])
 
   /* Closed tabs take their config-change chip and check token with them. */
   useEffect(() => {
@@ -1173,9 +1187,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             })
           )?.trim()
           if (!command || !host) return
+          // Keyed by the session's own dialled identity, backend-side.
           void safeInvoke<{ path: string; bytes: number; lines: number }>('capture_output', {
             sessionId,
-            endpoint: endpointFor(host),
             host: host.name,
             command,
           })
@@ -1188,7 +1202,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       { label: 'Close tab', danger: true, dividerBefore: true, onSelect: () => closeSession(sessionId) },
     ]
     setMenu({ x, y, items })
-  }, [reconnectSession, splitSession, closeSession, lookupHost, endpointFor])
+  }, [reconnectSession, splitSession, closeSession, lookupHost])
 
   /** Right-click on a folder row in the sidebar. */
   const openFolderMenu = useCallback((folderId: string, name: string, x: number, y: number) => {

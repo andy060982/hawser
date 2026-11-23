@@ -41,6 +41,14 @@ pub fn logs_dir() -> Result<PathBuf, KnownHostsError> {
         .join("logs"))
 }
 
+/// The logs folder when it exists as a real folder (every component under the
+/// app-data root checked, see `artifacts::real_dir`); None when nothing was
+/// recorded yet. A linked or non-folder `logs` is an error, never followed.
+fn existing_logs_dir() -> Result<Option<PathBuf>, KnownHostsError> {
+    let d = logs_dir()?;
+    Ok(artifacts::verified_dir(&d, false)?.then_some(d))
+}
+
 /// Civil date from a Unix timestamp, so filenames sort chronologically and are
 /// readable without a converter. Hinnant's algorithm; avoids pulling in chrono
 /// for what is ultimately one format string.
@@ -125,10 +133,9 @@ impl SessionLog {
     ) -> Result<Self, KnownHostsError> {
         let endpoint = endpoint.filter(|e| artifacts::validate_endpoint(e).is_ok());
         let dir = logs_dir()?;
-        std::fs::create_dir_all(&dir).map_err(|source| KnownHostsError::Io {
-            path: dir.clone(),
-            source,
-        })?;
+        // Created and checked component by component: a `logs` that is a link
+        // would send every transcript somewhere else.
+        artifacts::verified_dir(&dir, true)?;
         // A transcript holds everything the session displayed, in plaintext, so
         // it is as sensitive as the session was. Keep the directory owner-only.
         super::platform::restrict_perms(&dir, 0o700);
@@ -357,9 +364,9 @@ const MAX_TAIL_BYTES: usize = 256 * 1024;
 /// Returns None when the endpoint has no prior transcript.
 pub fn latest_transcript(endpoint: &str, max_bytes: usize) -> Result<Option<String>, KnownHostsError> {
     artifacts::validate_endpoint(endpoint)?;
-    match logs_dir() {
-        Ok(d) if d.exists() => latest_in(&d, endpoint, max_bytes),
-        _ => Ok(None),
+    match existing_logs_dir()? {
+        Some(d) => latest_in(&d, endpoint, max_bytes),
+        None => Ok(None),
     }
 }
 
@@ -448,8 +455,8 @@ fn read_tail(file: &mut File, max_bytes: usize) -> std::io::Result<String> {
 /// Best-effort: a file that will not delete (locked, permissions) is skipped,
 /// never fatal. Returns how many were removed, for the startup log line.
 pub fn prune(max_age_days: u64, max_files: usize) -> usize {
-    let dir = match logs_dir() {
-        Ok(d) if d.exists() => d,
+    let dir = match existing_logs_dir() {
+        Ok(Some(d)) => d,
         _ => return 0,
     };
 
@@ -508,9 +515,9 @@ pub struct LogEntry {
 
 /// List transcripts, newest first. Empty when there are none.
 pub fn list() -> Result<Vec<LogEntry>, KnownHostsError> {
-    match logs_dir() {
-        Ok(d) if d.exists() => list_in(&d),
-        _ => Ok(Vec::new()),
+    match existing_logs_dir()? {
+        Some(d) => list_in(&d),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -610,7 +617,8 @@ pub struct LogPage {
 /// Read one page of a transcript by its bare filename. Never through a
 /// symlink, and never a FIFO or device that could block the read.
 pub fn read_log(name: &str, at: PageAt) -> Result<LogPage, KnownHostsError> {
-    read_page_in(&logs_dir()?, name, at, PAGE_BYTES)
+    let dir = existing_logs_dir()?.ok_or_else(|| KnownHostsError::Parse(format!("no transcript {name}")))?;
+    read_page_in(&dir, name, at, PAGE_BYTES)
 }
 
 fn read_page_in(dir: &Path, name: &str, at: PageAt, page: u64) -> Result<LogPage, KnownHostsError> {
@@ -666,6 +674,10 @@ fn read_page_in(dir: &Path, name: &str, at: PageAt, page: u64) -> Result<LogPage
         lo = usize::from(s > 0);
         hi = buf.len();
     }
+    // The file can shrink between the size check and the read; never let the
+    // range invert (buf[1..0] would panic, and panic aborts).
+    let hi = hi.min(buf.len());
+    let lo = lo.min(hi);
     let start = rs + lo as u64;
     let end = rs + hi as u64;
     let first_line = 1 + count_newlines(&mut file, start).map_err(io_err)?;
@@ -785,9 +797,9 @@ pub fn cancel_searches() {
 /// nothing rather than every line ever recorded.
 pub fn search(query: &str, limit: usize, generation: u64) -> Result<SearchResult, KnownHostsError> {
     let stale = || SEARCH_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation;
-    match logs_dir() {
-        Ok(d) if d.exists() => search_in(&d, query, limit, &stale),
-        _ => Ok(SearchResult { hits: Vec::new(), scanned: 0, truncated: false, cancelled: false }),
+    match existing_logs_dir()? {
+        Some(d) => search_in(&d, query, limit, &stale),
+        None => Ok(SearchResult { hits: Vec::new(), scanned: 0, truncated: false, cancelled: false }),
     }
 }
 
@@ -893,18 +905,43 @@ fn read_line_capped<R: std::io::BufRead>(r: &mut R, out: &mut Vec<u8>, cap: usiz
 /// - final sigma ς folded to σ, so `ΠΑΝΕΠΙΣ` still finds `ΠΑΝΕΠΙΣΤΗΜΙΟ` and
 ///   `οδοσ` finds `οδος`;
 /// - the combining dot (U+0307) after an `i` dropped, so `İstanbul`
-///   (lowercase "i̇stanbul") is found by `istanbul` and the reverse.
+///   (lowercase "i̇stanbul") is found by `istanbul` and the reverse;
+/// - the common full folds in `FULL_FOLDS` expanded, so `Straße` is found by
+///   `STRASSE` and the `ﬁ` ligature by `fi`.
 ///
-/// No Unicode normalisation: std has none, and the frontend must fold the same way.
+/// Limits (shared with the frontend): no Unicode normalisation (std has none),
+/// no full folds beyond that table, and per-character lowercase follows each
+/// runtime's Unicode tables, which can differ for very recent characters.
+/// Full case folds beyond lowercase, applied to each lowercased character.
+/// Must match `FULL_FOLDS` in src/lib/foldMatch.ts exactly.
+const FULL_FOLDS: [(char, &str); 9] = [
+    ('ß', "ss"),
+    ('ﬀ', "ff"),
+    ('ﬁ', "fi"),
+    ('ﬂ', "fl"),
+    ('ﬃ', "ffi"),
+    ('ﬄ', "ffl"),
+    ('ﬅ', "st"),
+    ('ﬆ', "st"),
+    ('ŉ', "ʼn"),
+];
+
 fn fold_char(c: char, prev_i: &mut bool, out: &mut String) {
     for l in c.to_lowercase() {
         if l == '\u{307}' && *prev_i {
             *prev_i = false;
             continue;
         }
-        let l = if l == 'ς' { 'σ' } else { l };
-        out.push(l);
-        *prev_i = l == 'i';
+        if l == 'ς' {
+            out.push('σ');
+            *prev_i = false;
+        } else if let Some((_, full)) = FULL_FOLDS.iter().find(|(k, _)| *k == l) {
+            out.push_str(full);
+            *prev_i = full.ends_with('i');
+        } else {
+            out.push(l);
+            *prev_i = l == 'i';
+        }
     }
 }
 
@@ -1106,6 +1143,27 @@ mod tests {
         assert_eq!(lines("οδοσ"), [4]);
         assert_eq!(fold("ΟΣ"), "οσ");
         assert_eq!(fold("İ"), "i");
+    }
+
+    #[test]
+    fn folding_expands_common_full_folds() {
+        let d = search_dir(&[("a_20261001-100000.log", "Hauptstraße 1
+STRASSE 2
+the ﬁle
+GROẞ
+")]);
+        let lines = |q: &str| -> Vec<u64> {
+            search_in(&d, q, 50, NEVER).unwrap().hits.iter().map(|h| h.line).collect()
+        };
+        assert_eq!(lines("STRASSE"), [1, 2]);
+        assert_eq!(lines("straße"), [1, 2]);
+        assert_eq!(lines("file"), [3]);
+        assert_eq!(lines("gross"), [4]);
+        // Same vectors as the frontend test.
+        assert_eq!(fold("Straße"), "strasse");
+        assert_eq!(fold("ẞﬃ"), "ssffi");
+        // The hit's snippet still maps back to the original characters.
+        assert_eq!(orig_char_index("Hauptstraße", fold("Hauptstraße").find("sse").unwrap()), 9);
     }
 
     #[test]

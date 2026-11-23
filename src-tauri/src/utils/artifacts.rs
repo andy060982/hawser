@@ -10,12 +10,26 @@
 //! reach the AI under another host's policy and compared one device's config
 //! with another's.
 //!
-//! They are now keyed by an *endpoint key* the frontend derives from the
-//! connection (`src/lib/endpoint.ts`): `host:<id>` for a saved host,
-//! `qc:<user>@<host>:<port>` for quick connect, plus `|via:<jump>` when the
-//! connection rides a bastion. The key itself never becomes a path: it is
-//! hashed to a fixed 16-hex-char tag, and names take the form
-//! `<label>@<tag>` where the label is a readable, sanitised hostname.
+//! They are now keyed by an *endpoint identity* bound to where the connection
+//! actually goes: `host:<id>=<user>@<host>:<port>` for a saved host,
+//! `qc:<user>@<host>:<port>` for quick connect, plus `|via:<same for the
+//! bastion>` when the connection rides one. The catalogue id alone was not
+//! enough: repointing an entry at another device, or editing its bastion's
+//! address or account, kept the key, so the new device inherited the old
+//! one's transcript (and its AI context) and config baseline. With the
+//! destination in the identity, any such edit starts a new identity and the
+//! old artifacts become non-matching history.
+//!
+//! The backend derives the identity of a live session itself, from the
+//! parameters it actually dialled (`dial_identity`, stored on the session), and
+//! every config, capture and AI-context lookup made for a live session uses
+//! that. The frontend computes the same string (`src/lib/endpoint.ts`, kept in
+//! step by shared test vectors) only for lookups with no live session: the
+//! replay before a dial and the history of a host that is not connected.
+//!
+//! The identity never becomes a path: it is hashed to a fixed 16-hex-char tag,
+//! and names take the form `<label>@<tag>` where the label is a readable,
+//! sanitised hostname.
 //!
 //! Names written before this scheme carry no `@` (the old slug never produced
 //! one), so they are told apart reliably and treated as *legacy*: still listed
@@ -43,6 +57,64 @@ pub fn validate_endpoint(key: &str) -> Result<(), KnownHostsError> {
         return Err(KnownHostsError::Parse("invalid endpoint identity".into()));
     }
     Ok(())
+}
+
+/// The hostname as it enters an identity: trimmed, ASCII-lowercased (DNS
+/// names are case-insensitive; non-ASCII is left alone so Rust and JS agree).
+fn norm_host(host: &str) -> String {
+    host.trim().to_ascii_lowercase()
+}
+
+/// A catalogue id usable in an identity: non-empty, and free of the
+/// characters the identity format itself uses.
+fn valid_catalogue_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains(['=', '|', '@']) && !id.chars().any(char::is_control)
+}
+
+/// One hop of an identity: `host:<id>=<user>@<host>:<port>` for a catalogue
+/// entry, `qc:<user>@<host>:<port>` otherwise.
+pub fn hop_identity(catalogue_id: Option<&str>, user: &str, host: &str, port: u16) -> String {
+    let dest = format!("{user}@{}:{port}", norm_host(host));
+    match catalogue_id.filter(|id| valid_catalogue_id(id)) {
+        Some(id) => format!("host:{id}={dest}"),
+        None => format!("qc:{dest}"),
+    }
+}
+
+/// The catalogue ids named by a frontend-supplied identity, (target, jump).
+/// Only the ids are taken from it; every destination is re-derived.
+fn claimed_ids(claimed: &str) -> (Option<&str>, Option<&str>) {
+    fn id(seg: Option<&str>) -> Option<&str> {
+        let rest = seg?.strip_prefix("host:")?;
+        let id = rest.split('=').next().unwrap_or(rest);
+        valid_catalogue_id(id).then_some(id)
+    }
+    let mut parts = claimed.splitn(2, "|via:");
+    let target = id(parts.next());
+    let jump = id(parts.next());
+    (target, jump)
+}
+
+/// The identity of a connection, from the destination it actually dials and,
+/// when it rides one, the bastion it actually dials first.
+///
+/// `claimed` (the frontend's computed identity) contributes only which
+/// catalogue entries these are; the user, host and port of every hop come from
+/// the dial parameters. A claim whose destinations disagree with the dial
+/// therefore cannot pull in another endpoint's artifacts.
+pub fn dial_identity(
+    claimed: Option<&str>,
+    target: (&str, &str, u16),
+    jump: Option<(&str, &str, u16)>,
+) -> String {
+    let (tid, jid) = claimed.filter(|c| validate_endpoint(c).is_ok()).map(claimed_ids).unwrap_or((None, None));
+    let (user, host, port) = target;
+    let mut out = hop_identity(tid, user, host, port);
+    if let Some((ju, jh, jp)) = jump {
+        out.push_str("|via:");
+        out.push_str(&hop_identity(jid, ju, jh, jp));
+    }
+    out
 }
 
 /// Fixed-length filesystem tag for an endpoint key.
@@ -116,6 +188,99 @@ pub fn endpoint_dir(root: &Path, label: &str, key: &str) -> PathBuf {
         }
     }
     root.join(format!("{}@{tag}", safe_component(label)))
+}
+
+/// The app-data directory every artifact tree hangs off (`logs`, `configs`,
+/// `captures`). Components under it are verified by `real_dir`; the root
+/// itself is the platform's per-user application-data folder.
+pub fn app_data_root() -> Result<PathBuf, KnownHostsError> {
+    let store = super::known_hosts::store_path()?;
+    Ok(store.parent().ok_or(KnownHostsError::NoAppDataDir)?.to_path_buf())
+}
+
+/// Whether `meta` (from `symlink_metadata`) is a plain directory: not a
+/// symlink, and on Windows not a junction or other reparse point either.
+fn is_plain_dir(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Make sure every component of `dir` below `anchor` is a real directory,
+/// never a symlink, junction or other reparse point, creating missing ones
+/// when `create` is set (each owner-only on Unix).
+///
+/// The no-follow open in `open_regular` protects only the final file name. A
+/// planted link standing in for an endpoint folder (or for `logs` itself)
+/// would otherwise steer every read and write under it to wherever it points.
+/// Refused with `NotFound` when a component is missing and `create` is off,
+/// and with `InvalidInput` when one is not a plain directory.
+///
+/// A check, not a handle: a same-user process that swaps a verified folder
+/// for a link between this check and the open still wins. The app-data
+/// folder is owner-only, so that needs code already running as the user.
+pub fn real_dir(anchor: &Path, dir: &Path, create: bool) -> io::Result<()> {
+    use std::path::Component;
+    let rel = dir
+        .strip_prefix(anchor)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "artifact path outside the app-data folder"))?;
+    let mut cur = anchor.to_path_buf();
+    for c in rel.components() {
+        let Component::Normal(part) = c else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "unexpected artifact path component"));
+        };
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if is_plain_dir(&m) => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a plain folder (a link or a file); refusing to use it", cur.display()),
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+                let mut b = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    b.mode(0o700);
+                }
+                match b.create(&cur) {
+                    Ok(()) => {}
+                    // Raced with another creator: re-verify what is there now.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        let m = std::fs::symlink_metadata(&cur)?;
+                        if !is_plain_dir(&m) {
+                            return Err(io::Error::new(io::ErrorKind::InvalidInput, "artifact folder replaced by a link"));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// `real_dir` against the app-data root, as the crate's error type. Ok(false)
+/// when the folder does not exist and `create` is off (nothing stored yet).
+pub fn verified_dir(dir: &Path, create: bool) -> Result<bool, KnownHostsError> {
+    let anchor = app_data_root()?;
+    match real_dir(&anchor, dir, create) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !create => Ok(false),
+        Err(source) => Err(KnownHostsError::Io { path: dir.to_path_buf(), source }),
+    }
 }
 
 /// Open `path` for reading only if it is a regular file, never through a
@@ -201,16 +366,16 @@ pub fn publish_new(dir: &Path, base: &str, ext: &str, content: &[u8]) -> io::Res
         let target = dir.join(&name);
         // hard_link refuses an existing target atomically, so a same-second
         // name is never clobbered. Filesystems without links (FAT, some SMB
-        // shares) fall back to a checked rename.
+        // shares) fall back to a rename that is itself no-replace: checking
+        // for the target and then renaming over it left a window in which a
+        // second writer's file was silently replaced.
         match std::fs::hard_link(&tmp, &target) {
             Ok(()) => break Ok(name),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => match std::fs::symlink_metadata(&target) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    break std::fs::rename(&tmp, &target).map(|()| name);
-                }
+            Err(_) => match rename_noreplace(&tmp, &target) {
+                Ok(()) => break Ok(name),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => break Err(e),
-                Ok(_) => {}
             },
         }
         n += 1;
@@ -228,6 +393,62 @@ pub fn publish_new(dir: &Path, base: &str, ext: &str, content: &[u8]) -> io::Res
         }
     }
     result
+}
+
+/// Rename `from` to `to` atomically, failing with `AlreadyExists` instead of
+/// replacing a file already at `to`. Where the OS or filesystem offers no such
+/// rename, this fails: never a replacing rename.
+///
+/// The per-folder lock in `configs` is process-local, so two app instances
+/// could still publish into one folder at once; this rename keeps either from
+/// destroying the other's file, and single-instance enforcement (a later
+/// wave) removes the second instance altogether.
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let a = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+        let b = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+        // Through syscall(), not the glibc wrapper: renameat2 only joined
+        // glibc in 2.28, and the symbol would stop the app loading on older
+        // systems. A kernel or filesystem without RENAME_NOREPLACE reports
+        // ENOSYS or EINVAL, which is returned as is (no fallback).
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                a.as_ptr(),
+                libc::AT_FDCWD,
+                b.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let a = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+        let b = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+        let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_EXCL) };
+        if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+        let (a, b) = (wide(from), wide(to));
+        // No MOVEFILE_REPLACE_EXISTING: an existing target fails the move
+        // (ERROR_ALREADY_EXISTS / ERROR_FILE_EXISTS, both AlreadyExists).
+        let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+        if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no atomic no-replace rename on this platform"))
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +474,42 @@ mod tests {
         assert_eq!(split_tagged(&name), Some(("fw1", a.as_str())));
         assert_eq!(split_tagged("fw1"), None);
         assert_eq!(split_tagged("fw1@xyz"), None);
+    }
+
+    /// Shared with src/lib/frontend.test.mjs: the frontend must compute these
+    /// exact strings for the same hosts, or offline lookups would miss.
+    #[test]
+    fn identity_vectors_match_the_frontend() {
+        assert_eq!(dial_identity(Some("host:h-1"), ("admin", " FW1.Example.COM ", 22), None), "host:h-1=admin@fw1.example.com:22");
+        assert_eq!(
+            dial_identity(Some("host:h-1=x@y:1|via:host:b-1=z@w:2"), ("admin", "10.0.0.1", 2222), Some(("jump", "Bastion.lan", 22))),
+            "host:h-1=admin@10.0.0.1:2222|via:host:b-1=jump@bastion.lan:22"
+        );
+        assert_eq!(dial_identity(Some("qc:ignored"), ("root", "Box", 22), None), "qc:root@box:22");
+        assert_eq!(dial_identity(None, ("root", "box", 22), Some(("j", "b", 2))), "qc:root@box:22|via:qc:j@b:2");
+        assert_eq!(hop_identity(Some("a@b"), "x", "y", 1), "qc:x@y:1");
+        // Non-ASCII is not case-folded, exactly like the frontend.
+        assert_eq!(hop_identity(Some("h"), "u", "ÄBC", 22), "host:h=u@Äbc:22");
+    }
+
+    #[test]
+    fn identity_follows_the_dialled_destination() {
+        let id = |claim: &str, host: &str, jump: Option<(&str, &str, u16)>| {
+            dial_identity(Some(claim), ("admin", host, 22), jump)
+        };
+        let before = id("host:h-1", "10.0.0.1", None);
+        // Repointing the entry at another device: a new identity.
+        assert_ne!(before, id("host:h-1", "10.0.0.2", None));
+        // Editing the bastion's address or account: a new identity.
+        let via = id("host:h-1|via:host:b-1", "10.0.0.1", Some(("ops", "bastion-a", 22)));
+        assert_ne!(via, id("host:h-1|via:host:b-1", "10.0.0.1", Some(("ops", "bastion-b", 22))));
+        assert_ne!(via, id("host:h-1|via:host:b-1", "10.0.0.1", Some(("root", "bastion-a", 22))));
+        assert_ne!(via, id("host:h-1|via:host:b-1", "10.0.0.1", Some(("ops", "bastion-a", 2222))));
+        // A claim naming another destination cannot steer the result.
+        assert_eq!(id("host:h-1=admin@10.9.9.9:22", "10.0.0.1", None), before);
+        // Ids carrying format characters are not trusted as ids.
+        assert!(id("host:a@b", "x", None).starts_with("qc:"));
+        assert_ne!(endpoint_tag(&before), endpoint_tag(&id("host:h-1", "10.0.0.2", None)));
     }
 
     #[test]
@@ -304,6 +561,47 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 2, "staging files left behind: {names:?}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn rename_noreplace_never_clobbers() {
+        let d = tmp_dir();
+        std::fs::write(d.join("a"), "new").unwrap();
+        std::fs::write(d.join("b"), "theirs").unwrap();
+        let err = rename_noreplace(&d.join("a"), &d.join("b")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(d.join("b")).unwrap(), b"theirs");
+        rename_noreplace(&d.join("a"), &d.join("c")).unwrap();
+        assert_eq!(std::fs::read(d.join("c")).unwrap(), b"new");
+        assert!(!d.join("a").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_dir_refuses_symlinked_parents() {
+        let anchor = tmp_dir();
+        let elsewhere = tmp_dir();
+        std::fs::write(elsewhere.join("20261030-120000.txt"), "secret").unwrap();
+        // A planted link standing in for an endpoint folder.
+        std::fs::create_dir_all(anchor.join("configs")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, anchor.join("configs/fw1@0123456789abcdef")).unwrap();
+        let err = real_dir(&anchor, &anchor.join("configs/fw1@0123456789abcdef"), false).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(real_dir(&anchor, &anchor.join("configs/fw1@0123456789abcdef"), true).is_err());
+        // A linked root (logs -> elsewhere) is refused the same way.
+        std::os::unix::fs::symlink(&elsewhere, anchor.join("logs")).unwrap();
+        assert!(real_dir(&anchor, &anchor.join("logs"), true).is_err());
+        // Missing and not creating: NotFound. Creating: real folders appear.
+        let fresh = anchor.join("captures/x@0123456789abcdef");
+        assert_eq!(real_dir(&anchor, &fresh, false).unwrap_err().kind(), io::ErrorKind::NotFound);
+        real_dir(&anchor, &fresh, true).unwrap();
+        assert!(std::fs::symlink_metadata(&fresh).unwrap().is_dir());
+        // Outside the anchor or with `..`: refused.
+        assert!(real_dir(&anchor, &elsewhere, true).is_err());
+        assert!(real_dir(&anchor, &anchor.join("configs/../logs"), true).is_err());
+        let _ = std::fs::remove_dir_all(&anchor);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[cfg(unix)]

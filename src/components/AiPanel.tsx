@@ -9,7 +9,7 @@ import { type ColorPolicy, policyFor, useSettings } from '../lib/settings'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { getTerm } from '../lib/termRegistry'
 import { scanForSecrets, type SecretHit } from '../lib/secretScan'
-import { checkInsert, isDangerousCommand } from '../lib/dangerous'
+import { COPY_INSTEAD, isDangerousCommand, planInsert } from '../lib/dangerous'
 import { useDialogs } from '../lib/dialogs'
 import { ShieldAlert } from 'lucide-react'
 
@@ -69,12 +69,14 @@ export function aiAllowedFor(
 
    Advisor only, by architecture rather than by policy:
    - Suggestions render as chips; Insert pastes the command through the
-     terminal's own paste path (bracketed when the remote enabled it) with no
-     newline. Control characters are refused, multi-line text and destructive
-     commands need a confirm. The human pressing Enter is the approval step.
-   - Context is the tail of THIS endpoint's transcript (~4 KB), looked up by
-     endpoint identity rather than hostname, so another entry sharing the
-     address (with its own AI policy) can never supply it.
+     terminal's own paste path with no newline. One line with no control
+     characters is typed as is; anything with a line break only as a
+     bracketed paste (re-checked at the moment of writing), else refused.
+     Destructive commands need a confirm. The human pressing Enter is the
+     approval step.
+   - Context is the tail of THIS session's transcript (~4 KB), looked up by
+     the session's own dialled endpoint identity rather than hostname, and
+     refused if that is no longer the endpoint this host's AI policy is for.
    - The provider sees one endpoint, never other tabs.
 --------------------------------------------------------------------------- */
 export function AiPanel({
@@ -133,8 +135,11 @@ export function AiPanel({
   } | null>(null)
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
-  /** The run in flight, for the Stop button. */
+  /** The run in flight, for the Stop button. Set only once the backend has
+   *  registered it (ai_chat returned), so a Stop can always find it. */
   const runRef = useRef<string | null>(null)
+  /** Stop was pressed before the run was registered: cancel it as soon as it is. */
+  const stopPendingRef = useRef(false)
 
   const { settings } = useSettings()
   const allowed = aiAllowedFor(host, policyFor(settings, effectiveColor))
@@ -213,6 +218,7 @@ export function AiPanel({
   const stop = () => {
     const runId = runRef.current
     if (runId) void safeInvoke('ai_cancel', { runId }).catch(() => {})
+    else stopPendingRef.current = true
   }
 
   /** Actually fire the request — reached either directly, or after the user
@@ -230,38 +236,48 @@ export function AiPanel({
       unlistenRef.current = null
       setThreadMsgs(target, [...thread, { role: 'assistant', content: '' }])
       setStreaming(true)
+      runRef.current = null
+      stopPendingRef.current = false
       const runId = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      runRef.current = runId
-      unlistenRef.current = await safeListen<AiEvent>(`ai://${runId}`, (ev) => {
-        if (ev.error) {
-          setThreadMsgs(target, (m) => {
-            const copy = [...m]
-            copy[copy.length - 1] = {
-              role: 'assistant',
-              content: `⚠ ${ev.error}`,
-              error: true,
-            }
-            return copy
-          })
-        } else if (ev.delta) {
-          setThreadMsgs(target, (m) => {
-            const copy = [...m]
-            copy[copy.length - 1] = {
-              role: 'assistant',
-              content: copy[copy.length - 1].content + ev.delta,
-            }
-            return copy
-          })
-        }
-        if (ev.done) {
-          setStreaming(false)
-          if (runRef.current === runId) runRef.current = null
-          unlistenRef.current?.()
-          unlistenRef.current = null
-        }
-      })
-
+      /** The final event arrived (possibly before ai_chat even returned). */
+      let finished = false
+      let started = false
+      const finish = () => {
+        finished = true
+        setStreaming(false)
+        if (runRef.current === runId) runRef.current = null
+        unlistenRef.current?.()
+        unlistenRef.current = null
+      }
       try {
+        // Listener first, so no event of the run can be missed; registration
+        // failing is handled like any other failure below.
+        unlistenRef.current = await safeListen<AiEvent>(`ai://${runId}`, (ev) => {
+          if (ev.error) {
+            setThreadMsgs(target, (m) => {
+              const copy = [...m]
+              copy[copy.length - 1] = {
+                role: 'assistant',
+                content: `⚠ ${ev.error}`,
+                error: true,
+              }
+              return copy
+            })
+          } else if (ev.delta) {
+            setThreadMsgs(target, (m) => {
+              const copy = [...m]
+              copy[copy.length - 1] = {
+                role: 'assistant',
+                content: copy[copy.length - 1].content + ev.delta,
+              }
+              return copy
+            })
+          }
+          if (ev.done) finish()
+        })
+        if (stopPendingRef.current) throw new Error('Cancelled.')
+        // ai_chat registers the run before it returns, so from here a Stop
+        // reaches it.
         await safeInvoke('ai_chat', {
           runId,
           cfg,
@@ -269,15 +285,20 @@ export function AiPanel({
           systemContext,
           messages: thread,
         })
+        started = true
+        if (!finished) {
+          runRef.current = runId
+          if (stopPendingRef.current) void safeInvoke('ai_cancel', { runId }).catch(() => {})
+        }
       } catch (e) {
-        setStreaming(false)
-        if (runRef.current === runId) runRef.current = null
-        unlistenRef.current?.()
-        unlistenRef.current = null
         setThreadMsgs(target, (m) => [
           ...m.slice(0, -1),
           { role: 'assistant', content: `⚠ ${e instanceof Error ? e.message : e}`, error: true },
         ])
+      } finally {
+        stopPendingRef.current = false
+        // Nothing was started, so no final event will come to unlock the composer.
+        if (!started) finish()
       }
     },
     [cfg, setThreadMsgs],
@@ -305,12 +326,25 @@ export function AiPanel({
       // lookup, which could return another entry's output under this host's
       // AI policy. Labelled in the thread header so the user always knows what
       // was shared.
+      //
+      // The live session's own dialled identity keys the lookup; `endpoint`
+      // (what this host's policy above was evaluated for) must match it, so a
+      // tab still connected to a repointed host's old device is refused.
       let tail = ''
       if (endpoint) {
         try {
-          tail = (await safeInvoke<string | null>('session_history', { endpoint, maxBytes: 4000 })) ?? ''
-        } catch {
-          tail = ''
+          tail =
+            (await safeInvoke<string | null>('session_history', {
+              sessionId: targetSid,
+              endpoint,
+              maxBytes: 4000,
+            })) ?? ''
+        } catch (e) {
+          setThreadMsgs(targetSid, [
+            ...thread,
+            { role: 'assistant', content: `⚠ Not sent: ${errText(e)}`, error: true },
+          ])
+          return
         }
       }
 
@@ -332,7 +366,7 @@ export function AiPanel({
       }
       void dispatch(targetSid, thread, systemContext)
     },
-    [cfg, session, host, endpoint, allowed, streaming, messages, dispatch],
+    [cfg, session, host, endpoint, allowed, streaming, messages, dispatch, setThreadMsgs],
   )
 
   const explainSelection = () => {
@@ -559,6 +593,16 @@ function MessageView({ msg, sessionId }: { msg: Msg; sessionId: string }) {
   )
 }
 
+/** Whether xterm will bracket a paste right now: the remote enabled the mode
+ *  and the terminal is not configured to ignore it (Clipboard.ts applies
+ *  both). */
+function bracketedNow(term: {
+  modes: { bracketedPasteMode: boolean }
+  options: { ignoreBracketedPasteMode?: boolean }
+}): boolean {
+  return term.modes.bracketedPasteMode && term.options.ignoreBracketedPasteMode !== true
+}
+
 function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
   const [inserted, setInserted] = useState(false)
   const { confirm, alert } = useDialogs()
@@ -575,35 +619,36 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
      on their own prompt and presses Enter — or doesn't. That keystroke is the
      entire approval model; never "improve" this by appending \n.
 
-     It goes through term.paste(), the same path as a user paste: bracketed
-     paste when the remote enabled it (the shell then treats the block as
-     inert text), and the ordered write queue. A raw ssh_write bypassed all of
-     that, and every embedded newline was an Enter: a three-line suggestion ran
-     its first two lines on click. The model's output is steerable by whatever
-     is on the remote screen, so the destructive-command check applies here
-     regardless of the paste-guard setting. */
+     It goes through term.paste(), the same path as a user paste, and only in
+     a shape that cannot act on its own (lib/dangerous planInsert): one line
+     with no control characters, or a multi-line block only as a bracketed
+     paste. Without bracketed paste every line break is Enter, so multi-line
+     text is refused rather than confirmed. The bracketed-paste state is read
+     again synchronously right before writing, after every dialog: the remote
+     can switch it off while a confirm is open. The model's output is
+     steerable by whatever is on the remote screen, so the destructive-command
+     check applies here regardless of the paste-guard setting. */
   const insert = async () => {
-    const check = checkInsert(body)
-    if (check.kind === 'refuse') {
-      await alert(`This suggestion was not inserted: ${check.reason}. Use Copy if you really want it.`, {
-        title: 'Suggestion refused',
-      })
-      return
-    }
-    const target = getTerm(sessionId)
-    if (!target) {
+    const refuse = (reason: string) =>
+      void alert(`This suggestion was not inserted: ${reason}. ${COPY_INSTEAD}`, { title: 'Suggestion refused' })
+    const first = getTerm(sessionId)
+    if (!first) {
       await alert('This session’s terminal is not open, so nothing was inserted.', { title: 'Not inserted' })
       return
     }
-    if (check.kind === 'multiline') {
-      const bracketed = target.term.modes.bracketedPasteMode
-      const ok = await confirm(
-        bracketed
-          ? `This suggestion is ${check.lines} lines. It will be pasted as one block; review all of it before pressing Enter.`
-          : `This suggestion is ${check.lines} lines, and this terminal has not enabled bracketed paste: every line except the last will RUN as soon as it is inserted.`,
-        { title: 'Multi-line suggestion', confirmLabel: `Insert ${check.lines} lines`, danger: !bracketed },
-      )
-      if (!ok) return
+    const plan = planInsert(body, bracketedNow(first.term))
+    if (plan.kind === 'refuse') {
+      refuse(plan.reason)
+      return
+    }
+    if (
+      plan.lines > 1 &&
+      !(await confirm(
+        `This suggestion is ${plan.lines} lines. It will be pasted as one block; review all of it before pressing Enter.`,
+        { title: 'Multi-line suggestion', confirmLabel: `Insert ${plan.lines} lines` },
+      ))
+    ) {
+      return
     }
     const reason = isDangerousCommand(body)
     if (
@@ -616,7 +661,18 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
     ) {
       return
     }
-    target.term.paste(body)
+    // From here to paste(): no await, so nothing can change in between.
+    const target = getTerm(sessionId)
+    if (!target) {
+      void alert('This session’s terminal closed, so nothing was inserted.', { title: 'Not inserted' })
+      return
+    }
+    const final = planInsert(body, bracketedNow(target.term))
+    if (final.kind === 'refuse') {
+      refuse(final.reason)
+      return
+    }
+    target.term.paste(final.text)
     target.term.focus()
     setInserted(true)
     setTimeout(() => setInserted(false), 1600)

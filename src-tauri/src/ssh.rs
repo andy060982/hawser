@@ -519,6 +519,10 @@ pub struct Session {
     /// write so input into a dead session fails loudly instead of vanishing
     /// into a closed channel.
     alive: AtomicBool,
+    /// Endpoint identity derived from what this connection actually dialled
+    /// (see `utils::artifacts::dial_identity`). Keys the transcript, and every
+    /// config, capture and AI-context lookup made for this session.
+    endpoint: String,
 }
 
 #[derive(Default)]
@@ -600,6 +604,11 @@ fn take_tunnels(tunnels: &TunnelHandles) -> Vec<tokio::task::JoinHandle<()>> {
 }
 
 impl Registry {
+    /// The endpoint identity of a live session (see `Session::endpoint`).
+    pub fn endpoint_of(&self, id: &str) -> Result<String, SshError> {
+        Ok(self.get(id)?.endpoint.clone())
+    }
+
     fn get(&self, id: &str) -> Result<Arc<Session>, SshError> {
         self.sessions
             .get(id)
@@ -702,7 +711,8 @@ impl Registry {
         key_path: Option<&str>,
         jump: Option<JumpParams>,
         one_shot_password: Option<&str>,
-        // Endpoint identity for the transcript name (see utils::artifacts).
+        // The frontend's computed endpoint identity. Only its catalogue ids are
+        // used; destinations come from the dial (utils::artifacts::dial_identity).
         endpoint: Option<&str>,
     ) -> Result<(), SshError> {
         // A reconnect reuses the session id. Tear the previous connection down
@@ -821,6 +831,17 @@ impl Registry {
         // direct-tcpip channel to the real target and run the SSH handshake
         // over that stream — exactly what OpenSSH's ProxyJump does. The
         // bastion's own host key is checked and prompted like any other.
+        // Endpoint identity from the parameters actually dialled below, not
+        // from the claim: the claim only says which catalogue entries these are.
+        // (Derived here, before `jump` is consumed by the dial.)
+        // The identity comes from the dial parameters, not from the claim: the
+        // claim only says which catalogue entries these are.
+        let endpoint = crate::utils::artifacts::dial_identity(
+            endpoint,
+            (username, host, port),
+            jump.as_ref().map(|j| (j.username.as_str(), j.host.as_str(), j.port)),
+        );
+
         let (mut handle, jump_handle) = match jump {
             Some(j) => {
                 let jump_config = Arc::new(client::Config {
@@ -923,7 +944,7 @@ impl Registry {
         // Transcript. Opened here rather than inside the task so a failure is
         // visible immediately, and degraded to None rather than propagated:
         // losing a log must never take down a working connection.
-        let mut log = SessionLog::create_for(endpoint, host, username).ok();
+        let mut log = SessionLog::create_for(Some(&endpoint), host, username).ok();
         if let Some(l) = log.as_ref() {
             let _ = pump_app.emit(
                 &topic,
@@ -943,6 +964,7 @@ impl Registry {
             sftp: Mutex::new(None),
             _jump: jump_handle,
             alive: AtomicBool::new(true),
+            endpoint,
         });
 
         let pump_session = Arc::clone(&session);

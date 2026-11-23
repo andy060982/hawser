@@ -5,21 +5,42 @@
    - per-character lowercase, with no context;
    - final sigma ς folded to σ ('ΠΑΝΕΠΙΣ' finds 'ΠΑΝΕΠΙΣΤΗΜΙΟ', 'οδοσ' finds 'οδος');
    - the combining dot U+0307 after an 'i' dropped ('İstanbul' lowercases to
-     'i̇stanbul', and must match 'istanbul').
+     'i̇stanbul', and must match 'istanbul');
+   - the common full case folds in FULL_FOLDS expanded ('Straße' finds
+     'STRASSE', the 'ﬁ' ligature finds 'fi'). The same table is in Rust.
+   Limits, shared with the backend: no Unicode normalisation, no other full
+   folds, and per-character lowercase follows each runtime's Unicode tables,
+   which can differ for characters added in very recent Unicode versions.
    Folding can change length, so every folded UTF-16 unit records which
    original character it came from. */
+
+/** Full case folds beyond lowercase, applied to each lowercased character.
+ *  Must match `FULL_FOLDS` in session_log.rs exactly. */
+const FULL_FOLDS: Record<string, string> = {
+  'ß': 'ss',
+  'ﬀ': 'ff',
+  'ﬁ': 'fi',
+  'ﬂ': 'fl',
+  'ﬃ': 'ffi',
+  'ﬄ': 'ffl',
+  'ﬅ': 'st',
+  'ﬆ': 'st',
+  'ŉ': 'ʼn',
+}
 
 function foldChar(ch: string, state: { prevI: boolean }, out: string[]): number {
   let n = 0
   for (const l of ch.toLowerCase()) {
-    if (l === '̇' && state.prevI) {
+    if (l === '\u0307' && state.prevI) {
       state.prevI = false
       continue
     }
-    const f = l === 'ς' ? 'σ' : l
-    out.push(f)
-    n += f.length
-    state.prevI = f === 'i'
+    const f = l === 'ς' ? 'σ' : (FULL_FOLDS[l] ?? l)
+    for (const u of f) {
+      out.push(u)
+      n += u.length
+    }
+    state.prevI = f.endsWith('i')
   }
   return n
 }

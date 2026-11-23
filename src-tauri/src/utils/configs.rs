@@ -63,10 +63,9 @@ fn configs_dir(endpoint: &str, label: &str) -> Result<PathBuf, KnownHostsError> 
 /// it is only ever listed and read, never used as a baseline.
 fn legacy_dir(label: &str) -> Option<PathBuf> {
     let dir = configs_root().ok()?.join(legacy_slug(label));
-    match std::fs::symlink_metadata(&dir) {
-        Ok(m) if m.is_dir() => Some(dir),
-        _ => None,
-    }
+    // Every component a real folder, not only the last: a linked `configs`
+    // would otherwise lead the legacy view somewhere else.
+    matches!(artifacts::verified_dir(&dir, false), Ok(true)).then_some(dir)
 }
 
 /// One lock per snapshot folder: compare-with-newest and publish must not
@@ -79,10 +78,9 @@ fn dir_lock(dir: &Path) -> Arc<Mutex<()>> {
 }
 
 fn ensure_dir(dir: &Path) -> Result<(), KnownHostsError> {
-    std::fs::create_dir_all(dir).map_err(|source| KnownHostsError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
+    // Created component by component, each verified to be a real folder (see
+    // artifacts::real_dir), never through a planted link.
+    artifacts::verified_dir(dir, true)?;
     // A device config dump can hold SNMP communities, pre-shared keys, and other
     // secrets, so keep the per-host snapshot directory owner-only.
     super::platform::restrict_perms(dir, 0o700);
@@ -349,7 +347,7 @@ fn infos(dir: &Path, prefix: &str, legacy: bool) -> Result<Vec<SnapshotInfo>, Kn
 /// This endpoint's snapshots plus any in the legacy hostname folder, newest first.
 pub fn list_snapshots(endpoint: &str, label: &str) -> Result<Vec<SnapshotInfo>, KnownHostsError> {
     let dir = configs_dir(endpoint, label)?;
-    let mut out = if dir.exists() { infos(&dir, "", false)? } else { Vec::new() };
+    let mut out = if artifacts::verified_dir(&dir, false)? { infos(&dir, "", false)? } else { Vec::new() };
     if let Some(legacy) = legacy_dir(label) {
         out.extend(infos(&legacy, LEGACY_PREFIX, true)?);
     }
@@ -387,7 +385,13 @@ fn resolve(endpoint: &str, label: &str, id: &str) -> Result<PathBuf, KnownHostsE
                 .ok_or_else(|| KnownHostsError::Parse(format!("no legacy snapshot {name}")))?;
             checked(&dir, name)
         }
-        None => checked(&configs_dir(endpoint, label)?, id),
+        None => {
+            let dir = configs_dir(endpoint, label)?;
+            if !artifacts::verified_dir(&dir, false)? {
+                return Err(KnownHostsError::Parse(format!("no snapshot {id}")));
+            }
+            checked(&dir, id)
+        }
     }
 }
 
@@ -402,13 +406,25 @@ fn render_diff(old: &str, new: &str, older: &str, newer: &str) -> String {
     let (old, new) = (norm(old), norm(new));
     let diff = bounded_line_diff(&old, &new);
     let mut out = diff.unified_diff().context_radius(3).header(older, newer).to_string();
-    if out.len() > MAX_DIFF_OUT {
-        let cut = out[..MAX_DIFF_OUT].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let rest = out.len() - cut;
-        out.truncate(cut);
-        out.push_str(&format!("… diff truncated: {rest} more bytes not shown\n"));
-    }
+    cap_text(&mut out, MAX_DIFF_OUT);
     out
+}
+
+/// Cut `out` to at most `max` bytes at a line end, noting how much was left
+/// out. The cut backs off to a char boundary before slicing: a byte index
+/// inside a multi-byte character panics, and release builds abort on panic.
+fn cap_text(out: &mut String, max: usize) {
+    if out.len() <= max {
+        return;
+    }
+    let mut at = max;
+    while !out.is_char_boundary(at) {
+        at -= 1;
+    }
+    let cut = out[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let rest = out.len() - cut;
+    out.truncate(cut);
+    out.push_str(&format!("… diff truncated: {rest} more bytes not shown\n"));
 }
 
 pub fn read_snapshot(endpoint: &str, label: &str, name: &str) -> Result<String, KnownHostsError> {
@@ -515,6 +531,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn a_multibyte_char_at_the_diff_cap_does_not_panic() {
+        // The cap lands inside a 3-byte '€' at every offset 1..=2, and on a
+        // line with no newline before it at all.
+        for max in [4usize, 5, 6, 7, 8, 9] {
+            let mut t = format!("ab\n{}\n", "€".repeat(10));
+            cap_text(&mut t, max);
+            assert!(t.ends_with("more bytes not shown\n"), "{t}");
+            assert!(t.starts_with("ab\n") || t.starts_with('…'), "{t}");
+            let mut u = "€".repeat(10);
+            cap_text(&mut u, max);
+            assert!(u.starts_with('…'), "{u}");
+        }
+        let mut short = "ok\n".to_string();
+        cap_text(&mut short, 10);
+        assert_eq!(short, "ok\n");
+    }
+
     #[test]
     fn an_unreadable_baseline_is_an_error_not_an_empty_file() {
         use std::os::unix::fs::PermissionsExt;

@@ -183,8 +183,21 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
 
   /* Contents search: debounced, and only the newest query's answer is kept. */
   const searchSeq = useRef(0)
+  const wasContents = useRef(false)
   useEffect(() => {
-    if (mode !== 'contents') return
+    if (mode !== 'contents') {
+      // Leaving contents search: stop a scan already running on the backend
+      // (clearing the debounce timer only stops one not yet started), and
+      // drop its answer.
+      if (wasContents.current) {
+        wasContents.current = false
+        ++searchSeq.current
+        setSearching(false)
+        void safeInvoke('logs_search_cancel').catch(() => {})
+      }
+      return
+    }
+    wasContents.current = true
     const q = query.trim()
     const seq = ++searchSeq.current
     if (q.length < 2) {
@@ -214,6 +227,14 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
     }, 250)
     return () => window.clearTimeout(t)
   }, [mode, query])
+
+  /* Closing the browser mid-search stops the scan too. */
+  useEffect(
+    () => () => {
+      if (wasContents.current) void safeInvoke('logs_search_cancel').catch(() => {})
+    },
+    [],
+  )
 
   /* Hits grouped by session, keeping the backend's newest-first order. */
   const groups = useMemo(() => {
