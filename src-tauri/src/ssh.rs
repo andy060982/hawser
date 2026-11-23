@@ -4606,6 +4606,19 @@ struct Progress<'a> {
     cancel: watch::Receiver<bool>,
     notes: Vec<String>,
     notes_dropped: usize,
+    /// Remote editing only: the most bytes a download may write. Enforced
+    /// per chunk while streaming, so a file that grows (or a server that
+    /// understates its size) cannot fill the disk past it.
+    byte_limit: Option<u64>,
+    /// Remote editing only: the SHA-256 the upload's destination must still
+    /// have, checked by reading it back immediately before the commit (and
+    /// before any in-place write). See `edit_commit_guard`.
+    commit_guard: Option<String>,
+    /// Set when `commit_guard` refused the commit: the destination changed.
+    guard_tripped: bool,
+    /// Tests: run right before the commit guard reads the destination (a
+    /// concurrent writer). Always None outside the SFTP harness.
+    before_guard: Option<EditHook>,
     /// Tests: every event, as it would have been emitted.
     #[cfg(test)]
     sent: Option<Arc<std::sync::Mutex<Vec<TransferProgress>>>>,
@@ -4642,6 +4655,10 @@ impl<'a> Progress<'a> {
             cancel,
             notes: Vec::new(),
             notes_dropped: 0,
+            byte_limit: None,
+            commit_guard: None,
+            guard_tripped: false,
+            before_guard: None,
             #[cfg(test)]
             sent: None,
         }
@@ -4675,6 +4692,10 @@ impl<'a> Progress<'a> {
             cancel,
             notes: Vec::new(),
             notes_dropped: 0,
+            byte_limit: None,
+            commit_guard: None,
+            guard_tripped: false,
+            before_guard: None,
             #[cfg(test)]
             sent: None,
         }
@@ -5546,6 +5567,17 @@ async fn copy_remote_file(
             if n == 0 {
                 break;
             }
+            // Before the chunk is written: never more than the limit on disk.
+            if let Some(max) = p.byte_limit {
+                if done + n as u64 > max {
+                    return Err(SshError::PartialTransfer(format!(
+                        "{remote} is over {} MB (it grew while downloading, or the server \
+                         reported a smaller size); the download was stopped and the partial \
+                         copy deleted",
+                        max / (1024 * 1024)
+                    )));
+                }
+            }
             step(&p.cancel, dst.write_all(&buf[..n])).await?;
             done += n as u64;
             p.tick(done);
@@ -5776,6 +5808,7 @@ async fn copy_local_file(
             // The folder is not writable, only (perhaps) the file.
             let why = "the folder is not writable";
             let checked = check_in_place_target(sftp, &p.cancel, &target, replace).await?;
+            edit_commit_guard(sftp, p, None, &target).await?;
             p.warn(in_place_warning(&target, why));
             let done = write_in_place(sftp, p, &mut src, &target, checked, mode)
                 .await
@@ -5851,6 +5884,10 @@ async fn copy_local_file(
         }
     };
 
+    // Remote editing: the destination must still hold the bytes the edit
+    // was based on (see `edit_commit_guard`); otherwise nothing is replaced.
+    edit_commit_guard(sftp, p, Some(&tmp), &target).await?;
+
     // Replacing: what is at the destination now must still be what the user
     // agreed to replace (see `recheck_target`); a check that fails refuses.
     if replace {
@@ -5897,6 +5934,7 @@ async fn copy_local_file(
                     ))
                 }
             };
+            edit_commit_guard(sftp, p, Some(&tmp), &target).await?;
             p.warn(in_place_warning(&target, why));
             use tokio::io::AsyncSeekExt;
             step(&p.cancel, src.seek(std::io::SeekFrom::Start(0)))
@@ -6471,7 +6509,7 @@ async fn write_in_place(
 // `copy_remote_file` stages and commits the download, `copy_local_file` the
 // upload (staged, posix-rename where offered, mode kept), under `Replace`.
 
-use crate::utils::remote_edit::{RemoteStamp, MAX_EDIT_BYTES};
+use crate::utils::remote_edit::{RemoteBaseline, RemoteStamp, MAX_EDIT_BYTES};
 
 /// What the remote file looked like when it was (re)checked.
 fn stamp_of(m: &russh_sftp::protocol::FileAttributes) -> RemoteStamp {
@@ -6486,14 +6524,31 @@ pub(crate) struct EditProbe {
     pub mode: Option<u32>,
 }
 
+/// A remote file downloaded for editing.
+#[derive(Debug, Clone)]
+pub(crate) struct EditFetched {
+    pub probe: EditProbe,
+    /// The remote file as downloaded: its stamp and the SHA-256 of the bytes
+    /// now on disk here. Every later save is checked against this.
+    pub baseline: RemoteBaseline,
+    pub bytes: u64,
+}
+
 /// How a save was pushed to the server.
 #[derive(Debug)]
 pub(crate) enum EditPushed {
-    /// Uploaded; `stamp` is the remote file as it is now, the new baseline.
-    Uploaded { stamp: RemoteStamp, bytes: u64, notes: Vec<String> },
-    /// The remote file is not what was downloaded (someone else changed or
-    /// removed it): NOTHING was uploaded. `now` is None when it is gone.
-    Conflict { now: Option<RemoteStamp> },
+    /// Uploaded, and read back: the remote file holds exactly the bytes sent.
+    /// `baseline` is the new one.
+    Uploaded { baseline: RemoteBaseline, bytes: u64, notes: Vec<String> },
+    /// The remote file is not what the edit was based on. `now` is None when
+    /// it is gone.
+    ///
+    /// `during_upload: false`: someone else changed or removed it before the
+    /// commit, and NOTHING was uploaded. `true`: the upload was committed, but
+    /// reading it back found other bytes — someone wrote at the same time, so
+    /// the server may hold their version, not this one. Either way the
+    /// baseline is NOT moved on.
+    Conflict { now: Option<RemoteStamp>, during_upload: bool },
 }
 
 /// STAT (following a link, as an editor of `/etc/foo` -> `foo.real` would
@@ -6504,6 +6559,73 @@ async fn edit_stat(sftp: &SftpConn, remote: &str) -> Result<Option<russh_sftp::p
         Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Read a remote file and return the SHA-256 of its content. `Ok(None)` when
+/// it is definitely gone, or holds more than `MAX_EDIT_BYTES` (it cannot be
+/// the bytes an edit was based on, so it counts as changed).
+async fn remote_content_hash(sftp: &SftpConn, remote: &str) -> Result<Option<String>, SshError> {
+    use sha2::{Digest, Sha256};
+    let never = uncancellable();
+    let mut f = match step(&never, sftp.hi.open(remote)).await {
+        Ok(f) => f,
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let read: Result<Option<String>, SshError> = async {
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; CHUNK];
+        let mut done = 0u64;
+        loop {
+            let n = step(&never, f.read(&mut buf)).await?;
+            if n == 0 {
+                break;
+            }
+            done += n as u64;
+            if done > MAX_EDIT_BYTES {
+                return Ok(None);
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect()))
+    }
+    .await;
+    let _ = tokio::time::timeout(stall_timeout(), f.close()).await;
+    read
+}
+
+/// Remote editing's commit-time check (`Progress::commit_guard`): read the
+/// destination back and require the SHA-256 the edit was based on. Called by
+/// `copy_local_file` immediately before the commit, and before any in-place
+/// write; a no-op for every other transfer.
+///
+/// On a mismatch (or the file gone) nothing is committed: the staged copy
+/// `tmp` is removed and `p.guard_tripped` set, so the caller reports a
+/// conflict rather than an error. A failed read refuses too.
+///
+/// RESIDUAL: SFTP has no conditional write, so a write by someone else in the
+/// window between this read and the rename (one or two round trips) is not
+/// seen here. `edit_push_with` reads the result back afterwards, so such a
+/// race is reported as a conflict and never adopted as the new baseline —
+/// but their bytes may by then have been replaced by ours (or ours by theirs).
+async fn edit_commit_guard(sftp: &SftpConn, p: &mut Progress<'_>, tmp: Option<&str>, target: &str) -> Result<(), SshError> {
+    let Some(expect) = p.commit_guard.clone() else { return Ok(()) };
+    if let Some(hook) = p.before_guard.clone() {
+        hook();
+    }
+    let found = remote_content_hash(sftp, target).await;
+    let why = match found {
+        Ok(Some(h)) if h == expect => return Ok(()),
+        Ok(_) => {
+            p.guard_tripped = true;
+            format!("{target} was changed on the server while the save was being uploaded; not replacing it")
+        }
+        Err(e) => format!("could not read {target} back to check it before replacing it ({e}); not replacing it"),
+    };
+    if let Some(tmp) = tmp {
+        remove_remote_quietly(sftp, tmp).await;
+    }
+    Err(SshError::PartialTransfer(why))
 }
 
 /// The remote file, checked as editable: it exists, is a regular file (after
@@ -6529,13 +6651,35 @@ pub(crate) async fn edit_probe_with(sftp: &SftpConn, remote: &str) -> Result<Edi
     Ok(EditProbe { stamp: stamp_of(&m), mode: m.permissions })
 }
 
+/// SHA-256 of a local file of at most `MAX_EDIT_BYTES`, off the runtime.
+async fn local_edit_hash(local: &str) -> Result<String, SshError> {
+    let path = std::path::PathBuf::from(local);
+    tokio::task::spawn_blocking(move || {
+        let m = std::fs::symlink_metadata(&path)?;
+        if !m.is_file() || m.len() > MAX_EDIT_BYTES {
+            return Err(std::io::Error::other(format!(
+                "{} is not a plain file of at most {} MB",
+                path.display(),
+                MAX_EDIT_BYTES / (1024 * 1024)
+            )));
+        }
+        crate::utils::remote_edit::hash_file(&path)
+    })
+    .await
+    .map_err(|e| SshError::PartialTransfer(e.to_string()))?
+    .map_err(|e| SshError::PartialTransfer(format!("could not read the local copy: {e}")))
+}
+
 /// Download `remote` to `local` (a path that must not exist yet) and return
-/// the baseline: the remote size and mtime as they were downloaded. A file
-/// that changed WHILE it was being read is refused (the copy is removed), so
-/// the baseline always describes the bytes on disk.
-pub(crate) async fn edit_fetch_with(sftp: &Arc<SftpConn>, remote: &str, local: &str) -> Result<(EditProbe, u64), SshError> {
+/// the baseline: the remote size and mtime as they were downloaded, and the
+/// SHA-256 of the bytes written. A file that changed WHILE it was being read
+/// is refused (the copy is removed), and so is one that grows past
+/// `MAX_EDIT_BYTES` — the cap is enforced per chunk while streaming, so a
+/// lying or growing file never puts more than that on disk.
+pub(crate) async fn edit_fetch_with(sftp: &Arc<SftpConn>, remote: &str, local: &str) -> Result<EditFetched, SshError> {
     let before = edit_probe_with(sftp, remote).await?;
     let mut p = Progress::detached(uncancellable());
+    p.byte_limit = Some(MAX_EDIT_BYTES);
     let bytes = copy_remote_file(sftp, &mut p, remote, local, Overwrite::Never).await?;
     let after = edit_stat(sftp, remote).await;
     let steady = matches!(&after, Ok(Some(m)) if !before.stamp.differs(&stamp_of(m)) && bytes == before.stamp.size);
@@ -6548,53 +6692,103 @@ pub(crate) async fn edit_fetch_with(sftp: &Arc<SftpConn>, remote: &str, local: &
             )),
         });
     }
-    Ok((before, bytes))
+    let hash = match local_edit_hash(local).await {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(local).await;
+            return Err(e);
+        }
+    };
+    Ok(EditFetched { probe: before, baseline: RemoteBaseline { stamp: before.stamp, hash }, bytes })
 }
 
-/// Push a saved local copy back over `remote`.
+/// Push a saved local copy (a private snapshot) back over `remote`.
 ///
-/// With `expect` (a normal save), the remote file is STATed first and must
-/// still match that baseline: if its size or mtime differ, someone else
-/// changed it and NOTHING is uploaded (`Conflict`). Without (the user chose
-/// "Overwrite remote"), it is replaced regardless. The upload itself is
-/// `copy_local_file` under `Replace`, and the result is STATed again for the
-/// next baseline.
+/// With `expect` (a normal save), the save is checked against the baseline
+/// twice: a cheap STAT before staging (size or mtime differ: `Conflict`, and
+/// nothing is sent), then — the check that matters — the remote content is
+/// read back and hashed IMMEDIATELY BEFORE the commit (`edit_commit_guard`),
+/// so a same-size change within the same second, or a write made while the
+/// upload was being staged, is still a `Conflict` with nothing replaced.
+/// Without `expect` (the user chose "Overwrite remote"), it is replaced
+/// regardless.
 ///
-/// There is no lock on the server: a write by someone else between the check
-/// and the commit, or within the same second at the same size, is not seen.
+/// After the commit the remote file is read back again: only if it holds
+/// exactly the bytes sent does its stamp and hash become the new baseline;
+/// anything else means someone wrote concurrently, and is a `Conflict`
+/// (`during_upload`), never adopted.
+///
+/// RESIDUAL: SFTP has no conditional write. Between the commit-time read and
+/// the rename (one or two round trips) another writer can still land, and
+/// one of the two versions is lost. The read-back afterwards turns that into
+/// a reported conflict, but cannot undo it.
 pub(crate) async fn edit_push_with(
     sftp: &Arc<SftpConn>,
     local: &str,
     remote: &str,
-    expect: Option<RemoteStamp>,
+    expect: Option<&RemoteBaseline>,
 ) -> Result<EditPushed, SshError> {
+    edit_push_hooked(sftp, local, remote, expect, None, None).await
+}
+
+/// A test hook (a concurrent writer) for `edit_push_hooked`.
+pub(crate) type EditHook = Arc<dyn Fn() + Send + Sync>;
+
+/// `edit_push_with`, with test hooks: `before_guard` runs right before the
+/// commit-time read, `after_commit` between the commit and the read-back.
+/// Production passes None for both.
+pub(crate) async fn edit_push_hooked(
+    sftp: &Arc<SftpConn>,
+    local: &str,
+    remote: &str,
+    expect: Option<&RemoteBaseline>,
+    before_guard: Option<EditHook>,
+    after_commit: Option<EditHook>,
+) -> Result<EditPushed, SshError> {
+    let sent = local_edit_hash(local).await?;
     if let Some(base) = expect {
         match edit_stat(sftp, remote).await? {
-            None => return Ok(EditPushed::Conflict { now: None }),
+            None => return Ok(EditPushed::Conflict { now: None, during_upload: false }),
             Some(m) if !m.file_type().is_file() => {
                 return Err(SshError::PartialTransfer(format!(
                     "{remote} is now {}; not uploading over it",
                     remote_kind(&m)
                 )))
             }
-            Some(m) if base.differs(&stamp_of(&m)) => {
-                return Ok(EditPushed::Conflict { now: Some(stamp_of(&m)) })
+            Some(m) if base.stamp.differs(&stamp_of(&m)) => {
+                return Ok(EditPushed::Conflict { now: Some(stamp_of(&m)), during_upload: false })
             }
             Some(_) => {}
         }
     }
     let mut p = Progress::detached(uncancellable());
-    let bytes = copy_local_file(sftp, &mut p, local, remote, Overwrite::Replace).await?;
-    let notes = p.take_notes();
-    let stamp = match edit_stat(sftp, remote).await? {
-        Some(m) => stamp_of(&m),
-        None => {
-            return Err(SshError::PartialTransfer(format!(
-                "uploaded {remote}, but it was gone right after; check it on the server"
-            )))
+    p.commit_guard = expect.map(|b| b.hash.clone());
+    p.before_guard = before_guard;
+    let bytes = match copy_local_file(sftp, &mut p, local, remote, Overwrite::Replace).await {
+        Ok(b) => b,
+        Err(_) if p.guard_tripped => {
+            let now = edit_stat(sftp, remote).await.ok().flatten().map(|m| stamp_of(&m));
+            return Ok(EditPushed::Conflict { now, during_upload: false });
         }
+        Err(e) => return Err(e),
     };
-    Ok(EditPushed::Uploaded { stamp, bytes, notes })
+    let notes = p.take_notes();
+    if let Some(hook) = after_commit {
+        hook();
+    }
+    // Read it back: STAT, content, STAT. The new baseline is adopted only when
+    // the content is what was sent and the file did not change while read.
+    let first = edit_stat(sftp, remote).await?;
+    let content = remote_content_hash(sftp, remote).await?;
+    let last = edit_stat(sftp, remote).await?;
+    match (first, content, last) {
+        (Some(a), Some(h), Some(b)) if h == sent && !stamp_of(&a).differs(&stamp_of(&b)) => Ok(EditPushed::Uploaded {
+            baseline: RemoteBaseline { stamp: stamp_of(&b), hash: h },
+            bytes,
+            notes,
+        }),
+        (_, _, last) => Ok(EditPushed::Conflict { now: last.map(|m| stamp_of(&m)), during_upload: true }),
+    }
 }
 
 /// "Save a copy as name.conflict": upload the local copy to a NEW name next to
@@ -6629,7 +6823,7 @@ impl Registry {
     }
 
     /// `edit_fetch_with` on a session's SFTP channel.
-    pub(crate) async fn edit_fetch(&self, session_id: &str, remote: &str, local: &str) -> Result<(EditProbe, u64), SshError> {
+    pub(crate) async fn edit_fetch(&self, session_id: &str, remote: &str, local: &str) -> Result<EditFetched, SshError> {
         let sftp = self.sftp(session_id).await?;
         let r = edit_fetch_with(&sftp, remote, local).await;
         self.check_sftp(session_id, &sftp, r).await
@@ -6641,7 +6835,7 @@ impl Registry {
         session_id: &str,
         local: &str,
         remote: &str,
-        expect: Option<RemoteStamp>,
+        expect: Option<&RemoteBaseline>,
     ) -> Result<EditPushed, SshError> {
         let sftp = self.sftp(session_id).await?;
         let r = edit_push_with(&sftp, local, remote, expect).await;

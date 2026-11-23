@@ -1955,25 +1955,28 @@ async fn edit_download_modify_upload_round_trip() {
         h.put_remote("app.conf", b"listen 80;\n", 0o640);
         set_mtime(&h.remote.join("app.conf"), 1_700_000_000);
         let local = h.local_str("app.conf");
-        let (probe, bytes) = edit_fetch_with(&h.conn, "/app.conf", &local).await.unwrap();
-        assert_eq!(bytes, 11);
+        let fetched = edit_fetch_with(&h.conn, "/app.conf", &local).await.unwrap();
+        let probe = fetched.probe;
+        assert_eq!(fetched.bytes, 11);
         assert_eq!(probe.stamp, RemoteStamp { size: 11, mtime: Some(1_700_000_000) }, "{which}");
         assert_eq!(probe.mode.map(|m| m & 0o777), Some(0o640));
         assert_eq!(std::fs::read(&local).unwrap(), b"listen 80;\n");
+        assert_eq!(fetched.baseline.hash, crate::utils::remote_edit::sha256_hex(b"listen 80;\n"), "{which}: content baseline");
 
         std::fs::write(&local, b"listen 8080;\n").unwrap();
-        let pushed = edit_push_with(&h.conn, &local, "/app.conf", Some(probe.stamp)).await.unwrap();
-        let EditPushed::Uploaded { stamp, bytes, notes } = pushed else { panic!("{which}: {pushed:?}") };
+        let pushed = edit_push_with(&h.conn, &local, "/app.conf", Some(&fetched.baseline)).await.unwrap();
+        let EditPushed::Uploaded { baseline, bytes, notes } = pushed else { panic!("{which}: {pushed:?}") };
         assert_eq!(bytes, 13);
         assert!(notes.is_empty(), "{which}: {notes:?}");
         assert_eq!(h.remote_body("app.conf"), b"listen 8080;\n", "{which}");
         assert_eq!(Harness::mode(&h.remote.join("app.conf")), 0o640, "{which}: mode kept");
         let m = std::fs::metadata(h.remote.join("app.conf")).unwrap();
-        assert_eq!(stamp, RemoteStamp { size: 13, mtime: Some(filetime_secs(&m)) }, "{which}: new baseline");
+        assert_eq!(baseline.stamp, RemoteStamp { size: 13, mtime: Some(filetime_secs(&m)) }, "{which}: new baseline");
+        assert_eq!(baseline.hash, crate::utils::remote_edit::sha256_hex(b"listen 8080;\n"), "{which}: read back");
 
         // The next save is checked against the NEW baseline, and goes through.
         std::fs::write(&local, b"listen 443;\n").unwrap();
-        let again = edit_push_with(&h.conn, &local, "/app.conf", Some(stamp)).await.unwrap();
+        let again = edit_push_with(&h.conn, &local, "/app.conf", Some(&baseline)).await.unwrap();
         assert!(matches!(again, EditPushed::Uploaded { .. }), "{which}: {again:?}");
         assert_eq!(h.remote_body("app.conf"), b"listen 443;\n");
         Harness::assert_clean(&h.remote);
@@ -1994,15 +1997,17 @@ async fn edit_a_remote_change_is_a_conflict_and_nothing_is_uploaded() {
         h.put_remote("motd", b"hello", 0o644);
         set_mtime(&h.remote.join("motd"), 1_700_000_000);
         let local = h.local_str("motd");
-        let (probe, _) = edit_fetch_with(&h.conn, "/motd", &local).await.unwrap();
+        let fetched = edit_fetch_with(&h.conn, "/motd", &local).await.unwrap();
 
         let theirs: &[u8] = if same_size { b"HELLO" } else { b"their change" };
         std::fs::write(h.remote.join("motd"), theirs).unwrap();
         set_mtime(&h.remote.join("motd"), 1_700_000_100);
         std::fs::write(&local, b"my change").unwrap();
 
-        let pushed = edit_push_with(&h.conn, &local, "/motd", Some(probe.stamp)).await.unwrap();
-        let EditPushed::Conflict { now: Some(now) } = pushed else { panic!("same_size={same_size}: {pushed:?}") };
+        let pushed = edit_push_with(&h.conn, &local, "/motd", Some(&fetched.baseline)).await.unwrap();
+        let EditPushed::Conflict { now: Some(now), during_upload: false } = pushed else {
+            panic!("same_size={same_size}: {pushed:?}")
+        };
         assert_eq!(now.mtime, Some(1_700_000_100));
         assert_eq!(h.remote_body("motd"), theirs, "same_size={same_size}: their change survives");
         Harness::assert_clean(&h.remote);
@@ -2022,11 +2027,11 @@ async fn edit_a_deleted_remote_is_a_conflict() {
     let h = harness(false).await;
     h.put_remote("gone.txt", b"v1", 0o644);
     let local = h.local_str("gone.txt");
-    let (probe, _) = edit_fetch_with(&h.conn, "/gone.txt", &local).await.unwrap();
+    let fetched = edit_fetch_with(&h.conn, "/gone.txt", &local).await.unwrap();
     std::fs::remove_file(h.remote.join("gone.txt")).unwrap();
     std::fs::write(&local, b"v2").unwrap();
-    let pushed = edit_push_with(&h.conn, &local, "/gone.txt", Some(probe.stamp)).await.unwrap();
-    assert!(matches!(pushed, EditPushed::Conflict { now: None }), "{pushed:?}");
+    let pushed = edit_push_with(&h.conn, &local, "/gone.txt", Some(&fetched.baseline)).await.unwrap();
+    assert!(matches!(pushed, EditPushed::Conflict { now: None, during_upload: false }), "{pushed:?}");
     assert!(!h.remote.join("gone.txt").exists());
 }
 
@@ -2085,4 +2090,113 @@ async fn edit_fetch_refuses_what_it_cannot_baseline() {
     assert!(edit_fetch_with(&h.conn, "/a.txt", &h.local_str("a.txt")).await.is_err());
     assert_eq!(std::fs::read(h.local.join("a.txt")).unwrap(), b"local");
     Harness::assert_clean(&h.local);
+}
+
+/// The P1 case the stamp check cannot see: someone else made a SAME-SIZE
+/// change and the mtime is the same second. The content check at the commit
+/// boundary catches it, and nothing is replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_a_same_size_same_mtime_change_is_a_conflict() {
+    for opts in extension_sets() {
+        let which = label(&opts);
+        let h = harness_with(opts).await;
+        h.put_remote("hosts", b"10.0.0.1 db", 0o644);
+        set_mtime(&h.remote.join("hosts"), 1_700_000_000);
+        let local = h.local_str("hosts");
+        let fetched = edit_fetch_with(&h.conn, "/hosts", &local).await.unwrap();
+
+        // Theirs: same length, mtime put back to the same second.
+        std::fs::write(h.remote.join("hosts"), b"10.6.6.6 db").unwrap();
+        set_mtime(&h.remote.join("hosts"), 1_700_000_000);
+        std::fs::write(&local, b"10.0.0.2 db").unwrap();
+
+        let pushed = edit_push_with(&h.conn, &local, "/hosts", Some(&fetched.baseline)).await.unwrap();
+        assert!(matches!(pushed, EditPushed::Conflict { now: Some(_), during_upload: false }), "{which}: {pushed:?}");
+        assert_eq!(h.remote_body("hosts"), b"10.6.6.6 db", "{which}: their change survives");
+        Harness::assert_clean(&h.remote);
+    }
+}
+
+/// Someone writes the remote file WHILE the save is being staged (after the
+/// first STAT passed): the commit-time read sees it, the staged copy is
+/// dropped, and their version stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_a_write_during_staging_is_a_conflict_and_nothing_is_replaced() {
+    for opts in extension_sets() {
+        let which = label(&opts);
+        let h = harness_with(opts).await;
+        h.put_remote("app.ini", b"a=1\n", 0o644);
+        let local = h.local_str("app.ini");
+        let fetched = edit_fetch_with(&h.conn, "/app.ini", &local).await.unwrap();
+        std::fs::write(&local, b"a=2\n").unwrap();
+
+        // Two ways in: while the staging file is written, and just before the
+        // guard reads (the last moment before the commit).
+        let path = h.remote.join("app.ini");
+        h.fault("write", PART_SUFFIX, 1, vec![hook(move || std::fs::write(&path, b"a=9\n").unwrap())]);
+        let pushed = edit_push_with(&h.conn, &local, "/app.ini", Some(&fetched.baseline)).await.unwrap();
+        assert!(matches!(pushed, EditPushed::Conflict { during_upload: false, .. }), "{which}: {pushed:?}");
+        assert_eq!(h.remote_body("app.ini"), b"a=9\n", "{which}: their write survives");
+        Harness::assert_clean(&h.remote);
+
+        std::fs::write(h.remote.join("app.ini"), b"a=1\n").unwrap();
+        let path = h.remote.join("app.ini");
+        let theirs: EditHook = Arc::new(move || std::fs::write(&path, b"a=1\n#x\n").unwrap());
+        let pushed = edit_push_hooked(&h.conn, &local, "/app.ini", Some(&fetched.baseline), Some(theirs), None)
+            .await
+            .unwrap();
+        assert!(matches!(pushed, EditPushed::Conflict { during_upload: false, .. }), "{which}: {pushed:?}");
+        assert_eq!(h.remote_body("app.ini"), b"a=1\n#x\n", "{which}");
+        Harness::assert_clean(&h.remote);
+    }
+}
+
+/// Someone writes right after the commit (the window SFTP cannot close): the
+/// read-back finds bytes other than the ones sent, so it is reported as a
+/// conflict and NOT adopted as the new baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_a_concurrent_write_at_commit_is_never_adopted() {
+    let h = harness(true).await;
+    h.put_remote("site.conf", b"v1", 0o644);
+    let local = h.local_str("site.conf");
+    let fetched = edit_fetch_with(&h.conn, "/site.conf", &local).await.unwrap();
+    std::fs::write(&local, b"v2 mine").unwrap();
+    let path = h.remote.join("site.conf");
+    let theirs: EditHook = Arc::new(move || std::fs::write(&path, b"v2 theirs").unwrap());
+    let pushed = edit_push_hooked(&h.conn, &local, "/site.conf", Some(&fetched.baseline), None, Some(theirs))
+        .await
+        .unwrap();
+    assert!(matches!(pushed, EditPushed::Conflict { now: Some(_), during_upload: true }), "{pushed:?}");
+    // And a save checked against the OLD baseline now conflicts too.
+    std::fs::write(&local, b"v3 mine").unwrap();
+    let next = edit_push_with(&h.conn, &local, "/site.conf", Some(&fetched.baseline)).await.unwrap();
+    assert!(matches!(next, EditPushed::Conflict { during_upload: false, .. }), "{next:?}");
+    assert_eq!(h.remote_body("site.conf"), b"v2 theirs");
+    Harness::assert_clean(&h.remote);
+}
+
+/// The 20 MiB cap holds while streaming: a file that grows past it during
+/// the download (the probe saw it small) is stopped before more than the cap
+/// is written, and the partial copy is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_fetch_stops_a_file_that_grows_past_the_cap() {
+    let h = harness(true).await;
+    h.put_remote("grow.log", b"small\n", 0o644);
+    let path = h.remote.join("grow.log");
+    h.fault(
+        "open",
+        "grow.log",
+        1,
+        vec![hook(move || {
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len(crate::utils::remote_edit::MAX_EDIT_BYTES + 5 * CHUNK as u64).unwrap();
+        })],
+    );
+    let local = h.local_str("grow.log");
+    let e = edit_fetch_with(&h.conn, "/grow.log", &local).await.unwrap_err();
+    assert!(e.to_string().contains("over 20 MB") && e.to_string().contains("deleted"), "{e}");
+    assert!(!Path::new(&local).exists());
+    Harness::assert_clean(&h.local);
+    let left: Vec<_> = std::fs::read_dir(&h.local).unwrap().flatten().collect();
+    assert!(left.is_empty(), "no partial copy left: {left:?}");
 }

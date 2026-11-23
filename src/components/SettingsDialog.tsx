@@ -291,8 +291,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               added as the last argument — never through a shell. For example{' '}
               <code className="font-mono">code --wait</code>, <code className="font-mono">subl -w</code> or{' '}
               <code className="font-mono">open -a TextEdit</code>. Left empty, the system&apos;s default app
-              is used, except for executable and launcher files (.sh, .command, .exe, .desktop…), which it
-              could run instead of opening.
+              is used only for plain text and document types (.txt, .log, .md, .conf, .ini, .toml, .yaml,
+              .json, .xml, .csv, .env, .diff…) and files with no extension; anything else (scripts,
+              .html, .wsb, unknown types) needs an editor command here, because its default app could run
+              it instead of opening it.
             </p>
           </section>
 

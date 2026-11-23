@@ -51,8 +51,8 @@ pub fn open_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Open a file with the platform's default app for its type (remote editing:
-/// utils::remote_edit, which refuses executable and launcher types before it
-/// gets here). The path is passed as one argument — never through a shell
+/// utils::remote_edit, which only lets known inert text and document types
+/// get here — see `default_app_refusal`). The path is passed as one argument — never through a shell
 /// string — and is absolute, so it cannot read as an option.
 ///
 /// Windows uses ShellExecuteW directly: `cmd /c start` would re-parse a
@@ -119,6 +119,34 @@ pub fn reveal_file(path: &Path) -> std::io::Result<()> {
         let dir = path.parent().unwrap_or(path);
         spawn_reaped(Command::new("xdg-open").arg(dir))
     }
+}
+
+/// Whether `m` (from `symlink_metadata`, never `metadata`) is a reparse point
+/// on Windows: a symlink, junction, mount point, or any other entry the
+/// filesystem may redirect. Always false elsewhere (`is_symlink` covers Unix).
+pub fn is_reparse_point(m: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = m;
+        false
+    }
+}
+
+/// A real directory: LSTAT says directory, and it is no symlink or reparse
+/// point (a junction reports as a directory on Windows).
+pub fn is_real_dir(m: &std::fs::Metadata) -> bool {
+    m.is_dir() && !m.file_type().is_symlink() && !is_reparse_point(m)
+}
+
+/// A real regular file: no symlink, no reparse point.
+pub fn is_real_file(m: &std::fs::Metadata) -> bool {
+    m.is_file() && !m.file_type().is_symlink() && !is_reparse_point(m)
 }
 
 /// Restrict a path to the owner only — `0700` for a directory, `0600` for a

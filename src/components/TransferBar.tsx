@@ -204,7 +204,9 @@ function EditingSection({
             {conflictPromptDue(e, dismissed) && (
               <div role="alert" className="border-t border-warn/40 bg-warn/10 px-3 py-1.5">
                 <p className="text-[11px] text-warn">
-                  {e.message ?? `${e.name} changed on the server.`} Your save was not uploaded.
+                  {/* The backend's message says whether the save was held back or raced
+                      a concurrent write (remote_edit.rs, push). */}
+                  {e.message ?? `${e.name} changed on the server. Your save was not uploaded.`}
                 </p>
                 <div className="mt-1 flex flex-wrap gap-1.5">
                   <button

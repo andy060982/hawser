@@ -15,8 +15,13 @@
 //!   cannot read what was downloaded. The original file name is kept so the
 //!   editor picks the right syntax mode; `meta.json` (remote path and content
 //!   hash, never contents) and the upload snapshot sit OUTSIDE `file/`.
-//! - **Baseline.** The remote size and mtime as downloaded, plus the SHA-256
-//!   of the bytes last known to match the server (`synced_hash`).
+//! - **Baseline.** The remote file as downloaded or last uploaded
+//!   (`RemoteBaseline`: its size, mtime and the SHA-256 of its content), plus
+//!   the SHA-256 of the bytes last known to be safe on the server
+//!   (`synced_hash`). A save is committed only if the remote content still
+//!   hashes to the baseline when read back immediately before the commit,
+//!   and the upload is adopted as the new baseline only if reading it back
+//!   afterwards finds exactly the bytes sent (see `ssh::edit_push_with`).
 //! - **Watcher.** A 1 s poll of the local file's size and mtime, debounced:
 //!   a change fires only once the file has been stable for a whole poll, so
 //!   editors that write in steps, or save atomically by renaming a new file
@@ -25,12 +30,18 @@
 //! - **Push.** The local file is snapshotted (read once, hashed, written to a
 //!   private snapshot) and the snapshot uploaded, so the bytes hashed are the
 //!   bytes sent even while the editor keeps writing.
-//! - **Opening.** Never executes a downloaded file: the default app is refused
-//!   for executable and launcher types (`launcher_refusal`), and the editor
-//!   command gets the file as ONE argv entry, never through a shell.
-//! - **Cleanup.** Stopping, closing the session or quitting deletes a clean
-//!   copy. A copy with changes the server does not have is kept and reported
-//!   (`Leftover`); the next launch lists any that are still there.
+//! - **Opening.** The OS default app is used only for known inert text and
+//!   document types (`default_app_refusal`, an ALLOW-list); anything else
+//!   needs the editor command, which gets the file as ONE argv entry, never
+//!   through a shell.
+//! - **Cleanup.** Stopping, closing the session or quitting deletes a copy
+//!   only when it is known to be clean. A copy with changes the server does
+//!   not have, or one whose state is unknown (missing — perhaps mid-save —
+//!   after the watcher's grace period, or unreadable), is kept and reported
+//!   (`Leftover`); the next launch lists any that are still there. Deletion
+//!   only ever touches a verified tree: real folders and plain files under a
+//!   real edit root, never a symlink or reparse point (`remove_edit_dir`).
+//!   The launch sweep finishes before the first edit can be created.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -73,6 +84,15 @@ pub struct RemoteStamp {
     /// Seconds since the epoch (SFTP v3 has no finer mtime). `None` when the
     /// server does not report one.
     pub mtime: Option<u32>,
+}
+
+/// What a save is checked against: the remote file as it was downloaded or
+/// last uploaded — its stamp (a cheap first check) and the SHA-256 of its
+/// content (the check that decides, made at the commit boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBaseline {
+    pub stamp: RemoteStamp,
+    pub hash: String,
 }
 
 impl RemoteStamp {
@@ -170,60 +190,51 @@ pub fn hash_file(path: &Path) -> std::io::Result<String> {
 
 /* ---------------------------------------------------- what may be opened */
 
-/// Extensions the OS may RUN (or mount, install or follow) instead of opening
-/// as a document when handed to the default app.
-const LAUNCHER_EXTS: &[&str] = &[
-    // macOS
-    "app", "command", "tool", "workflow", "action", "scpt", "scptd", "applescript", "terminal",
-    "webloc", "inetloc", "fileloc", "pkg", "mpkg", "dmg", "kext", "prefpane", "osax",
-    // Linux / Unix
-    "sh", "bash", "zsh", "csh", "tcsh", "ksh", "fish", "desktop", "appimage", "run", "deb", "rpm",
-    "snap", "flatpakref",
-    // Windows
-    "exe", "com", "bat", "cmd", "msi", "msp", "msc", "scr", "pif", "cpl", "ps1", "psm1", "psd1",
-    "vbs", "vbe", "jse", "wsf", "wsh", "ws", "hta", "lnk", "url", "reg", "inf", "application",
-    "appref-ms", "gadget", "msh", "scf", "shs", "settingcontent-ms", "library-ms", "chm", "iso",
-    "img", "vhd", "vhdx",
-    // interpreters a default handler may run directly
-    "jar", "jnlp", "py", "pyw", "pyc", "pyz",
+/// The only types handed to the OS default app: inert text and document
+/// formats whose default handler shows them rather than runs them. HTML is
+/// deliberately NOT here: it opens in a browser, which runs its scripts
+/// against a local file. Everything else — scripts, launchers, `.wsb`,
+/// installers, and any extension not on this list — needs the editor
+/// command, because a default handler that is not in this list may run,
+/// mount, install or follow what it is given.
+const INERT_EXTS: &[&str] = &[
+    "txt", "log", "md", "conf", "cfg", "ini", "toml", "yaml", "yml", "json", "xml", "csv", "tsv",
+    "env", "properties", "diff", "patch",
 ];
 
-/// Extra launcher types on Windows, where the default handler runs scripts
-/// (Windows Script Host runs `.js`; language installers register theirs).
-const WINDOWS_LAUNCHER_EXTS: &[&str] = &["js", "pl", "rb", "tcl"];
+/// The name as the OS will dispatch on it: Win32 strips trailing dots and
+/// spaces (`run.wsb .` IS `run.wsb` there), so they are stripped here on
+/// every platform.
+fn normalized_name(name: &str) -> &str {
+    name.trim_end_matches(['.', ' '])
+}
 
-/// The extension the OS will dispatch on, lowercased: after Win32's own
-/// trailing-dot/space stripping (`run.exe.` IS `run.exe` there), and none for
-/// a dotfile like `.bashrc`.
+/// The extension the OS will dispatch on, lowercased, or None for a name
+/// with no dot at all. A leading dot counts: Windows dispatches `.wsb` on
+/// its `wsb` extension, and `.bashrc` has the extension `bashrc`.
 fn dispatch_extension(name: &str) -> Option<String> {
-    let trimmed = name.trim_end_matches(['.', ' ']);
-    let (stem, ext) = trimmed.rsplit_once('.')?;
-    (!stem.is_empty() && !ext.is_empty()).then(|| ext.to_ascii_lowercase())
+    let (_, ext) = normalized_name(name).rsplit_once('.')?;
+    (!ext.is_empty()).then(|| ext.to_ascii_lowercase())
 }
 
-fn is_launcher_ext(ext: &str, windows: bool) -> bool {
-    LAUNCHER_EXTS.contains(&ext) || (windows && WINDOWS_LAUNCHER_EXTS.contains(&ext))
-}
-
-/// Why `name` must not be handed to the default app, if it must not: an
-/// executable or launcher type by extension, or any execute bit set in one of
-/// `modes` (the remote file's, and on Unix the local copy's). Opening it with
-/// an explicitly configured editor command is fine and skips this check.
-pub fn launcher_refusal(name: &str, modes: &[Option<u32>]) -> Option<String> {
-    launcher_refusal_for(name, modes, cfg!(windows))
-}
-
-fn launcher_refusal_for(name: &str, modes: &[Option<u32>], windows: bool) -> Option<String> {
-    const FIX: &str = "Set an editor command in Settings → Remote editing to open it with your editor instead.";
-    if let Some(ext) = dispatch_extension(name).filter(|e| is_launcher_ext(e, windows)) {
+/// Why `name` must not be handed to the default app, if it must not: it is
+/// not a known inert type (`INERT_EXTS`, or no extension at all), or any
+/// execute bit is set in one of `modes` (the remote file's, and on Unix the
+/// local copy's — an executable extensionless file is a program). The
+/// configured editor command opens anything and skips this check.
+pub fn default_app_refusal(name: &str, modes: &[Option<u32>]) -> Option<String> {
+    const FIX: &str = "To open it, set an editor command (for example code --wait) in Settings → \
+                       Remote editing; Hawser then opens every file with that editor.";
+    let shown = normalized_name(name);
+    if let Some(ext) = dispatch_extension(name).filter(|e| !INERT_EXTS.contains(&e.as_str())) {
         return Some(format!(
-            "{name} is an executable or launcher file type (.{ext}): the system's default app \
-             could run it instead of opening it. {FIX}"
+            "{shown} is a .{ext} file, and only plain text and document types are opened with the \
+             system's default app (its default app could run it instead of opening it). {FIX}"
         ));
     }
     if modes.iter().flatten().any(|m| m & 0o111 != 0) {
         return Some(format!(
-            "{name} is marked executable, so the system's default app could run it instead of \
+            "{shown} is marked executable, so the system's default app could run it instead of \
              opening it. {FIX}"
         ));
     }
@@ -290,9 +301,16 @@ pub fn split_command(s: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-/// Programs refused as the editor: shells and interpreters would read the file
-/// name (server-chosen) as code, and launchers would hand it straight back to
-/// the default app this setting exists to avoid.
+/// Common mistakes caught when the editor command is saved: a shell or
+/// interpreter (`bash`, `python`) would read the file as code, and a launcher
+/// (`xdg-open`, `start`) would hand it back to the default app.
+///
+/// NOT a security boundary. The editor command is the user's own, trusted
+/// choice — anyone who can change it can already run what they like as this
+/// user — and a name list cannot tell programs apart anyway (`python3.12`,
+/// a renamed copy or an alias all pass). What IS enforced for every command:
+/// the program is an absolute path or found on PATH, it is started directly
+/// with the file as one separate argv entry, and never through a shell.
 const REFUSED_PROGRAMS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "csh", "tcsh", "fish", "busybox", "cmd",
     "command", "powershell", "pwsh", "env", "sudo", "doas", "su", "xargs", "nohup", "exec",
@@ -366,9 +384,10 @@ fn resolve_program(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 ///
 /// The program must be an absolute path to a program, or a bare name found in
 /// `dirs`; a relative path (`./x`, `bin/x`) is refused, since it would depend
-/// on the app's working directory. Shells, interpreters and launchers are
-/// refused (`REFUSED_PROGRAMS`); macOS `open` only with `-a`/`-b`/`-e`/`-t`,
-/// which name the app to use rather than the file's default one.
+/// on the app's working directory. A few common mistakes are caught
+/// (`REFUSED_PROGRAMS`, which is a convenience, not a security check); macOS
+/// `open` only with `-a`/`-b`/`-e`/`-t`, which name the app to use rather than
+/// the file's default one.
 pub fn parse_editor(raw: &str, dirs: &[PathBuf]) -> Result<Option<EditorCommand>, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -498,7 +517,7 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
         other => other?,
     }
     let m = std::fs::symlink_metadata(dir)?;
-    if !m.is_dir() {
+    if !super::platform::is_real_dir(&m) {
         return Err(std::io::Error::other(format!("{} is not a plain folder", dir.display())));
     }
     super::platform::restrict_perms(dir, 0o700);
@@ -565,27 +584,136 @@ fn write_meta(dir: &Path, meta: &Meta) -> std::io::Result<()> {
     std::fs::rename(&tmp, dir.join("meta.json"))
 }
 
+/// `meta.json`, read only when it is a plain file (never through a link).
 fn read_meta(dir: &Path) -> Option<Meta> {
-    serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()
+    let path = dir.join("meta.json");
+    if !super::platform::is_real_file(&std::fs::symlink_metadata(&path).ok()?) {
+        return None;
+    }
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// Whether the local copy holds changes the server does not have. A copy
-/// that is gone has nothing to lose; one that cannot be read might.
-fn local_dirty(local: &Path, synced_hash: &str) -> bool {
+/// What the local copy holds compared with what the server is known to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalState {
+    /// The same bytes: deleting it loses nothing.
+    Clean,
+    /// Changes the server does not have.
+    Dirty,
+    /// Missing (an editor may be mid-save, with the original moved aside),
+    /// not a plain file, or unreadable: it may hold changes, so it is kept.
+    Unknown,
+}
+
+fn local_state(local: &Path, synced_hash: &str) -> LocalState {
     match std::fs::symlink_metadata(local) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
-        Ok(_) => hash_file(local).map(|h| h != synced_hash).unwrap_or(true),
+        Ok(m) if super::platform::is_real_file(&m) => match hash_file(local) {
+            Ok(h) if h == synced_hash => LocalState::Clean,
+            Ok(_) => LocalState::Dirty,
+            Err(_) => LocalState::Unknown,
+        },
+        _ => LocalState::Unknown,
     }
 }
 
-/// Delete one edit's folder — only ever one under `root`.
-fn remove_edit_dir(root: &Path, dir: &Path) {
-    if dir.starts_with(root) && dir != root {
-        let _ = std::fs::remove_dir_all(dir);
-        // The session folder goes too once it is empty.
-        if let Some(parent) = dir.parent().filter(|p| *p != root) {
-            let _ = std::fs::remove_dir(parent);
+/// `local_state`, giving a missing or odd copy up to `grace` to come back
+/// (the watcher's `MISSING_GRACE`): an editor that renames the original aside
+/// before writing the new one leaves the path missing for a moment.
+fn settled_local_state(local: &Path, synced_hash: &str, grace: Duration) -> LocalState {
+    let deadline = Instant::now() + grace;
+    loop {
+        let st = local_state(local, synced_hash);
+        if st != LocalState::Unknown || Instant::now() >= deadline {
+            return st;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The most entries one edit folder may hold for deletion to go ahead (the
+/// file, `meta.json`, a snapshot, and an editor's own temp/backup files).
+const MAX_TREE_ENTRIES: usize = 10_000;
+
+/// Check that everything under `dir` is a real folder or a plain file — no
+/// symlink, no Windows reparse point (junction, mount point), nothing else —
+/// LSTAT only, never following anything.
+fn verify_tree(dir: &Path) -> Result<(), String> {
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((d, depth)) = stack.pop() {
+        let m = std::fs::symlink_metadata(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+        if !super::platform::is_real_dir(&m) {
+            return Err(format!("{} is not a plain folder", d.display()));
+        }
+        for e in std::fs::read_dir(&d).map_err(|e| format!("{}: {e}", d.display()))? {
+            let p = e.map_err(|e| format!("{}: {e}", d.display()))?.path();
+            seen += 1;
+            if seen > MAX_TREE_ENTRIES || depth > 16 {
+                return Err(format!("{} holds more than expected", dir.display()));
+            }
+            let m = std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            if super::platform::is_real_dir(&m) {
+                stack.push((p, depth + 1));
+            } else if !super::platform::is_real_file(&m) {
+                return Err(format!("{} is a link or special file", p.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `dir` is exactly `<root>/<session>/<edit>`, with plain names, and the
+/// root, the session folder and `dir` are all real folders (LSTAT).
+fn verify_edit_dir(root: &Path, dir: &Path) -> Result<(), String> {
+    use std::path::Component;
+    let session = dir.parent().ok_or("no session folder")?;
+    if session.parent() != Some(root) {
+        return Err(format!("{} is not an edit folder under {}", dir.display(), root.display()));
+    }
+    for p in [dir, session] {
+        if !matches!(p.components().next_back(), Some(Component::Normal(_))) {
+            return Err(format!("{} is not a plain folder name", p.display()));
+        }
+    }
+    for p in [root, session, dir] {
+        let m = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if !super::platform::is_real_dir(&m) {
+            return Err(format!("{} is a link or not a folder", p.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Delete one edit's folder — only `<root>/<session>/<edit>`, only when the
+/// whole chain and everything inside is verified (`verify_edit_dir`,
+/// `verify_tree`), and never following a link. Anything else is refused and
+/// left as it is. The session folder goes too once it is empty.
+///
+/// The delete itself is `std::fs::remove_dir_all`, which removes a link
+/// rather than following it (openat/unlinkat on Unix, handles on Windows), so
+/// even an entry swapped for a link after the check is not followed inside
+/// `dir`. RESIDUAL: an ancestor (the root or session folder) swapped for a
+/// link between the check and the delete — by a process running as this
+/// same user — would redirect the path.
+fn remove_edit_dir(root: &Path, dir: &Path) -> Result<(), String> {
+    verify_edit_dir(root, dir)?;
+    verify_tree(dir)?;
+    std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if let Some(session) = dir.parent() {
+        if std::fs::symlink_metadata(session).is_ok_and(|m| super::platform::is_real_dir(&m)) {
+            let _ = std::fs::remove_dir(session); // only if now empty
+        }
+    }
+    Ok(())
+}
+
+/// `remove_edit_dir`, logging a refusal (the folder is then left alone).
+fn remove_edit_dir_logged(root: &Path, dir: &Path) -> bool {
+    match remove_edit_dir(root, dir) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("hawser: left an edit folder in place: {e}");
+            false
         }
     }
 }
@@ -603,35 +731,70 @@ pub struct Leftover {
     dir: PathBuf,
 }
 
-/// At launch: delete every edit folder whose copy is clean (or gone, or never
-/// finished downloading), and return the ones with unsynced changes, which are
-/// kept where they are.
-pub fn sweep(root: &Path) -> Vec<Leftover> {
+/// At launch: delete every edit folder whose copy is known to be clean (or
+/// that never finished downloading: no `meta.json`, so it was never opened),
+/// and return the rest — unsynced, missing or unreadable copies — which are
+/// kept where they are and reported.
+///
+/// The root and every folder are checked with LSTAT before they are read or
+/// deleted: a root, session or edit folder that is a symlink or reparse point
+/// is refused (nothing is traversed through it or deleted), and so is an edit
+/// folder holding a link. `is_current` names folders created by this run,
+/// which are never touched (`startup_sweep` also runs before any can exist).
+pub fn sweep(root: &Path, is_current: &dyn Fn(&Path) -> bool) -> Vec<Leftover> {
     let mut kept = Vec::new();
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if super::platform::is_real_dir(&m) => {}
+        Ok(_) => {
+            eprintln!("hawser: {} is a link or not a folder; not sweeping it", root.display());
+            return kept;
+        }
+        Err(_) => return kept,
+    }
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| super::platform::is_real_dir(&m));
     let Ok(sessions) = std::fs::read_dir(root) else { return kept };
     for s in sessions.flatten() {
         let sdir = s.path();
-        if !s.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
+        if !real_dir(&sdir) {
+            continue; // a link (or a stray file): never followed, never deleted
         }
         for e in std::fs::read_dir(&sdir).into_iter().flatten().flatten() {
             let dir = e.path();
-            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            if !real_dir(&dir) || is_current(&dir) {
                 continue;
             }
-            let leftover = read_meta(&dir).and_then(|m| {
-                let local = dir.join("file").join(&m.name);
-                (crate::ssh::safe_local_component(&m.name) && local_dirty(&local, &m.synced_hash)).then(|| Leftover {
-                    id: format!("{}/{}", s.file_name().to_string_lossy(), e.file_name().to_string_lossy()),
-                    remote_path: m.remote,
-                    local_path: local.to_string_lossy().to_string(),
-                    name: m.name,
-                    dir: dir.clone(),
-                })
-            });
-            match leftover {
-                Some(l) => kept.push(l),
-                None => remove_edit_dir(root, &dir),
+            if let Err(why) = verify_edit_dir(root, &dir).and_then(|()| verify_tree(&dir)) {
+                eprintln!("hawser: left an edit folder in place: {why}");
+                continue;
+            }
+            let id = format!("{}/{}", s.file_name().to_string_lossy(), e.file_name().to_string_lossy());
+            let leftover = |remote: String, name: String, local: PathBuf| Leftover {
+                id: id.clone(),
+                remote_path: remote,
+                local_path: local.to_string_lossy().to_string(),
+                name,
+                dir: dir.clone(),
+            };
+            let has_meta = std::fs::symlink_metadata(dir.join("meta.json")).is_ok();
+            match read_meta(&dir) {
+                // Never finished downloading, so never opened: nothing to lose.
+                None if !has_meta => {
+                    remove_edit_dir_logged(root, &dir);
+                }
+                // Unreadable metadata: what it holds is unknown, so keep it.
+                None => kept.push(leftover("(unknown)".into(), id.clone(), dir.join("file"))),
+                Some(m) if !crate::ssh::safe_local_component(&m.name) => {
+                    kept.push(leftover(m.remote, id.clone(), dir.join("file")))
+                }
+                Some(m) => {
+                    let local = dir.join("file").join(&m.name);
+                    match local_state(&local, &m.synced_hash) {
+                        LocalState::Clean => {
+                            remove_edit_dir_logged(root, &dir);
+                        }
+                        LocalState::Dirty | LocalState::Unknown => kept.push(leftover(m.remote, m.name, local)),
+                    }
+                }
             }
         }
         let _ = std::fs::remove_dir(&sdir); // only if now empty
@@ -751,7 +914,10 @@ impl PushMode {
 }
 
 struct EditState {
-    baseline: RemoteStamp,
+    /// The remote file as downloaded or last uploaded (and read back).
+    baseline: RemoteBaseline,
+    /// The bytes last known to be safe on the server (after "Save a copy",
+    /// under another name): what decides whether the local copy is unsynced.
     synced_hash: String,
     status: EditStatus,
     message: Option<String>,
@@ -817,12 +983,38 @@ impl Edit {
 }
 
 /// Every live edit, plus the kept copies. Managed Tauri state.
-#[derive(Default)]
 pub struct RemoteEdits {
     edits: DashMap<String, Arc<Edit>>,
     leftovers: Mutex<Vec<Leftover>>,
     /// (session, remote path) being opened right now: a double-click opens once.
     opening: Mutex<HashSet<(String, String)>>,
+    /// True once the launch sweep has finished: no edit folder is created
+    /// before then, so the sweep can never delete one of this run's.
+    swept: watch::Sender<bool>,
+    /// Every edit folder this run created; the sweep never touches them.
+    created: Mutex<HashSet<PathBuf>>,
+}
+
+impl Default for RemoteEdits {
+    fn default() -> Self {
+        Self {
+            edits: DashMap::new(),
+            leftovers: Mutex::new(Vec::new()),
+            opening: Mutex::new(HashSet::new()),
+            swept: watch::channel(false).0,
+            created: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+/// Marks the launch sweep finished when dropped — also when it failed or
+/// panicked, so a broken sweep cannot block editing forever.
+struct SweptOnDrop<'a>(&'a watch::Sender<bool>);
+
+impl Drop for SweptOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
 }
 
 /// Releases an `opening` claim.
@@ -900,21 +1092,28 @@ impl RemoteEdits {
         super::platform::reveal_file(Path::new(&l.local_path)).map_err(|e| e.to_string())
     }
 
-    /// Delete a kept copy (the user chose Discard).
+    /// Delete a kept copy (the user chose Discard). A folder that fails the
+    /// checks (`remove_edit_dir`) is left alone and stays listed.
     pub fn leftover_discard(&self, id: &str) -> Result<(), String> {
         let l = self.take_leftover(id)?;
         let root = edit_root()?;
-        remove_edit_dir(&root, &l.dir);
+        if let Err(e) = remove_edit_dir(&root, &l.dir) {
+            self.add_leftover(l);
+            return Err(format!("the kept copy was not deleted: {e}"));
+        }
         Ok(())
     }
 
-    /// Stop one edit's watcher and settle its folder: deleted when clean (or
-    /// when `discard`), else kept and listed. Returns where it was kept.
+    /// Stop one edit's watcher and settle its folder: deleted only when its
+    /// copy is known to be clean (or when `discard`), else kept and listed. A
+    /// missing copy gets the watcher's grace period to come back, then counts
+    /// as unknown and is kept. Returns where it was kept.
     fn finish(&self, edit: &Edit, discard: bool) -> Option<String> {
         let _ = edit.stop.send(true);
         self.edits.remove(&edit.id);
-        let Ok(root) = edit_root() else { return None };
-        if !discard && local_dirty(&edit.local, &edit.synced_hash()) {
+        let Ok(root) = edit_root() else { return Some(edit.local.to_string_lossy().to_string()) };
+        let keep = !discard && settled_local_state(&edit.local, &edit.synced_hash(), MISSING_GRACE) != LocalState::Clean;
+        if keep || !remove_edit_dir_logged(&root, &edit.dir) {
             let local = edit.local.to_string_lossy().to_string();
             let session = edit.dir.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
             let leaf = edit.dir.file_name().map(|n| n.to_string_lossy().to_string());
@@ -927,7 +1126,6 @@ impl RemoteEdits {
             });
             return Some(local);
         }
-        remove_edit_dir(&root, &edit.dir);
         None
     }
 
@@ -945,14 +1143,20 @@ impl RemoteEdits {
 
 /// At launch, off the setup thread: settle what an earlier run left behind
 /// and tell the frontend about kept copies.
+///
+/// Ordering: `open` waits for this sweep to finish (`RemoteEdits::swept`)
+/// before it creates an edit folder, so the sweep only ever sees folders
+/// left by earlier runs (and skips any in `created` regardless).
 pub fn startup_sweep(app: AppHandle) {
+    let edits = Arc::clone(&app.state::<Arc<RemoteEdits>>());
     std::thread::spawn(move || {
+        let _done = SweptOnDrop(&edits.swept);
         let Ok(root) = edit_root() else { return };
-        let found = std::panic::catch_unwind(|| sweep(&root)).unwrap_or_default();
+        let is_current = |p: &Path| edits.created.lock().unwrap_or_else(|p| p.into_inner()).contains(p);
+        let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sweep(&root, &is_current))).unwrap_or_default();
         if found.is_empty() {
             return;
         }
-        let edits = app.state::<Arc<RemoteEdits>>();
         for l in found {
             edits.add_leftover(l);
         }
@@ -967,7 +1171,7 @@ pub async fn open(app: &AppHandle, session_id: &str, remote: &str) -> Result<Edi
     let editor = blocking(load_editor).await?;
     if let Some(e) = edits.find(session_id, remote) {
         if editor.is_none() {
-            if let Some(why) = launcher_refusal(&e.name, &[e.remote_mode]) {
+            if let Some(why) = default_app_refusal(&e.name, &[e.remote_mode]) {
                 return Err(why);
             }
         }
@@ -977,12 +1181,14 @@ pub async fn open(app: &AppHandle, session_id: &str, remote: &str) -> Result<Edi
     }
 
     let name = remote_file_name(remote)?;
+    // No edit folder before the launch sweep is done (see `startup_sweep`).
+    let _ = edits.swept.subscribe().wait_for(|done| *done).await;
     let registry = app.state::<Registry>();
     let endpoint = registry.endpoint_of(session_id).map_err(|e| e.to_string())?;
     let _claim = edits.claim(session_id, remote)?;
     let probe = registry.edit_probe(session_id, remote).await.map_err(|e| e.to_string())?;
     if editor.is_none() {
-        if let Some(why) = launcher_refusal(&name, &[probe.mode]) {
+        if let Some(why) = default_app_refusal(&name, &[probe.mode]) {
             return Err(why);
         }
     }
@@ -994,30 +1200,32 @@ pub async fn open(app: &AppHandle, session_id: &str, remote: &str) -> Result<Edi
         prepare_edit_dir(&r2, &sid, &n).map_err(|e| format!("could not create the edit folder: {e}"))
     })
     .await?;
+    edits.created.lock().unwrap_or_else(|p| p.into_inner()).insert(dir.clone());
     let local_s = local.to_string_lossy().to_string();
-    let fetched = registry.edit_fetch(session_id, remote, &local_s).await;
-    let (probe, bytes) = match fetched {
+    let fetched = match registry.edit_fetch(session_id, remote, &local_s).await {
         Ok(v) => v,
         Err(e) => {
-            remove_edit_dir(&root, &dir);
+            remove_edit_dir_logged(&root, &dir);
             return Err(e.to_string());
         }
     };
+    let (probe, bytes) = (fetched.probe, fetched.bytes);
 
     // Owner-only, and never executable here whatever the server's mode.
     let (l2, d2) = (local.clone(), dir.clone());
     let meta = Meta { remote: remote.to_string(), name: name.clone(), synced_hash: String::new() };
+    let hash = fetched.baseline.hash.clone();
+    let h2 = hash.clone();
     let settled = blocking(move || {
         super::platform::restrict_perms(&l2, 0o600);
-        let hash = hash_file(&l2).map_err(|e| e.to_string())?;
-        write_meta(&d2, &Meta { synced_hash: hash.clone(), ..meta }).map_err(|e| e.to_string())?;
-        Ok((hash, local_stamp(&l2)))
+        write_meta(&d2, &Meta { synced_hash: h2, ..meta }).map_err(|e| e.to_string())?;
+        Ok(local_stamp(&l2))
     })
     .await;
-    let (hash, stamp) = match settled {
+    let stamp = match settled {
         Ok(v) => v,
         Err(e) => {
-            remove_edit_dir(&root, &dir);
+            remove_edit_dir_logged(&root, &dir);
             return Err(format!("could not prepare the local copy: {e}"));
         }
     };
@@ -1025,7 +1233,7 @@ pub async fn open(app: &AppHandle, session_id: &str, remote: &str) -> Result<Edi
     let opener = if editor.is_some() { "command" } else { "default" };
     let l3 = local.clone();
     if let Err(e) = blocking(move || launch(editor.as_ref(), &l3).map_err(|e| format!("could not open the editor: {e}"))).await {
-        remove_edit_dir(&root, &dir);
+        remove_edit_dir_logged(&root, &dir);
         return Err(e);
     }
 
@@ -1041,7 +1249,7 @@ pub async fn open(app: &AppHandle, session_id: &str, remote: &str) -> Result<Edi
         remote_mode: probe.mode,
         opener,
         state: Mutex::new(EditState {
-            baseline: probe.stamp,
+            baseline: fetched.baseline,
             synced_hash: hash,
             status: EditStatus::Synced,
             message: None,
@@ -1076,7 +1284,8 @@ pub async fn stop(app: &AppHandle, edit_id: &str, mode: StopMode) -> Result<Stop
     // Let a push in flight finish first: its result decides what is unsynced.
     let _g = edit.push_lock.lock().await;
     let (local, synced) = (edit.local.clone(), edit.synced_hash());
-    let dirty = blocking(move || Ok(local_dirty(&local, &synced))).await?;
+    // Missing (perhaps mid-save) after the grace period counts as unsynced.
+    let dirty = blocking(move || Ok(settled_local_state(&local, &synced, MISSING_GRACE) != LocalState::Clean)).await?;
     if dirty && mode == StopMode::Ask {
         return Ok(StopOutcome { stopped: false, dirty: true, kept_at: None });
     }
@@ -1205,7 +1414,7 @@ async fn push(app: &AppHandle, edit: &Arc<Edit>, mode: PushMode) -> EditInfo {
         return fail(why);
     }
 
-    let baseline = edit.state.lock().unwrap_or_else(|p| p.into_inner()).baseline;
+    let baseline = edit.state.lock().unwrap_or_else(|p| p.into_inner()).baseline.clone();
     let info = edit.update(|s| {
         s.status = EditStatus::Uploading;
         s.message = None;
@@ -1221,7 +1430,7 @@ async fn push(app: &AppHandle, edit: &Arc<Edit>, mode: PushMode) -> EditInfo {
             .map(|(target, bytes)| Outcome::Copied { target, bytes }),
         PushMode::Overwrite => registry.edit_push(&edit.session_id, &snap_s, &edit.remote, None).await.map(Outcome::from),
         PushMode::Auto | PushMode::Now => registry
-            .edit_push(&edit.session_id, &snap_s, &edit.remote, Some(baseline))
+            .edit_push(&edit.session_id, &snap_s, &edit.remote, Some(&baseline))
             .await
             .map(Outcome::from),
     };
@@ -1236,11 +1445,21 @@ async fn push(app: &AppHandle, edit: &Arc<Edit>, mode: PushMode) -> EditInfo {
     };
     let info = match result {
         // Nothing was uploaded.
-        Ok(Outcome::Conflict { gone }) => {
-            let what = if gone {
-                format!("{} was deleted or moved on the server since you opened it", edit.name)
-            } else {
-                format!("{} was changed on the server since you opened it", edit.name)
+        Ok(Outcome::Conflict { gone, during_upload }) => {
+            let what = match (during_upload, gone) {
+                (true, _) => format!(
+                    "{} was changed on the server while your save was being uploaded; the server may \
+                     now hold the other version instead of yours. Check it, then upload again.",
+                    edit.name
+                ),
+                (false, true) => format!(
+                    "{} was deleted or moved on the server since you opened it. Your save was not uploaded.",
+                    edit.name
+                ),
+                (false, false) => format!(
+                    "{} was changed on the server since you opened it. Your save was not uploaded.",
+                    edit.name
+                ),
             };
             audit_upload(
                 edit,
@@ -1255,7 +1474,7 @@ async fn push(app: &AppHandle, edit: &Arc<Edit>, mode: PushMode) -> EditInfo {
                 s.conflict_seq += 1;
             })
         }
-        Ok(Outcome::Uploaded { stamp, bytes, notes }) => {
+        Ok(Outcome::Uploaded { baseline, bytes, notes }) => {
             audit_upload(
                 edit,
                 mode,
@@ -1264,7 +1483,7 @@ async fn push(app: &AppHandle, edit: &Arc<Edit>, mode: PushMode) -> EditInfo {
             );
             let _ = synced_meta().await;
             edit.update(|s| {
-                s.baseline = stamp;
+                s.baseline = baseline;
                 s.synced_hash = hash.clone();
                 s.status = EditStatus::Synced;
                 s.message = (!notes.is_empty()).then(|| notes.join("; "));
@@ -1307,17 +1526,18 @@ async fn push(app: &AppHandle, edit: &Arc<Edit>, mode: PushMode) -> EditInfo {
 
 /// How a push ended, as `push` reports it.
 enum Outcome {
-    Uploaded { stamp: RemoteStamp, bytes: u64, notes: Vec<String> },
-    /// The remote file changed (or is `gone`): nothing was uploaded.
-    Conflict { gone: bool },
+    Uploaded { baseline: RemoteBaseline, bytes: u64, notes: Vec<String> },
+    /// The remote file changed (or is `gone`). Before the commit: nothing
+    /// was uploaded. `during_upload`: it changed as the save was committed.
+    Conflict { gone: bool, during_upload: bool },
     Copied { target: String, bytes: u64 },
 }
 
 impl From<EditPushed> for Outcome {
     fn from(p: EditPushed) -> Self {
         match p {
-            EditPushed::Uploaded { stamp, bytes, notes } => Self::Uploaded { stamp, bytes, notes },
-            EditPushed::Conflict { now } => Self::Conflict { gone: now.is_none() },
+            EditPushed::Uploaded { baseline, bytes, notes } => Self::Uploaded { baseline, bytes, notes },
+            EditPushed::Conflict { now, during_upload } => Self::Conflict { gone: now.is_none(), during_upload },
         }
     }
 }
@@ -1473,26 +1693,54 @@ mod tests {
     }
 
     #[test]
-    fn executable_and_launcher_types_are_refused_for_the_default_app() {
+    fn only_inert_types_go_to_the_default_app() {
+        let ok = |n: &str| default_app_refusal(n, &[Some(0o100644)]).is_none();
         for name in [
-            "Evil.app", "run.command", "x.EXE", "setup.bat", "a.cmd", "deploy.sh", "x.desktop",
-            "script.ps1", "a.vbs", "tool.jar", "notes.txt.exe", "run.exe.", "run.exe . ", "a.py",
-            "img.dmg", "link.lnk", "x.AppImage",
+            "nginx.conf", "notes.TXT", "app.log", "README.md", "x.yaml", "x.yml", "Cargo.toml", "a.ini",
+            "a.cfg", "data.json", "pom.xml", "t.csv", "t.tsv", "prod.env", "app.properties", "fix.diff",
+            "fix.patch", "README", "Makefile", "notes.txt.", "notes.txt . ", "a.",
         ] {
-            assert!(launcher_refusal_for(name, &[Some(0o100644)], false).is_some(), "{name}");
+            assert!(ok(name), "{name} should open with the default app");
         }
-        for name in ["nginx.conf", "app.js", "README", ".bashrc", "x.yaml", "Makefile", "page.html", "a.sh.txt"] {
-            assert!(launcher_refusal_for(name, &[Some(0o100644)], false).is_none(), "{name}");
+        for name in [
+            // The audit's case: Windows Sandbox config runs a logon command.
+            "box.wsb", "box.WSB", "box.wsb.", "box.wsb . ", "box.wsb  ",
+            // Scripts, launchers and installers.
+            "deploy.sh", "a.py", "script.ps1", "a.vbs", "Evil.app", "run.command", "x.EXE", "setup.bat",
+            "a.cmd", "x.desktop", "tool.jar", "notes.txt.exe", "img.dmg", "link.lnk", "x.AppImage",
+            "app.js", "page.html", "page.htm", "a.svg",
+            // Unknown types are not assumed safe.
+            "a.zzz", "archive.tar.gz", "a.sh.txt.bin",
+        ] {
+            assert!(!ok(name), "{name} must need the editor command");
         }
-        // Windows runs scripts its handlers know.
-        assert!(launcher_refusal_for("app.js", &[None], true).is_some());
-        assert!(launcher_refusal_for("app.js", &[None], false).is_none());
-        // Any execute bit, on the server or here.
-        assert!(launcher_refusal_for("backup", &[Some(0o100755)], false).is_some());
-        assert!(launcher_refusal_for("backup", &[Some(0o100644), Some(0o100700)], false).is_some());
-        assert!(launcher_refusal_for("backup", &[Some(0o100640), None], false).is_none());
-        let why = launcher_refusal_for("deploy.sh", &[None], false).unwrap();
-        assert!(why.contains("editor command"), "{why}");
+        // Any execute bit, on the server or here: an extensionless program.
+        assert!(default_app_refusal("backup", &[Some(0o100755)]).is_some());
+        assert!(default_app_refusal("backup", &[Some(0o100644), Some(0o100700)]).is_some());
+        assert!(default_app_refusal("backup", &[Some(0o100640), None]).is_none());
+        assert!(default_app_refusal("a.txt", &[Some(0o100755)]).is_some());
+        // The message says how to fix it.
+        let why = default_app_refusal("box.wsb", &[None]).unwrap();
+        assert!(why.contains("editor command") && why.contains("Settings"), "{why}");
+    }
+
+    /// Dotfiles dispatch on their suffix (Windows reads `.wsb` as the `wsb`
+    /// extension), so a bare dot plus a launcher suffix is never "no
+    /// extension"; a dotfile with an inert suffix is fine.
+    #[test]
+    fn dotfiles_and_a_bare_dot_plus_suffix_are_classified_by_that_suffix() {
+        assert_eq!(dispatch_extension(".wsb").as_deref(), Some("wsb"));
+        assert_eq!(dispatch_extension(".bashrc").as_deref(), Some("bashrc"));
+        assert_eq!(dispatch_extension(".env").as_deref(), Some("env"));
+        assert_eq!(dispatch_extension(".wsb. ").as_deref(), Some("wsb"));
+        assert_eq!(dispatch_extension("README"), None);
+        assert_eq!(dispatch_extension("a."), None);
+        for name in [".wsb", ".WSB", ".sh", ".py", ".exe", ".desktop", ".command", ".wsb.", ".bashrc", ".profile"] {
+            assert!(default_app_refusal(name, &[Some(0o100644)]).is_some(), "{name}");
+        }
+        for name in [".env", ".txt", ".conf", ".json"] {
+            assert!(default_app_refusal(name, &[Some(0o100644)]).is_none(), "{name}");
+        }
     }
 
     #[test]
@@ -1617,15 +1865,74 @@ mod tests {
         let dirty = mk(b"edited", b"original");
         // A download that never finished: no meta.
         let (half, _) = prepare_edit_dir(&root, "tab2", "b.conf").unwrap();
-        let kept = sweep(&root);
-        assert_eq!(kept.len(), 1, "{kept:?}");
-        assert_eq!(kept[0].remote_path, "/etc/a.conf");
-        assert!(kept[0].local_path.ends_with("a.conf"));
+        // The local copy is missing (an editor mid-save): unknown, so kept.
+        let missing = mk(b"x", b"x");
+        std::fs::remove_file(missing.join("file").join("a.conf")).unwrap();
+        // Created by this run: never touched, whatever its state.
+        let (current, _) = prepare_edit_dir(&root, "tab3", "c.conf").unwrap();
+        let cur = current.clone();
+        let kept = sweep(&root, &|p: &Path| p == cur);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.iter().all(|k| k.remote_path == "/etc/a.conf" && k.local_path.ends_with("a.conf")));
         assert!(dirty.exists());
+        assert!(missing.exists(), "a missing copy is unknown, never deleted");
+        assert!(current.exists(), "this run's folder is never swept");
         assert!(!clean.exists());
         assert!(!half.exists());
         assert!(!half.parent().unwrap().exists(), "an emptied session folder goes too");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// A planted link must never steer the sweep outside the edit root: a
+    /// symlinked root is not traversed, a symlinked session or edit folder is
+    /// skipped, and an edit folder holding a link is left whole.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_refuses_links_and_touches_nothing_outside_the_root() {
+        use std::os::unix::fs::symlink;
+        let none = |_: &Path| false;
+        let base = scratch("sweeplink");
+        // Something outside that looks exactly like an edit tree (no meta:
+        // a sweep that followed the link would delete it).
+        let outside = base.join("project");
+        std::fs::create_dir_all(outside.join("src").join("lib")).unwrap();
+        std::fs::write(outside.join("src").join("lib").join("main.rs"), b"fn main() {}").unwrap();
+
+        // 1. The root itself is a symlink.
+        let root = base.join("remote-edit");
+        symlink(&outside, &root).unwrap();
+        assert!(sweep(&root, &none).is_empty());
+        assert!(outside.join("src/lib/main.rs").exists(), "a symlinked root is not traversed");
+        std::fs::remove_file(&root).unwrap();
+
+        // 2. A real root whose session folder, edit folder, or content links out.
+        std::fs::create_dir(&root).unwrap();
+        symlink(&outside, root.join("sess-link")).unwrap();
+        std::fs::create_dir(root.join("sess")).unwrap();
+        symlink(outside.join("src"), root.join("sess").join("edit-link")).unwrap();
+        let (holder, file) = prepare_edit_dir(&root, "sess2", "a.conf").unwrap();
+        write_private(&file, b"same").unwrap();
+        write_meta(&holder, &Meta { remote: "/a.conf".into(), name: "a.conf".into(), synced_hash: sha256_hex(b"same") }).unwrap();
+        symlink(&outside, holder.join("file").join("planted")).unwrap();
+
+        let kept = sweep(&root, &none);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(outside.join("src/lib/main.rs").exists(), "nothing outside the root was touched");
+        assert!(root.join("sess-link").symlink_metadata().is_ok(), "the session link is left as it is");
+        assert!(root.join("sess/edit-link").symlink_metadata().is_ok(), "the edit link is left as it is");
+        assert!(holder.join("file/a.conf").exists(), "a folder holding a link is not deleted");
+
+        // Direct deletion refuses the same things.
+        assert!(remove_edit_dir(&root, &holder).is_err());
+        assert!(remove_edit_dir(&root, &root.join("sess").join("edit-link")).is_err());
+        assert!(remove_edit_dir(&root, &outside.join("src")).is_err(), "not under the root");
+        assert!(remove_edit_dir(&root, &root.join("sess")).is_err(), "not an edit folder");
+        assert!(outside.join("src/lib/main.rs").exists());
+        // Once the planted link is gone, the clean copy is swept as usual.
+        std::fs::remove_file(holder.join("file").join("planted")).unwrap();
+        assert!(sweep(&root, &none).is_empty());
+        assert!(!holder.exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1644,14 +1951,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `open` waits on `swept` before creating an edit folder; it opens only
+    /// once the launch sweep is done — also when the sweep failed or panicked.
+    #[tokio::test]
+    async fn no_edit_starts_before_the_launch_sweep_finishes() {
+        for panics in [false, true] {
+            let edits = Arc::new(RemoteEdits::default());
+            let mut rx = edits.swept.subscribe();
+            assert!(!*rx.borrow(), "not swept yet");
+            let e2 = Arc::clone(&edits);
+            let sweeper = std::thread::spawn(move || {
+                let _done = SweptOnDrop(&e2.swept);
+                std::thread::sleep(Duration::from_millis(200));
+                if panics {
+                    panic!("sweep failed");
+                }
+            });
+            let t0 = Instant::now();
+            tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|d| *d)).await.unwrap().unwrap();
+            assert!(t0.elapsed() >= Duration::from_millis(150), "waited for the sweep");
+            assert_eq!(sweeper.join().is_err(), panics);
+        }
+    }
+
     #[test]
-    fn unsynced_means_different_bytes_and_a_missing_copy_is_clean() {
+    fn unsynced_means_different_bytes_and_a_missing_copy_is_unknown() {
         let dir = scratch("dirty");
         let f = dir.join("x");
         std::fs::write(&f, b"abc").unwrap();
-        assert!(!local_dirty(&f, &sha256_hex(b"abc")));
-        assert!(local_dirty(&f, &sha256_hex(b"abd")));
-        assert!(!local_dirty(&dir.join("gone"), "whatever"));
+        assert_eq!(local_state(&f, &sha256_hex(b"abc")), LocalState::Clean);
+        assert_eq!(local_state(&f, &sha256_hex(b"abd")), LocalState::Dirty);
+        assert_eq!(local_state(&dir.join("gone"), "whatever"), LocalState::Unknown);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Cleanup gives a copy that is missing mid-save the grace period: one
+    /// that comes back in time is judged on its bytes, one that does not
+    /// stays unknown (kept).
+    #[test]
+    fn cleanup_waits_out_an_editors_rename_save() {
+        let dir = scratch("grace");
+        let f = dir.join("x.conf");
+        let hash = sha256_hex(b"v1");
+        let f2 = f.clone();
+        let saver = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            std::fs::write(&f2, b"v2").unwrap();
+        });
+        assert_eq!(settled_local_state(&f, &hash, Duration::from_secs(5)), LocalState::Dirty);
+        saver.join().unwrap();
+        std::fs::remove_file(&f).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(settled_local_state(&f, &hash, Duration::from_millis(500)), LocalState::Unknown);
+        assert!(t0.elapsed() >= Duration::from_millis(500), "the grace period is waited out");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
