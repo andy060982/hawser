@@ -39,3 +39,18 @@ export function setLocalRoot(root: string | null | undefined): void {
 export function defaultLocalRoot(windows: boolean): string {
   return localRoot ?? (windows ? 'C:\\' : '/')
 }
+
+/** Example key path for the Host editor, in this platform's form. `~/` is
+ *  expanded by the backend on every platform. */
+export function keyPathPlaceholder(windows: boolean): string {
+  return windows ? 'C:\\Users\\you\\.ssh\\id_ed25519' : '~/.ssh/id_ed25519'
+}
+
+/** Where saved passwords live, in this platform's words. */
+export function vaultName(platform: 'windows' | 'macos' | 'other'): string {
+  return platform === 'windows'
+    ? 'Windows Credential Manager'
+    : platform === 'macos'
+      ? 'the macOS Keychain'
+      : "the system's credential store"
+}

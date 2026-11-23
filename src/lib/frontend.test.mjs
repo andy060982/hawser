@@ -15,7 +15,15 @@ import {
   sanitizeImport, setVaultFoldsCase, usableImportedId, vaultIdKey,
 } from './tree.ts'
 import { clearLocal, emitLocal, onLocal } from './localTerm.ts'
-import { defaultLocalRoot, localBaseName, setLocalRoot, unsafeTransferName } from './localPath.ts'
+import { defaultLocalRoot, keyPathPlaceholder, localBaseName, setLocalRoot, unsafeTransferName } from './localPath.ts'
+import { appShortcut, terminalKeyAction } from './keyChords.ts'
+import { isMouseReport, looksLikeTerminalReply, planPaste, shouldBroadcast, snippetText } from './termInput.ts'
+import { ModalStack, clickTooSoon, enterOutcome } from './modalStack.ts'
+import { closeConfirmText, liveSessionCount } from './closeGuard.ts'
+import {
+  effectiveHostColor, folderLabels, inheritedHostColor, jumpDependents, ownColor,
+} from './tree.ts'
+import { hasPendingLocal } from './localTerm.ts'
 
 const deferred = () => {
   let resolve, reject
@@ -514,4 +522,199 @@ test('queued narrowing survives a failed save and clears only when carried', () 
   assert.deepEqual(q.pending(), [])
   q.settle(first) // a stale success is harmless
   assert.deepEqual(q.pending(), [])
+})
+
+
+/* ------------------------------------------------------------------ W5 */
+
+const key = (code, mods = {}, k) => ({
+  code,
+  key: k ?? code.replace(/^Key/, '').replace(/^Digit/, ''),
+  ctrlKey: false, shiftKey: false, altKey: false, metaKey: false,
+  ...mods,
+})
+
+test('tab, ordinal and snippet chords belong to the app even in a focused terminal', () => {
+  assert.deepEqual(appShortcut(key('Tab', { ctrlKey: true }, 'Tab')), { kind: 'cycleTab', dir: 1 })
+  assert.deepEqual(appShortcut(key('Tab', { ctrlKey: true, shiftKey: true }, 'Tab')), { kind: 'cycleTab', dir: -1 })
+  // Ctrl+3..8 would otherwise send ESC/FS/GS/RS/US/DEL to the remote.
+  for (let d = 1; d <= 9; d++) {
+    assert.deepEqual(appShortcut(key(`Digit${d}`, { ctrlKey: true })), { kind: 'gotoTab', index: d - 1 })
+    assert.equal(terminalKeyAction(key(`Digit${d}`, { ctrlKey: true })), 'app')
+  }
+  // Ctrl+Shift+2 is "@" in e.key on US layouts (xterm would send NUL).
+  assert.deepEqual(appShortcut(key('Digit2', { ctrlKey: true, shiftKey: true }, '@')), { kind: 'snippet', slot: 2 })
+  assert.equal(terminalKeyAction(key('Digit2', { ctrlKey: true, shiftKey: true }, '@')), 'app')
+  assert.deepEqual(appShortcut(key('KeyW', { ctrlKey: true, shiftKey: true })), { kind: 'command', code: 'KeyW' })
+  // Plain Ctrl letters stay with the shell (readline owns them).
+  assert.equal(appShortcut(key('KeyW', { ctrlKey: true })), null)
+  assert.equal(terminalKeyAction(key('KeyW', { ctrlKey: true })), 'pass')
+  assert.equal(appShortcut(key('Tab', {}, 'Tab')), null)
+})
+
+test('AltGr (Ctrl+Alt) and Meta never trigger a Ctrl shortcut, copy included', () => {
+  const altgr = { ctrlKey: true, altKey: true }
+  for (const code of ['Digit0', 'Minus', 'Equal', 'KeyC', 'Digit7', 'Tab']) {
+    assert.equal(terminalKeyAction(key(code, altgr)), 'pass', code)
+    assert.equal(appShortcut(key(code, altgr)), null, code)
+  }
+  assert.equal(terminalKeyAction(key('KeyC', { ctrlKey: true, altKey: true, shiftKey: true })), 'pass')
+  assert.equal(terminalKeyAction(key('Digit1', { ctrlKey: true, metaKey: true })), 'pass')
+})
+
+test('zoom leaves Ctrl+_ (Ctrl+Shift+Minus) to the shell', () => {
+  assert.equal(terminalKeyAction(key('Minus', { ctrlKey: true })), 'zoomOut')
+  assert.equal(terminalKeyAction(key('Minus', { ctrlKey: true, shiftKey: true }, '_')), 'pass')
+  assert.equal(terminalKeyAction(key('Equal', { ctrlKey: true, shiftKey: true }, '+')), 'zoomIn')
+  assert.equal(terminalKeyAction(key('Digit0', { ctrlKey: true })), 'zoomReset')
+  assert.equal(terminalKeyAction(key('KeyC', { ctrlKey: true })), 'copyOrInterrupt')
+  assert.equal(terminalKeyAction(key('KeyC', { ctrlKey: true, shiftKey: true })), 'copy')
+  assert.equal(terminalKeyAction(key('KeyV', { ctrlKey: true, shiftKey: true })), 'paste')
+})
+
+test('broadcast mirrors only user input, never terminal replies or mouse reports', () => {
+  const replies = [
+    '\x1b[?1;2c', '\x1b[>0;276;0c', '\x1b[0n', '\x1b[12;5R', '\x1b[?12;5R', '\x1b[?2004;1$y',
+    '\x1b[I', '\x1b[O', '\x1b[8;24;80t', '\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\', '\x1b]10;rgb:ffff/ffff/ffff\x07',
+    '\x1bP1$r0m\x1b\\',
+  ]
+  for (const r of replies) {
+    assert.ok(looksLikeTerminalReply(r), JSON.stringify(r))
+    // xterm says "not user input" for these; and without the flag the shape decides.
+    assert.equal(shouldBroadcast(r, false), false)
+    assert.equal(shouldBroadcast(r, null), false)
+  }
+  for (const m of ['\x1b[<0;12;5M', '\x1b[<0;12;5m', '\x1b[32;12;5M', '\x1b[M !!']) {
+    assert.ok(isMouseReport(m), JSON.stringify(m))
+    // Mouse reports are user-made but name a position in THIS pane.
+    assert.equal(shouldBroadcast(m, true), false)
+  }
+  for (const typed of ['l', 's', '\r', '\x1b[A', '\x1b[1;5C', '\x03', 'show run\r']) {
+    assert.equal(shouldBroadcast(typed, true), true)
+    assert.equal(shouldBroadcast(typed, null), true)
+  }
+  // Shift+F3 has the shape of a cursor report; the origin flag keeps it.
+  assert.equal(shouldBroadcast('\x1b[1;2R', true), true)
+})
+
+test('a multi-line paste without bracketed paste needs a confirm', () => {
+  assert.deepEqual(planPaste('show ver', false), { kind: 'paste' })
+  assert.deepEqual(planPaste('a\nb\nc', false), { kind: 'confirm', lines: 2 })
+  assert.deepEqual(planPaste('a\r\nb\r\n', false), { kind: 'confirm', lines: 2 })
+  // A single trailing newline still runs the line.
+  assert.deepEqual(planPaste('reload\n', false), { kind: 'confirm', lines: 1 })
+  // Bracketed: inert until Enter.
+  assert.deepEqual(planPaste('a\nb', true), { kind: 'paste' })
+})
+
+test('snippets press Enter as CR, like the keyboard', () => {
+  assert.equal(snippetText('show ip int brief', true), 'show ip int brief\r')
+  assert.equal(snippetText('show ip int brief', false), 'show ip int brief')
+})
+
+test('Escape and Enter act on the top modal only', () => {
+  const st = new ModalStack()
+  const editor = st.push()
+  const alert = st.push()
+  assert.ok(st.isTop(alert) && !st.isTop(editor))
+  assert.equal(st.size, 2)
+  st.remove(alert)
+  assert.ok(st.isTop(editor))
+  st.remove(editor)
+  assert.equal(st.size, 0)
+  assert.ok(!st.isTop(editor))
+})
+
+test('Enter on a focused Cancel cancels, in every kind of dialog', () => {
+  for (const kind of ['confirm', 'prompt']) {
+    for (const danger of [false, true]) {
+      assert.equal(enterOutcome(kind, danger, 'cancel'), 'cancel', `${kind} ${danger}`)
+      assert.equal(enterOutcome(kind, danger, 'confirm'), 'confirm')
+    }
+  }
+  assert.equal(enterOutcome('confirm', false, 'other'), 'confirm')
+  assert.equal(enterOutcome('confirm', true, 'other'), 'none')
+  assert.equal(enterOutcome('prompt', false, 'input'), 'confirm')
+  assert.equal(enterOutcome('alert', false, 'other'), 'confirm')
+})
+
+test('a click right after a dialog appears is not taken as its answer', () => {
+  assert.ok(clickTooSoon(1000, 1100, true))
+  assert.ok(!clickTooSoon(1000, 1400, true))
+  // Keyboard activation (detail 0) is never guarded.
+  assert.ok(!clickTooSoon(1000, 1001, false))
+})
+
+test('closing the window asks only with live sessions and the setting on', () => {
+  const s = [{ status: 'connected' }, { status: 'disconnected' }, { status: 'connecting' }, { status: 'error' }]
+  assert.equal(liveSessionCount(s), 2)
+  assert.match(closeConfirmText(s, true), /2 sessions are still connected/)
+  assert.equal(closeConfirmText(s, false), null)
+  assert.equal(closeConfirmText([{ status: 'disconnected' }], true), null)
+  assert.match(closeConfirmText([{ status: 'connected' }], true), /1 session is/)
+})
+
+const H = (id, extra = {}) => ({ kind: 'host', id, name: id, hostname: `${id}.lan`, port: 22, username: 'u', auth: 'password', ...extra })
+const F = (id, name, children, color) => ({ kind: 'folder', id, name, children, ...(color ? { color } : {}) })
+
+test("the 'off' colour never overrides a red folder", () => {
+  const tree = [F('prod', 'Production', [H('a', { color: 'none' }), H('b'), H('c', { color: 'blue' })], 'red'), H('top')]
+  assert.equal(ownColor('none'), undefined)
+  assert.equal(effectiveHostColor(tree, 'a'), 'red')
+  assert.equal(effectiveHostColor(tree, 'b'), 'red')
+  assert.equal(effectiveHostColor(tree, 'c'), 'blue')
+  assert.equal(effectiveHostColor(tree, 'top'), undefined)
+  assert.equal(effectiveHostColor(tree, 'missing'), undefined)
+  assert.equal(inheritedHostColor(tree, 'c'), 'red')
+  // Nested: the nearest coloured folder wins; an 'off' folder passes it through.
+  const nested = [F('o', 'Outer', [F('i', 'Inner', [H('x')], 'none')], 'red')]
+  assert.equal(effectiveHostColor(nested, 'x'), 'red')
+})
+
+test('a jump host knows its dependents; duplicate folder names get paths', () => {
+  const tree = [H('bastion'), H('db1', { jumpHostId: 'bastion' }), F('f', 'Sites', [H('db2', { jumpHostId: 'bastion' })]), H('self', { jumpHostId: 'self' })]
+  assert.deepEqual(jumpDependents(tree, 'bastion').map((h) => h.id), ['db1', 'db2'])
+  assert.deepEqual(jumpDependents(tree, 'self'), [])
+  const folders = [F('e', 'East', [F('l1', 'Lab', [])]), F('w', 'West', [F('l2', 'Lab', [])]), F('u', 'Unique', [])]
+  const labels = folderLabels(folders)
+  assert.equal(labels.get('l1'), 'East / Lab')
+  assert.equal(labels.get('l2'), 'West / Lab')
+  assert.equal(labels.get('u'), 'Unique')
+  const twins = folderLabels([F('a', 'Lab', []), F('b', 'Lab', [])])
+  assert.notEqual(twins.get('a'), twins.get('b'))
+})
+
+test('buffered pane text survives a StrictMode remount and keeps its order', async () => {
+  emitLocal('s-sm', 'one ')
+  const first = []
+  const off = onLocal('s-sm', (t) => first.push(t))
+  off() // StrictMode: the first mount is thrown away at once
+  const second = []
+  onLocal('s-sm', (t) => second.push(t))
+  emitLocal('s-sm', 'two')
+  await Promise.resolve()
+  assert.deepEqual(first, [])
+  assert.deepEqual(second, ['one ', 'two'])
+  // With nobody subscribed when the flush runs, the text is kept for later.
+  emitLocal('s-sm2', 'later')
+  const off2 = onLocal('s-sm2', () => {})
+  off2()
+  await Promise.resolve()
+  assert.ok(hasPendingLocal('s-sm2'))
+  clearLocal('s-sm')
+  clearLocal('s-sm2')
+})
+
+test('the key path example follows the platform', () => {
+  assert.equal(keyPathPlaceholder(false), '~/.ssh/id_ed25519')
+  assert.match(keyPathPlaceholder(true), /^C:\\/)
+})
+
+test('a progress note is kept on the active row', () => {
+  const row = { ...queuedRow('t1', 's1', 'upload', { name: 'f', path: '/l/f', dest: '/r/f', overwrite: 'never' }), status: 'active' }
+  let list = applyProgress([row], { sessionId: 's1', transferId: 't1', root: '/l/f', filePath: '/l/f', bytesTransferred: 1, totalBytes: 9, direction: 'upload', done: false, note: 'writing in place' })
+  assert.equal(list[0].note, 'writing in place')
+  list = applyProgress(list, { sessionId: 's1', transferId: 't1', root: '/l/f', filePath: '/l/f', bytesTransferred: 5, totalBytes: 9, direction: 'upload', done: false })
+  assert.equal(list[0].note, 'writing in place')
+  assert.equal(list[0].bytesDone, 5)
 })

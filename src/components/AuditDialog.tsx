@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, Archive, CheckCircle2, Info, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 import { useDialogs } from '../lib/dialogs'
 
 interface AuditView {
@@ -80,11 +81,9 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
 
   useEffect(refresh, [refresh])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Escape closes this dialog only while it is the top modal (an alert over
+  // it takes its own Escape).
+  useModalLayer(true, onClose)
 
   const verify = () => {
     setVerifying(true)

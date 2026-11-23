@@ -196,6 +196,12 @@ function TransferRow({
         )}
       </div>
 
+      {t.status === 'active' && t.note && (
+        <p className="break-words border-t border-line/40 bg-surface-2/40 px-3 py-1 font-mono text-[10.5px] text-warn">
+          {t.note}
+        </p>
+      )}
+
       {notes.length > 0 && (
         <ul className="border-t border-line/40 bg-surface-2/40 px-3 py-1 font-mono text-[10.5px] text-warn">
           {notes.map((n, i) => (

@@ -201,6 +201,11 @@ fn line_delta(old: &str, new: &str) -> (usize, usize) {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigCheck {
+    /// The endpoint identity whose folder this check read and wrote: the
+    /// identity of the connection it actually ran on. The frontend routes the
+    /// notice by it, not by what it asked about (a reconnect can have
+    /// replaced the tab's connection before the check ran).
+    pub endpoint: String,
     /// "first" (no earlier snapshot: this one is the baseline), "unchanged"
     /// (identical to the newest snapshot: nothing saved), or "changed".
     pub status: &'static str,
@@ -223,7 +228,14 @@ pub struct ConfigCheck {
 pub fn check_snapshot(endpoint: &str, label: &str, content: &str) -> Result<ConfigCheck, KnownHostsError> {
     let dir = configs_dir(endpoint, label)?;
     ensure_dir(&dir)?;
-    check_in(&dir, content, &now_stamp())
+    check_for(&dir, endpoint, content, &now_stamp())
+}
+
+/// `check_in`, reporting `endpoint` as the identity whose folder `dir` is.
+fn check_for(dir: &Path, endpoint: &str, content: &str, stamp: &str) -> Result<ConfigCheck, KnownHostsError> {
+    let mut check = check_in(dir, content, stamp)?;
+    check.endpoint = endpoint.to_string();
+    Ok(check)
 }
 
 fn check_in(dir: &Path, content: &str, stamp: &str) -> Result<ConfigCheck, KnownHostsError> {
@@ -249,6 +261,7 @@ fn check_in(dir: &Path, content: &str, stamp: &str) -> Result<ConfigCheck, Known
         None => ("first", 0, 0),
         Some((_, _, old)) if norm(old) == norm(content) => {
             return Ok(ConfigCheck {
+                endpoint: String::new(),
                 status: "unchanged",
                 name: None,
                 previous,
@@ -264,6 +277,7 @@ fn check_in(dir: &Path, content: &str, stamp: &str) -> Result<ConfigCheck, Known
     };
     let name = write_new_snapshot(dir, stamp, content)?;
     Ok(ConfigCheck {
+        endpoint: String::new(),
         status,
         name: Some(name),
         previous,
@@ -620,5 +634,26 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join(&a)).unwrap(), "one\n");
         assert_eq!(std::fs::read_to_string(dir.join(&b)).unwrap(), "two\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W5: the check reports the identity whose folder it used, so a late
+    /// reply is routed to that endpoint's tab and not the one it was asked
+    /// for; two endpoints sharing a label keep separate baselines.
+    #[test]
+    fn check_reports_the_endpoint_it_snapshotted() {
+        let root = tmp_dir();
+        let (da, db) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&da).unwrap();
+        std::fs::create_dir_all(&db).unwrap();
+        let a = check_for(&da, "host:aaa", "x\n", "20261031-090000").unwrap();
+        assert_eq!(a.endpoint, "host:aaa");
+        assert_eq!(a.status, "first");
+        let b = check_for(&db, "host:bbb", "y\n", "20261031-090000").unwrap();
+        assert_eq!(b.endpoint, "host:bbb");
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(json["endpoint"], "host:bbb");
+        // An empty or forged identity never names a folder.
+        assert!(configs_dir("", "fw1").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

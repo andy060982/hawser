@@ -187,6 +187,9 @@ export interface Transfer {
   /** Notes from a successful transfer (written through a symlink, a
    *  non-atomic in-place fallback). */
   notes?: string[]
+  /** The latest live warning from a progress event (see
+   *  TransferProgressEvent.note), shown while the row is active. */
+  note?: string
   /** Per-file failures accumulated from `sftp://failure` events during a
    *  recursive (folder) transfer. Lets the UI show the FULL list — not just the
    *  first — and retry exactly the files that didn't make it. */
@@ -226,6 +229,9 @@ export interface TransferProgressEvent {
   totalBytes: number
   direction: TransferDirection
   done: boolean
+  /** A warning to show while the transfer still runs (the in-place,
+   *  non-atomic fallback), sent before the destination is truncated. */
+  note?: string
 }
 
 /** Payload of the `sftp://failure` event. Mirrors TransferFailure in

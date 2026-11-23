@@ -100,6 +100,24 @@ pub fn home_dir() -> Option<PathBuf> {
     var.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
+/// Expand a leading `~` in a user-typed path (a key file in the Host editor):
+/// `~` alone, `~/…`, and on Windows `~\…`, against `home`. Anything else,
+/// including `~user/…` and a path with no home to expand against, is returned
+/// unchanged, so the error names exactly what was typed.
+pub fn expand_home(path: &str, home: Option<&std::path::Path>) -> PathBuf {
+    let Some(home) = home else { return PathBuf::from(path) };
+    if path == "~" {
+        return home.to_path_buf();
+    }
+    let rest = path
+        .strip_prefix("~/")
+        .or_else(|| if cfg!(windows) { path.strip_prefix("~\\") } else { None });
+    match rest {
+        Some(r) => home.join(r),
+        None => PathBuf::from(path),
+    }
+}
+
 /// Best-effort user "Documents" directory for exports. Falls back to the home
 /// directory when there is no Documents folder.
 ///
@@ -169,5 +187,21 @@ mod tests {
         let reaper = super::reaped(&mut cmd).unwrap().expect("a reaper thread");
         // The reaper collected the exit status: no zombie is left.
         assert_eq!(reaper.join().unwrap().and_then(|s| s.code()), Some(3));
+    }
+
+    #[test]
+    fn expand_home_handles_tilde_paths_only() {
+        use super::expand_home;
+        use std::path::PathBuf;
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(expand_home("~/.ssh/id_ed25519", Some(home)), home.join(".ssh/id_ed25519"));
+        assert_eq!(expand_home("~", Some(home)), home.to_path_buf());
+        assert_eq!(expand_home("/abs/key", Some(home)), PathBuf::from("/abs/key"));
+        assert_eq!(expand_home("~other/key", Some(home)), PathBuf::from("~other/key"));
+        assert_eq!(expand_home("~/k", None), PathBuf::from("~/k"));
+        #[cfg(windows)]
+        assert_eq!(expand_home("~\\k", Some(home)), home.join("k"));
+        #[cfg(not(windows))]
+        assert_eq!(expand_home("~\\k", Some(home)), PathBuf::from("~\\k"));
     }
 }

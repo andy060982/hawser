@@ -552,6 +552,44 @@ impl client::Handler for TrustAny {
     }
 }
 
+/// Trusts any key, and records the negotiated algorithms like ClientHandler.
+struct Recording {
+    algos: Algos,
+}
+
+impl client::Handler for Recording {
+    type Error = SshError;
+
+    async fn check_server_key(&mut self, _: &russh::keys::PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn kex_done(
+        &mut self,
+        _: Option<&[u8]>,
+        names: &russh::Names,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        record_negotiated(&self.algos, names);
+        Ok(())
+    }
+}
+
+/// W5: the status bar shows what the key exchange really negotiated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negotiated_algorithms_are_recorded() {
+    let algos: Algos = Arc::default();
+    let opts = Opts { posix_rename: false, rename_replaces: false, refuse_sftp: false };
+    let (_ssh, _remote, _faults, _seen) = connect_with(opts, Recording { algos: Arc::clone(&algos) }).await;
+    let got = algos.lock().unwrap().clone().expect("kex_done recorded nothing");
+    // The test server's only host key is Ed25519, so that is what was used.
+    assert_eq!(got.host_key, "ssh-ed25519");
+    assert!(!got.kex.is_empty() && got.kex != "none", "{got:?}");
+    assert!(!got.cipher.is_empty() && got.cipher != "none", "{got:?}");
+    let json = serde_json::to_value(&got).unwrap();
+    assert!(json.get("hostKey").is_some(), "{json}");
+}
+
 /// A connected SFTP client over a server rooted at `remote`, plus a local
 /// scratch folder.
 struct Harness {
@@ -577,6 +615,14 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// A logged-in SSH connection to a fresh test server.
 async fn connect(opts: Opts) -> (Handle<TrustAny>, PathBuf, Faults, Arc<Seen>) {
+    connect_with(opts, TrustAny).await
+}
+
+/// `connect`, with the client handler supplied.
+async fn connect_with<H>(opts: Opts, handler: H) -> (Handle<H>, PathBuf, Faults, Arc<Seen>)
+where
+    H: client::Handler<Error = SshError> + Send + 'static,
+{
     let remote = scratch("remote");
     let (client_io, server_io) = tokio::io::duplex(1 << 20);
     let config = Arc::new(russh::server::Config {
@@ -603,7 +649,7 @@ async fn connect(opts: Opts) -> (Handle<TrustAny>, PathBuf, Faults, Arc<Seen>) {
             let _ = running.await;
         }
     });
-    let mut ssh = client::connect_stream(Arc::new(client::Config::default()), client_io, TrustAny)
+    let mut ssh = client::connect_stream(Arc::new(client::Config::default()), client_io, handler)
         .await
         .unwrap();
     let auth = ssh.authenticate_password("u", "p").await.unwrap();

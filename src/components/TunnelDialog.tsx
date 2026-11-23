@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { ArrowRight, Cable, Plus, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 import { validateForward } from '../lib/transfers'
 
 interface ForwardInfo {
@@ -30,6 +31,9 @@ export function TunnelDialog({
   sessionTitle: string
   onClose: () => void
 }) {
+  // A modal layer (app shortcuts stay off behind it). Its Escape is the
+  // panel's own onKeyDown, so an alert stacked above keeps its Escape.
+  useModalLayer(true)
   const [forwards, setForwards] = useState<ForwardInfo[]>([])
   const [localPort, setLocalPort] = useState('')
   const [remoteHost, setRemoteHost] = useState('127.0.0.1')

@@ -194,6 +194,14 @@ async fn ssh_resize(
         .map_err(|e| e.to_string())
 }
 
+/// The algorithms a live session negotiated with its target (kex, cipher,
+/// host key), for the status bar. None until the first key exchange is
+/// recorded; an error for a session that is not open.
+#[tauri::command]
+fn ssh_algorithms(registry: State<'_, Registry>, session_id: String) -> CmdResult<Option<ssh::Negotiated>> {
+    registry.algorithms(&session_id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn ssh_disconnect(
     app: AppHandle,
@@ -1499,7 +1507,7 @@ pub fn run() {
             None
         }
     };
-    let app = with_single_instance_plugin(tauri::Builder::default(), |app| {
+    let app = with_single_instance_plugin(with_app_menu(tauri::Builder::default()), |app| {
         if let Some(w) = app.get_webview_window("main") {
             let _ = w.unminimize();
             let _ = w.show();
@@ -1589,6 +1597,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ssh_connect,
+            ssh_algorithms,
             ssh_write,
             ssh_resize,
             ssh_disconnect,
@@ -1671,6 +1680,98 @@ pub fn run() {
     });
 }
 
+/// macOS app-menu item ids that the frontend handles.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MENU_CLOSE_TAB: &str = "hawser-close-tab";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MENU_QUIT: &str = "hawser-quit";
+
+/// The frontend event a custom menu item raises, if it is one of ours.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn menu_event_name(id: &str) -> Option<&'static str> {
+    match id {
+        MENU_CLOSE_TAB => Some("menu://close-tab"),
+        MENU_QUIT => Some("menu://quit"),
+        _ => None,
+    }
+}
+
+/// On macOS, replace Tauri's default menu. Its File > Close Window (Cmd+W)
+/// closed the app's only window, and App > Quit (Cmd+Q) exited, both with
+/// every SSH session in it and no confirmation. Here Cmd+W is "Close Tab"
+/// and Cmd+Q is "Quit Hawser"; both are handed to the frontend, which asks
+/// first while sessions are live (confirmCloseActive). Edit stays: WKWebView
+/// needs its items for copy and paste. Other platforms have no app menu.
+fn with_app_menu<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::Emitter;
+        builder.menu(macos_menu).on_menu_event(|app, event| {
+            if let Some(name) = menu_event_name(event.id().as_ref()) {
+                let _ = app.emit(name, ());
+            }
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_menu<R: tauri::Runtime>(h: &AppHandle<R>) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
+    let pkg = h.package_info();
+    let about = AboutMetadata {
+        name: Some(pkg.name.clone()),
+        version: Some(pkg.version.to_string()),
+        ..Default::default()
+    };
+    let app_menu = Submenu::with_items(
+        h,
+        pkg.name.clone(),
+        true,
+        &[
+            &PredefinedMenuItem::about(h, None, Some(about))?,
+            &PredefinedMenuItem::separator(h)?,
+            &PredefinedMenuItem::services(h, None)?,
+            &PredefinedMenuItem::separator(h)?,
+            &PredefinedMenuItem::hide(h, None)?,
+            &PredefinedMenuItem::hide_others(h, None)?,
+            &PredefinedMenuItem::show_all(h, None)?,
+            &PredefinedMenuItem::separator(h)?,
+            &MenuItem::with_id(h, MENU_QUIT, "Quit Hawser", true, Some("CmdOrCtrl+Q"))?,
+        ],
+    )?;
+    let file = Submenu::with_items(
+        h,
+        "File",
+        true,
+        &[&MenuItem::with_id(h, MENU_CLOSE_TAB, "Close Tab", true, Some("CmdOrCtrl+W"))?],
+    )?;
+    let edit = Submenu::with_items(
+        h,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(h, None)?,
+            &PredefinedMenuItem::redo(h, None)?,
+            &PredefinedMenuItem::separator(h)?,
+            &PredefinedMenuItem::cut(h, None)?,
+            &PredefinedMenuItem::copy(h, None)?,
+            &PredefinedMenuItem::paste(h, None)?,
+            &PredefinedMenuItem::select_all(h, None)?,
+        ],
+    )?;
+    let window = Submenu::with_items(
+        h,
+        "Window",
+        true,
+        &[&PredefinedMenuItem::minimize(h, None)?, &PredefinedMenuItem::maximize(h, None)?],
+    )?;
+    Menu::with_items(h, &[&app_menu, &file, &edit, &window])
+}
+
 /// Register the single-instance plugin, where it can run safely.
 ///
 /// On Linux the plugin (2.4.1) unwraps the session-bus address, and a
@@ -1715,6 +1816,16 @@ fn run_second_instance(mut context: tauri::Context<tauri::Wry>) {
 mod tests {
     use super::*;
     use utils::artifacts::dial_identity;
+
+    /// W5: the custom macOS menu's Close Tab / Quit reach the frontend as
+    /// their own events; nothing else is forwarded.
+    #[test]
+    fn menu_items_map_to_frontend_events() {
+        assert_eq!(menu_event_name(MENU_CLOSE_TAB), Some("menu://close-tab"));
+        assert_eq!(menu_event_name(MENU_QUIT), Some("menu://quit"));
+        assert_eq!(menu_event_name("close_window"), None);
+        assert_eq!(menu_event_name(""), None);
+    }
 
     /// A failed capture is audited without the device's stderr.
     #[test]

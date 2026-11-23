@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { KeyRound, X, Zap } from 'lucide-react'
+import { useModalLayer } from '../lib/useModalLayer'
 
 /* ---------------------------------------------------------------------------
    Quick connect (Ctrl+Shift+P): `user@host[:port]`, optional password, go.
@@ -26,11 +27,9 @@ export function QuickConnect({
     inputRef.current?.focus()
   }, [])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Escape closes this dialog only while it is the top modal (an alert over
+  // it takes its own Escape).
+  useModalLayer(true, onClose)
 
   const go = () => {
     // user@host[:port] — the same shape everyone already types into ssh.

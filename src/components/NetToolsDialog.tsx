@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { Activity, Globe, Radar, Route, Square, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 import { netTargetError, parsePort } from '../lib/transfers'
 
 interface ToolEvent {
@@ -30,6 +31,9 @@ export function NetToolsDialog({
   initialPort?: number
   onClose: () => void
 }) {
+  // A modal layer (app shortcuts stay off behind it). Its Escape is the
+  // panel's own onKeyDown, so an alert stacked above keeps its Escape.
+  useModalLayer(true)
   const [target, setTarget] = useState(initialTarget)
   const [port, setPort] = useState(String(initialPort ?? 22))
   const [lines, setLines] = useState<string[]>([])

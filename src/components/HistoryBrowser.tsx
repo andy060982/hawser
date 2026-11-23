@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { Clock, FileText, Search, TextSearch, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 import { foldMatches } from '../lib/foldMatch'
 
 interface LogEntry {
@@ -121,11 +122,9 @@ export function HistoryBrowser({ onClose }: { onClose: () => void }) {
      completion on the backend for nothing. */
   useEffect(() => () => void safeInvoke('logs_search_cancel').catch(() => {}), [])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Escape closes this dialog only while it is the top modal (an alert over
+  // it takes its own Escape).
+  useModalLayer(true, onClose)
 
   /* Reads run concurrently on the backend, so a large transcript clicked first
      can resolve after a small one clicked second. Only the latest request may

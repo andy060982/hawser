@@ -953,10 +953,39 @@ struct ClientHandler {
     /// The attempt's kill switch: a parked host-key check gives up when it
     /// fires (see `Kill`).
     kill: Kill,
+    /// What the key exchange actually negotiated, filled by `kex_done` (and
+    /// refreshed on every rekey), for the status bar.
+    algos: Algos,
 }
 
 /// Where `ClientHandler::disconnected` leaves the reason a transport died.
 type DeathNote = Arc<std::sync::Mutex<Option<String>>>;
+
+/// The algorithms a connection negotiated, as the server and this client
+/// agreed them in the key exchange (not a guess or a preference list).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Negotiated {
+    pub kex: String,
+    pub cipher: String,
+    pub host_key: String,
+}
+
+/// Shared slot a handler fills and the session reads.
+pub(crate) type Algos = Arc<std::sync::Mutex<Option<Negotiated>>>;
+
+/// Record a finished key exchange into `slot`. Called from every handler's
+/// `kex_done`, the first exchange and each rekey alike.
+pub(crate) fn record_negotiated(slot: &Algos, names: &russh::Names) {
+    let n = Negotiated {
+        kex: names.kex.as_ref().to_string(),
+        cipher: names.cipher.as_ref().to_string(),
+        host_key: names.key.as_str().to_string(),
+    };
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(n);
+    }
+}
 
 impl ClientHandler {
     fn cancelled(&self) -> bool {
@@ -1069,6 +1098,16 @@ fn settle_host_key(
 
 impl client::Handler for ClientHandler {
     type Error = SshError;
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        names: &russh::Names,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        record_negotiated(&self.algos, names);
+        Ok(())
+    }
 
     async fn check_server_key(
         &mut self,
@@ -1223,6 +1262,8 @@ pub struct Session {
     /// end of this session tears down its own forwards and never a newer
     /// connection's for the same tab.
     generation: u64,
+    /// What the target's key exchange negotiated (see `Negotiated`).
+    algos: Algos,
 }
 
 impl Session {
@@ -1602,6 +1643,14 @@ impl SessionRef {
 }
 
 impl Registry {
+    /// The algorithms a live session negotiated with its target (None until
+    /// the first key exchange has been recorded).
+    pub fn algorithms(&self, id: &str) -> Result<Option<Negotiated>, SshError> {
+        let s = self.get(id)?;
+        let g = s.algos.lock().map(|g| g.clone()).unwrap_or(None);
+        Ok(g)
+    }
+
     /// The endpoint identity of a live session (see `Session::endpoint`).
     pub fn endpoint_of(&self, id: &str) -> Result<String, SshError> {
         Ok(self.get(id)?.endpoint.clone())
@@ -1799,6 +1848,7 @@ impl Registry {
         let owner: PromptOwner = (session_id.to_string(), ticket);
         let wait = HumanWait::default();
         let death: DeathNote = Arc::default();
+        let algos: Algos = Arc::default();
         // Fires on every exit that does not register a session, including this
         // future being dropped by a cancel: no russh task or socket from this
         // attempt survives it (see `Kill`).
@@ -1834,6 +1884,7 @@ impl Registry {
                     wait: wait.clone(),
                     death: Arc::default(),
                     kill: kill.clone(),
+                    algos: Arc::default(),
                 };
                 let jlabel = format!("{}:{}", j.host, j.port);
                 let mut jh = handshake(
@@ -1888,6 +1939,7 @@ impl Registry {
                     wait: wait.clone(),
                     death: Arc::clone(&death),
                     kill: kill.clone(),
+                    algos: Arc::clone(&algos),
                 };
                 let h = handshake(
                     hop_config(host, port),
@@ -1915,6 +1967,7 @@ impl Registry {
                     wait: wait.clone(),
                     death: Arc::clone(&death),
                     kill: kill.clone(),
+                    algos: Arc::clone(&algos),
                 };
                 let h = handshake(
                     hop_config(host, port), tcp, handler, &wait, &format!("{host}:{port}"),
@@ -1981,6 +2034,7 @@ impl Registry {
             alive: AtomicBool::new(true),
             endpoint,
             generation: ticket,
+            algos,
         });
 
         // Output pump. Spawned now so its JoinHandle can be registered
@@ -2962,7 +3016,9 @@ async fn authenticate(
             let path = key_path.ok_or_else(|| {
                 SshError::AuthFailed(format!("{username}: no key file configured"))
             })?;
-            let key = russh::keys::load_secret_key(path, secret.as_ref().map(|p| p.as_str()))
+            // `~/.ssh/id_ed25519` is how a key path is written on Unix.
+            let file = crate::utils::platform::expand_home(path, crate::utils::platform::home_dir().as_deref());
+            let key = russh::keys::load_secret_key(&file, secret.as_ref().map(|p| p.as_str()))
                 .map_err(|e| SshError::AuthFailed(format!("could not load key {path}: {e}")))?;
             drop(secret);
             let key = Arc::new(key);
@@ -3448,6 +3504,7 @@ async fn copy_id(
         wait: wait.clone(),
         death: Arc::default(),
         kill: kill.clone(),
+        algos: Arc::default(),
     };
     let hlabel = format!("{host}:{port}");
     let mut handle =

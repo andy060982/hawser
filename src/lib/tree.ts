@@ -223,10 +223,18 @@ export function renameFolder(nodes: HostNode[], folderId: string, name: string):
   })
 }
 
-/** A host's effective colour: its own if set, else the nearest ancestor
- *  folder's. Returns undefined when neither the host (nor a coloured ancestor)
- *  is found. Used for the wrong-window frame and the AI-off default. */
-export function effectiveHostColor(nodes: HostNode[], hostId: string): HostColor | undefined {
+/** A colour that actually overrides its folder's. `'none'` (the editor's
+ *  "off" chip, or an older hosts.json) means "no colour of my own", never
+ *  "opt out of my folder's policy": a host inside a red Production folder
+ *  stays red. Opting a host out of a red folder's policy takes moving it out
+ *  of the folder, a visible act. */
+export function ownColor(c: HostColor | undefined): HostColor | undefined {
+  return c && c !== 'none' ? c : undefined
+}
+
+/** The colour a host would inherit from its nearest coloured ancestor folder
+ *  (undefined at top level or when the host is not found). */
+export function inheritedHostColor(nodes: HostNode[], hostId: string): HostColor | undefined {
   const SEARCHING = Symbol('searching')
   const walk = (
     list: HostNode[],
@@ -234,16 +242,25 @@ export function effectiveHostColor(nodes: HostNode[], hostId: string): HostColor
   ): HostColor | undefined | typeof SEARCHING => {
     for (const n of list) {
       if (isFolder(n)) {
-        const res = walk(n.children, n.color ?? inherited)
+        const res = walk(n.children, ownColor(n.color) ?? inherited)
         if (res !== SEARCHING) return res
       } else if (n.id === hostId) {
-        return n.color ?? inherited
+        return inherited
       }
     }
     return SEARCHING
   }
   const r = walk(nodes, undefined)
   return r === SEARCHING ? undefined : r
+}
+
+/** A host's effective colour: its own if set, else the nearest ancestor
+ *  folder's. Returns undefined when neither the host (nor a coloured ancestor)
+ *  is found. Used for the wrong-window frame and every colour policy. */
+export function effectiveHostColor(nodes: HostNode[], hostId: string): HostColor | undefined {
+  const host = findHost(nodes, hostId)
+  if (!host) return undefined
+  return ownColor(host.color) ?? inheritedHostColor(nodes, hostId)
 }
 
 /** Set (or clear, with 'none'/undefined) a folder's accent colour. */
@@ -556,4 +573,38 @@ export class NarrowQueue {
   settle(batch: Map<string, number>): void {
     for (const [id, g] of batch) if (this.gen.get(id) === g) this.gen.delete(id)
   }
+}
+
+/** Hosts that ride `hostId` as their jump host (ProxyJump). */
+export function jumpDependents(nodes: HostNode[], hostId: string): Host[] {
+  return allHosts(nodes).filter((h) => h.id !== hostId && h.jumpHostId === hostId)
+}
+
+/** A display label per folder id: its name, or its full path ("Sites / East")
+ *  whenever another folder shares that name, so pickers can tell them apart. */
+export function folderLabels(nodes: HostNode[]): Map<string, string> {
+  const paths = new Map<string, string[]>()
+  const walk = (list: HostNode[], trail: string[]) => {
+    for (const n of list) {
+      if (!isFolder(n)) continue
+      const path = [...trail, n.name]
+      paths.set(n.id, path)
+      walk(n.children, path)
+    }
+  }
+  walk(nodes, [])
+  const count = new Map<string, number>()
+  for (const p of paths.values()) count.set(p[p.length - 1], (count.get(p[p.length - 1]) ?? 0) + 1)
+  const labels = new Map<string, string>()
+  const used = new Map<string, number>()
+  for (const [id, p] of paths) {
+    const name = p[p.length - 1]
+    let label = (count.get(name) ?? 0) > 1 ? p.join(' / ') : name
+    // Same name at the same path: number them in tree order.
+    const seen = (used.get(label) ?? 0) + 1
+    used.set(label, seen)
+    if (seen > 1) label = `${label} (${seen})`
+    labels.set(id, label)
+  }
+  return labels
 }

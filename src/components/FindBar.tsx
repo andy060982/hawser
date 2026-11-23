@@ -12,9 +12,13 @@ import { getTerm } from '../lib/termRegistry'
 --------------------------------------------------------------------------- */
 export function FindBar({
   sessionId,
+  focusNonce = 0,
   onClose,
 }: {
+  /** The pane to search: the focused one, followed as the user switches. */
   sessionId: string
+  /** Changes on every Ctrl+Shift+F, so pressing it again re-focuses. */
+  focusNonce?: number
   onClose: () => void
 }) {
   const [query, setQuery] = useState('')
@@ -22,7 +26,18 @@ export function FindBar({
 
   useEffect(() => {
     inputRef.current?.focus()
-  }, [])
+    inputRef.current?.select()
+  }, [focusNonce])
+
+  // Retarget: when the focused pane changes, the old pane's highlights go
+  // (they were left behind), and the search runs again in the new one.
+  useEffect(
+    () => () => {
+      getTerm(sessionId)?.search.clearDecorations()
+      getTerm(sessionId)?.term.clearSelection()
+    },
+    [sessionId],
+  )
 
   // Live-search as the query changes; decorations highlight every match.
   useEffect(() => {

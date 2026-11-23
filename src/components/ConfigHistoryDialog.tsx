@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Camera, FileDiff, GitCompareArrows, X } from 'lucide-react'
 import type { Host } from '../types'
 import { safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 
 interface SnapshotInfo {
   /** Snapshot id: a filename, or `legacy:<filename>` for one recorded before
@@ -96,11 +97,9 @@ export function ConfigHistoryDialog({
 
   useEffect(refresh, [refresh])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Escape closes this dialog only while it is the top modal (an alert over
+  // it takes its own Escape).
+  useModalLayer(true, onClose)
 
   /* Selection drives the viewer: one snapshot shows its content, two show
      their diff (chronologically ordered regardless of click order). A

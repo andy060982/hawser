@@ -3,6 +3,7 @@ import { Settings2, X } from 'lucide-react'
 import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { policyFor, useSettings } from '../lib/settings'
 import { safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 
 /* ---------------------------------------------------------------------------
    App settings: host-colour policies + safety toggles.
@@ -12,7 +13,7 @@ import { safeInvoke } from '../lib/tauri'
    rather than something baked into the code.
 --------------------------------------------------------------------------- */
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
-  const { settings, update, setColorPolicy } = useSettings()
+  const { settings, update, setColorPolicy, loadError, saveError, saveAnyway } = useSettings()
   const [shells, setShells] = useState<{ id: string; label: string; program: string }[]>([])
   useEffect(() => {
     void safeInvoke<{ id: string; label: string; program: string }[]>('local_shell_profiles').then(
@@ -20,11 +21,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     )
   }, [])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Escape closes this dialog only while it is the top modal.
+  useModalLayer(true, onClose)
 
   return (
     <div className="absolute inset-0 z-50 flex justify-center">
@@ -52,6 +50,25 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          {loadError && (
+            <div className="selectable mb-3 rounded border border-warn/50 bg-warn/10 px-3 py-2 text-[12px] text-warn">
+              Your saved settings could not be read, so the defaults are in use and changes are NOT being
+              saved (that would replace the file).
+              <span className="mt-1 block font-mono text-[11px] text-ink-dim">{loadError}</span>
+              <button
+                type="button"
+                onClick={saveAnyway}
+                className="mt-1.5 rounded border border-warn/60 px-2 py-0.5 text-[11.5px] text-warn hover:bg-warn/20"
+              >
+                Save these settings over it
+              </button>
+            </div>
+          )}
+          {saveError && !loadError && (
+            <p className="selectable mb-3 rounded border border-alert/40 bg-alert/10 px-3 py-2 text-[12px] text-alert">
+              Settings could not be saved; changes last only until Hawser closes. {saveError}
+            </p>
+          )}
           {/* --- Host colour policies --- */}
           <section>
             <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">

@@ -69,7 +69,15 @@ const update = (list: Transfer[], id: string, f: (t: Transfer) => Transfer): Tra
 export function applyProgress(list: Transfer[], p: TransferProgressEvent): Transfer[] {
   return update(list, p.transferId, (t) =>
     t.status === 'active' || t.status === 'queued'
-      ? { ...t, status: 'active', bytesDone: p.bytesTransferred, bytesTotal: p.totalBytes }
+      ? {
+          ...t,
+          status: 'active',
+          bytesDone: p.bytesTransferred,
+          bytesTotal: p.totalBytes,
+          // A live warning sticks until a newer one replaces it: later
+          // progress events carry none.
+          note: p.note ?? t.note,
+        }
       : t,
   )
 }

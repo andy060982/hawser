@@ -111,6 +111,15 @@ interface SettingsCtx {
   ready: boolean
   update: (patch: Partial<Settings>) => void
   setColorPolicy: (color: HostColor, patch: Partial<ColorPolicy>) => void
+  /** Why settings.json could not be read. While set, changes apply for this
+   *  run but are NOT saved (saving defaults would overwrite the real file),
+   *  until the user chooses `saveAnyway`. */
+  loadError: string | null
+  /** Why the last save failed; cleared by the next successful one. */
+  saveError: string | null
+  /** After a failed load: save the current settings over the unreadable
+   *  file from now on. */
+  saveAnyway: () => void
 }
 
 const Ctx = createContext<SettingsCtx | null>(null)
@@ -124,6 +133,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   // real file is read); only persist genuine user changes.
   const loaded = useRef(false)
   const [ready, setReady] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   useEffect(() => {
     void safeInvoke<unknown>('settings_load')
@@ -131,13 +142,30 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         setSettings(hydrate(raw))
         loaded.current = true
       })
+      .catch((e: unknown) => {
+        // Keep the defaults for this run, and say so: saving them would
+        // replace the user's real (unreadable right now) settings file.
+        setLoadError(e instanceof Error ? e.message : String(e))
+      })
       .finally(() => setReady(true))
+  }, [])
+
+  const save = useCallback((next: Settings) => {
+    void safeInvoke('settings_save', { settings: next })
+      .then(() => setSaveError(null))
+      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)))
   }, [])
 
   const persist = useCallback((next: Settings) => {
     setSettings(next)
-    if (loaded.current) void safeInvoke('settings_save', { settings: next }).catch(() => {})
-  }, [])
+    if (loaded.current) save(next)
+  }, [save])
+
+  const saveAnyway = useCallback(() => {
+    loaded.current = true
+    setLoadError(null)
+    save(settingsRef.current)
+  }, [save])
 
   const update = useCallback(
     (patch: Partial<Settings>) => persist({ ...settingsRef.current, ...patch }),
@@ -157,7 +185,11 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [persist],
   )
 
-  return <Ctx.Provider value={{ settings, ready, update, setColorPolicy }}>{children}</Ctx.Provider>
+  return (
+    <Ctx.Provider value={{ settings, ready, update, setColorPolicy, loadError, saveError, saveAnyway }}>
+      {children}
+    </Ctx.Provider>
+  )
 }
 
 export function useSettings(): SettingsCtx {

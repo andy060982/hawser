@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { KeyRound, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 
 interface AuthPromptField {
   prompt: string
@@ -89,18 +90,15 @@ export function AuthPromptDialog() {
     setBusy(false)
     firstRef.current?.focus()
 
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        void cancel()
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request?.requestId])
 
+  // Escape cancels authentication, while this prompt is the top modal.
+  const cancelRef = useRef<() => Promise<void>>(async () => {})
+  useModalLayer(!!request, () => void cancelRef.current())
+
   if (!request) return null
+  cancelRef.current = cancel
 
   async function submit(vals: string[]) {
     if (!request) return

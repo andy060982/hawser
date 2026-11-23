@@ -1,5 +1,14 @@
+import { useEffect, useState } from 'react'
 import { FileDiff, Lock, RotateCw, Wifi, WifiOff } from 'lucide-react'
 import type { Session } from '../types'
+import { safeInvoke } from '../lib/tauri'
+
+/** What the backend recorded from the key exchange (ssh::Negotiated). */
+interface Negotiated {
+  kex: string
+  cipher: string
+  hostKey: string
+}
 
 export function StatusBar({
   session, hostCount, size, onReconnect, configChange, onViewConfigChange, local = false,
@@ -17,6 +26,28 @@ export function StatusBar({
   onViewConfigChange?: () => void
 }) {
   const dead = session && session.status !== 'connected' && session.status !== 'connecting'
+
+  /* The real negotiated algorithms, read from the backend for the session
+     on show (it used to print a fixed "aes256-gcm · ed25519" for every
+     connection). Re-read on every connect; nothing is shown until known. */
+  const [algos, setAlgos] = useState<{ id: string; n: Negotiated } | null>(null)
+  const sid = session?.id
+  const connected = session?.status === 'connected' && !local
+  useEffect(() => {
+    if (!sid || !connected) return
+    // A new connection: the previous one's algorithms no longer apply.
+    setAlgos(null)
+    let live = true
+    void safeInvoke<Negotiated | null>('ssh_algorithms', { sessionId: sid })
+      .then((n) => {
+        if (live && n) setAlgos({ id: sid, n })
+      })
+      .catch(() => {})
+    return () => {
+      live = false
+    }
+  }, [sid, connected])
+  const shown = connected && algos && algos.id === sid ? algos.n : null
   return (
     <footer className="flex h-6 shrink-0 items-center gap-4 border-t border-line bg-surface-1 px-3 text-[11px] text-ink-faint">
       {session ? (
@@ -55,10 +86,13 @@ export function StatusBar({
               Config changed +{configChange.added} −{configChange.removed}
             </button>
           )}
-          {session.status === 'connected' && !local && (
-            <span className="flex items-center gap-1.5">
+          {shown && (
+            <span
+              className="flex items-center gap-1.5 font-mono"
+              title={`Negotiated with the server — key exchange: ${shown.kex}, cipher: ${shown.cipher}, host key: ${shown.hostKey}`}
+            >
               <Lock size={10} aria-hidden />
-              aes256-gcm · ed25519
+              {shown.cipher} · {shown.hostKey}
             </span>
           )}
           {/* Real measured geometry. This was a hardcoded 80x24 placeholder,

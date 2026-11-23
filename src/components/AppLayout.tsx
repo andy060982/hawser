@@ -4,10 +4,16 @@ import {
   addFolder, allFolders, allHosts, bindingChanged, catalogueProblem, countHosts,
   findHost, isBorrowed, moveHost, NarrowQueue, reidentify, sanitizeImport, setVaultFoldsCase,
   effectiveHostColor, removeFolder, removeHost, renameFolder, setFolderColor, upsertHost,
+  jumpDependents, folderLabels,
 } from '../lib/tree'
+import { anyModalOpen } from '../lib/modalStack'
+import { appShortcut } from '../lib/keyChords'
+import { snippetText } from '../lib/termInput'
+import { getTerm } from '../lib/termRegistry'
+import { closeConfirmText } from '../lib/closeGuard'
 import { setLocalRoot } from '../lib/localPath'
 import { resolveStartupCommands } from '../lib/startupPresets'
-import { safeInvoke, safeListen } from '../lib/tauri'
+import { inTauri, safeInvoke, safeListen } from '../lib/tauri'
 import { transfer as runTransfer, cancelTransfer } from '../lib/sftp'
 import {
   applyFailure, applyProgress, canRetry, clearFinished, markActive, markCancelled, markDone,
@@ -96,6 +102,10 @@ const SIDEBAR_DEFAULT = 260
 
 /** What `config_check` reports (utils::configs::ConfigCheck). */
 interface ConfigCheckResult {
+  /** The endpoint identity the backend actually snapshotted: the identity of
+   *  the connection it ran on, which a reconnect can have replaced since the
+   *  request was made. Routes the notice. */
+  endpoint?: string
   status: 'first' | 'unchanged' | 'changed'
   name: string | null
   previous: string | null
@@ -116,14 +126,24 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [showHistory, setShowHistory] = useState(false)
   const [showAudit, setShowAudit] = useState(false)
   const [showFind, setShowFind] = useState(false)
+  /** Bumped by each Ctrl+Shift+F, so an open find bar re-focuses its input. */
+  const [findNonce, setFindNonce] = useState(0)
   const [tunnelFor, setTunnelFor] = useState<Session | null>(null)
   const [netTools, setNetTools] = useState<{ target: string; port: number } | null>(null)
-  const [configFor, setConfigFor] = useState<Host | null>(null)
+  /** Config History target: the host (labels, capture command), the
+   *  endpoint identity whose snapshots to show, and the live session to run
+   *  lookups through, if one is connected to exactly that endpoint. */
+  const [configFor, setConfigFor] = useState<
+    { host: Host; endpoint: string; liveSessionId: string | null } | null
+  >(null)
   /** Snapshots to preselect when the config dialog opens from the change chip. */
   const [configSelect, setConfigSelect] = useState<string[] | undefined>(undefined)
   /** Per session: what the on-connect config check found, when it found a change. */
   const [configChanges, setConfigChanges] = useState<
-    Record<string, { hostId: string; added: number; removed: number; previous: string; name: string }>
+    Record<
+      string,
+      { hostId: string; endpoint: string; added: number; removed: number; previous: string; name: string }
+    >
   >({})
   /** Endpoint identity → when its config was last checked, so split panes and
    *  quick reconnects to one box don't each run the capture command again. */
@@ -193,7 +213,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     (h: Host) => endpointKey(h, (id) => findHost(hostsRef.current, id)),
     [],
   )
-  const { settings, ready: settingsReady } = useSettings()
+  const { settings, ready: settingsReady, loadError: settingsLoadError, saveError: settingsSaveError } =
+    useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
   const { confirm, alert, prompt } = useDialogs()
@@ -231,13 +252,35 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   )
   const activeAccent = hostColorHex(activeColor)
 
+  /* Settings that failed to load or save are said out loud once each (the
+     Settings dialog keeps a banner, and the way to save anyway). */
+  useEffect(() => {
+    if (!settingsLoadError) return
+    void alert(
+      `Your settings could not be read, so the defaults are in use and changes will not be saved this session (open Settings to save over the file).\n\n${settingsLoadError}`,
+      { title: 'Settings not loaded' },
+    )
+  }, [settingsLoadError, alert])
+  useEffect(() => {
+    if (!settingsSaveError) return
+    void alert(`Your settings change could not be saved, and lasts only until Hawser closes.\n\n${settingsSaveError}`, {
+      title: 'Settings not saved',
+    })
+  }, [settingsSaveError, alert])
+
   /* Remember which hosts were open, so a restart can pick them up again.
      Only host ids and view mode: a TCP connection cannot be serialised, so
      "restore" means reconnect, not resume. Anything that was RUNNING on the
      remote is gone unless it was inside tmux/screen — see the on-connect
      command field. */
+  /** Set once sessions.json has been read (or found absent/unreadable): a
+   *  save before then could write [] over the tabs it was about to restore
+   *  (a startup local shell reaching "connected" was enough). */
+  const [tabsRestored, setTabsRestored] = useState(false)
+  /** A sessions save failed and the user was told; cleared by the next success. */
+  const sessionsSaveFailedRef = useRef(false)
   useEffect(() => {
-    if (!loadedRef.current) return
+    if (!loadedRef.current || !tabsRestored) return
     // Persist everything except failed connections. Disconnected sessions are
     // kept on purpose: a dropped link or a dormant-restored tab should come
     // back next launch too, not just live ones. Only 'error' (auth failed, bad
@@ -248,7 +291,19 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       .filter((s) => s.status !== 'error' && !s.hostId.startsWith('local-'))
       .map((s) => ({ hostId: s.hostId, view: s.view, paneIndex: s.paneIndex }))
     void safeInvoke('sessions_save', { list: open })
-  }, [sessions])
+      .then(() => {
+        sessionsSaveFailedRef.current = false
+      })
+      .catch((e) => {
+        if (sessionsSaveFailedRef.current) return
+        sessionsSaveFailedRef.current = true
+        void alert(
+          `Your open tabs could not be saved, so they will not be restored next time unless a later save succeeds.\n\n${e instanceof Error ? e.message : e}`,
+          { title: 'Open tabs not saved' },
+        )
+      })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, tabsRestored])
 
   /* Catalogue load. Only a MISSING file (the backend's null) is a first run:
      keep the seed and write it out. A file that exists but cannot be read,
@@ -267,6 +322,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       .catch(() => {})
     const failed = (why: string) => {
       setHosts([])
+      // Nothing to restore against; startup actions waiting on it may run.
+      setTabsRestored(true)
       void alert(
         `Your saved hosts could not be loaded, so none are shown and changes will NOT be saved until this is fixed (restart Hawser after repairing the file).\n\n${why}`,
         { title: 'Host catalogue not loaded' },
@@ -330,6 +387,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       { hostId: string; view: WorkspaceView; paneIndex?: number }[] | null
     >('sessions_load').then((list) => {
       if (!Array.isArray(list)) return
+      const restored: Session[] = []
       list.forEach((entry, i) => {
         const host = findHost(hostsRef.current, entry.hostId)
         if (!host) return
@@ -348,14 +406,29 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           status: 'disconnected',
           view: entry.view ?? 'terminal',
         }
-        setSessions((prev) => [...prev, session])
+        restored.push(session)
         emitLocal(
           sid,
           `\x1b[38;5;244m${host.name} restored from your last session.\x1b[0m\r\n` +
             `\x1b[38;5;244mNot connected — press Reconnect (status bar) when ready.\x1b[0m\r\n`,
         )
       })
+      if (restored.length === 0) return
+      // Restored tabs come first in the strip, ahead of anything opened while
+      // the load ran (a startup local shell), and one of them is selected so
+      // the workspace never shows "No active session" beside a full strip.
+      setSessions((prev) => [...restored, ...prev])
+      setActiveId((cur) => cur ?? restored[0].id)
     })
+      .catch((e) => {
+        // Unreadable sessions.json: nothing to restore. Saving stays on (the
+        // next save replaces it), but the user hears why the tabs are gone.
+        void alert(`Your last session's tabs could not be restored: ${e instanceof Error ? e.message : e}`, {
+          title: 'Tabs not restored',
+        })
+      })
+      .finally(() => setTabsRestored(true))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [catalogueLoaded])
 
   /** Last save failure already reported, so a run of failing saves (a full
@@ -538,7 +611,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       ? Promise.resolve(null)
       : safeInvoke<string | null>('session_history', { endpoint: endpointFor(host), maxBytes: 12_000 })
     ).then((history) => {
-      if (!history) return
+      // The tab may have closed while the read ran: buffering for it would
+      // pin the text in localTerm forever.
+      if (!history || !sessionsRef.current.some((s) => s.id === session.id)) return
       emitLocal(
         session.id,
         `\x1b[38;5;240m--- previous session on ${host.name} (history, not live) ---\x1b[0m\r\n` +
@@ -588,7 +663,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         const { [sid]: _gone, ...rest } = m
         return rest
       })
-    const report = (sid: string, r: ConfigCheckResult) => {
+    const report = (sid: string, r: ConfigCheckResult, endpoint: string) => {
       if (r.status === 'first') {
         dropChip(sid)
         note(sid, 'config baseline saved; future connects will report changes against it')
@@ -604,7 +679,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         const { name, previous } = r
         setConfigChanges((m) => ({
           ...m,
-          [sid]: { hostId: host.id, added: r.added, removed: r.removed, previous, name },
+          [sid]: { hostId: host.id, endpoint, added: r.added, removed: r.removed, previous, name },
         }))
       }
     }
@@ -620,7 +695,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     if (missed) {
       undeliveredChangeRef.current.delete(ep)
       configCheckedRef.current.set(ep, Date.now())
-      report(sessionId, missed)
+      report(sessionId, missed, ep)
       return
     }
 
@@ -640,7 +715,11 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     })
       .then((r) => {
         if (!r) return
-        if (!current()) {
+        // Routed by what the backend actually snapshotted. If a reconnect
+        // replaced this tab's connection before the check ran, that is the
+        // new connection's endpoint, not the one this request was made for.
+        const checked = r.endpoint || ep
+        if (!current() || checked !== ep) {
           // Its tab closed or redialled before it landed. A change was already
           // saved as the new baseline, so it must still reach the user: in a
           // tab to this host that is already connected again, or else on the
@@ -652,18 +731,18 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             const live = sessionsRef.current.find((s) => {
               if (s.status !== 'connected') return false
               const dialledBy = dialledRef.current.get(s.id)
-              if (dialledBy !== undefined) return dialledBy === ep
+              if (dialledBy !== undefined) return dialledBy === checked
               const h = lookupHost(s.hostId)
-              return !!h && endpointFor(h) === ep
+              return !!h && endpointFor(h) === checked
             })
-            if (live) report(live.id, r)
-            else undeliveredChangeRef.current.set(ep, r)
+            if (live) report(live.id, r, checked)
+            else undeliveredChangeRef.current.set(checked, r)
           } else {
-            configCheckedRef.current.delete(ep)
+            configCheckedRef.current.delete(checked)
           }
           return
         }
-        report(sessionId, r)
+        report(sessionId, r, checked)
       })
       .catch((e: unknown) => {
         if (!current()) {
@@ -679,6 +758,20 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     const live = new Set(sessions.map((s) => s.id))
     configReplies.current.retain(live)
     for (const id of dialledRef.current.keys()) if (!live.has(id)) dialledRef.current.delete(id)
+    // Per-session UI state goes with its tab (these grew for the whole run).
+    const prune = <T,>(m: Record<string, T>): Record<string, T> => {
+      const stale = Object.keys(m).filter((id) => !live.has(id))
+      if (stale.length === 0) return m
+      const next = { ...m }
+      for (const id of stale) delete next[id]
+      return next
+    }
+    setSizes(prune)
+    setSftpPaths(prune)
+    const groupsLive = new Set(sessions.map((s) => s.groupId))
+    for (const g of Object.keys(lastPaneRef.current)) {
+      if (!groupsLive.has(g) || !live.has(lastPaneRef.current[g])) delete lastPaneRef.current[g]
+    }
     setConfigChanges((m) => {
       const stale = Object.keys(m).filter((id) => !live.has(id))
       if (stale.length === 0) return m
@@ -699,7 +792,18 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     configReplies.current.invalidate(sessionId)
     dialledRef.current.delete(sessionId)
 
-    const dial: Promise<unknown> = host.local
+    // A jump host that no longer exists (deleted, or a hand-edited id) fails
+    // the connect. Going direct instead would silently change the route, and
+    // send the password straight to an internal address from this network.
+    const jumpGone =
+      !host.local && !!host.jumpHostId && host.jumpHostId !== host.id && !findHost(hostsRef.current, host.jumpHostId)
+    const dial: Promise<unknown> = jumpGone
+      ? Promise.reject(
+          new Error(
+            `${host.name} is set to connect through a jump host that no longer exists. Edit the host and pick another jump host (or "Direct connection").`,
+          ),
+        )
+      : host.local
       ? safeInvoke('local_shell_start', {
           sessionId,
           profile: host.local.profile,
@@ -731,7 +835,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       ephemeral: ephemeralHostsRef.current.has(host.id),
       // ProxyJump: resolve the bastion's connection details from the
       // catalogue at dial time, so editing the bastion updates every host
-      // that rides it. Self-reference and missing hosts degrade to direct.
+      // that rides it. A self-reference degrades to direct; a missing
+      // bastion never gets here (jumpGone above).
       jump: (() => {
         if (!host.jumpHostId || host.jumpHostId === host.id) return null
         const j = findHost(hostsRef.current, host.jumpHostId)
@@ -853,6 +958,34 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     [hosts, persistHosts, alert],
   )
 
+  /** Delete a host after an explicit yes — from the sidebar menu and the
+   *  editor alike. Names the hosts that ride it as their jump host: they are
+   *  left pointing at it and refuse to connect until given another one (they
+   *  never silently go direct). Resolves whether it deleted. */
+  const requestDeleteHost = useCallback(
+    async (hostId: string): Promise<boolean> => {
+      const host = findHost(hostsRef.current, hostId)
+      if (!host) return false
+      const deps = jumpDependents(hostsRef.current, hostId)
+      const depText =
+        deps.length === 0
+          ? ''
+          : `\n\n${deps.length} host${deps.length === 1 ? ' uses' : 's use'} it as a jump host: ${deps
+              .slice(0, 8)
+              .map((d) => d.name)
+              .join(', ')}${deps.length > 8 ? ', …' : ''}. ${
+              deps.length === 1 ? 'It' : 'They'
+            } will refuse to connect until you pick another jump host.`
+      const ok = await confirm(
+        `Delete "${host.name}"? Its saved password is removed from the system credential store too, unless another host shares it.${depText}`,
+        { title: 'Delete host', confirmLabel: 'Delete', danger: true },
+      )
+      if (ok) deleteHost(hostId)
+      return ok
+    },
+    [confirm, deleteHost],
+  )
+
   /** Closes a whole tab: every pane in that session's group. */
   const closeSession = useCallback(async (id: string) => {
     // Confirm-close guard: if the setting is on and any pane in this tab is
@@ -874,26 +1007,29 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         return
       }
     }
-    setSessions((prev) => {
-      const target = prev.find((s) => s.id === id)
-      const doomed = new Set(
-        target ? prev.filter((s) => s.groupId === target.groupId).map((s) => s.id) : [id],
-      )
-      doomed.forEach((d) => {
-        clearLocal(d)
-        // Disarm a connect that has not dialled yet, or its fallback timer
-        // would open a shell for a tab that no longer exists.
-        pendingRef.current.delete(d)
-        void safeInvoke('ssh_disconnect', { sessionId: d })
-      })
-      const next = prev.filter((s) => !doomed.has(s.id))
-      setActiveId((cur) => {
-        if (cur && !doomed.has(cur)) return cur
-        // Focus the neighbour that took the closed tab's slot, else the last.
-        const idx = prev.findIndex((s) => s.id === id)
-        return next[Math.min(idx, next.length - 1)]?.id ?? null
-      })
-      return next
+    // Side effects run here, once, from the current list — not inside the
+    // state updater, which StrictMode calls twice.
+    const prev = sessionsRef.current
+    const target = prev.find((s) => s.id === id)
+    const doomed = new Set(
+      target ? prev.filter((s) => s.groupId === target.groupId).map((s) => s.id) : [id],
+    )
+    doomed.forEach((d) => {
+      clearLocal(d)
+      // Disarm a connect that has not dialled yet, or its fallback timer
+      // would open a shell for a tab that no longer exists.
+      pendingRef.current.delete(d)
+      void safeInvoke('ssh_disconnect', { sessionId: d })
+    })
+    const next = prev.filter((s) => !doomed.has(s.id))
+    const idx = prev.findIndex((s) => s.id === id)
+    const neighbour = next[Math.min(idx, next.length - 1)]?.id ?? null
+    sessionsRef.current = next
+    setSessions((cur) => cur.filter((s) => !doomed.has(s.id)))
+    setActiveId((cur) => {
+      if (cur && !doomed.has(cur)) return cur
+      // Focus the neighbour that took the closed tab's slot, else the last.
+      return neighbour
     })
   }, [confirm])
 
@@ -1045,13 +1181,21 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         return
       }
     }
-    const text = autoRun ? `${command}
-` : command
-    const bytes = Array.from(new TextEncoder().encode(text))
-    void safeInvoke('ssh_write', { sessionId, data: bytes }).catch((e: unknown) => {
-      const msg = e instanceof Error ? e.message : String(e)
-      emitLocal(sessionId, `\r\n\x1b[38;2;242;178;92m● snippet not sent\x1b[0m ${msg}\r\n`)
-    })
+    // Through the pane's own input path: the same ordered write queue as typed
+    // keys (a direct ssh_write could interleave with them), mirrored to the
+    // other panes when broadcast is on, and Enter as CR like the keyboard.
+    const text = snippetText(command, autoRun)
+    const pane = getTerm(sessionId)
+    if (pane) {
+      pane.input(text)
+      return
+    }
+    void safeInvoke('ssh_write', { sessionId, data: Array.from(new TextEncoder().encode(text)) }).catch(
+      (e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e)
+        emitLocal(sessionId, `\r\n\x1b[38;2;242;178;92m● snippet not sent\x1b[0m ${msg}\r\n`)
+      },
+    )
   }, [confirm])
 
   /** Quick connect: an ephemeral host, never saved, password (if any) used
@@ -1095,10 +1239,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
      list have loaded. */
   const startupLocalDone = useRef(false)
   useEffect(() => {
-    if (startupLocalDone.current || !settingsReady || shellProfiles.length === 0) return
+    // After the restored tabs, so the strip order does not depend on which
+    // load finished first.
+    if (startupLocalDone.current || !settingsReady || !tabsRestored || shellProfiles.length === 0) return
     startupLocalDone.current = true
     if (settingsRef.current.localShellOnStartup) openLocal()
-  }, [settingsReady, shellProfiles, openLocal])
+  }, [settingsReady, tabsRestored, shellProfiles, openLocal])
 
   const quickConnect = useCallback(
     (username: string, hostname: string, port: number, password: string | null) => {
@@ -1163,6 +1309,43 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     }
   }, [alert])
 
+  /** Move a host to a folder (null: top level). When that changes the
+   *  host's effective colour, its colour policy (AI access, connect confirm,
+   *  broadcast) changes with it, so the user confirms that first. */
+  const moveHostChecked = useCallback(
+    async (hostId: string, folderId: string | null) => {
+      const before = effectiveHostColor(hostsRef.current, hostId)
+      const next = moveHost(hostsRef.current, hostId, folderId)
+      const after = effectiveHostColor(next, hostId)
+      if ((before ?? 'none') !== (after ?? 'none')) {
+        const name = findHost(hostsRef.current, hostId)?.name ?? 'This host'
+        const ok = await confirm(
+          `${name} changes colour from ${before ?? 'none'} to ${after ?? 'none'} with this move, and gets that colour's policy (AI access, connect confirmation, broadcast).`,
+          { title: 'Colour policy changes', confirmLabel: 'Move' },
+        )
+        if (!ok) return
+      }
+      persistHosts(moveHost(hostsRef.current, hostId, folderId))
+    },
+    [confirm, persistHosts],
+  )
+
+  /** Config History for a saved host: its current endpoint, through a tab
+   *  connected to exactly that endpoint if there is one. */
+  const openConfigHistory = useCallback(
+    (host: Host) => {
+      const endpoint = endpointFor(host)
+      const live = sessionsRef.current.find(
+        (t) =>
+          t.hostId === host.id &&
+          t.status === 'connected' &&
+          (dialledRef.current.get(t.id) ?? endpoint) === endpoint,
+      )
+      setConfigFor({ host, endpoint, liveSessionId: live?.id ?? null })
+    },
+    [endpointFor],
+  )
+
   /** Right-click on a host row in the sidebar. */
   const openHostMenu = useCallback((host: Host, x: number, y: number) => {
     const live = sessionsRef.current.find(
@@ -1188,13 +1371,16 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       },
       {
         label: 'Config snapshots…',
-        onSelect: () => setConfigFor(host),
+        onSelect: () => openConfigHistory(host),
       },
       {
         label: 'Move to folder…',
         onSelect: () => {
           // Second-level menu: same anchor, new items. Cheaper and more
           // keyboard-predictable than nested hover submenus.
+          // Folders are labelled by their path, so two folders that share a
+          // name can be told apart.
+          const labels = folderLabels(hostsRef.current)
           const folders = allFolders(hostsRef.current)
           setMenu({
             x,
@@ -1202,11 +1388,11 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             items: [
               {
                 label: '(top level)',
-                onSelect: () => persistHosts(moveHost(hostsRef.current, host.id, null)),
+                onSelect: () => void moveHostChecked(host.id, null),
               },
               ...folders.map((f) => ({
-                label: f.name,
-                onSelect: () => persistHosts(moveHost(hostsRef.current, host.id, f.id)),
+                label: labels.get(f.id) ?? f.name,
+                onSelect: () => void moveHostChecked(host.id, f.id),
               })),
             ],
           })
@@ -1218,18 +1404,11 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         dividerBefore: true,
         // Deleting from a context menu must not be a single misclick on
         // something that also removes the stored password's referent.
-        onSelect: () => {
-          void confirm(
-            `Delete "${host.name}"? Its saved password is removed from the OS keychain too, unless another host shares it.`,
-            { title: 'Delete host', confirmLabel: 'Delete', danger: true },
-          ).then((ok) => {
-            if (ok) deleteHost(host.id)
-          })
-        },
+        onSelect: () => void requestDeleteHost(host.id),
       },
     ]
     setMenu({ x, y, items })
-  }, [openHost, deleteHost, persistHosts, confirm])
+  }, [openHost, requestDeleteHost, moveHostChecked, openConfigHistory])
 
   /** Right-click on a tab in the strip. */
   const openTabMenu = useCallback((sessionId: string, x: number, y: number) => {
@@ -1324,13 +1503,30 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           label: 'Delete folder (keep hosts)',
           danger: true,
           dividerBefore: true,
-          // Children are promoted, never deleted — so no confirm needed: the
-          // destructive-looking action cannot actually lose a host.
-          onSelect: () => persistHosts(removeFolder(hostsRef.current, folderId)),
+          // Children are promoted, never deleted, so no host is lost. But a
+          // coloured folder's hosts lose the colour they inherit (and its
+          // policy): that one case is confirmed.
+          onSelect: async () => {
+            const cur = hostsRef.current
+            const next = removeFolder(cur, folderId)
+            const changed = allHosts(cur).filter(
+              (h) => (effectiveHostColor(cur, h.id) ?? 'none') !== (effectiveHostColor(next, h.id) ?? 'none'),
+            )
+            if (
+              changed.length > 0 &&
+              !(await confirm(
+                `${changed.length} host${changed.length === 1 ? '' : 's'} in "${name}" will lose the folder's colour, and with it its policy (AI access, connect confirmation, broadcast).`,
+                { title: 'Delete folder', confirmLabel: 'Delete folder' },
+              ))
+            ) {
+              return
+            }
+            persistHosts(removeFolder(hostsRef.current, folderId))
+          },
         },
       ],
     })
-  }, [persistHosts])
+  }, [persistHosts, confirm])
 
   /** App menu from the title bar — the discoverable home for everything that
    *  was previously only reachable by knowing where to click. */
@@ -1428,18 +1624,16 @@ Passwords are NOT included — they stay in the system's credential store. On-co
     clearLocal(sessionId)
     pendingRef.current.delete(sessionId)
     void safeInvoke('ssh_disconnect', { sessionId })
-    setSessions((prev) => {
-      const closed = prev.find((s) => s.id === sessionId)
-      const next = prev.filter((s) => s.id !== sessionId)
-      setActiveId((cur) => {
-        if (cur && cur !== sessionId) return cur
-        // Prefer a sibling in the same tab, so closing a pane keeps you in that
-        // tab rather than jumping away; else fall back to any remaining session.
-        const sib = closed && next.find((s) => s.groupId === closed.groupId)
-        return (sib ?? next[next.length - 1])?.id ?? null
-      })
-      return next
-    })
+    const prev = sessionsRef.current
+    const closed = prev.find((s) => s.id === sessionId)
+    const next = prev.filter((s) => s.id !== sessionId)
+    // Prefer a sibling in the same tab, so closing a pane keeps you in that
+    // tab rather than jumping away; else fall back to any remaining session.
+    const sib = closed && next.find((s) => s.groupId === closed.groupId)
+    const fallback = (sib ?? next[next.length - 1])?.id ?? null
+    sessionsRef.current = next
+    setSessions((cur) => cur.filter((s) => s.id !== sessionId))
+    setActiveId((cur) => (cur && cur !== sessionId ? cur : fallback))
   }, [])
 
   /** The active tab's layout tree. Falls back to a single leaf for the focused
@@ -1571,43 +1765,44 @@ Passwords are NOT included — they stay in the system's credential store. On-co
   // management to those would quietly break line editing over SSH. Terminals
   // cannot encode Ctrl+Shift+<letter> distinctly, so that space is free for the
   // UI — the same reason Windows Terminal and VS Code use it.
+  // The chord table lives in lib/keyChords, shared with the terminal: a
+  // focused terminal hands every one of these chords back unprocessed, so they
+  // reach this listener and the remote never sees them.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!e.ctrlKey || e.altKey) return
-
-      // Ctrl+Tab cycles tabs; Shift reverses. Not a readline binding.
-      if (e.key === 'Tab') {
+      const sc = appShortcut(e)
+      if (!sc) return
+      // Behind a modal, app shortcuts do nothing: Ctrl+Shift+W would close
+      // the tab under a confirm, Ctrl+Shift+<digit> type a snippet into it.
+      if (anyModalOpen()) {
         e.preventDefault()
-        cycleTab(e.shiftKey ? -1 : 1)
         return
       }
 
-      // Ctrl+1..9 jumps to a tab by ordinal — also unclaimed by readline.
-      // Ordinal of the TAB strip (groups), not of the flat pane list.
-      const n = Number(e.key)
-      if (!e.shiftKey && Number.isInteger(n) && n >= 1 && n <= 9 && groups[n - 1]) {
-        e.preventDefault()
-        setActiveId(paneForGroup(groups[n - 1]))
-        return
-      }
-
-      if (!e.shiftKey) return
-
-      // Ctrl+Shift+<digit>: the focused host's snippet in that slot. Uses
-      // e.code (Digit1..Digit9) because Shift+1 produces "!" in e.key.
-      const slotMatch = /^Digit([1-9])$/.exec(e.code)
-      if (slotMatch && activeId) {
-        const cur = sessionsRef.current.find((t) => t.id === activeId)
-        const host = cur && findHost(hostsRef.current, cur.hostId)
-        const snip = host?.snippets?.find((sn) => sn.slot === Number(slotMatch[1]))
-        if (snip) {
+      switch (sc.kind) {
+        case 'cycleTab':
           e.preventDefault()
-          sendSnippet(activeId, snip.command, snip.autoRun ?? false)
+          cycleTab(sc.dir)
+          return
+        case 'gotoTab':
+          // Ordinal of the TAB strip (groups), not of the flat pane list.
+          e.preventDefault()
+          if (groups[sc.index]) setActiveId(paneForGroup(groups[sc.index]))
+          return
+        case 'snippet': {
+          e.preventDefault()
+          if (!activeId) return
+          const cur = sessionsRef.current.find((t) => t.id === activeId)
+          const host = cur && findHost(hostsRef.current, cur.hostId)
+          const snip = host?.snippets?.find((sn) => sn.slot === sc.slot)
+          if (snip) void sendSnippet(activeId, snip.command, snip.autoRun ?? false)
+          return
         }
-        return
+        case 'command':
+          break
       }
 
-      switch (e.code) {
+      switch (sc.code) {
         case 'KeyA': // AI assistant panel
           e.preventDefault()
           setShowAi((v) => !v)
@@ -1623,6 +1818,8 @@ Passwords are NOT included — they stay in the system's credential store. On-co
         case 'KeyF': // find in the focused terminal
           if (!activeId) break
           e.preventDefault()
+          // A fresh nonce each press: an open bar re-focuses its input.
+          setFindNonce((n) => n + 1)
           setShowFind(true)
           break
         case 'KeyE': // toggle Terminal <-> Files
@@ -1632,15 +1829,81 @@ Passwords are NOT included — they stay in the system's credential store. On-co
         case 'KeyW':
           if (!activeId) break
           e.preventDefault()
-          closeSession(activeId)
+          void closeSession(activeId)
           break
         default:
+          // KeyK belongs to the sidebar's own listener.
           break
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [active?.view, activeId, groups, paneForGroup, setView, closeSession, cycleTab, sendSnippet, openLocal])
+
+  /* Closing the window — the title-bar X, Alt+F4, and on macOS the menu's
+     Quit (Cmd+Q) — asks first while sessions are live (confirmCloseActive),
+     like closing a tab does. Tauri holds the close while this listener is
+     registered and destroys the window only if it is not prevented. */
+  const closingRef = useRef(false)
+  const confirmWindowClose = useCallback(async (): Promise<boolean> => {
+    const text = closeConfirmText(sessionsRef.current, settingsRef.current.confirmCloseActive)
+    if (!text) return true
+    return confirm(text, { title: 'Quit Hawser?', confirmLabel: 'Quit', danger: true })
+  }, [confirm])
+  useEffect(() => {
+    if (!inTauri()) return
+    let un: (() => void) | null = null
+    let dead = false
+    void import('@tauri-apps/api/window')
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onCloseRequested(async (ev) => {
+          // A second close while the first one's confirm is open: hold it.
+          if (closingRef.current) {
+            ev.preventDefault()
+            return
+          }
+          closingRef.current = true
+          try {
+            if (!(await confirmWindowClose())) ev.preventDefault()
+          } finally {
+            closingRef.current = false
+          }
+        }),
+      )
+      .then((fn) => {
+        if (dead) fn()
+        else un = fn
+      })
+      .catch(() => {})
+    return () => {
+      dead = true
+      un?.()
+    }
+  }, [confirmWindowClose])
+
+  /* macOS app menu (lib.rs): Cmd+W closes the active TAB (with the tab's own
+     confirm), never the window; Cmd+Q goes through the window close above. */
+  const closeActiveRef = useRef<() => void>(() => {})
+  closeActiveRef.current = () => {
+    if (anyModalOpen()) return
+    const id = activeId
+    if (id) void closeSession(id)
+  }
+  useEffect(() => {
+    const uns: (() => void)[] = []
+    let dead = false
+    const add = (p: Promise<() => void>) => void p.then((fn) => (dead ? fn() : uns.push(fn)))
+    add(safeListen<null>('menu://close-tab', () => closeActiveRef.current()))
+    add(
+      safeListen<null>('menu://quit', () => {
+        void import('@tauri-apps/api/window').then(({ getCurrentWindow }) => getCurrentWindow().close())
+      }),
+    )
+    return () => {
+      dead = true
+      uns.forEach((fn) => fn())
+    }
+  }, [])
 
   /* ---------------------------------------------------------------- render */
 
@@ -1745,12 +2008,18 @@ Passwords are NOT included — they stay in the system's credential store. On-co
         configChange={activeId ? configChanges[activeId] : undefined}
         local={!!(active && lookupHost(active.hostId)?.local)}
         onViewConfigChange={(() => {
-          const c = activeId ? configChanges[activeId] : undefined
+          const sid = activeId
+          const c = sid ? configChanges[sid] : undefined
           const h = c && lookupHost(c.hostId)
-          if (!c || !h) return undefined
+          if (!sid || !c || !h) return undefined
           return () => {
+            // The notice's own endpoint, through this tab only while it is
+            // still connected to exactly that endpoint: never the saved host's
+            // first connected tab, which can be another device by now.
+            const s = sessionsRef.current.find((t) => t.id === sid)
+            const live = s?.status === 'connected' && dialledRef.current.get(sid) === c.endpoint
             setConfigSelect([c.previous, c.name])
-            setConfigFor(h)
+            setConfigFor({ host: h, endpoint: c.endpoint, liveSessionId: live ? sid : null })
           }
         })()}
       />
@@ -1828,13 +2097,9 @@ Passwords are NOT included — they stay in the system's credential store. On-co
 
       {configFor && (
         <ConfigHistoryDialog
-          host={configFor}
-          endpoint={endpointFor(configFor)}
-          liveSessionId={
-            sessions.find(
-              (t) => t.hostId === configFor.id && t.status === 'connected',
-            )?.id ?? null
-          }
+          host={configFor.host}
+          endpoint={configFor.endpoint}
+          liveSessionId={configFor.liveSessionId}
           initialSelected={configSelect}
           onClose={() => {
             setConfigFor(null)
@@ -1856,7 +2121,7 @@ Passwords are NOT included — they stay in the system's credential store. On-co
       )}
 
       {showFind && activeId && (
-        <FindBar sessionId={activeId} onClose={() => setShowFind(false)} />
+        <FindBar sessionId={activeId} focusNonce={findNonce} onClose={() => setShowFind(false)} />
       )}
 
       {editing && (
@@ -1864,7 +2129,7 @@ Passwords are NOT included — they stay in the system's credential store. On-co
           host={editing.host}
           catalogue={hosts}
           onSave={saveHost}
-          onDelete={deleteHost}
+          onDelete={requestDeleteHost}
           onClose={() => setEditing(null)}
         />
       )}

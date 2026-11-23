@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, Fingerprint, ShieldAlert, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 
 interface HostKeyRequest {
   requestId: string
@@ -93,18 +94,15 @@ export function HostKeyDialog() {
     setCopied(false)
     cancelRef.current?.focus()
 
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        void respond(false)
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request?.requestId])
 
+  // Escape denies, while this prompt is the top modal.
+  useModalLayer(!!request, () => void respondRef.current(false))
+  const respondRef = useRef<(accept: boolean) => Promise<void>>(async () => {})
+
   if (!request) return null
+  respondRef.current = respond
 
   async function respond(accept: boolean) {
     if (!request) return

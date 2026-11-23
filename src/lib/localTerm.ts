@@ -13,8 +13,19 @@ type Handler = (text: string) => void
 
 const subscribers = new Map<string, Set<Handler>>()
 const pending = new Map<string, string[]>()
+/** Buffered text on its way to a pane that just subscribed. Delivered on a
+ *  microtask, not inside onLocal: React StrictMode mounts a pane, unmounts it
+ *  and mounts it again in one go, and a synchronous flush handed the buffered
+ *  notices ("restored…", "connection failed") to the throwaway first mount.
+ *  Text emitted meanwhile queues behind it, so order is kept. */
+const flushing = new Map<string, string[]>()
 
 export function emitLocal(sessionId: string, text: string): void {
+  const inFlight = flushing.get(sessionId)
+  if (inFlight) {
+    inFlight.push(text)
+    return
+  }
   const subs = subscribers.get(sessionId)
   if (subs && subs.size > 0) {
     subs.forEach((h) => h(text))
@@ -30,11 +41,20 @@ export function onLocal(sessionId: string, handler: Handler): () => void {
   subs.add(handler)
   subscribers.set(sessionId, subs)
 
-  // Flush anything that arrived before this pane existed.
+  // Flush anything that arrived before this pane existed, to whichever pane
+  // is subscribed once the current commit settles.
   const queued = pending.get(sessionId)
-  if (queued?.length) {
+  if (queued?.length && !flushing.has(sessionId)) {
     pending.delete(sessionId)
-    queued.forEach((t) => handler(t))
+    flushing.set(sessionId, queued)
+    queueMicrotask(() => {
+      const list = flushing.get(sessionId)
+      flushing.delete(sessionId)
+      if (!list || list.length === 0) return
+      const live = subscribers.get(sessionId)
+      if (live && live.size > 0) list.forEach((t) => live.forEach((h) => h(t)))
+      else pending.set(sessionId, [...list, ...(pending.get(sessionId) ?? [])])
+    })
   }
 
   return () => {
@@ -50,5 +70,11 @@ export function onLocal(sessionId: string, handler: Handler): () => void {
  *  session that happens to reuse the id. */
 export function clearLocal(sessionId: string): void {
   pending.delete(sessionId)
+  flushing.delete(sessionId)
   subscribers.delete(sessionId)
+}
+
+/** Whether text is buffered for a session no pane has picked up (tests). */
+export function hasPendingLocal(sessionId: string): boolean {
+  return (pending.get(sessionId)?.length ?? 0) > 0
 }

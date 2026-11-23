@@ -7,6 +7,8 @@ import type { Session } from '../types'
 import { safeInvoke, safeListen, inTauri } from '../lib/tauri'
 import { onLocal } from '../lib/localTerm'
 import { isDangerousCommand } from '../lib/dangerous'
+import { terminalKeyAction } from '../lib/keyChords'
+import { planPaste, shouldBroadcast } from '../lib/termInput'
 import { useSettings } from '../lib/settings'
 import { useDialogs } from '../lib/dialogs'
 import { registerTerm, unregisterTerm } from '../lib/termRegistry'
@@ -157,7 +159,6 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     const search = new SearchAddon()
     term.loadAddon(search)
     term.open(host)
-    registerTerm(session.id, term, search)
 
     // WebGL renderer: the difference between smooth and unusable when tailing a
     // busy log. Context loss (GPU reset, driver update, RDP reconnect) silently
@@ -183,6 +184,22 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     // full clipboard text before it reaches the shell; term.paste keeps
     // bracketed-paste framing.
     const doPaste = async (text: string) => {
+      // Without bracketed paste every line break is Enter, so each line runs
+      // the moment it lands (Cisco IOS, PAN-OS, Junos, cmd.exe, plain sh never
+      // enable it). That takes an explicit yes. Checked again after any dialog:
+      // the remote can switch the mode while one is open.
+      const plan = planPaste(text, term.modes.bracketedPasteMode)
+      if (
+        plan.kind === 'confirm' &&
+        !(await confirmRef.current(
+          `This paste has ${plan.lines} line break${plan.lines === 1 ? '' : 's'}, and this terminal has not enabled bracketed paste, so ${
+            plan.lines === 1 ? 'the line runs' : `${plan.lines} lines run`
+          } as soon as it lands. Paste it?`,
+          { title: 'Multi-line paste', confirmLabel: 'Paste and run', danger: true },
+        ))
+      ) {
+        return
+      }
       if (settingsRef.current.dangerousGuard) {
         const reason = isDangerousCommand(text)
         if (
@@ -240,7 +257,9 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     // keys vanish, Enter does nothing, no clue why. Report it once — per
     // keystroke would paint the screen with duplicates.
     let warnedDead = false
-    const send = (bytes: number[]) => {
+    /** `mirror`: this chunk is user input, so broadcast may copy it to the
+     *  sibling panes (see shouldBroadcast). */
+    const send = (bytes: number[], mirror: boolean) => {
       void queueWrite(session.id, bytes).catch(
         (e: unknown) => {
           if (warnedDead) return
@@ -255,10 +274,16 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
       // Broadcast: mirror the same bytes to sibling panes. Fire-and-forget and
       // errors ignored — a dead sibling is not this pane's problem to report,
       // and the input-not-sent notice above already covers the focused one.
+      if (!mirror) return
       for (const other of broadcastRef.current) {
         void queueWrite(other, bytes).catch(() => {})
       }
     }
+
+    // Snippets and other app-originated input: as typed, through the same
+    // ordered queue, and mirrored like typed input.
+    const encodeText = (text: string) => Array.from(encoder.encode(text))
+    registerTerm(session.id, { term, search, input: (text) => send(encodeText(text), true) })
 
     // Right-click pastes, PuTTY-style — the muscle memory every network admin
     // brings to a terminal. The browser context menu is suppressed only inside
@@ -270,9 +295,10 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
       // With a selection, right-click copies it and clears — but copy-on-select
       // has usually already put it on the clipboard, so this is mostly a no-op
       // confirmation. Without a selection, right-click pastes (PuTTY muscle
-      // memory). doPaste applies the dangerous-command guard, then term.paste
-      // (not a raw send) so xterm keeps bracketed-paste framing — a multi-line
-      // payload arrives inert for review instead of auto-running.
+      // memory). doPaste confirms a multi-line paste the remote would run line
+      // by line, applies the dangerous-command guard, then term.paste (not a
+      // raw send) so xterm adds bracketed-paste framing when the remote asked
+      // for it.
       if (copySelection()) {
         term.clearSelection()
         return
@@ -319,8 +345,27 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     }
     host.addEventListener('paste', onPaste, true)
 
+    /* Which onData chunks the user produced. xterm marks its own replies
+       (DA, CPR, DECRQM, OSC colour reports, focus reports) as not user
+       input; only its internal core service exposes that flag, as an
+       onUserInput event fired synchronously just before the matching onData.
+       If a future xterm hides it, shouldBroadcast falls back to the chunk's
+       shape (userInput null). */
+    let userInput = false
+    const core = (term as unknown as {
+      _core?: { coreService?: { onUserInput?: (cb: () => void) => { dispose(): void } } }
+    })._core
+    const userSub =
+      typeof core?.coreService?.onUserInput === 'function'
+        ? core.coreService.onUserInput(() => {
+            userInput = true
+          })
+        : null
+
     const dataSub = term.onData((data) => {
-      send(Array.from(encoder.encode(data)))
+      const fromUser = userSub ? userInput : null
+      userInput = false
+      send(encodeText(data), shouldBroadcast(data, fromUser))
 
       // Local echo so the layout stays usable in a plain browser (npm run dev)
       // with no backend attached.
@@ -328,9 +373,10 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     })
 
     // onBinary carries latin1-encoded bytes — one char per byte — so charCodeAt
-    // is correct here and TextEncoder would be actively wrong.
+    // is correct here and TextEncoder would be actively wrong. Only X10 mouse
+    // reports travel this way: a position in THIS pane, never broadcast.
     const binarySub = term.onBinary((data) => {
-      send(Array.from(data, (ch) => ch.charCodeAt(0) & 0xff))
+      send(Array.from(data, (ch) => ch.charCodeAt(0) & 0xff), false)
     })
 
     /* -------------------------------------------------- copy / paste keys */
@@ -339,51 +385,66 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     // reach the remote as SIGINT. Returning false tells xterm "handled, do not
     // forward to the PTY". Ctrl+Shift+C/V are the unambiguous forms.
     term.attachCustomKeyEventHandler((e) => {
+      if (e.type === 'keyup') return true
+      const action = terminalKeyAction(e)
+
+      // App shortcuts (Ctrl+Tab, Ctrl+1..9, Ctrl+Shift+1..9, Ctrl+Shift+A/E/F/
+      // K/P/T/W) belong to the app even while the terminal has focus.
+      // Returning false makes xterm skip the key WITHOUT cancelling it, so it
+      // bubbles to the window listener in AppLayout; preventDefault keeps the
+      // textarea from inserting anything. The remote receives nothing.
+      if (action === 'app') {
+        e.preventDefault()
+        return false
+      }
       if (e.type !== 'keydown') return true
 
       // Every branch below that handles the key also cancels the browser's own
       // default for it: returning false only stops xterm, and on Windows
       // (WebView2) Ctrl+Shift+V is the native "paste as plain text", which
       // would fire a second, independent paste through onPaste.
-      if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
-        e.preventDefault()
-        copySelection()
-        return false
-      }
-      if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
-        e.preventDefault()
-        e.stopPropagation()
-        // Guarded paste — see pasteFromClipboard and the context-menu paste above.
-        pasteFromClipboard()
-        return false
-      }
-      if (e.ctrlKey && !e.shiftKey && e.code === 'KeyC' && term.hasSelection()) {
-        copySelection()
-        term.clearSelection()
-        return false
-      }
-
-      // Font zoom: Ctrl +/- to resize this pane's text, Ctrl+0 to reset —
-      // like a browser. Clamped, then re-fit AND re-sent to the remote PTY: the
-      // host box does not change size, so the ResizeObserver never fires, and a
-      // bare fit() left the remote drawing at the old width.
-      if (e.ctrlKey && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
-        e.preventDefault()
-        term.options.fontSize = Math.min((term.options.fontSize ?? TERMINAL_FONT_SIZE) + 1, 32)
-        pushResize()
-        return false
-      }
-      if (e.ctrlKey && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
-        e.preventDefault()
-        term.options.fontSize = Math.max((term.options.fontSize ?? TERMINAL_FONT_SIZE) - 1, 8)
-        pushResize()
-        return false
-      }
-      if (e.ctrlKey && (e.code === 'Digit0' || e.code === 'Numpad0')) {
-        e.preventDefault()
-        term.options.fontSize = TERMINAL_FONT_SIZE
-        pushResize()
-        return false
+      // AltGr (Ctrl+Alt on Windows) never reaches here as a Ctrl chord: a
+      // German `}` or Polish `ć` is text, not zoom or copy (lib/keyChords).
+      switch (action) {
+        case 'copy':
+          e.preventDefault()
+          copySelection()
+          return false
+        case 'paste':
+          e.preventDefault()
+          e.stopPropagation()
+          // Guarded paste — see pasteFromClipboard and the context-menu paste above.
+          pasteFromClipboard()
+          return false
+        case 'copyOrInterrupt':
+          // Ctrl+C is overloaded: with a selection it means copy, without one
+          // it must reach the remote as SIGINT.
+          if (!term.hasSelection()) break
+          copySelection()
+          term.clearSelection()
+          return false
+        // Font zoom: Ctrl +/- to resize this pane's text, Ctrl+0 to reset —
+        // like a browser. Clamped, then re-fit AND re-sent to the remote PTY:
+        // the host box does not change size, so the ResizeObserver never
+        // fires, and a bare fit() left the remote drawing at the old width.
+        // Ctrl+Shift+Minus is Ctrl+_ (readline undo) and goes to the shell.
+        case 'zoomIn':
+          e.preventDefault()
+          term.options.fontSize = Math.min((term.options.fontSize ?? TERMINAL_FONT_SIZE) + 1, 32)
+          pushResize()
+          return false
+        case 'zoomOut':
+          e.preventDefault()
+          term.options.fontSize = Math.max((term.options.fontSize ?? TERMINAL_FONT_SIZE) - 1, 8)
+          pushResize()
+          return false
+        case 'zoomReset':
+          e.preventDefault()
+          term.options.fontSize = TERMINAL_FONT_SIZE
+          pushResize()
+          return false
+        default:
+          break
       }
 
       // Any other keystroke drops the selection.
@@ -410,6 +471,17 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     // before the backend listener so buffered messages flush immediately.
     const unLocal = onLocal(session.id, (text) => term.write(text))
 
+    /* The first size report is what dials (AppLayout connectPending), and the
+       backend does not buffer output for a listener that is not there yet. So
+       the pane reports its size only once its output listener is registered
+       (or failed to register: the dial still happens, and the error shows). */
+    let listening = false
+    const listenSettled = () => {
+      listening = true
+      if (disposed) return
+      const { cols, rows } = sizeRef.current
+      if (cols > 0 && rows > 0) onSizeRef.current?.(session.id, cols, rows)
+    }
     void safeListen<string>(`ssh://${session.id}`, (chunk) => {
       term.write(chunk)
     })
@@ -417,12 +489,14 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
         // The session may have closed while the listener was registering.
         if (disposed) un()
         else unlisten = un
+        listenSettled()
       })
       .catch((e: unknown) => {
         // Without this the failure is an unhandled rejection and the pane just
         // stays blank while the session connects.
         const msg = e instanceof Error ? e.message : String(e)
         term.write(`\r\n\x1b[38;2;242;178;92m● cannot receive output\x1b[0m ${msg}\r\n`)
+        listenSettled()
       })
 
     /* ------------------------------------------------------------ sizing */
@@ -451,7 +525,7 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
       const { cols, rows } = term
       if (cols === sizeRef.current.cols && rows === sizeRef.current.rows) return
       sizeRef.current = { cols, rows }
-      onSizeRef.current?.(session.id, cols, rows)
+      if (listening) onSizeRef.current?.(session.id, cols, rows)
       sendResize()
     }
     pushResizeRef.current = pushResize
@@ -487,6 +561,7 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
       unregisterTerm(session.id)
       dataSub.dispose()
       binarySub.dispose()
+      userSub?.dispose()
       // Dispose the renderer before the Terminal: the reverse order leaks the
       // WebGL context until GC, and browsers cap live contexts at roughly 16.
       webgl?.dispose()
