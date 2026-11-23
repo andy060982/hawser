@@ -7,8 +7,14 @@ import type { Session } from '../types'
 import { safeInvoke, safeListen, inTauri } from '../lib/tauri'
 import { onLocal } from '../lib/localTerm'
 import { isDangerousCommand } from '../lib/dangerous'
-import { terminalKeyAction } from '../lib/keyChords'
-import { planPaste, shouldBroadcast } from '../lib/termInput'
+import { openTabCount, terminalKeyAction } from '../lib/keyChords'
+import {
+  bracketedNow,
+  pasteMirrorText,
+  pasteNeedsConfirmNow,
+  planPaste,
+  shouldBroadcast,
+} from '../lib/termInput'
 import { useSettings } from '../lib/settings'
 import { useDialogs } from '../lib/dialogs'
 import { registerTerm, unregisterTerm } from '../lib/termRegistry'
@@ -180,40 +186,86 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     termRef.current = term
     fitRef.current = fit
 
+    /** Set while this pane writes a paste of its own (pasteLocal): onData
+     *  then sends to this pane only. xterm's paste() fires onData
+     *  synchronously, so the flag covers exactly that one chunk. */
+    let localOnly = false
+    const pasteLocal = (text: string) => {
+      localOnly = true
+      try {
+        term.paste(text)
+      } finally {
+        localOnly = false
+      }
+    }
+
     // All paste paths funnel here so the dangerous-command guard can inspect the
     // full clipboard text before it reaches the shell; term.paste keeps
     // bracketed-paste framing.
+    //
+    // Broadcast: a paste goes to this pane only, unless it is one plain line
+    // (lib/termInput pasteMirrorText), which is mirrored unframed as if typed.
+    // Multi-line text is never broadcast: a sibling whose CLI has not enabled
+    // bracketed paste would run every line.
     const doPaste = async (text: string) => {
+      const mirrorText = pasteMirrorText(text)
+      const localNote =
+        mirrorText === null && broadcastRef.current.length > 0
+          ? '\n\nBroadcast is on, but this paste goes only to this pane: multi-line text (or text with control characters) is never sent to the other panes.'
+          : ''
+      const breaks = planPaste(text, false)
+      const lines = breaks.kind === 'confirm' ? breaks.lines : 0
       // Without bracketed paste every line break is Enter, so each line runs
       // the moment it lands (Cisco IOS, PAN-OS, Junos, cmd.exe, plain sh never
-      // enable it). That takes an explicit yes. Checked again after any dialog:
-      // the remote can switch the mode while one is open.
-      const plan = planPaste(text, term.modes.bracketedPasteMode)
-      if (
-        plan.kind === 'confirm' &&
-        !(await confirmRef.current(
-          `This paste has ${plan.lines} line break${plan.lines === 1 ? '' : 's'}, and this terminal has not enabled bracketed paste, so ${
-            plan.lines === 1 ? 'the line runs' : `${plan.lines} lines run`
-          } as soon as it lands. Paste it?`,
+      // enable it). That takes an explicit yes.
+      const askMulti = () =>
+        confirmRef.current(
+          `This paste has ${lines} line break${lines === 1 ? '' : 's'}, and this terminal has not enabled bracketed paste, so ${
+            lines === 1 ? 'the line runs' : `${lines} lines run`
+          } as soon as it lands. Paste it?${localNote}`,
           { title: 'Multi-line paste', confirmLabel: 'Paste and run', danger: true },
-        ))
-      ) {
-        return
+        )
+      let multiOk = false
+      let noted = false
+      if (pasteNeedsConfirmNow(text, bracketedNow(term), false)) {
+        if (!(await askMulti())) return
+        multiOk = true
+        noted = true
+      } else if (localNote) {
+        if (
+          !(await confirmRef.current(`Paste into this pane only?${localNote}`, {
+            title: 'Paste not broadcast',
+            confirmLabel: 'Paste here',
+          }))
+        ) {
+          return
+        }
+        noted = true
       }
       if (settingsRef.current.dangerousGuard) {
         const reason = isDangerousCommand(text)
         if (
           reason &&
-          !(await confirmRef.current(`Pasted text looks destructive (${reason}). Paste it?`, {
-            title: 'Destructive paste',
-            confirmLabel: 'Paste',
-            danger: true,
-          }))
+          !(await confirmRef.current(
+            `Pasted text looks destructive (${reason}). Paste it?${noted ? '' : localNote}`,
+            { title: 'Destructive paste', confirmLabel: 'Paste', danger: true },
+          ))
         ) {
           return
         }
       }
-      term.paste(text)
+      if (disposed) return
+      // Re-checked synchronously after the dialogs: the remote can switch
+      // bracketed paste off while one is open. Once the multi-line confirm has
+      // been given, either mode is fine; no await follows it before writing.
+      if (pasteNeedsConfirmNow(text, bracketedNow(term), multiOk)) {
+        if (!(await askMulti()) || disposed) return
+      }
+      pasteLocal(text)
+      if (mirrorText !== null) {
+        const bytes = encodeText(mirrorText)
+        for (const other of broadcastRef.current) void queueWrite(other, bytes).catch(() => {})
+      }
     }
 
     // Read the clipboard and paste it through the guard. Shared by every paste
@@ -251,15 +303,16 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     // expects; handing over the JS string would re-encode anything outside
     // ASCII and corrupt both pasted text and escape sequences.
     const encoder = new TextEncoder()
+    const encodeText = (text: string) => Array.from(encoder.encode(text))
 
     // A write into a session that never connected rejects with "no open
     // session". Swallowing that is what made a dead tab look like a hung app:
     // keys vanish, Enter does nothing, no clue why. Report it once — per
     // keystroke would paint the screen with duplicates.
     let warnedDead = false
-    /** `mirror`: this chunk is user input, so broadcast may copy it to the
-     *  sibling panes (see shouldBroadcast). */
-    const send = (bytes: number[], mirror: boolean) => {
+    /** `mirrorTo`: the sibling sessions that get the same bytes ([] for this
+     *  pane only; see shouldBroadcast and pasteMirrorText). */
+    const send = (bytes: number[], mirrorTo: readonly string[]) => {
       void queueWrite(session.id, bytes).catch(
         (e: unknown) => {
           if (warnedDead) return
@@ -274,16 +327,20 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
       // Broadcast: mirror the same bytes to sibling panes. Fire-and-forget and
       // errors ignored — a dead sibling is not this pane's problem to report,
       // and the input-not-sent notice above already covers the focused one.
-      if (!mirror) return
-      for (const other of broadcastRef.current) {
+      for (const other of mirrorTo) {
         void queueWrite(other, bytes).catch(() => {})
       }
     }
 
-    // Snippets and other app-originated input: as typed, through the same
-    // ordered queue, and mirrored like typed input.
-    const encodeText = (text: string) => Array.from(encoder.encode(text))
-    registerTerm(session.id, { term, search, input: (text) => send(encodeText(text), true) })
+    // Snippets: as typed, through the same ordered queue, to exactly the
+    // siblings the caller approved. AI insert: pasteLocal, never broadcast.
+    registerTerm(session.id, {
+      term,
+      search,
+      input: (text, mirrorTo) => send(encodeText(text), mirrorTo),
+      pasteLocal,
+      broadcastTargets: () => [...broadcastRef.current],
+    })
 
     // Right-click pastes, PuTTY-style — the muscle memory every network admin
     // brings to a terminal. The browser context menu is suppressed only inside
@@ -365,7 +422,8 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     const dataSub = term.onData((data) => {
       const fromUser = userSub ? userInput : null
       userInput = false
-      send(encodeText(data), shouldBroadcast(data, fromUser))
+      const mirror = !localOnly && shouldBroadcast(data, fromUser)
+      send(encodeText(data), mirror ? broadcastRef.current : [])
 
       // Local echo so the layout stays usable in a plain browser (npm run dev)
       // with no backend attached.
@@ -376,7 +434,7 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     // is correct here and TextEncoder would be actively wrong. Only X10 mouse
     // reports travel this way: a position in THIS pane, never broadcast.
     const binarySub = term.onBinary((data) => {
-      send(Array.from(data, (ch) => ch.charCodeAt(0) & 0xff), false)
+      send(Array.from(data, (ch) => ch.charCodeAt(0) & 0xff), [])
     })
 
     /* -------------------------------------------------- copy / paste keys */
@@ -386,7 +444,7 @@ export function TerminalPane({ session, visible, focused = true, onSize, broadca
     // forward to the PTY". Ctrl+Shift+C/V are the unambiguous forms.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type === 'keyup') return true
-      const action = terminalKeyAction(e)
+      const action = terminalKeyAction(e, openTabCount())
 
       // App shortcuts (Ctrl+Tab, Ctrl+1..9, Ctrl+Shift+1..9, Ctrl+Shift+A/E/F/
       // K/P/T/W) belong to the app even while the terminal has focus.

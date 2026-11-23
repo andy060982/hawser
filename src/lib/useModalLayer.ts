@@ -1,18 +1,19 @@
 import { useEffect, useRef } from 'react'
-import { modals } from './modalStack'
+import { LAYER, modals } from './modalStack'
 
 /** Register a modal layer while `active`, and run `onEscape` for an Escape
  *  pressed while this layer is the top one (see modalStack). Returns a ref
  *  holding the layer id (0 while inactive), set before any key can arrive,
- *  for handlers of other keys that must also act only on top. */
-export function useModalLayer(active: boolean, onEscape?: () => void) {
+ *  for handlers of other keys that must also act only on top. `priority` is
+ *  the layer's z-order tier (modalStack LAYER), matching its CSS z-index. */
+export function useModalLayer(active: boolean, onEscape?: () => void, priority: number = LAYER.panel) {
   const onEscapeRef = useRef(onEscape)
   onEscapeRef.current = onEscape
   const idRef = useRef(0)
 
   useEffect(() => {
     if (!active) return
-    const id = modals.push()
+    const id = modals.push(priority)
     idRef.current = id
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || !modals.isTop(id)) return
@@ -28,6 +29,7 @@ export function useModalLayer(active: boolean, onEscape?: () => void) {
       modals.remove(id)
       if (idRef.current === id) idRef.current = 0
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active])
 
   return idRef

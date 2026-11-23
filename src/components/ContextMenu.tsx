@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState } from 'react'
 import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 
 export interface MenuItem {
   label: string
@@ -45,7 +46,7 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
   }, [menu])
 
   // A layer while open: Escape closes the menu only, never a dialog under it.
-  useModalLayer(!!menu, onClose)
+  useModalLayer(!!menu, onClose, LAYER.menu)
 
   if (!menu) return null
 

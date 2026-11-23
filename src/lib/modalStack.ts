@@ -8,29 +8,58 @@
  *  stay off while any modal is open. Pure (no React) so it is tested directly;
  *  the hook lives in useModalLayer.ts. */
 export class ModalStack {
-  private layers: number[] = []
+  private layers: { id: number; priority: number }[] = []
   private next = 0
 
-  /** Open a layer above every current one. */
-  push(): number {
+  /** Open a layer at `priority` (its z-order tier, see LAYER). It is on top
+   *  of every layer of a lower tier whenever it was opened, and of layers of
+   *  its own tier opened before it. Registration order alone used to decide,
+   *  so a host-key prompt that arrived after the quit confirm took Escape and
+   *  Enter while it was painted underneath. */
+  push(priority: number = LAYER.panel): number {
     const id = ++this.next
-    this.layers.push(id)
+    this.layers.push({ id, priority })
     return id
   }
 
   /** Close a layer, wherever it is in the stack. */
   remove(id: number): void {
-    this.layers = this.layers.filter((l) => l !== id)
+    this.layers = this.layers.filter((l) => l.id !== id)
+  }
+
+  /** The layer that gets keys: highest tier, latest within it. */
+  top(): number | null {
+    let best: { id: number; priority: number } | null = null
+    for (const l of this.layers) if (!best || l.priority >= best.priority) best = l
+    return best ? best.id : null
   }
 
   isTop(id: number): boolean {
-    return this.layers.length > 0 && this.layers[this.layers.length - 1] === id
+    return id !== 0 && this.top() === id
   }
 
   get size(): number {
     return this.layers.length
   }
 }
+
+/** Z-order tiers. Each modal registers with the tier that matches its CSS
+ *  z-index, so the layer painted on top is the one that receives Escape and
+ *  Enter. SSH prompts (host key, keyboard-interactive auth) are above
+ *  everything: they arrive asynchronously from a dial, block it until
+ *  answered, and must never sit hidden under an app dialog. */
+export const LAYER = {
+  /** Editors, settings, history, audit, quick connect…: z-50. */
+  panel: 50,
+  /** Context menu: z-[60]. */
+  menu: 60,
+  /** confirm / alert / prompt (lib/dialogs): z-[65]. */
+  dialog: 65,
+  /** The AI panel's secret warning: z-[70]. */
+  aiWarning: 70,
+  /** Host-key and auth prompts: z-[80]. */
+  sshPrompt: 80,
+} as const
 
 /** The app's one stack. */
 export const modals = new ModalStack()
@@ -59,11 +88,33 @@ export function enterOutcome(
   return danger ? 'none' : 'confirm'
 }
 
-/** A pointer click this soon after a dialog appeared is treated as aimed at
- *  whatever was there before (the second click of a double-click on the
- *  previous dialog's button), not at this dialog. */
-export const CLICK_GUARD_MS = 350
+/** Whether a click on a dialog was meant for it.
+ *
+ *  A click counts only if this dialog saw both halves of it: the pointerdown
+ *  AND the pointerup, after it mounted. The second click of a double-click
+ *  aimed at the previous dialog's button has its pointerdown on this one,
+ *  but `MouseEvent.detail` says it is click 2 of a series whose first press
+ *  this dialog never saw, so it is refused too. A keyboard-activated click
+ *  (Enter or Space on a focused button, `detail` 0) always counts. There is
+ *  no timer: a deliberate first click is never discarded for being quick.
+ *
+ *  Feed it pointerdown/pointerup from the dialog's root (capture phase) and
+ *  ask `accepts(e.detail)` in each click handler. */
+export class PressGuard {
+  private downs = 0
+  private released = false
 
-export function clickTooSoon(shownAt: number, now: number, pointer: boolean): boolean {
-  return pointer && now - shownAt < CLICK_GUARD_MS
+  pointerDown(): void {
+    this.downs += 1
+    this.released = false
+  }
+
+  pointerUp(): void {
+    if (this.downs > 0) this.released = true
+  }
+
+  accepts(detail: number): boolean {
+    if (detail === 0) return true
+    return this.released && this.downs >= detail
+  }
 }

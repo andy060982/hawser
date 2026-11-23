@@ -73,3 +73,56 @@ export function planPaste(text: string, bracketed: boolean): PastePlan {
 export function snippetText(command: string, autoRun: boolean): string {
   return autoRun ? `${command}\r` : command
 }
+
+/** Whether xterm will bracket a paste right now: the remote enabled the mode
+ *  and the terminal is not configured to ignore it (xterm's Clipboard.ts
+ *  applies both). Read synchronously right before every write. */
+export function bracketedNow(term: {
+  modes: { bracketedPasteMode: boolean }
+  options: { ignoreBracketedPasteMode?: boolean }
+}): boolean {
+  return term.modes.bracketedPasteMode && term.options.ignoreBracketedPasteMode !== true
+}
+
+/** Any line break: such text is never broadcast (see pasteMirrorText). */
+export const isMultiLine = (text: string): boolean => /[\r\n]/.test(text)
+
+/** What a paste mirrors to broadcast siblings: the text itself for a single
+ *  line of plain characters, else nothing (it goes to the source pane only).
+ *
+ *  Broadcast cannot know each sibling's bracketed-paste state, and the bytes
+ *  a bracketed source would send (`ESC[200~…ESC[201~` around embedded CRs)
+ *  run line by line on a sibling that never enabled the mode. So the rule is
+ *  deliberately blunt: multi-line text (paste, AI insert, snippet) is never
+ *  broadcast, and neither is a paste carrying any other control character.
+ *  A single plain line is mirrored unframed, as if typed. */
+export function pasteMirrorText(text: string): string | null {
+  // eslint-disable-next-line no-control-regex
+  return text.length > 0 && !/[\x00-\x1f\x7f]/.test(text) ? text : null
+}
+
+/** The synchronous re-check right before a paste is written, after every
+ *  dialog: the remote can turn bracketed paste off while one is open, and a
+ *  paste that was safe when it was planned would then run line by line.
+ *  True when the multi-line confirm is needed now and was not given yet. */
+export function pasteNeedsConfirmNow(text: string, bracketed: boolean, multiConfirmed: boolean): boolean {
+  return !multiConfirmed && planPaste(text, bracketed).kind === 'confirm'
+}
+
+/** Where a snippet goes when the source pane would broadcast to `siblings`.
+ *  A multi-line snippet goes to the source only (the multi-line rule above);
+ *  `localOnly` says that broadcast was on and was not applied. */
+export function snippetTargets(
+  command: string,
+  siblings: readonly string[],
+): { targets: string[]; localOnly: boolean } {
+  if (isMultiLine(command)) return { targets: [], localOnly: siblings.length > 0 }
+  return { targets: [...siblings], localOnly: false }
+}
+
+/** Siblings a confirmed broadcast may still reach: those the user approved
+ *  that are still broadcast targets now. A pane added while the dialog was
+ *  open was never named in it, so it gets nothing. */
+export function stillApproved(approved: readonly string[], now: readonly string[]): string[] {
+  return approved.filter((id) => now.includes(id))
+}

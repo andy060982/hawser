@@ -11,9 +11,16 @@ import type { SearchAddon } from '@xterm/addon-search'
 export interface TermEntry {
   term: Terminal
   search: SearchAddon
-  /** Send text as user input: through the pane's ordered write queue, and
-   *  mirrored to its siblings when broadcast is on (snippets use this). */
-  input: (text: string) => void
+  /** Send text as user input through the pane's ordered write queue, and the
+   *  same bytes to exactly `mirrorTo` (sibling session ids the caller had
+   *  approved; [] for this pane only). Snippets use this. */
+  input: (text: string, mirrorTo: readonly string[]) => void
+  /** Paste into THIS pane only (xterm's paste, so bracketed-paste framing
+   *  applies), never broadcast. AI insert uses this. */
+  pasteLocal: (text: string) => void
+  /** The sibling sessions typed input in this pane is mirrored to right now
+   *  (broadcast on), else []. */
+  broadcastTargets: () => string[]
 }
 
 const terms = new Map<string, TermEntry>()

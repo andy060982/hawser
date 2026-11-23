@@ -1,7 +1,9 @@
 /** App-wide settings: host-color policies and a couple of safety toggles.
  *
  *  Persisted to %APPDATA%\hawser\settings.json via the settings_load/save IPC
- *  commands (same corrupt-tolerant contract as the host catalogue). Exposed
+ *  commands (same fail-closed contract as the host catalogue: an unreadable
+ *  or corrupt file is a load error, and nothing is saved over it until the
+ *  user explicitly chooses to). Exposed
  *  through a context so the cross-cutting consumers — connect flow, AI panel,
  *  broadcast, close guard — read one source of truth instead of threading
  *  props through the whole tree.

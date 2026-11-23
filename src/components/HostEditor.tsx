@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { KeyRound, Plus, Server, Trash2, X } from 'lucide-react'
 import type { AuthMethod, Host, HostNode, Snippet } from '../types'
 import {
-  allHosts, credentialDestinations, findHost, inheritedHostColor, ownColor, sameVaultId, upsertHost,
+  allHosts, credentialDestinations, findHost, inheritedHostColor, ownColor, upsertHost, vaultSlotSharing,
 } from '../lib/tree'
 import {
   STARTUP_PRESETS,
@@ -111,18 +111,19 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
    *  use it too — saving under the host's own id stored a password that was
    *  never read. */
   const credKey = draft.credentialId ?? draft.id
-  const lender = draft.credentialId
-    ? allHosts(catalogue).find((h) => h.id === draft.credentialId)
-    : undefined
-  /** Hosts that borrow THIS host's vault entry ("Same as <this>"). */
-  const borrowers = allHosts(catalogue).filter(
-    (h) => h.id !== draft.id && !!h.credentialId && sameVaultId(h.credentialId, draft.id),
-  )
-  /** The vault slot is someone else's or shared with others. A key
-   *  passphrase lives in the same slot as a password, so saving one here
-   *  would replace a password other hosts log in with. */
-  const sharedSlot = !!lender || borrowers.length > 0
-  const sharedWith = lender ? lender.name : borrowers.map((b) => b.name).slice(0, 3).join(', ')
+  /** Who else uses that slot (lib/tree vaultSlotSharing): judged by the
+   *  effective slot, so borrowers of a deleted lender and case-variant ids
+   *  are caught too. A key passphrase lives in the same slot as a password,
+   *  so saving one into a shared slot would replace a password other hosts
+   *  log in with. */
+  const sharing = vaultSlotSharing(catalogue, draft)
+  const lender = sharing.lender
+  const sharedSlot = sharing.shared
+  const sharedWith = lender
+    ? lender.name
+    : sharing.others.length > 0
+      ? sharing.others.map((b) => b.name).slice(0, 3).join(', ')
+      : 'a host that was deleted'
 
   /** The jump host this entry names, and whether it still exists: a deleted
    *  bastion must read as such, never as "Direct connection". */

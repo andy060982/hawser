@@ -705,3 +705,28 @@ export function folderLabels(nodes: HostNode[]): Map<string, string> {
   }
   return labels
 }
+
+/** Who else uses the vault slot a host's draft points at, for the key-
+ *  passphrase guard (a passphrase lives in the same slot as a password).
+ *
+ *  Judged by the effective slot (`credentialId ?? id`), never by the draft's
+ *  own id: two hosts borrowing the slot of a lender that was deleted share it
+ *  with each other although neither can name a lender, and a lender id that
+ *  differs only in case is the same slot where the vault folds case. A draft
+ *  that borrows any slot other than its own counts as shared even when
+ *  nobody else is found: the slot was some other host's. */
+export function vaultSlotSharing(
+  nodes: HostNode[],
+  draft: { id: string; credentialId?: string },
+): { shared: boolean; lender?: Host; others: Host[]; orphaned: boolean } {
+  const credKey = draft.credentialId ?? draft.id
+  const hosts = allHosts(nodes)
+  const borrowing = !!draft.credentialId && !sameVaultId(draft.credentialId, draft.id)
+  const lender = borrowing
+    ? hosts.find((h) => h.id !== draft.id && sameVaultId(h.id, credKey))
+    : undefined
+  const others = hosts.filter(
+    (h) => h.id !== draft.id && h !== lender && sameVaultId(h.credentialId ?? h.id, credKey),
+  )
+  return { shared: borrowing || others.length > 0, lender, others, orphaned: borrowing && !lender }
+}

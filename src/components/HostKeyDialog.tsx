@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Check, Fingerprint, ShieldAlert, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 
 interface HostKeyRequest {
   requestId: string
@@ -98,7 +99,7 @@ export function HostKeyDialog() {
   }, [request?.requestId])
 
   // Escape denies, while this prompt is the top modal.
-  useModalLayer(!!request, () => void respondRef.current(false))
+  useModalLayer(!!request, () => void respondRef.current(false), LAYER.sshPrompt)
   const respondRef = useRef<(accept: boolean) => Promise<void>>(async () => {})
 
   if (!request) return null
@@ -126,7 +127,7 @@ export function HostKeyDialog() {
     : ['SHA256', request.fingerprint]
 
   return (
-    <div className="absolute inset-0 z-50 flex justify-center">
+    <div className="absolute inset-0 z-[80] flex justify-center">
       {/* Scrim: dims the shell without hiding it, so the user keeps the context
           of which window raised this. */}
       <div

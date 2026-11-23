@@ -1204,17 +1204,13 @@ fn sessions_path() -> Result<PathBuf, KnownHostsError> {
         .join("sessions.json"))
 }
 
-/// The open-tabs list. Unreadable or corrupt reads as absent (nothing to
-/// restore), after a copy of it is kept.
+/// The open-tabs list. `None` only when there is no file. An unreadable or
+/// corrupt one is an error (after a copy of it is kept), exactly like an
+/// unreadable file: reading it as absent let the next ordinary save replace
+/// it without the user ever hearing about it. The frontend reports the error
+/// and saves again only once the user says so.
 pub fn load_sessions() -> Result<Option<Value>, KnownHostsError> {
-    let path = sessions_path()?;
-    match read_json(&path) {
-        Err(KnownHostsError::Parse(why)) => {
-            eprintln!("hawser: {why}");
-            Ok(None)
-        }
-        other => other,
-    }
+    read_json(&sessions_path()?)
 }
 
 pub fn save_sessions(list: &Value) -> Result<(), KnownHostsError> {
@@ -1227,22 +1223,22 @@ pub fn save_sessions(list: &Value) -> Result<(), KnownHostsError> {
 /* -------------------------------------------------------------------------- */
 
 /// Generic sibling-file persistence in the hawser data dir, for small settings
-/// files (ai.json, settings.json). A corrupt file reads as absent (the app runs
-/// on defaults), but only after a copy of it is kept, so the next save cannot
-/// destroy the only one.
+/// files (ai.json, settings.json). `None` only when there is no file. A
+/// corrupt file is an error, the same as an unreadable one, after a
+/// `.corrupt-<ts>` copy of it is kept: it used to read as absent, so the next
+/// ordinary settings edit wrote defaults over it with no warning. The
+/// frontend surfaces the error and saves only once the user confirms.
 pub fn load_named(name: &str) -> Result<Option<Value>, KnownHostsError> {
+    load_named_in(&named_dir()?, name)
+}
+
+fn named_dir() -> Result<PathBuf, KnownHostsError> {
     let store = super::known_hosts::store_path()?;
-    let path = store
-        .parent()
-        .ok_or(KnownHostsError::NoAppDataDir)?
-        .join(name);
-    match read_json(&path) {
-        Err(KnownHostsError::Parse(why)) => {
-            eprintln!("hawser: {why}");
-            Ok(None)
-        }
-        other => other,
-    }
+    Ok(store.parent().ok_or(KnownHostsError::NoAppDataDir)?.to_path_buf())
+}
+
+fn load_named_in(dir: &Path, name: &str) -> Result<Option<Value>, KnownHostsError> {
+    read_json(&dir.join(name))
 }
 
 pub fn save_named(name: &str, value: &Value) -> Result<(), KnownHostsError> {
@@ -1543,6 +1539,23 @@ mod tests {
         assert!(read_json(&d.join("absent.json")).unwrap().is_none());
         std::fs::write(&f, b"\xef\xbb\xbf[]").unwrap();
         assert_eq!(read_json(&f).unwrap(), Some(json!([])));
+    }
+
+    #[test]
+    fn a_corrupt_settings_file_is_an_error_not_defaults() {
+        let d = bindings_in("named").parent().unwrap().to_path_buf();
+        for name in ["settings.json", "ai.json"] {
+            let f = d.join(name);
+            std::fs::write(&f, b"{ \"theme\": ").unwrap();
+            let e = load_named_in(&d, name).unwrap_err().to_string();
+            assert!(e.contains(&format!("{name}.corrupt-")), "{e}");
+            assert_eq!(std::fs::read(&f).unwrap(), b"{ \"theme\": ", "left in place");
+            let backups = std::fs::read_dir(&d).unwrap().flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}.corrupt-")))
+                .count();
+            assert_eq!(backups, 1);
+            assert!(load_named_in(&d, &format!("absent-{name}")).unwrap().is_none());
+        }
     }
 
     #[cfg(unix)]

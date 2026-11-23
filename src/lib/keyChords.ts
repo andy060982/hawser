@@ -37,18 +37,50 @@ export type AppCommandCode = (typeof APP_COMMAND_CODES)[number]
 /** A plain Ctrl chord: Ctrl held, and neither Alt (AltGr) nor Meta. */
 export const isPlainCtrl = (e: KeyLike): boolean => e.ctrlKey && !e.altKey && !e.metaKey
 
-/** The app shortcut this chord means, or null. Pure: whether the shortcut can
- *  act right now (a tab at that index, a snippet in that slot, no modal open)
- *  is the caller's business, but the chord is the app's either way, so the
- *  remote must never receive it. */
-export function appShortcut(e: KeyLike): AppShortcut | null {
+/** A key value that is one printable character (not "Unidentified",
+ *  "Dead", "Process", "Tab", a control character…). */
+const printable = (key: string): boolean =>
+  // eslint-disable-next-line no-control-regex
+  [...key].length === 1 && !/[\x00-\x1f\x7f]/.test(key)
+
+/** The tab digit (1-9) a Ctrl chord without Shift names, or null.
+ *
+ *  By the character the key produces (`e.key`) whenever that is printable,
+ *  and by the physical key (`e.code`) only when it is not. On French AZERTY
+ *  the Digit8 key produces `_` without Shift, and Ctrl+_ is readline's undo:
+ *  mapping it by `e.code` swallowed it as "tab 8". The number row there
+ *  produces digits only with Shift, so on AZERTY Ctrl+<digit> tab switching
+ *  is simply not available; the chord belongs to the terminal. Numpad keys
+ *  are never tab chords. */
+function tabDigit(e: KeyLike): number | null {
+  if (e.code.startsWith('Numpad')) return null
+  if (printable(e.key)) {
+    return /^[1-9]$/.test(e.key) ? Number(e.key) : null
+  }
+  const m = /^Digit([1-9])$/.exec(e.code)
+  return m ? Number(m[1]) : null
+}
+
+/** The app shortcut this chord means, or null. Pure. Whether the shortcut can
+ *  act right now (a snippet in that slot, no modal open) is mostly the
+ *  caller's business, and the chord is the app's either way, so the remote
+ *  must never receive it, with one exception: a tab chord for a tab that
+ *  does not exist (`tabCount` given and too small) is not an app chord at
+ *  all, so the terminal encodes it as usual. */
+export function appShortcut(e: KeyLike, tabCount?: number): AppShortcut | null {
   if (!isPlainCtrl(e)) return null
   if (e.key === 'Tab' || e.code === 'Tab') return { kind: 'cycleTab', dir: e.shiftKey ? -1 : 1 }
-  // e.code, never e.key: Shift+1 is "!" and Ctrl+Shift+2 is "@" in e.key.
-  const digit = /^Digit([1-9])$/.exec(e.code)
-  if (digit) {
-    const n = Number(digit[1])
-    return e.shiftKey ? { kind: 'snippet', slot: n } : { kind: 'gotoTab', index: n - 1 }
+  if (e.shiftKey) {
+    // Snippet slots by physical key: Shift+1 is "!" on US (and "1" on
+    // AZERTY) in e.key, and Ctrl+Shift+2 must never reach xterm as NUL.
+    const digit = /^Digit([1-9])$/.exec(e.code)
+    if (digit) return { kind: 'snippet', slot: Number(digit[1]) }
+  } else {
+    const n = tabDigit(e)
+    if (n !== null) {
+      if (tabCount !== undefined && n > tabCount) return null
+      return { kind: 'gotoTab', index: n - 1 }
+    }
   }
   if (e.shiftKey && (APP_COMMAND_CODES as readonly string[]).includes(e.code)) {
     return { kind: 'command', code: e.code as AppCommandCode }
@@ -70,8 +102,10 @@ export type TerminalKeyAction =
   /** Not ours: let xterm encode it. */
   | 'pass'
 
-export function terminalKeyAction(e: KeyLike): TerminalKeyAction {
-  if (appShortcut(e)) return 'app'
+/** `tabCount`: tabs open now, so a chord for a tab that does not exist is
+ *  left to xterm (see appShortcut). */
+export function terminalKeyAction(e: KeyLike, tabCount?: number): TerminalKeyAction {
+  if (appShortcut(e, tabCount)) return 'app'
   if (!isPlainCtrl(e)) return 'pass'
   if (e.shiftKey && e.code === 'KeyC') return 'copy'
   if (e.shiftKey && e.code === 'KeyV') return 'paste'
@@ -83,3 +117,11 @@ export function terminalKeyAction(e: KeyLike): TerminalKeyAction {
   if ((e.code === 'Digit0' && !e.shiftKey) || e.code === 'Numpad0') return 'zoomReset'
   return 'pass'
 }
+
+/** Tabs open right now, kept by the app shell for the terminal's key handler
+ *  (which lives outside React). Infinity until the shell reports. */
+let openTabs = Number.POSITIVE_INFINITY
+export const setOpenTabCount = (n: number): void => {
+  openTabs = n
+}
+export const openTabCount = (): number => openTabs

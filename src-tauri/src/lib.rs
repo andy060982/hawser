@@ -1399,7 +1399,8 @@ async fn ai_config_save(config: serde_json::Value) -> CmdResult<()> {
 
 /// App-wide settings (colour policies, device profiles, UI defaults).
 /// %APPDATA%\hawser\settings.json — opaque JSON owned by the frontend, same
-/// corrupt-tolerant contract as the host catalogue.
+/// fail-closed contract as the host catalogue: a corrupt file is an error
+/// (a copy kept), and the frontend saves over it only once the user agrees.
 #[tauri::command]
 async fn settings_load() -> CmdResult<Option<serde_json::Value>> {
     off(|| utils::hosts::load_named("settings.json").map_err(|e| e.to_string())).await

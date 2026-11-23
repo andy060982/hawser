@@ -7,8 +7,8 @@ import {
   jumpDependents, folderLabels,
 } from '../lib/tree'
 import { anyModalOpen } from '../lib/modalStack'
-import { appShortcut } from '../lib/keyChords'
-import { snippetText } from '../lib/termInput'
+import { appShortcut, setOpenTabCount } from '../lib/keyChords'
+import { snippetTargets, snippetText, stillApproved } from '../lib/termInput'
 import { getTerm } from '../lib/termRegistry'
 import { closeConfirmText } from '../lib/closeGuard'
 import { setLocalRoot } from '../lib/localPath'
@@ -142,7 +142,18 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [configChanges, setConfigChanges] = useState<
     Record<
       string,
-      { hostId: string; endpoint: string; added: number; removed: number; previous: string; name: string }
+      {
+        hostId: string
+        /** The host as it was when checked: the chip and Config History keep
+         *  working from it (with the notice's endpoint and live tab) after
+         *  the catalogue entry is deleted. */
+        host: Host
+        endpoint: string
+        added: number
+        removed: number
+        previous: string
+        name: string
+      }
     >
   >({})
   /** Endpoint identity → when its config was last checked, so split panes and
@@ -277,10 +288,13 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  save before then could write [] over the tabs it was about to restore
    *  (a startup local shell reaching "connected" was enough). */
   const [tabsRestored, setTabsRestored] = useState(false)
+  /** False after sessions.json could not be read (unreadable or corrupt; the
+   *  backend kept a copy): nothing is saved over it until the user agrees. */
+  const [sessionsWritable, setSessionsWritable] = useState(true)
   /** A sessions save failed and the user was told; cleared by the next success. */
   const sessionsSaveFailedRef = useRef(false)
   useEffect(() => {
-    if (!loadedRef.current || !tabsRestored) return
+    if (!loadedRef.current || !tabsRestored || !sessionsWritable) return
     // Persist everything except failed connections. Disconnected sessions are
     // kept on purpose: a dropped link or a dormant-restored tab should come
     // back next launch too, not just live ones. Only 'error' (auth failed, bad
@@ -303,7 +317,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         )
       })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessions, tabsRestored])
+  }, [sessions, tabsRestored, sessionsWritable])
 
   /* Catalogue load. Only a MISSING file (the backend's null) is a first run:
      keep the seed and write it out. A file that exists but cannot be read,
@@ -421,10 +435,15 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       setActiveId((cur) => cur ?? restored[0].id)
     })
       .catch((e) => {
-        // Unreadable sessions.json: nothing to restore. Saving stays on (the
-        // next save replaces it), but the user hears why the tabs are gone.
-        void alert(`Your last session's tabs could not be restored: ${e instanceof Error ? e.message : e}`, {
-          title: 'Tabs not restored',
+        // Unreadable or corrupt sessions.json: nothing to restore, and
+        // nothing saved over it (the next ordinary save would replace the
+        // only copy the user might want back) unless the user says so.
+        setSessionsWritable(false)
+        void confirm(
+          `Your last session's tabs could not be restored: ${e instanceof Error ? e.message : e}\n\nSave your open tabs over that file from now on? If you choose Not now, open tabs are not remembered this run.`,
+          { title: 'Tabs not restored', confirmLabel: 'Save tabs', cancelLabel: 'Not now' },
+        ).then((ok) => {
+          if (ok) setSessionsWritable(true)
         })
       })
       .finally(() => setTabsRestored(true))
@@ -691,7 +710,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         const { name, previous } = r
         setConfigChanges((m) => ({
           ...m,
-          [sid]: { hostId: host.id, endpoint, added: r.added, removed: r.removed, previous, name },
+          [sid]: { hostId: host.id, host, endpoint, added: r.added, removed: r.removed, previous, name },
         }))
       }
     }
@@ -1176,30 +1195,57 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     if (activeId) splitSession(activeId, dir)
   }, [activeId, splitSession])
 
-  /** Send a snippet to the focused pane, as if typed. */
+  /** Send a snippet to the focused pane, as if typed, and with broadcast on
+   *  to the sibling panes the user approved by name and count. */
   const sendSnippet = useCallback(async (sessionId: string, command: string, autoRun: boolean) => {
+    const pane = getTerm(sessionId)
+    // Broadcast: a multi-line snippet goes to this pane only (lib/termInput
+    // snippetTargets); a one-line one to every sibling, named in the confirm.
+    const plan = snippetTargets(command, pane?.broadcastTargets() ?? [])
+    const nameOf = (id: string) => sessionsRef.current.find((t) => t.id === id)?.title ?? id
+    const total = plan.targets.length + 1
+    const listed = (ids: string[]) =>
+      [sessionId, ...ids].map((id) => `• ${nameOf(id)}`).join('\n')
+    const localNote = plan.localOnly
+      ? '\n\nBroadcast is on, but this snippet has more than one line, so it is sent only to this pane.'
+      : ''
+    const reason = settingsRef.current.dangerousGuard ? isDangerousCommand(command) : null
     // Dangerous-command guard: a snippet carries a full command, so we can
-    // check it before it hits the wire (unlike live keystrokes).
-    if (settingsRef.current.dangerousGuard) {
-      const reason = isDangerousCommand(command)
-      if (
-        reason &&
-        !(await confirm(`This snippet looks destructive (${reason}). Send it?`, {
+    // check it before it hits the wire (unlike live keystrokes). With
+    // broadcast, the one confirm lists every session it will reach.
+    if (reason) {
+      const ok = await confirm(
+        plan.targets.length > 0
+          ? `This snippet looks destructive (${reason}). ${autoRun ? 'Run' : 'Send'} it in ${total} sessions?\n\n${listed(plan.targets)}`
+          : `This snippet looks destructive (${reason}). Send it?${localNote}`,
+        {
           title: 'Destructive snippet',
-          confirmLabel: 'Send',
+          confirmLabel: plan.targets.length > 0 ? `Send to ${total}` : 'Send',
           danger: true,
-        }))
-      ) {
-        return
-      }
+        },
+      )
+      if (!ok) return
+    } else if (plan.targets.length > 0) {
+      const ok = await confirm(
+        `${autoRun ? 'Run' : 'Type'} this snippet in ${total} sessions? Broadcast is on.\n\n${listed(plan.targets)}`,
+        { title: 'Broadcast snippet', confirmLabel: `${autoRun ? 'Run' : 'Send'} in ${total}` },
+      )
+      if (!ok) return
+    } else if (plan.localOnly) {
+      const ok = await confirm(`Send this snippet to this pane only?${localNote}`, {
+        title: 'Snippet not broadcast',
+        confirmLabel: 'Send here',
+      })
+      if (!ok) return
     }
     // Through the pane's own input path: the same ordered write queue as typed
-    // keys (a direct ssh_write could interleave with them), mirrored to the
-    // other panes when broadcast is on, and Enter as CR like the keyboard.
+    // keys (a direct ssh_write could interleave with them), and Enter as CR
+    // like the keyboard. Siblings: only those approved above that are still
+    // broadcast targets now (a pane added meanwhile was never named).
     const text = snippetText(command, autoRun)
-    const pane = getTerm(sessionId)
-    if (pane) {
-      pane.input(text)
+    const live = getTerm(sessionId)
+    if (live) {
+      live.input(text, stillApproved(plan.targets, live.broadcastTargets()))
       return
     }
     void safeInvoke('ssh_write', { sessionId, data: Array.from(new TextEncoder().encode(text)) }).catch(
@@ -1780,9 +1826,13 @@ Passwords are NOT included — they stay in the system's credential store. On-co
   // The chord table lives in lib/keyChords, shared with the terminal: a
   // focused terminal hands every one of these chords back unprocessed, so they
   // reach this listener and the remote never sees them.
+  // The terminal's key handler asks the same question (lib/keyChords).
+  useEffect(() => setOpenTabCount(groups.length), [groups.length])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const sc = appShortcut(e)
+      // A tab chord for a tab that does not exist is not ours (the terminal
+      // already let xterm encode it): same count as the terminal's check.
+      const sc = appShortcut(e, groups.length)
       if (!sc) return
       // Behind a modal, app shortcuts do nothing: Ctrl+Shift+W would close
       // the tab under a confirm, Ctrl+Shift+<digit> type a snippet into it.
@@ -2022,7 +2072,10 @@ Passwords are NOT included — they stay in the system's credential store. On-co
         onViewConfigChange={(() => {
           const sid = activeId
           const c = sid ? configChanges[sid] : undefined
-          const h = c && lookupHost(c.hostId)
+          // The live catalogue entry when it still exists, else the one the
+          // check ran for: deleting a saved host leaves its tab and snapshots
+          // in place, so the chip and Config History must stay usable.
+          const h = c && (lookupHost(c.hostId) ?? c.host)
           if (!sid || !c || !h) return undefined
           return () => {
             // The notice's own endpoint, through this tab only while it is

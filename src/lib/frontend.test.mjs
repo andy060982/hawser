@@ -12,13 +12,16 @@ import {
 } from './transfers.ts'
 import {
   bindingChanged, catalogueProblem, credentialDestinations, isBorrowed, NarrowQueue, reidentify, sameVaultId, SaveQueue,
-  sanitizeImport, setVaultFoldsCase, usableImportedId, vaultIdKey,
+  sanitizeImport, setVaultFoldsCase, usableImportedId, vaultIdKey, vaultSlotSharing,
 } from './tree.ts'
 import { clearLocal, emitLocal, onLocal } from './localTerm.ts'
 import { defaultLocalRoot, keyPathPlaceholder, localBaseName, setLocalRoot, unsafeTransferName } from './localPath.ts'
 import { appShortcut, terminalKeyAction } from './keyChords.ts'
-import { isMouseReport, looksLikeTerminalReply, planPaste, shouldBroadcast, snippetText } from './termInput.ts'
-import { ModalStack, clickTooSoon, enterOutcome } from './modalStack.ts'
+import {
+  bracketedNow, isMouseReport, looksLikeTerminalReply, pasteMirrorText, pasteNeedsConfirmNow, planPaste, shouldBroadcast,
+  snippetTargets, snippetText, stillApproved,
+} from './termInput.ts'
+import { LAYER, ModalStack, PressGuard, enterOutcome } from './modalStack.ts'
 import { closeConfirmText, liveSessionCount } from './closeGuard.ts'
 import {
   effectiveHostColor, folderLabels, inheritedHostColor, jumpDependents, ownColor,
@@ -730,11 +733,56 @@ test('Enter on a focused Cancel cancels, in every kind of dialog', () => {
   assert.equal(enterOutcome('alert', false, 'other'), 'confirm')
 })
 
-test('a click right after a dialog appears is not taken as its answer', () => {
-  assert.ok(clickTooSoon(1000, 1100, true))
-  assert.ok(!clickTooSoon(1000, 1400, true))
-  // Keyboard activation (detail 0) is never guarded.
-  assert.ok(!clickTooSoon(1000, 1001, false))
+test('a click counts only when this dialog saw both its pointerdown and pointerup', () => {
+  // Deliberate single click, however quick: down + up + click(detail 1).
+  const g = new PressGuard()
+  g.pointerDown()
+  g.pointerUp()
+  assert.ok(g.accepts(1))
+  // Pressed on the previous dialog, released on this one: no down seen.
+  const late = new PressGuard()
+  late.pointerUp()
+  assert.ok(!late.accepts(1))
+  // The second click of a double-click aimed at the previous dialog: both
+  // halves land here, but it is click 2 of a series this dialog saw 1 of.
+  const dbl = new PressGuard()
+  dbl.pointerDown()
+  dbl.pointerUp()
+  assert.ok(!dbl.accepts(2))
+  // Pressed but not yet released (a synthetic click mid-press): refused.
+  const held = new PressGuard()
+  held.pointerDown()
+  assert.ok(!held.accepts(1))
+  // A double-click entirely on this dialog: its first click counts.
+  const own = new PressGuard()
+  own.pointerDown()
+  own.pointerUp()
+  assert.ok(own.accepts(1))
+  // Keyboard activation (detail 0) always counts.
+  assert.ok(new PressGuard().accepts(0))
+})
+
+test('the modal on top is decided by tier, not by registration order', () => {
+  const st = new ModalStack()
+  const quit = st.push(LAYER.dialog)
+  // A host-key prompt arriving later is above it (and painted above it).
+  const hostKey = st.push(LAYER.sshPrompt)
+  assert.ok(st.isTop(hostKey) && !st.isTop(quit))
+  // A confirm raised while the SSH prompt is up stays under it.
+  const paste = st.push(LAYER.dialog)
+  assert.ok(st.isTop(hostKey) && !st.isTop(paste))
+  st.remove(hostKey)
+  // Same tier: the later one is on top.
+  assert.ok(st.isTop(paste) && !st.isTop(quit))
+  // A lower tier opened later does not jump above a higher one.
+  const menu = st.push(LAYER.menu)
+  assert.ok(st.isTop(paste) && !st.isTop(menu))
+  st.remove(paste)
+  st.remove(quit)
+  assert.ok(st.isTop(menu))
+  assert.ok(!st.isTop(0))
+  // Tiers agree with the CSS z-index order the components use.
+  assert.ok(LAYER.panel < LAYER.menu && LAYER.menu < LAYER.dialog && LAYER.dialog < LAYER.aiWarning && LAYER.aiWarning < LAYER.sshPrompt)
 })
 
 test('closing the window asks only with live sessions and the setting on', () => {
@@ -809,4 +857,92 @@ test('a progress note is kept on the active row', () => {
   list = applyProgress(list, { sessionId: 's1', transferId: 't1', root: '/l/f', filePath: '/l/f', bytesTransferred: 5, totalBytes: 9, direction: 'upload', done: false })
   assert.equal(list[0].note, 'writing in place')
   assert.equal(list[0].bytesDone, 5)
+})
+
+/* ------------------------------------------------------------------ W5b */
+
+test('tab chords follow the produced character; AZERTY Ctrl+_ reaches the shell', () => {
+  // French AZERTY: Digit8 produces "_" without Shift; Ctrl+_ is readline undo.
+  assert.equal(appShortcut(key('Digit8', { ctrlKey: true }, '_'), 9), null)
+  assert.equal(terminalKeyAction(key('Digit8', { ctrlKey: true }, '_'), 9), 'pass')
+  // Digit1 is "&" there: not a tab chord either.
+  assert.equal(appShortcut(key('Digit1', { ctrlKey: true }, '&')), null)
+  // A layout whose digit comes from another physical key: by e.key.
+  assert.deepEqual(appShortcut(key('KeyQ', { ctrlKey: true }, '3')), { kind: 'gotoTab', index: 2 })
+  // e.key not printable: fall back to the physical key.
+  assert.deepEqual(appShortcut(key('Digit4', { ctrlKey: true }, 'Unidentified')), { kind: 'gotoTab', index: 3 })
+  assert.deepEqual(appShortcut(key('Digit4', { ctrlKey: true }, 'Dead')), { kind: 'gotoTab', index: 3 })
+  // Numpad digits are never tab chords.
+  assert.equal(appShortcut(key('Numpad2', { ctrlKey: true }, '2')), null)
+  // Snippet slots stay on the physical key (US "@", AZERTY "2").
+  assert.deepEqual(appShortcut(key('Digit2', { ctrlKey: true, shiftKey: true }, '@'), 1), { kind: 'snippet', slot: 2 })
+  assert.deepEqual(appShortcut(key('Digit2', { ctrlKey: true, shiftKey: true }, '2'), 1), { kind: 'snippet', slot: 2 })
+})
+
+test('a tab chord for a tab that does not exist is left to the terminal', () => {
+  assert.deepEqual(appShortcut(key('Digit3', { ctrlKey: true }), 3), { kind: 'gotoTab', index: 2 })
+  assert.equal(appShortcut(key('Digit4', { ctrlKey: true }), 3), null)
+  assert.equal(terminalKeyAction(key('Digit4', { ctrlKey: true }), 3), 'pass')
+  assert.equal(terminalKeyAction(key('Digit3', { ctrlKey: true }), 3), 'app')
+  assert.equal(terminalKeyAction(key('Digit1', { ctrlKey: true }), 0), 'pass')
+  // Without a count (unknown), every digit chord is still the app's.
+  assert.equal(terminalKeyAction(key('Digit9', { ctrlKey: true })), 'app')
+})
+
+test('multi-line paste, AI insert text and snippets are never broadcast', () => {
+  // One plain line is mirrored as typed (unframed).
+  assert.equal(pasteMirrorText('show run'), 'show run')
+  // Any line break, or any other control character: this pane only.
+  for (const t of ['a\nb', 'a\r', 'conf t\r\nint g0/1\r\n', 'x\x1b[201~y', 'a\tb', '\x7f', '']) {
+    assert.equal(pasteMirrorText(t), null, JSON.stringify(t))
+  }
+  // Snippets: one line goes to every sibling, several lines to the source only.
+  assert.deepEqual(snippetTargets('reload', ['b', 'c']), { targets: ['b', 'c'], localOnly: false })
+  assert.deepEqual(snippetTargets('conf t\nno ip route', ['b', 'c']), { targets: [], localOnly: true })
+  assert.deepEqual(snippetTargets('conf t\nend', []), { targets: [], localOnly: false })
+  // After the confirm: only approved siblings that are still targets.
+  assert.deepEqual(stillApproved(['b', 'c', 'd'], ['c', 'd', 'e']), ['c', 'd'])
+  assert.deepEqual(stillApproved([], ['a']), [])
+})
+
+test('the paste mode is re-checked right before writing', () => {
+  const text = 'line1\nline2'
+  // Bracketed when planned, then switched off while a dialog was open:
+  // the multi-line confirm is needed now.
+  assert.equal(pasteNeedsConfirmNow(text, true, false), false)
+  assert.equal(pasteNeedsConfirmNow(text, false, false), true)
+  // Once confirmed, either mode is fine.
+  assert.equal(pasteNeedsConfirmNow(text, false, true), false)
+  // One line never needs it.
+  assert.equal(pasteNeedsConfirmNow('ls', false, false), false)
+  // ignoreBracketedPasteMode makes xterm send it unframed.
+  assert.equal(bracketedNow({ modes: { bracketedPasteMode: true }, options: {} }), true)
+  assert.equal(bracketedNow({ modes: { bracketedPasteMode: true }, options: { ignoreBracketedPasteMode: true } }), false)
+  assert.equal(bracketedNow({ modes: { bracketedPasteMode: false }, options: {} }), false)
+})
+
+test('the passphrase guard judges the effective vault slot', () => {
+  setVaultFoldsCase(true)
+  try {
+    // Two borrowers of a deleted lender share the slot with each other.
+    const orphans = [H('a', { credentialId: 'gone' }), H('b', { credentialId: 'gone' })]
+    const r = vaultSlotSharing(orphans, orphans[0])
+    assert.ok(r.shared && r.orphaned && !r.lender)
+    assert.deepEqual(r.others.map((h) => h.id), ['b'])
+    // A lone borrower of a deleted lender: still someone else's slot.
+    assert.ok(vaultSlotSharing([H('a', { credentialId: 'gone' })], { id: 'a', credentialId: 'gone' }).shared)
+    // Case-variant lender id, where the vault folds case.
+    const cv = [H('Core1'), H('edge', { credentialId: 'core1' })]
+    const e = vaultSlotSharing(cv, cv[1])
+    assert.equal(e.lender?.id, 'Core1')
+    assert.ok(e.shared && !e.orphaned)
+    // The lender sees its (case-variant) borrower.
+    assert.deepEqual(vaultSlotSharing(cv, cv[0]).others.map((h) => h.id), ['edge'])
+    // Own slot, nobody else: not shared.
+    assert.ok(!vaultSlotSharing([H('solo'), H('other')], H('solo')).shared)
+    // Pointing at its own id is its own slot.
+    assert.ok(!vaultSlotSharing([H('solo', { credentialId: 'solo' })], { id: 'solo', credentialId: 'solo' }).shared)
+  } finally {
+    setVaultFoldsCase(true)
+  }
 })

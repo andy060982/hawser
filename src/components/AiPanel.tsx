@@ -8,9 +8,12 @@ import type { HostColor } from '../lib/hostColors'
 import { type ColorPolicy, policyFor, useSettings } from '../lib/settings'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { getTerm } from '../lib/termRegistry'
+import { bracketedNow } from '../lib/termInput'
 import { scanForSecrets, type SecretHit } from '../lib/secretScan'
 import { COPY_INSTEAD, isDangerousCommand, planInsert } from '../lib/dangerous'
 import { useDialogs } from '../lib/dialogs'
+import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 import { ShieldAlert } from 'lucide-react'
 
 interface AiConfig {
@@ -133,6 +136,10 @@ export function AiPanel({
     systemContext: string
     hits: SecretHit[]
   } | null>(null)
+  /* The secret warning is a modal layer: app shortcuts (Ctrl+Shift+K and the
+     rest check anyModalOpen) stay off while it is up, and Escape cancels it
+     (only it, never a dialog under or over it). */
+  useModalLayer(!!pendingSend, () => setPendingSend(null), LAYER.aiWarning)
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
   /** The run in flight, for the Stop button. Set as ai_chat is sent: the
@@ -497,7 +504,11 @@ export function AiPanel({
             onMouseDown={() => setPendingSend(null)}
             aria-hidden
           />
-          <div className="relative w-full max-w-[20rem] overflow-hidden rounded-panel border border-warn/50 bg-surface-2 shadow-2xl">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            className="relative w-full max-w-[20rem] overflow-hidden rounded-panel border border-warn/50 bg-surface-2 shadow-2xl"
+          >
             <header className="flex items-center gap-2 border-b border-line px-3 py-2.5">
               <ShieldAlert size={15} className="shrink-0 text-warn" aria-hidden />
               <span className="text-[12.5px] font-medium text-ink">Possible secret in context</span>
@@ -531,6 +542,7 @@ export function AiPanel({
             <footer className="flex justify-end gap-2 border-t border-line bg-surface-1 px-3 py-2.5">
               <button
                 type="button"
+                autoFocus
                 onClick={() => setPendingSend(null)}
                 className="rounded border border-line px-3 py-1 text-[12px] text-ink-dim hover:bg-surface-3 hover:text-ink"
               >
@@ -589,18 +601,10 @@ function MessageView({ msg, sessionId }: { msg: Msg; sessionId: string }) {
   )
 }
 
-/** Whether xterm will bracket a paste right now: the remote enabled the mode
- *  and the terminal is not configured to ignore it (Clipboard.ts applies
- *  both). */
-function bracketedNow(term: {
-  modes: { bracketedPasteMode: boolean }
-  options: { ignoreBracketedPasteMode?: boolean }
-}): boolean {
-  return term.modes.bracketedPasteMode && term.options.ignoreBracketedPasteMode !== true
-}
-
 function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
   const [inserted, setInserted] = useState(false)
+  /** The last insert happened while broadcast was on (it went here only). */
+  const [insertedLocal, setInsertedLocal] = useState(false)
   const { confirm, alert } = useDialogs()
   // Strip an optional language tag line ("bash\n...") and trailing whitespace.
   const lines = raw.replace(/^\s*\n/, '').split('\n')
@@ -637,10 +641,15 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
       refuse(plan.reason)
       return
     }
+    // AI insert is never broadcast: it goes to this pane only.
+    const localNote =
+      first.broadcastTargets().length > 0
+        ? ' Broadcast is on, but a suggestion is inserted only into this pane, never into the others.'
+        : ''
     if (
       plan.lines > 1 &&
       !(await confirm(
-        `This suggestion is ${plan.lines} lines. It will be pasted as one block; review all of it before pressing Enter.`,
+        `This suggestion is ${plan.lines} lines. It will be pasted as one block; review all of it before pressing Enter.${localNote}`,
         { title: 'Multi-line suggestion', confirmLabel: `Insert ${plan.lines} lines` },
       ))
     ) {
@@ -649,7 +658,7 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
     const reason = isDangerousCommand(body)
     if (
       reason &&
-      !(await confirm(`This suggestion looks destructive (${reason}). Insert it?`, {
+      !(await confirm(`This suggestion looks destructive (${reason}). Insert it?${localNote}`, {
         title: 'Destructive suggestion',
         confirmLabel: 'Insert',
         danger: true,
@@ -668,8 +677,11 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
       refuse(final.reason)
       return
     }
-    target.term.paste(final.text)
+    // Never broadcast (pasteLocal): the siblings' bracketed-paste state is
+    // unknown, and the model's text is the least trusted input there is.
+    target.pasteLocal(final.text)
     target.term.focus()
+    setInsertedLocal(target.broadcastTargets().length > 0)
     setInserted(true)
     setTimeout(() => setInserted(false), 1600)
   }
@@ -686,7 +698,11 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
           className="flex flex-1 items-center justify-center gap-1 py-1 text-[11px] text-accent hover:bg-accent/10"
         >
           {inserted ? <Check size={11} aria-hidden /> : <CornerDownLeft size={11} aria-hidden />}
-          {inserted ? 'Typed — press Enter to run' : 'Insert into terminal'}
+          {inserted
+            ? insertedLocal
+              ? 'Typed in this pane only — press Enter to run'
+              : 'Typed — press Enter to run'
+            : 'Insert into terminal'}
         </button>
         <button
           type="button"

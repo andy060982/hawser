@@ -23,7 +23,7 @@ import {
   type ReactNode,
 } from 'react'
 import { AlertTriangle, X } from 'lucide-react'
-import { clickTooSoon, enterOutcome, modals } from './modalStack'
+import { LAYER, PressGuard, enterOutcome, modals } from './modalStack'
 import { useModalLayer } from './useModalLayer'
 
 export interface ConfirmOptions {
@@ -145,12 +145,14 @@ function DialogModal({
   const settle = (ok: boolean, value?: string) => onSettle(req.id, ok, value)
   const settleRef = useRef(settle)
   settleRef.current = settle
-  /** When this dialog appeared, for the click-through guard. */
-  const shownAt = useRef(performance.now())
-  /** A pointer click this soon after mounting was meant for the dialog
-   *  that stood here a moment ago (see clickTooSoon). */
+  /** Click-through guard: a click counts only if its pointerdown and
+   *  pointerup both landed on this dialog after it mounted (see PressGuard),
+   *  so the tail of a double-click on the dialog that stood here a moment
+   *  ago cannot answer this one. */
+  const press = useRef<PressGuard | null>(null)
+  if (!press.current) press.current = new PressGuard()
   const guarded = (e: React.MouseEvent, ok: boolean, value?: string) => {
-    if (clickTooSoon(shownAt.current, performance.now(), e.detail > 0)) return
+    if (!press.current?.accepts(e.detail)) return
     settle(ok, value)
   }
   const confirmRef = useRef<HTMLButtonElement>(null)
@@ -169,16 +171,20 @@ function DialogModal({
   const safeDefault = isConfirm && !!req.danger
 
   // Escape cancels, but only while this dialog is the top modal.
-  const layer = useModalLayer(true, () => settleRef.current(false))
+  const layer = useModalLayer(true, () => settleRef.current(false), LAYER.dialog)
 
   // Focus the default action, and wire Enter. Reset whenever the head request
   // changes (keyed by id below).
   useEffect(() => {
-    if (isPrompt) {
-      inputRef.current?.focus()
-      inputRef.current?.select()
-    } else {
-      ;(safeDefault ? cancelRef : confirmRef).current?.focus()
+    // Only while on top: under an SSH prompt (a higher tier) taking focus
+    // would leave a native Enter to activate this hidden dialog's button.
+    if (modals.isTop(layer.current)) {
+      if (isPrompt) {
+        inputRef.current?.focus()
+        inputRef.current?.select()
+      } else {
+        ;(safeDefault ? cancelRef : confirmRef).current?.focus()
+      }
     }
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Enter' || !modals.isTop(layer.current)) return
@@ -202,7 +208,11 @@ function DialogModal({
   }, [safeDefault, isPrompt, req.kind, req.danger, layer])
 
   return (
-    <div className="absolute inset-0 z-[60] flex justify-center">
+    <div
+      className="absolute inset-0 z-[65] flex justify-center"
+      onPointerDownCapture={() => press.current?.pointerDown()}
+      onPointerUpCapture={() => press.current?.pointerUp()}
+    >
       <div
         className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]"
         aria-hidden

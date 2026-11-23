@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { KeyRound, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 
 interface AuthPromptField {
   prompt: string
@@ -95,7 +96,7 @@ export function AuthPromptDialog() {
 
   // Escape cancels authentication, while this prompt is the top modal.
   const cancelRef = useRef<() => Promise<void>>(async () => {})
-  useModalLayer(!!request, () => void cancelRef.current())
+  useModalLayer(!!request, () => void cancelRef.current(), LAYER.sshPrompt)
 
   if (!request) return null
   cancelRef.current = cancel
@@ -124,7 +125,7 @@ export function AuthPromptDialog() {
   }
 
   return (
-    <div className="absolute inset-0 z-50 flex justify-center">
+    <div className="absolute inset-0 z-[80] flex justify-center">
       <div
         className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]"
         aria-hidden
