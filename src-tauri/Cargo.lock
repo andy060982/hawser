@@ -2058,6 +2058,7 @@ name = "hawser"
 version = "0.6.0"
 dependencies = [
  "dashmap",
+ "dbus-secret-service",
  "futures-util",
  "keyring",
  "libc",
@@ -2066,6 +2067,7 @@ dependencies = [
  "reqwest",
  "russh",
  "russh-sftp",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2077,6 +2079,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "windows-sys 0.61.2",
+ "zbus 5.19.0",
  "zeroize",
 ]
 

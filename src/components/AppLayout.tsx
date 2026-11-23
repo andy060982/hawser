@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DialIdentity, Host, HostNode, Session, Transfer, TransferProgressEvent, TransferFailureEvent, WorkspaceView } from '../types'
 import {
   addFolder, allFolders, allHosts, bindingChanged, catalogueProblem, countHosts,
-  credentialDestinations, findHost, moveHost, reidentify, sanitizeImport,
+  findHost, isBorrowed, moveHost, NarrowQueue, reidentify, sanitizeImport, setVaultFoldsCase,
   effectiveHostColor, removeFolder, removeHost, renameFolder, setFolderColor, upsertHost,
 } from '../lib/tree'
 import { setLocalRoot } from '../lib/localPath'
@@ -259,6 +259,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   useEffect(() => {
     // Where the local file pane starts (the system drive on Windows).
     void safeInvoke<string>('local_root').then(setLocalRoot).catch(() => {})
+    // How the OS vault compares credential ids (folds case on Windows).
+    void safeInvoke<boolean>('vault_id_rule')
+      .then((f) => {
+        if (typeof f === 'boolean') setVaultFoldsCase(f)
+      })
+      .catch(() => {})
     const failed = (why: string) => {
       setHosts([])
       void alert(
@@ -266,30 +272,48 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         { title: 'Host catalogue not loaded' },
       )
     }
-    void safeInvoke<unknown>('hosts_load')
-      .then((tree) => {
-        if (tree === null || tree === undefined) {
-          // First run (or no backend): seed. An EMPTY saved list is the
-          // user's choice (they deleted every host), not a first run.
-          loadedRef.current = true
-          setCatalogueLoaded(true)
-          if (tree === null) {
-            safeInvoke('hosts_save', { tree: seedHosts }).catch((e) =>
-              void alert(`Could not save the host catalogue: ${e instanceof Error ? e.message : e}`),
-            )
+    const loaded = () => {
+      loadedRef.current = true
+      setCatalogueLoaded(true)
+    }
+    const load = (retry: boolean) =>
+      void safeInvoke<unknown>('hosts_load')
+        .then(async (tree) => {
+          if (tree === undefined) {
+            loaded() // no backend (browser preview)
+            return
           }
-          return
-        }
-        const problem = catalogueProblem(tree)
-        if (problem) {
-          failed(`hosts.json is not a valid host catalogue: ${problem}.`)
-          return
-        }
-        setHosts(tree as HostNode[])
-        loadedRef.current = true
-        setCatalogueLoaded(true)
-      })
-      .catch((e) => failed(e instanceof Error ? e.message : String(e)))
+          if (tree === null) {
+            // First run: seed. An EMPTY saved list is the user's choice (they
+            // deleted every host), not a first run. The seed is created only
+            // if no file exists; one that appeared meanwhile is loaded.
+            try {
+              const created = await safeInvoke<boolean>('hosts_seed', { tree: seedHosts })
+              if (created === false && retry) {
+                load(false)
+                return
+              }
+            } catch (e) {
+              void alert(`Could not save the host catalogue: ${e instanceof Error ? e.message : e}`)
+            }
+            loaded()
+            return
+          }
+          const problem = catalogueProblem(tree)
+          if (problem) {
+            // The backend's JSON check passed, so it kept no copy: keep one now.
+            const copy = await safeInvoke<string | null>('hosts_keep_backup').then(
+              (p) => (p ? ` A copy of it was kept at ${p}.` : ''),
+              (e) => ` (No copy could be kept: ${e instanceof Error ? e.message : e}.)`,
+            )
+            failed(`hosts.json is not a valid host catalogue: ${problem}. It was left in place.${copy}`)
+            return
+          }
+          setHosts(tree as HostNode[])
+          loaded()
+        })
+        .catch((e) => failed(e instanceof Error ? e.message : String(e)))
+    load(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seedHosts])
 
@@ -337,11 +361,19 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   /** Last save failure already reported, so a run of failing saves (a full
    *  disk) does not stack one dialog per edit. Cleared by the next success. */
   const saveFailedRef = useRef(false)
-  const persistHosts = useCallback((next: HostNode[]) => {
+  /** Vault ids whose binding must shrink to the hosts that still use them.
+   *  Sent with the catalogue save, which narrows them first and saves only
+   *  if that worked; kept until a save that carried them succeeds. */
+  const narrowQueueRef = useRef(new NarrowQueue())
+  const persistHosts = useCallback((next: HostNode[], narrow: string[] = []) => {
     setHosts(next)
+    const queue = narrowQueueRef.current
+    queue.add(narrow)
     if (!loadedRef.current) return
-    safeInvoke('hosts_save', { tree: next })
+    const batch = queue.take()
+    safeInvoke('hosts_save', { tree: next, narrow: [...batch.keys()] })
       .then(() => {
+        queue.settle(batch)
         saveFailedRef.current = false
       })
       .catch((e) => {
@@ -353,16 +385,6 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
         )
       })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  /** Revoke destinations a saved password no longer serves: keep, in the
-   *  backend's binding for vault entry `credKey`, only the hosts in `tree`
-   *  that still use it. Never adds one (that needs the password typed). */
-  const narrowBinding = useCallback((credKey: string, tree: HostNode[]) => {
-    safeInvoke('credential_binding_narrow', {
-      hostId: credKey,
-      destinations: credentialDestinations(tree, credKey),
-    }).catch((e) => console.warn(`could not narrow the binding of ${credKey}:`, e))
   }, [])
 
   /* Byte-progress and per-file failure streams from Rust, matched on the
@@ -797,36 +819,38 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     (host: Host) => {
       const before = findHost(hosts, host.id)
       const next = upsertHost(hosts, host)
-      persistHosts(next)
       // An edited address, account or shared credential: the old
-      // destination must stop receiving the saved password.
-      if (before && bindingChanged(before, host)) narrowBinding(before.credentialId ?? before.id, next)
+      // destination must stop receiving the saved password. Narrowed with
+      // the save itself (see persistHosts), never after it.
+      persistHosts(next, before && bindingChanged(before, host) ? [before.credentialId ?? before.id] : [])
     },
-    [hosts, persistHosts, narrowBinding],
+    [hosts, persistHosts],
   )
 
   const deleteHost = useCallback(
     (hostId: string) => {
       const before = findHost(hosts, hostId)
       const next = removeHost(hosts, hostId)
-      persistHosts(next)
       // Remove its saved password (and binding) from the OS vault too — unless
-      // another host still borrows that entry via credentialId (compared
-      // case-folded: the Windows vault folds case, so `H-1` borrows `h-1`).
-      const same = (a?: string) => a !== undefined && a.toLowerCase() === hostId.toLowerCase()
-      if (!allHosts(next).some((h) => same(h.credentialId))) {
+      // another host still borrows that entry via credentialId (compared with
+      // the vault's id rule: on Windows `H-1` borrows `h-1`).
+      const borrowed = isBorrowed(next, hostId)
+      const narrow = [
+        // Still borrowed: its own destination stops receiving the password.
+        ...(borrowed ? [hostId] : []),
+        // A borrower going away: the lender's password stops going to it.
+        ...(before?.credentialId ? [before.credentialId] : []),
+      ]
+      persistHosts(next, narrow)
+      if (!borrowed) {
         safeInvoke('credential_delete', { hostId }).catch((e) =>
           void alert(
             `The host was removed, but its saved password could not be deleted from the system credential store: ${e instanceof Error ? e.message : e}`,
           ),
         )
-      } else {
-        narrowBinding(hostId, next)
       }
-      // A borrower going away: the lender's password stops going to it.
-      if (before?.credentialId) narrowBinding(before.credentialId, next)
     },
-    [hosts, persistHosts, narrowBinding, alert],
+    [hosts, persistHosts, alert],
   )
 
   /** Closes a whole tab: every pane in that session's group. */

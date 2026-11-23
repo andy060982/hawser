@@ -11,7 +11,8 @@ import {
   markFailed, netTargetError, parsePort, policyFor, queuedRow, retryJobs, validateForward,
 } from './transfers.ts'
 import {
-  bindingChanged, catalogueProblem, credentialDestinations, reidentify, sanitizeImport, usableImportedId,
+  bindingChanged, catalogueProblem, credentialDestinations, isBorrowed, NarrowQueue, reidentify, sameVaultId,
+  sanitizeImport, setVaultFoldsCase, usableImportedId, vaultIdKey,
 } from './tree.ts'
 import { clearLocal, emitLocal, onLocal } from './localTerm.ts'
 import { defaultLocalRoot, localBaseName, setLocalRoot, unsafeTransferName } from './localPath.ts'
@@ -355,9 +356,11 @@ test('an import keeps only known fields and holds back self-acting ones', () => 
   assert.deepEqual(off.risky.map((r) => r.name), ['fw1'])
   assert.equal(off.risky[0].enables.length, 4)
   const h = off.tree[0]
-  for (const f of ['planted', 'startupCommands', 'checkConfigOnConnect', 'configCommand', 'aiAllowed', 'local']) {
+  for (const f of ['planted', 'startupCommands', 'checkConfigOnConnect', 'configCommand', 'local']) {
     assert.equal(h[f], undefined, f)
   }
+  // A declined AI opt-in becomes an explicit opt-out, never "inherit".
+  assert.equal(h.aiAllowed, false)
   assert.deepEqual(h.snippets, [{ label: 'a', command: 'ls', slot: 3 }])
   assert.equal(off.tree[1].junk, undefined)
   assert.equal(off.tree[1].children[0].name, 'quiet')
@@ -440,4 +443,75 @@ test('tunnel and network tools dialogs have no window Escape handler', async () 
     assert.ok(!/addEventListener\(\s*'keydown'/.test(src), `${f} still listens on window`)
     assert.ok(/onKeyDown=\{onPanelKey\}/.test(src), `${f} lost its panel Escape handler`)
   }
+})
+
+/* W4b: import privacy. */
+test('an imported AI opt-out is always kept, an opt-in only with a yes', () => {
+  const file = [
+    mkHost({ id: 'h-off', name: 'off', aiAllowed: false }),
+    mkHost({ id: 'h-on', name: 'on', aiAllowed: true }),
+    mkHost({ id: 'h-unset', name: 'unset' }),
+  ]
+  const declined = sanitizeImport(file, false)
+  assert.deepEqual(declined.risky.map((r) => r.name), ['on'], 'an opt-out is not a risk')
+  assert.equal(declined.tree[0].aiAllowed, false, 'opt-out kept when declining')
+  assert.equal(declined.tree[1].aiAllowed, false, 'declined opt-in is explicit false')
+  assert.equal('aiAllowed' in declined.tree[2], false, 'an unset choice stays unset')
+  const accepted = sanitizeImport(file, true)
+  assert.equal(accepted.tree[0].aiAllowed, false, 'opt-out kept when accepting')
+  assert.equal(accepted.tree[1].aiAllowed, true)
+})
+
+test('an imported local profile is rebuilt from known fields only', () => {
+  const file = [mkHost({ local: { profile: 'zsh', program: '/tmp/evil', args: ['-c', 'x'], env: { A: 1 } } })]
+  assert.deepEqual(sanitizeImport(file, true).tree[0].local, { profile: 'zsh' })
+  assert.equal(sanitizeImport(file, false).tree[0].local, undefined)
+})
+
+/* W4b: one credential-id rule, the vault's. */
+test('credential ids compare with the vault rule (folded on Windows, exact elsewhere)', () => {
+  const tree = [
+    mkHost({ id: 'h-1', hostname: 'a' }),
+    mkHost({ id: 'b', hostname: 'b', credentialId: 'H-1' }),
+  ]
+  try {
+    setVaultFoldsCase(true) // Windows
+    assert.equal(vaultIdKey('H-Ab'), 'h-ab')
+    assert.ok(sameVaultId('H-1', 'h-1'))
+    assert.deepEqual(credentialDestinations(tree, 'h-1').map((d) => d.host), ['a', 'b'])
+    assert.ok(isBorrowed(tree, 'h-1'), 'H-1 borrows h-1: never deleted from under it')
+    const [x] = reidentify([mkHost({ id: 'H-1' })], tree)
+    assert.notEqual(vaultIdKey(x.id), 'h-1')
+
+    setVaultFoldsCase(false) // macOS / Linux: two separate entries
+    assert.equal(vaultIdKey('H-Ab'), 'H-Ab')
+    assert.ok(!sameVaultId('H-1', 'h-1'))
+    assert.deepEqual(credentialDestinations(tree, 'h-1').map((d) => d.host), ['a'])
+    assert.ok(!isBorrowed(tree, 'h-1'), 'H-1 is a different entry: h-1 may be deleted')
+    const [y] = reidentify([mkHost({ id: 'H-1' })], tree)
+    assert.equal(y.id, 'H-1', 'a distinct vault id is kept')
+    assert.ok(bindingChanged(mkHost({ credentialId: 'H-1' }), mkHost({ credentialId: 'h-1' })))
+  } finally {
+    setVaultFoldsCase(true)
+  }
+})
+
+/* W4b: narrowing rides with the save and is retried until one succeeds. */
+test('queued narrowing survives a failed save and clears only when carried', () => {
+  const q = new NarrowQueue()
+  q.add(['lender'])
+  const first = q.take()
+  // That save failed: the next save (any edit) carries it again.
+  q.add([])
+  const second = q.take()
+  assert.deepEqual([...second.keys()], ['lender'])
+  // Queued again while the second save is in flight: an older success
+  // must not drop the newer request.
+  q.add(['lender', 'other'])
+  q.settle(second)
+  assert.deepEqual(q.pending().sort(), ['lender', 'other'])
+  q.settle(q.take())
+  assert.deepEqual(q.pending(), [])
+  q.settle(first) // a stale success is harmless
+  assert.deepEqual(q.pending(), [])
 })

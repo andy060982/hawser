@@ -676,9 +676,44 @@ async fn hosts_load() -> CmdResult<Option<serde_json::Value>> {
     off(|| utils::hosts::load().map_err(|e| e.to_string())).await
 }
 
+/// Save the catalogue. `narrow`: vault ids whose binding must first shrink to
+/// the destinations that still use them in `tree` (an edited, deleted or
+/// repointed host). Narrowing and saving are one operation, narrowing first:
+/// if a binding cannot be narrowed nothing is saved and the error says so.
 #[tauri::command]
-async fn hosts_save(tree: serde_json::Value) -> CmdResult<()> {
-    off(move || utils::hosts::save(&tree).map_err(|e| e.to_string())).await
+async fn hosts_save(tree: serde_json::Value, narrow: Option<Vec<String>>) -> CmdResult<()> {
+    off(move || match narrow.as_deref() {
+        Some(ids) if !ids.is_empty() => utils::hosts::save_and_narrow(&tree, ids),
+        _ => utils::hosts::save(&tree).map_err(|e| e.to_string()),
+    })
+    .await
+}
+
+/// The first-run seed: written only if no catalogue file exists. Returns
+/// false when one appeared meanwhile (it is kept, and should be loaded).
+#[tauri::command]
+async fn hosts_seed(tree: serde_json::Value) -> CmdResult<bool> {
+    off(move || utils::hosts::save_new(&tree).map_err(|e| e.to_string())).await
+}
+
+/// Keep a `.corrupt-<ts>` copy of hosts.json, for a file the frontend's
+/// structural check refused. Returns the copy's path, if a file exists.
+#[tauri::command]
+async fn hosts_keep_backup() -> CmdResult<Option<String>> {
+    off(|| {
+        utils::hosts::keep_catalogue_backup()
+            .map(|p| p.map(|p| p.display().to_string()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// How the OS vault compares ids: `true` when it folds case (Windows
+/// Credential Manager). The frontend compares credential ids with this rule
+/// (lib/vaultId.ts), the same one the backend's bindings use.
+#[tauri::command]
+fn vault_id_rule() -> bool {
+    credentials::vault_folds_case()
 }
 
 /// Tabs open at last exit, so a restart can offer them again.
@@ -1450,17 +1485,27 @@ async fn credential_binding_narrow(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
-        // First, so a second launch hands over and exits before anything else
-        // starts: two instances would race on the audit log and every other
-        // data file. The running window is brought forward instead.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.unminimize();
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
-        }))
+    let context = tauri::generate_context!();
+    // The app-wide instance lock, before ANY store is opened (the audit
+    // writer, hosts, bindings, the vault journal, settings): see
+    // utils::instance. Held until the process exits.
+    let _instance = match utils::instance::acquire() {
+        Ok(utils::instance::Acquire::Held(lock)) => Some(lock),
+        Ok(utils::instance::Acquire::Busy) => return run_second_instance(context),
+        Err(e) => {
+            // No usable app-data folder: no store can be opened either, so
+            // there is nothing for a second instance to race on.
+            eprintln!("hawser: could not take the instance lock ({e}); continuing without it");
+            None
+        }
+    };
+    let app = with_single_instance_plugin(tauri::Builder::default(), |app| {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    })
         .setup(|app| {
             app.manage(Registry::default());
             app.manage(Arc::new(local_shell::LocalShells::default()));
@@ -1468,7 +1513,8 @@ pub fn run() {
             app.manage(Arc::new(AuthPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
 
-            // The audit writer thread, before anything can be recorded.
+            // The audit writer thread, before anything can be recorded. It
+            // also ingests records an earlier exit had to spill.
             utils::audit::start();
             // The data directory is owner-only (0700) on Unix; files in it are
             // written 0600 (utils::hosts::write_atomic).
@@ -1486,6 +1532,32 @@ pub fn run() {
             // migration reads it — and reintroduce the frontend-writable-source
             // bug. Run inline (small catalogue + a few vault reads); a panic is
             // contained so a migration hiccup never blocks startup.
+            // First, settle a password save a crash interrupted (the vault
+            // intent journal): its secret ends up paired with the binding it
+            // was saved for, or removed.
+            match std::panic::catch_unwind(utils::hosts::repair_vault_intent) {
+                Ok(Ok(Some(r))) => {
+                    let (summary, id) = match &r {
+                        utils::hosts::Repair::Completed(id) => ("an interrupted password save had completed", id),
+                        utils::hosts::Repair::BindingFinished(id) => ("finished recording where an interrupted password save may be sent", id),
+                        utils::hosts::Repair::SecretRemoved(id) => ("removed a password whose save was interrupted; save it again", id),
+                    };
+                    eprintln!("hawser: {summary} ('{id}')");
+                    utils::audit::record("credential.repair", summary, serde_json::json!({ "hostId": id, "ok": true }));
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => eprintln!("hawser: {e}"),
+                Err(_) => eprintln!("hawser: the vault journal repair panicked"),
+            }
+            match std::panic::catch_unwind(utils::ai::repair_ai_intent) {
+                Ok(Ok(Some(summary))) => {
+                    eprintln!("hawser: {summary}");
+                    utils::audit::record("ai.key_repair", summary, serde_json::json!({ "profile": "default", "ok": true }));
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => eprintln!("hawser: {e}"),
+                Err(_) => eprintln!("hawser: the AI key journal repair panicked"),
+            }
             let _ = std::panic::catch_unwind(utils::hosts::migrate_bindings);
             let _ = std::panic::catch_unwind(utils::ai::migrate_ai_origins);
 
@@ -1565,6 +1637,9 @@ pub fn run() {
             settings_save,
             hosts_load,
             hosts_save,
+            hosts_seed,
+            hosts_keep_backup,
+            vault_id_rule,
             hosts_export,
             sessions_load,
             sessions_save,
@@ -1584,15 +1659,56 @@ pub fn run() {
             credential_delete,
             credential_binding_narrow,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while running tauri application");
     app.run(|_app, event| {
-        // Audit records are written by a background thread; give the queue a
-        // moment to drain so the last actions of a session are not lost.
+        // Audit records are written by a background thread: give the queue
+        // up to 10 s to drain, then spill whatever is still pending to
+        // audit.pending-<ts>.jsonl, recorded at the next start.
         if let tauri::RunEvent::Exit = event {
-            utils::audit::flush(std::time::Duration::from_secs(3));
+            utils::audit::shutdown(std::time::Duration::from_secs(10));
         }
     });
+}
+
+/// Register the single-instance plugin, where it can run safely.
+///
+/// On Linux the plugin (2.4.1) unwraps the session-bus address, and a
+/// malformed `DBUS_SESSION_BUS_ADDRESS` would panic inside it (an abort in
+/// release builds). The address is checked first; without a usable bus the
+/// plugin is left out and only the instance lock guards the data (a second
+/// launch then exits without focusing the first window).
+fn with_single_instance_plugin<R: tauri::Runtime>(
+    builder: tauri::Builder<R>,
+    on_second: impl Fn(&tauri::AppHandle<R>) + Send + Sync + 'static,
+) -> tauri::Builder<R> {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = zbus::Address::session() {
+        eprintln!("hawser: no usable D-Bus session address ({e}); a second launch will not focus this window");
+        return builder;
+    }
+    builder.plugin(tauri_plugin_single_instance::init(move |app, _argv, _cwd| on_second(app)))
+}
+
+/// Another process holds the instance lock: open nothing, let the plugin hand
+/// this launch to the running window (it exits the process when it can), and
+/// exit cleanly if it could not. No window is created and no store is opened.
+fn run_second_instance(mut context: tauri::Context<tauri::Wry>) {
+    context.config_mut().app.windows.clear();
+    // A launch at the same moment as the first: give that one time to open
+    // its hand-off endpoint, so this one reaches it instead of racing it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let built = with_single_instance_plugin(tauri::Builder::default(), |_| {})
+        .setup(|_| {
+            // Reached only when the plugin did not hand off and exit.
+            eprintln!("hawser: another Hawser instance is running; exiting");
+            std::process::exit(0)
+        })
+        .build(context);
+    if let Err(e) = built {
+        eprintln!("hawser: another Hawser instance is running; exiting ({e})");
+    }
+    std::process::exit(0)
 }
 
 #[cfg(test)]

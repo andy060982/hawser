@@ -141,6 +141,12 @@ const EV_INTEGRITY: &str = "audit.integrity_failed";
 const EV_ARCHIVED: &str = "audit.archived";
 /// Event tag noting records the writer had to drop (its queue was full).
 const EV_DROPPED: &str = "audit.dropped";
+/// Records accepted before an exit that could not write them in time, spilled
+/// to `audit.pending-*.jsonl` and recorded at the next start.
+const EV_RECOVERED: &str = "audit.recovered";
+/// Prefix / suffix of spilled-record files beside the log.
+const PENDING_PREFIX: &str = "audit.pending-";
+const PENDING_SUFFIX: &str = ".jsonl";
 
 /// One audit record. Serialized as a single line of JSON (JSON Lines).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +662,8 @@ struct Faults {
     fail_sync: std::sync::atomic::AtomicBool,
     crash_archive_after: std::sync::atomic::AtomicU8,
     fail_newline_repair: std::sync::atomic::AtomicBool,
+    /// A verify waits here (outside every lock) until the test releases it.
+    verify_gate: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> KnownHostsError + '_ {
@@ -710,6 +718,11 @@ fn split_torn(path: &Path) -> Result<(u64, u64, bool), KnownHostsError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, false)),
         Err(e) => return Err(io_err(path)(e)),
     };
+    split_torn_in(&mut f, path)
+}
+
+/// `split_torn` on an open handle (`path` only names it in errors).
+fn split_torn_in(f: &mut File, path: &Path) -> Result<(u64, u64, bool), KnownHostsError> {
     let len = f.metadata().map_err(io_err(path))?.len();
     if len == 0 {
         return Ok((0, 0, false));
@@ -765,7 +778,11 @@ fn unused_sibling(dir_of: &Path, base: &str) -> PathBuf {
 /// SHA-256 of a file, streamed, plus its first line classified (for following
 /// archive pins). Memory stays bounded.
 fn hash_file(path: &Path) -> std::io::Result<(String, Option<AuditEntry>)> {
-    let f = File::open(path)?;
+    hash_reader(File::open(path)?)
+}
+
+/// `hash_file` over any reader (a snapshot's handle, cut at its length).
+fn hash_reader(f: impl Read) -> std::io::Result<(String, Option<AuditEntry>)> {
     let mut hasher = Sha256::new();
     let mut first: Option<Option<AuditEntry>> = None;
     let mut line: Vec<u8> = Vec::new();
@@ -807,6 +824,53 @@ fn hash_file(path: &Path) -> std::io::Result<(String, Option<AuditEntry>)> {
 struct PinProblem {
     fatal: bool,
     message: String,
+}
+
+/// Which file is at the log's path, and how long it is: changes on any
+/// append, torn-tail rewrite or rotation (a new file).
+#[derive(Debug, Clone, PartialEq)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    ino: (u64, u64),
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(Stamp {
+        len: m.len(),
+        modified: m.modified().ok(),
+        #[cfg(unix)]
+        ino: {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        },
+    })
+}
+
+/// A consistent view of the log for a verify or an archive: the open file,
+/// its torn-tail split and the seal, all taken together under the locks, then
+/// read WITHOUT them, so appends never wait behind a long verify. The log is
+/// append-only between locks: bytes before `keep` cannot change, and a
+/// rewrite or rotation replaces the file at the path, never this handle's.
+struct Snapshot {
+    file: Option<File>,
+    len: u64,
+    keep: u64,
+    torn: bool,
+    seal: SealRead,
+    stamp: Option<Stamp>,
+}
+
+/// An archive's verdict and pin, computed from a snapshot outside the locks.
+/// Used at commit only if the file is still exactly the one snapshotted.
+struct Prepared {
+    stamp: Option<Stamp>,
+    prior: VerifyReport,
+    last: Option<(u64, String)>,
+    sha: Option<String>,
+    len: u64,
 }
 
 impl<A: Anchor> Log<A> {
@@ -1113,7 +1177,15 @@ impl<A: Anchor> Log<A> {
             let _lock = FileLock::acquire(&self.path)?;
             // Another process (a forced second instance) may have appended
             // since our last write: never chain from a head it moved past.
-            if guard.as_ref().is_some_and(|s| file_len(&self.path).ok() != Some(s.len)) {
+            // Or it may have staged a rotation and moved the seal, then died
+            // before renaming: the live file is unchanged, but appending to it
+            // would seal the OLD chain over a committed stage, which the next
+            // recovery would then discard. One stat per append catches it:
+            // any staged file sends us through recovery (which completes a
+            // committed stage) and a fresh session.
+            if guard.as_ref().is_some_and(|s| {
+                file_len(&self.path).ok() != Some(s.len) || std::fs::symlink_metadata(self.rotating_path()).is_ok()
+            }) {
                 *guard = None;
             }
             if guard.is_none() {
@@ -1191,26 +1263,53 @@ impl<A: Anchor> Log<A> {
         Ok(out)
     }
 
-    /// Walk the chain and compare it with the seal. Holds the writer lock (and
-    /// the cross-process lock), so it never sees the file and the seal at
-    /// different stages of one append.
+    /// Walk the chain and compare it with the seal. The file handle, its
+    /// length and the seal are taken together under the writer and
+    /// cross-process locks, so they never show different stages of one
+    /// append; the walk itself runs without them. (The writer thread runs the
+    /// two halves on different threads.)
+    #[cfg(test)]
     fn verify(&self) -> Result<VerifyReport, KnownHostsError> {
+        match self.locked_snapshot()? {
+            Ok(mut snap) => self.verify_snapshot(&mut snap).map(|(r, _)| r),
+            Err(pending) => Ok(pending),
+        }
+    }
+
+    /// Take a [`Snapshot`] under the session and cross-process locks (held
+    /// only for this: a recovery check, a tail read, a seal read). `Err` is
+    /// the report for a rotation still pending on the keychain.
+    fn locked_snapshot(&self) -> Result<Result<Snapshot, VerifyReport>, KnownHostsError> {
         let _guard = self.session.lock().map_err(|_| KnownHostsError::Io {
             path: self.path.clone(),
             source: std::io::Error::other("audit lock poisoned"),
         })?;
         let _lock = FileLock::acquire(&self.path)?;
         if self.recover_rotation()? == Rotation::Pending {
-            return Ok(VerifyReport {
+            return Ok(Err(VerifyReport {
                 ok: false,
                 status: Status::Warning,
                 count: 0,
                 message: format!("Cannot verify yet: {ROTATION_PENDING}."),
                 broken_at: None,
                 seal_status: "unavailable".to_string(),
-            });
+            }));
         }
-        self.verify_locked().map(|(r, _)| r)
+        self.take_snapshot().map(Ok)
+    }
+
+    /// The snapshot itself; the caller holds the locks.
+    fn take_snapshot(&self) -> Result<Snapshot, KnownHostsError> {
+        let mut file = match File::open(&self.path) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io_err(&self.path)(e)),
+        };
+        let (len, keep, torn) = match file.as_mut() {
+            Some(f) => split_torn_in(f, &self.path)?,
+            None => (0, 0, false),
+        };
+        Ok(Snapshot { file, len, keep, torn, seal: self.anchor.read(), stamp: stamp(&self.path) })
     }
 
     /// Walk the archive pins back through the generations: the current log's
@@ -1281,9 +1380,26 @@ impl<A: Anchor> Log<A> {
 
     /// The report, plus the last parseable record (for an archive's pin).
     fn verify_locked(&self) -> Result<(VerifyReport, Option<(u64, String)>), KnownHostsError> {
-        let (_, keep, torn) = split_torn(&self.path)?;
-        let seal = self.anchor.read();
-        let chain = self.walk_file(Some(keep), &wanted(&seal))?;
+        let mut snap = self.take_snapshot()?;
+        self.verify_snapshot(&mut snap)
+    }
+
+    /// Verify a snapshot. Needs no lock: it reads only the snapshot's handle
+    /// (up to `keep`) and the immutable archives.
+    fn verify_snapshot(&self, snap: &mut Snapshot) -> Result<(VerifyReport, Option<(u64, String)>), KnownHostsError> {
+        #[cfg(test)]
+        if let Some(gate) = self.faults.verify_gate.lock().unwrap().take() {
+            let _ = gate.recv();
+        }
+        let (keep, torn) = (snap.keep, snap.torn);
+        let seal = snap.seal.clone();
+        let chain = match snap.file.as_mut() {
+            Some(f) => {
+                f.seek(SeekFrom::Start(0)).map_err(io_err(&self.path))?;
+                walk_reader(&*f, Some(keep), &wanted(&seal)).map_err(io_err(&self.path))?
+            }
+            None => walk_reader(std::io::empty(), None, &wanted(&seal)).map_err(io_err(&self.path))?,
+        };
         let count = chain.rows;
         let mut decision = reconcile(&chain, &seal);
         let pin = self.archived_log_problem(chain.first.as_ref());
@@ -1488,7 +1604,42 @@ impl<A: Anchor> Log<A> {
     /// the archive stays tamper-evident after the seal moves on. See
     /// [`Self::recover_rotation`] for the crash-safe ordering. Returns the
     /// archive's file name.
+    /// Everything under the locks (the writer uses `archive_prepared`).
+    #[cfg(test)]
     fn archive(&self) -> Result<String, String> {
+        self.archive_with(None)
+    }
+
+    /// Archive with the slow part (verifying and hashing the whole log) done
+    /// on a snapshot OUTSIDE the locks, so appends carry on meanwhile. The
+    /// commit then takes the locks and uses that work only if the file is
+    /// still exactly the one snapshotted; otherwise (records were appended
+    /// meanwhile) it is redone under the locks, so nothing is ever archived
+    /// without being pinned.
+    fn archive_prepared(&self) -> Result<String, String> {
+        let prepared = self.prepare_archive()?;
+        self.archive_with(Some(prepared))
+    }
+
+    /// The unlocked half of `archive_prepared`.
+    fn prepare_archive(&self) -> Result<Prepared, String> {
+        Ok(match self.locked_snapshot().map_err(|e| e.to_string())? {
+            Err(_) => return Err(ROTATION_PENDING.to_string()),
+            Ok(mut snap) => {
+                let (prior, last) = self.verify_snapshot(&mut snap).map_err(|e| e.to_string())?;
+                let sha = match snap.file.as_mut() {
+                    Some(f) if snap.len > 0 => {
+                        f.seek(SeekFrom::Start(0)).map_err(|e| format!("could not read the audit log: {e}"))?;
+                        Some(hash_reader((&*f).take(snap.len)).map_err(|e| format!("could not read the audit log: {e}"))?.0)
+                    }
+                    _ => None,
+                };
+                Prepared { stamp: snap.stamp, prior, last, sha, len: snap.len }
+            }
+        })
+    }
+
+    fn archive_with(&self, prepared: Option<Prepared>) -> Result<String, String> {
         let mut guard = self.session.lock().map_err(|_| "audit lock poisoned".to_string())?;
         // Whatever happens below, the next append re-reads the disk.
         *guard = None;
@@ -1499,12 +1650,19 @@ impl<A: Anchor> Log<A> {
         if matches!(self.anchor.read(), SealRead::Unavailable) {
             return Err("the keychain is unavailable; cannot archive without moving the anchor".into());
         }
-        let (prior, last) = self.verify_locked().map_err(|e| e.to_string())?;
-        let bytes_len = file_len(&self.path).map_err(|e| e.to_string())?;
-        let sha = if bytes_len > 0 {
-            Some(hash_file(&self.path).map_err(|e| format!("could not read the audit log: {e}"))?.0)
-        } else {
-            None
+        let now = stamp(&self.path);
+        let (prior, last, sha, bytes_len) = match prepared.filter(|p| p.stamp == now) {
+            Some(p) => (p.prior, p.last, p.sha, p.len),
+            None => {
+                let (prior, last) = self.verify_locked().map_err(|e| e.to_string())?;
+                let bytes_len = file_len(&self.path).map_err(|e| e.to_string())?;
+                let sha = if bytes_len > 0 {
+                    Some(hash_file(&self.path).map_err(|e| format!("could not read the audit log: {e}"))?.0)
+                } else {
+                    None
+                };
+                (prior, last, sha, bytes_len)
+            }
         };
 
         // A name never used before: the timestamp plus the archived file's
@@ -1641,8 +1799,10 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
 
 /// Work for the writer thread. One thread owns the log and handles these in
 /// the order they were queued, so a verify sees every record queued before it.
+/// A verify or an archive only takes its snapshot there; the long part runs
+/// on its own thread, so appends never wait behind it.
 enum Job {
-    Record { event: String, summary: String, detail: Value },
+    Record { id: u64, event: String, summary: String, detail: Value },
     Verify(mpsc::Sender<Result<VerifyReport, String>>),
     Archive(mpsc::Sender<Result<String, String>>),
     Flush(mpsc::Sender<()>),
@@ -1652,10 +1812,37 @@ enum Job {
 /// it). Beyond this many the newest are dropped, counted, and the count is
 /// itself recorded once the writer catches up, so a drop is never silent.
 const QUEUE: usize = 16 * 1024;
+/// Accepted-but-unwritten records kept for a spill (queued plus failed).
+const MAX_PENDING: usize = 2 * QUEUE;
+
+/// A record accepted by `record` and not yet durably written. Kept until the
+/// append succeeds, so an exit that cannot wait for the writer (or an append
+/// that failed) spills it instead of losing it.
+struct PendingRec {
+    event: String,
+    summary: String,
+    detail: Value,
+    accepted: u64,
+    /// The writer has started on it: at a spill it may or may not have landed.
+    in_progress: bool,
+}
+
+#[derive(Default)]
+struct Pending {
+    next: u64,
+    recs: BTreeMap<u64, PendingRec>,
+}
+
+type SharedPending = std::sync::Arc<Mutex<Pending>>;
+
+fn lock_pending(p: &SharedPending) -> std::sync::MutexGuard<'_, Pending> {
+    p.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct Writer {
     tx: SyncSender<Job>,
     dropped: std::sync::Arc<AtomicU64>,
+    pending: SharedPending,
 }
 
 impl Writer {
@@ -1666,23 +1853,44 @@ impl Writer {
         let (tx, rx) = mpsc::sync_channel::<Job>(QUEUE);
         let dropped = std::sync::Arc::new(AtomicU64::new(0));
         let lost = std::sync::Arc::clone(&dropped);
+        let pending: SharedPending = Default::default();
+        let shared = std::sync::Arc::clone(&pending);
         std::thread::Builder::new()
             .name("hawser-audit".into())
-            .spawn(move || serve(open(), rx, &lost))?;
-        Ok(Self { tx, dropped })
+            .spawn(move || serve(open().map(std::sync::Arc::new), rx, &lost, &shared))?;
+        Ok(Self { tx, dropped, pending })
     }
 
     fn record(&self, event: &str, summary: String, detail: Value) {
-        let job = Job::Record { event: event.to_string(), summary, detail };
+        let id = {
+            let mut p = lock_pending(&self.pending);
+            if p.recs.len() >= MAX_PENDING {
+                drop(p);
+                if self.dropped.fetch_add(1, Ordering::SeqCst) == 0 {
+                    eprintln!("hawser: audit backlog full; dropping records until the writer catches up ({event})");
+                }
+                return;
+            }
+            let id = p.next;
+            p.next += 1;
+            p.recs.insert(
+                id,
+                PendingRec { event: event.to_string(), summary: summary.clone(), detail: detail.clone(), accepted: now_secs(), in_progress: false },
+            );
+            id
+        };
+        let job = Job::Record { id, event: event.to_string(), summary, detail };
         match self.tx.try_send(job) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                lock_pending(&self.pending).recs.remove(&id);
                 if self.dropped.fetch_add(1, Ordering::SeqCst) == 0 {
                     eprintln!("hawser: audit queue full; dropping records until the writer catches up ({event})");
                 }
             }
             Err(TrySendError::Disconnected(_)) => {
-                eprintln!("hawser: audit writer is gone; dropped ({event})");
+                // Kept in `pending`: spilled at exit, recorded next start.
+                eprintln!("hawser: audit writer is gone; ({event}) is kept for the next start");
             }
         }
     }
@@ -1692,14 +1900,103 @@ impl Writer {
         self.tx.send(make(tx)).ok()?;
         rx.recv().ok()
     }
+
+    /// Wait up to `timeout` for everything queued so far to be handled.
+    /// True when the writer answered in time.
+    fn flush(&self, timeout: Duration) -> bool {
+        let (tx, rx) = mpsc::channel();
+        // std's SyncSender has no send_timeout: retry try_send until the deadline.
+        let deadline = Instant::now() + timeout;
+        let mut job = Job::Flush(tx);
+        loop {
+            match self.tx.try_send(job) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return false,
+                Err(TrySendError::Full(j)) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    job = j;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok()
+    }
+
+    /// Move every accepted-but-unwritten record into `dir/audit.pending-<ts>.jsonl`
+    /// (0600), one JSON object per line. The writer skips any record it has not
+    /// started yet once it is spilled, so it is never written twice; one it had
+    /// started is marked `uncertain` (de-duplicated at ingest). Returns the file.
+    fn spill(&self, dir: &Path) -> std::io::Result<Option<PathBuf>> {
+        let recs = std::mem::take(&mut lock_pending(&self.pending).recs);
+        let lost = self.dropped.swap(0, Ordering::SeqCst);
+        if recs.is_empty() && lost == 0 {
+            return Ok(None);
+        }
+        let mut text = String::new();
+        for r in recs.values() {
+            let line = serde_json::json!({
+                "event": r.event, "summary": r.summary, "detail": r.detail,
+                "accepted": r.accepted, "uncertain": r.in_progress,
+            });
+            text.push_str(&line.to_string());
+            text.push('\n');
+        }
+        if lost > 0 {
+            let line = serde_json::json!({
+                "event": EV_DROPPED,
+                "summary": format!("{lost} audit entr{} could not be recorded: the writer was blocked and its queue was full", if lost == 1 { "y" } else { "ies" }),
+                "detail": { "count": lost }, "accepted": now_secs(), "uncertain": false,
+            });
+            text.push_str(&line.to_string());
+            text.push('\n');
+        }
+        std::fs::create_dir_all(dir)?;
+        let ts = now_secs();
+        for n in 0..1000u32 {
+            let name = match n {
+                0 => format!("{PENDING_PREFIX}{ts}{PENDING_SUFFIX}"),
+                n => format!("{PENDING_PREFIX}{ts}-{n}{PENDING_SUFFIX}"),
+            };
+            let path = dir.join(name);
+            let mut opts = OpenOptions::new();
+            opts.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
+                Ok(mut f) => {
+                    f.write_all(text.as_bytes())?;
+                    f.sync_all()?;
+                    let _ = sync_dir(&path);
+                    return Ok(Some(path));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::other("no free audit.pending file name"))
+    }
 }
 
-fn serve<A: Anchor>(log: Result<Log<A>, String>, rx: Receiver<Job>, dropped: &AtomicU64) {
+fn serve<A: Anchor + 'static>(
+    log: Result<std::sync::Arc<Log<A>>, String>,
+    rx: Receiver<Job>,
+    dropped: &AtomicU64,
+    pending: &SharedPending,
+) {
+    if let Ok(l) = &log {
+        ingest_pending(l);
+    }
     for job in rx {
         let log = match &log {
             Ok(l) => l,
             Err(e) => {
                 match job {
+                    // Kept in `pending` for a spill at exit.
                     Job::Record { event, .. } => eprintln!("hawser: audit append failed ({event}): {e}"),
                     Job::Verify(r) => drop(r.send(Err(e.clone()))),
                     Job::Archive(r) => drop(r.send(Err(e.clone()))),
@@ -1720,14 +2017,128 @@ fn serve<A: Anchor>(log: Result<Log<A>, String>, rx: Receiver<Job>, dropped: &At
             }
         }
         match job {
-            Job::Record { event, summary, detail } => {
-                if let Err(e) = log.record(&event, &summary, detail) {
-                    eprintln!("hawser: audit append failed ({event}): {e}");
+            Job::Record { id, event, summary, detail } => {
+                // Claim it; a record already spilled (exit) is not written.
+                let claimed = match lock_pending(pending).recs.get_mut(&id) {
+                    Some(r) => {
+                        r.in_progress = true;
+                        true
+                    }
+                    None => false,
+                };
+                if !claimed {
+                    continue;
+                }
+                let res = log.record(&event, &summary, detail);
+                let mut p = lock_pending(pending);
+                match res {
+                    Ok(()) => {
+                        p.recs.remove(&id);
+                    }
+                    Err(e) => {
+                        // Kept: a spill at exit carries it to the next start.
+                        if let Some(r) = p.recs.get_mut(&id) {
+                            r.in_progress = false;
+                        }
+                        eprintln!("hawser: audit append failed ({event}): {e}; kept for the next start");
+                    }
                 }
             }
-            Job::Verify(r) => drop(r.send(log.verify().map_err(|e| e.to_string()))),
-            Job::Archive(r) => drop(r.send(log.archive())),
+            Job::Verify(r) => match log.locked_snapshot() {
+                Ok(Ok(mut snap)) => {
+                    let l = std::sync::Arc::clone(log);
+                    let spawned = std::thread::Builder::new().name("hawser-audit-verify".into()).spawn(move || {
+                        drop(r.send(l.verify_snapshot(&mut snap).map(|(v, _)| v).map_err(|e| e.to_string())))
+                    });
+                    if let Err(e) = spawned {
+                        eprintln!("hawser: could not start an audit verify: {e}");
+                    }
+                }
+                Ok(Err(report)) => drop(r.send(Ok(report))),
+                Err(e) => drop(r.send(Err(e.to_string()))),
+            },
+            Job::Archive(r) => {
+                let l = std::sync::Arc::clone(log);
+                let spawned = std::thread::Builder::new()
+                    .name("hawser-audit-archive".into())
+                    .spawn(move || drop(r.send(l.archive_prepared())));
+                if let Err(e) = spawned {
+                    eprintln!("hawser: could not start an audit archive: {e}");
+                }
+            }
             Job::Flush(r) => drop(r.send(())),
+        }
+    }
+}
+
+/// Record what an earlier exit spilled (`audit.pending-*.jsonl` beside the
+/// log): an `audit.recovered` note per file, then each record, with the time
+/// it was originally accepted. A record marked `uncertain` (the writer had
+/// started on it) is skipped when the log's tail already has it. A file is
+/// removed only once all of it is recorded; if recording stops part-way it
+/// stays for the next start (whose pass may then repeat the part already
+/// written, which the `audit.recovered` notes make visible).
+fn ingest_pending<A: Anchor>(log: &Log<A>) {
+    let Some(dir) = log.path.parent() else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with(PENDING_PREFIX) && n.ends_with(PENDING_SUFFIX) && e.file_type().is_ok_and(|t| t.is_file())
+        })
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    for file in files {
+        let Ok(bytes) = std::fs::read(&file) else { continue };
+        let mut rows: Vec<Value> = Vec::new();
+        let mut bad = 0u64;
+        let _ = for_each_line(&bytes[..], |l| match l.map(serde_json::from_slice::<Value>) {
+            Some(Ok(v)) if v.get("event").and_then(Value::as_str).is_some() => rows.push(v),
+            Some(_) => bad += 1,
+            None => bad += 1,
+        });
+        let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let note = log.record(
+            EV_RECOVERED,
+            &format!(
+                "{} audit entr{} accepted before the previous exit, which could not wait for them, are recorded below (from {name}){}",
+                rows.len(),
+                if rows.len() == 1 { "y" } else { "ies" },
+                if bad > 0 { format!("; {bad} unreadable line(s) skipped") } else { String::new() }
+            ),
+            serde_json::json!({ "count": rows.len(), "file": name, "unreadable": bad }),
+        );
+        if let Err(e) = note {
+            eprintln!("hawser: could not record spilled audit entries yet ({e}); kept {name}");
+            return;
+        }
+        let recent = log.list(256).unwrap_or_default();
+        for v in rows {
+            let event = v.get("event").and_then(Value::as_str).unwrap_or_default().to_string();
+            let summary = v.get("summary").and_then(Value::as_str).unwrap_or_default().to_string();
+            let mut detail = v.get("detail").cloned().unwrap_or(Value::Null);
+            if v.get("uncertain").and_then(Value::as_bool) == Some(true) {
+                let want = sanitize(detail.clone());
+                if recent.iter().any(|r| r.event == event && r.summary == summary && r.detail == want) {
+                    continue;
+                }
+            }
+            if !detail.is_object() {
+                detail = serde_json::json!({});
+            }
+            if let Some(o) = detail.as_object_mut() {
+                o.insert("acceptedAt".into(), v.get("accepted").cloned().unwrap_or(Value::Null));
+                o.insert("recovered".into(), Value::Bool(true));
+            }
+            if let Err(e) = log.record(&event, &summary, detail) {
+                eprintln!("hawser: could not record spilled audit entries yet ({e}); kept {name}");
+                return;
+            }
+        }
+        if let Err(e) = std::fs::remove_file(&file) {
+            eprintln!("hawser: recorded but could not remove {name}: {e}");
         }
     }
 }
@@ -1764,13 +2175,19 @@ fn resolve_audit_path() -> Result<PathBuf, String> {
 }
 
 /// Copy the audit files (`audit.jsonl`, its archives, torn evidence and a
-/// staged rotation) from `from` into `to`, once: skipped when `to` already has
-/// a log or a migration marker. The originals are left in place, since a
-/// roaming profile shares them with other machines.
+/// staged rotation) from `from` into `to`. The originals are left in place,
+/// since a roaming profile shares them with other machines.
+///
+/// Crash-safe and retried until it completes: each file is copied to a temp
+/// name, synced, and only then renamed into place, and `audit.migrated` is
+/// written LAST. Without the marker the migration runs again; a destination
+/// that is a strict prefix of its source (a copy an older build cut short) is
+/// replaced, while one that is complete or has grown past its source (this
+/// machine appended to it) is kept.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn migrate_audit_files(from: &Path, to: &Path) -> std::io::Result<()> {
     let marker = to.join("audit.migrated");
-    if marker.exists() || to.join(AUDIT_FILE).exists() {
+    if marker.exists() {
         return Ok(());
     }
     std::fs::create_dir_all(to)?;
@@ -1786,12 +2203,49 @@ fn migrate_audit_files(from: &Path, to: &Path) -> std::io::Result<()> {
                 continue;
             }
             let dest = to.join(&*name);
-            if !dest.exists() {
-                std::fs::copy(entry.path(), &dest)?;
+            if !migration_needs_copy(&entry.path(), &dest)? {
+                continue;
             }
+            let tmp = to.join(format!(".migrating-{name}"));
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::copy(entry.path(), &tmp)?;
+            File::open(&tmp)?.sync_all()?;
+            std::fs::rename(&tmp, &dest)?;
         }
     }
-    std::fs::write(&marker, b"1\n")
+    sync_dir(&marker)?;
+    let tmp = to.join(".migrating-audit.migrated");
+    std::fs::write(&tmp, b"1\n")?;
+    File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &marker)?;
+    sync_dir(&marker)
+}
+
+/// Whether `dest` still needs `src` copied over it: missing, or a strict
+/// prefix of `src` (an interrupted copy). Anything else is kept.
+fn migration_needs_copy(src: &Path, dest: &Path) -> std::io::Result<bool> {
+    let dlen = match std::fs::metadata(dest) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    let slen = std::fs::metadata(src)?.len();
+    if dlen >= slen {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (BufReader::new(File::open(src)?), BufReader::new(File::open(dest)?));
+    let (mut x, mut y) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    let mut left = dlen;
+    while left > 0 {
+        let n = (left.min(x.len() as u64)) as usize;
+        a.read_exact(&mut x[..n])?;
+        b.read_exact(&mut y[..n])?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+        left -= n as u64;
+    }
+    Ok(true)
 }
 
 fn writer() -> Option<&'static Writer> {
@@ -1827,28 +2281,30 @@ pub fn record(event: &str, summary: impl Into<String>, detail: Value) {
     }
 }
 
-/// Wait (up to `timeout`) for every record queued so far to be written. Called
-/// on exit, so the last actions of a session are not lost with the process.
-pub fn flush(timeout: Duration) {
+/// At exit: wait (up to `timeout`) for every record queued so far to be
+/// written, then spill whatever is still unwritten — records the writer could
+/// not reach in time (a long keychain prompt, another process holding the
+/// log), and records whose append failed — to `audit.pending-<ts>.jsonl`
+/// beside the log. The next start records them (`audit.recovered`). So an
+/// accepted record is never lost silently with the process.
+pub fn shutdown(timeout: Duration) {
     let Some(w) = writer() else { return };
-    let (tx, rx) = mpsc::channel();
-    // std's SyncSender has no send_timeout: retry try_send until the deadline.
-    let deadline = Instant::now() + timeout;
-    let mut job = Job::Flush(tx);
-    loop {
-        match w.tx.try_send(job) {
-            Ok(()) => break,
-            Err(TrySendError::Disconnected(_)) => return,
-            Err(TrySendError::Full(j)) => {
-                if Instant::now() >= deadline {
-                    return;
-                }
-                job = j;
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
+    if !w.flush(timeout) {
+        eprintln!("hawser: the audit writer did not finish within {}s; spilling what is left", timeout.as_secs());
     }
-    let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let dir = match audit_path() {
+        Ok(p) => p.parent().map(Path::to_path_buf),
+        Err(_) => None,
+    };
+    let Some(dir) = dir else {
+        eprintln!("hawser: no audit folder; unwritten audit records are lost");
+        return;
+    };
+    match w.spill(&dir) {
+        Ok(Some(p)) => eprintln!("hawser: unwritten audit records kept in {} for the next start", p.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("hawser: could not keep unwritten audit records: {e}"),
+    }
 }
 
 /// A record as handed to the UI (the chain fields are not interesting there).
@@ -2718,6 +3174,179 @@ mod tests {
         std::fs::write(from.join(AUDIT_FILE), b"roamed\n").unwrap();
         migrate_audit_files(&from, &to).unwrap();
         assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"newer\n");
+    }
+
+    /// W4b: process B stages a rotation, moves the seal (commit) and dies
+    /// before the renames. Process A, holding a cached head whose file length
+    /// still matches, must complete B's committed rotation, not append to the
+    /// old chain and seal it (which made the next recovery discard the stage).
+    #[test]
+    fn a_rotation_committed_by_another_process_is_completed_not_discarded() {
+        let (p, m) = (tmp(), Mem::default());
+        let a = restart(&p, &m);
+        rec(&a, 3); // A has a cached session
+        let b = restart(&p, &m);
+        b.faults.crash_archive_after.store(2, Ordering::SeqCst);
+        assert!(b.archive().is_err(), "B dies after the commit");
+        drop(b);
+        assert!(a.rotating_path().exists());
+        a.record("connect", "after B", json!({})).unwrap();
+        assert!(!a.rotating_path().exists(), "the committed stage was completed");
+        let first: AuditEntry = serde_json::from_str(&lines(&p)[0]).unwrap();
+        assert_eq!(first.event, EV_ARCHIVED, "A appended to the NEW log");
+        let r = restart(&p, &m).verify().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 2), "{}", r.message);
+        assert!(!m.frozen());
+    }
+
+    /// W4b: a verify runs outside the writer and the log locks, so appends
+    /// (and a flush) complete while it is still running.
+    #[test]
+    fn appends_never_wait_behind_a_verify() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        let (release, gate) = mpsc::channel();
+        *log.faults.verify_gate.lock().unwrap() = Some(gate);
+        let w = Writer::spawn(move || Ok(log)).unwrap();
+        w.record("connect", "before".into(), json!({}));
+        // Queued before the records below (the verify's place in the order).
+        let (tx, verify) = mpsc::channel();
+        w.tx.send(Job::Verify(tx)).unwrap();
+        for i in 0..5 {
+            w.record("connect", format!("during {i}"), json!({}));
+        }
+        assert!(w.flush(Duration::from_secs(5)), "appends finished while the verify was blocked");
+        assert_eq!(lines(&p).len(), 6);
+        release.send(()).unwrap();
+        let r = verify.recv().unwrap().unwrap();
+        // The verify saw the log as of its place in the queue.
+        assert_eq!((r.status, r.count), (Status::Verified, 1), "{}", r.message);
+        assert_eq!(restart(&p, &m).verify().unwrap().count, 6);
+    }
+
+    /// W4b: records the writer could not reach before exit are spilled, and
+    /// the next start records them after an `audit.recovered` note.
+    #[test]
+    fn records_left_at_exit_are_spilled_and_recovered_next_start() {
+        let (p, m) = (tmp(), Mem::default());
+        rec(&restart(&p, &m), 1);
+        // A writer stuck before it can write anything (a keychain prompt).
+        let (release, stuck) = mpsc::channel::<()>();
+        let (p2, m2) = (p.clone(), m.clone());
+        let w = Writer::spawn(move || {
+            let _ = stuck.recv();
+            Ok(restart(&p2, &m2))
+        })
+        .unwrap();
+        for i in 0..3 {
+            w.record("sftp.put", format!("upload {i}"), json!({ "n": i }));
+        }
+        assert!(!w.flush(Duration::from_millis(200)), "the writer is stuck");
+        // Spilled aside first, so the stuck writer's own startup ingest does
+        // not pick it up in this test.
+        let aside = p.parent().unwrap().join("aside");
+        let spilled = w.spill(&aside).unwrap().expect("a pending file");
+        assert!(spilled.file_name().unwrap().to_string_lossy().starts_with(PENDING_PREFIX));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&spilled).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // The stuck writer wakes up: spilled records are not written twice.
+        release.send(()).unwrap();
+        assert!(w.flush(Duration::from_secs(5)));
+        assert_eq!(lines(&p).len(), 1, "spilled records were not also written");
+        drop(w);
+        let spilled = {
+            let dest = p.with_file_name(spilled.file_name().unwrap());
+            std::fs::rename(&spilled, &dest).unwrap();
+            dest
+        };
+
+        // Next start: ingested, in order, after a note; the file is gone.
+        let w = Writer::spawn({
+            let (p, m) = (p.clone(), m.clone());
+            move || Ok(restart(&p, &m))
+        })
+        .unwrap();
+        let r = w.ask(Job::Verify).unwrap().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 5), "{}", r.message);
+        assert!(!spilled.exists());
+        let all = lines(&p);
+        assert!(all[1].contains(EV_RECOVERED), "{}", all[1]);
+        for (i, l) in all[2..].iter().enumerate() {
+            let e: AuditEntry = serde_json::from_str(l).unwrap();
+            assert_eq!(e.summary, format!("upload {i}"));
+            assert_eq!(e.detail.get("recovered"), Some(&Value::Bool(true)));
+        }
+    }
+
+    /// An uncertain spilled record (the writer had started on it) that did
+    /// land is not recorded twice.
+    #[test]
+    fn an_uncertain_spilled_record_that_landed_is_not_duplicated() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        log.record("connect", "landed", json!({ "host": "fw1" })).unwrap();
+        let line = json!({ "event": "connect", "summary": "landed", "detail": { "host": "fw1" }, "accepted": 1, "uncertain": true });
+        std::fs::write(p.with_file_name(format!("{PENDING_PREFIX}1{PENDING_SUFFIX}")), format!("{line}\n")).unwrap();
+        ingest_pending(&log);
+        let all = lines(&p);
+        assert_eq!(all.len(), 2, "only the recovered note was added: {all:?}");
+    }
+
+    /// W4b: an archive verified and hashed outside the locks is used only if
+    /// the file is still the one it saw; appends since then are redone under
+    /// the lock, so the pin always covers every archived record.
+    #[test]
+    fn a_prepared_archive_is_redone_when_records_were_appended_meanwhile() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        rec(&log, 2);
+        let stale = log.prepare_archive().unwrap();
+        rec(&log, 2); // appended while the archive was being prepared
+        let name = log.archive_with(Some(stale)).unwrap();
+        let first: AuditEntry = serde_json::from_str(&lines(&p)[0]).unwrap();
+        assert_eq!(first.detail["archivedSha256"].as_str().unwrap(), hash_file(&p.with_file_name(&name)).unwrap().0);
+        assert_eq!(first.detail["archivedLastSeq"], json!(4));
+        rec(&log, 1);
+        let r = log.verify().unwrap();
+        assert_eq!(r.status, Status::Verified, "{}", r.message);
+        // And an unchanged file uses the prepared work as is.
+        let fresh = log.prepare_archive().unwrap();
+        log.archive_with(Some(fresh)).unwrap();
+        assert_eq!(log.verify().unwrap().status, Status::Verified);
+    }
+
+    /// W4b: a migration cut short is retried (no marker yet), completing a
+    /// partial copy; a local log that grew past its source is never replaced.
+    #[test]
+    fn an_interrupted_migration_is_retried_until_its_marker_is_written() {
+        let from = tmp().parent().unwrap().to_path_buf();
+        let to = tmp().parent().unwrap().join("local");
+        std::fs::write(from.join(AUDIT_FILE), b"line one\nline two\n").unwrap();
+        std::fs::write(from.join("audit-1-abc.archived.jsonl"), b"old\n").unwrap();
+        // An older build copied half the live log and died: no archive, no marker.
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join(AUDIT_FILE), b"line one\n").unwrap();
+        migrate_audit_files(&from, &to).unwrap();
+        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"line one\nline two\n");
+        assert!(to.join("audit-1-abc.archived.jsonl").exists());
+        assert!(to.join("audit.migrated").exists());
+        let temps = std::fs::read_dir(&to).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".migrating-"))
+            .count();
+        assert_eq!(temps, 0);
+        // Without a marker, a local log that has grown past its source is kept.
+        std::fs::remove_file(to.join("audit.migrated")).unwrap();
+        std::fs::write(to.join(AUDIT_FILE), b"line one\nline two\nlocal three\n").unwrap();
+        migrate_audit_files(&from, &to).unwrap();
+        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"line one\nline two\nlocal three\n");
+        // A divergent shorter one is kept too (not a prefix: not ours to replace).
+        std::fs::remove_file(to.join("audit.migrated")).unwrap();
+        std::fs::write(to.join(AUDIT_FILE), b"other\n").unwrap();
+        migrate_audit_files(&from, &to).unwrap();
+        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"other\n");
     }
 
     #[test]

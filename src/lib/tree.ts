@@ -5,6 +5,30 @@ import type { Host, HostFolder, HostNode } from '../types'
 const isFolder = (n: HostNode): n is HostFolder => n.kind === 'folder'
 import type { HostColor } from './hostColors'
 
+/* ------------------------------------------------------------- vault ids */
+
+/** Whether the OS vault folds the case of ids. The backend says which
+ *  (`vault_id_rule`: Windows Credential Manager folds, the macOS Keychain and
+ *  the Secret Service do not); until it answers, fold, the cautious choice for
+ *  the delete-time borrower check (a password is never deleted from under a
+ *  borrower that differs only in case). */
+let vaultFolds = true
+
+export function setVaultFoldsCase(folds: boolean): void {
+  vaultFolds = folds
+}
+
+/** The one comparator for credential ids, with the vault's own rule: ASCII
+ *  case-folded where the vault folds (ids there are ASCII-only, as the
+ *  backend enforces), exact elsewhere. Two ids name the same saved password
+ *  exactly when their keys are equal. */
+export function vaultIdKey(id: string): string {
+  return vaultFolds ? id.replace(/[A-Z]/g, (c) => c.toLowerCase()) : id
+}
+
+export const sameVaultId = (a: string | undefined, b: string): boolean =>
+  a !== undefined && vaultIdKey(a) === vaultIdKey(b)
+
 /** Parse a dotted-quad to a u32, or null if it isn't a valid IPv4. */
 function parseIpv4(s: string): number | null {
   const parts = s.split('.')
@@ -251,10 +275,10 @@ export function allFolders(nodes: HostNode[]): HostFolder[] {
  *  saved credential on this machine either way, so a new id costs nothing.
  */
 export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode[] {
-  // Ids are compared case-folded: the Windows credential vault folds case, so
+  // Ids are compared with the vault's rule: where it folds case (Windows),
   // `H-ABC` beside an existing `h-abc` would address (and on delete, remove)
   // the existing host's saved password.
-  const key = (id: string) => id.toLowerCase()
+  const key = vaultIdKey
   const taken = new Set<string>()
   const collect = (list: HostNode[]) => {
     for (const n of list) {
@@ -398,9 +422,9 @@ const HOST_FIELDS = [
   'kind', 'id', 'name', 'hostname', 'port', 'username', 'auth', 'keyPath', 'jumpHostId',
   'tag', 'color', 'credentialId', 'snippets',
 ] as const
-const RISKY_FIELDS = [
-  'startupCommands', 'startupCommand', 'configCommand', 'checkConfigOnConnect', 'aiAllowed', 'local',
-] as const
+/** Copied only with an explicit yes. `aiAllowed` and `local` are handled
+ *  separately below (an AI opt-out is always kept; `local` is rebuilt). */
+const RISKY_FIELDS = ['startupCommands', 'startupCommand', 'configCommand', 'checkConfigOnConnect'] as const
 const FOLDER_FIELDS = ['kind', 'id', 'name', 'color', 'children'] as const
 
 /** Copy an imported tree keeping only the fields a host or folder may carry
@@ -447,10 +471,18 @@ export function sanitizeImport(
       }
       if (n.aiAllowed === true) enables.push('shares its terminal output with the AI assistant')
       if (isObj(n.local)) enables.push(`opens a local shell (${String(n.local.profile)}) instead of SSH`)
+      const keep = enables.length > 0 && allowRisky
       if (enables.length) {
         risky.push({ name: String(n.name), enables })
-        if (allowRisky) Object.assign(h, pick(n, RISKY_FIELDS))
+        if (keep) Object.assign(h, pick(n, RISKY_FIELDS))
       }
+      // AI: an opt-out is safe and always kept. An opt-in needs the yes; on
+      // a no it becomes an explicit opt-out, never "unset" (which would
+      // inherit the local colour policy, usually "allowed").
+      if (n.aiAllowed === false) h.aiAllowed = false
+      else if (n.aiAllowed === true) h.aiAllowed = keep
+      // A local profile is rebuilt from its one known field, never copied.
+      if (keep && isObj(n.local) && typeof n.local.profile === 'string') h.local = { profile: n.local.profile }
       return h as unknown as HostNode
     })
   return { tree: walk(tree), risky }
@@ -467,7 +499,7 @@ export function credentialDestinations(
 ): { host: string; port: number; username: string }[] {
   const out: { host: string; port: number; username: string }[] = []
   for (const h of allHosts(nodes)) {
-    if ((h.credentialId ?? h.id) !== credKey) continue
+    if (!sameVaultId(h.credentialId ?? h.id, credKey)) continue
     const d = { host: h.hostname, port: h.port, username: h.username }
     if (!out.some((o) => o.host === d.host && o.port === d.port && o.username === d.username)) out.push(d)
   }
@@ -480,6 +512,48 @@ export function bindingChanged(before: Host, after: Host): boolean {
     before.hostname !== after.hostname ||
     before.port !== after.port ||
     before.username !== after.username ||
-    (before.credentialId ?? before.id) !== (after.credentialId ?? after.id)
+    !sameVaultId(before.credentialId ?? before.id, after.credentialId ?? after.id)
   )
+}
+
+/** Whether any host in `nodes` still borrows vault entry `credKey` (through
+ *  `credentialId`), by the vault's id rule: deleting the owner must not take
+ *  the password from under it. */
+export function isBorrowed(nodes: HostNode[], credKey: string): boolean {
+  return allHosts(nodes).some((h) => sameVaultId(h.credentialId, credKey))
+}
+
+/** Vault ids whose binding must shrink with the next catalogue save, kept
+ *  until a save that carried them succeeds: a failed save (narrowing refused,
+ *  disk full) leaves them queued, so the next save of any edit retries them
+ *  rather than leaving an old destination authorized. */
+export class NarrowQueue {
+  private gen = new Map<string, number>()
+  private n = 0
+
+  /** Queue ids (compared by `vaultIdKey`); returns everything queued. */
+  add(ids: Iterable<string>): string[] {
+    for (const id of ids) {
+      const k = vaultIdKey(id)
+      const had = [...this.gen.keys()].find((x) => vaultIdKey(x) === k)
+      if (had !== undefined) this.gen.delete(had)
+      this.gen.set(id, ++this.n)
+    }
+    return this.pending()
+  }
+
+  pending(): string[] {
+    return [...this.gen.keys()]
+  }
+
+  /** A snapshot to send with a save. */
+  take(): Map<string, number> {
+    return new Map(this.gen)
+  }
+
+  /** The save that carried `batch` succeeded: drop those ids unless they
+   *  were queued again since (a newer save carries them). */
+  settle(batch: Map<string, number>): void {
+    for (const [id, g] of batch) if (this.gen.get(id) === g) this.gen.delete(id)
+  }
 }

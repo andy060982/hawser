@@ -82,10 +82,34 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a secret exists, without exposing it. Lets the UI show "password
+/// Whether a secret exists, without decrypting it. Lets the UI show "password
 /// saved" while the plaintext stays in the vault.
+///
+/// An existence query, never a read: on macOS an attributes-only Keychain
+/// search (no `kSecReturnData`), so opening the host editor cannot raise a
+/// Keychain "allow access" prompt; on Linux a Secret Service search, which
+/// lists locked items without unlocking them; on Windows `CredReadW`, whose
+/// DPAPI decrypt never prompts (the blob is wiped before it is freed).
 pub fn has_secret(host_id: &str) -> bool {
-    matches!(read_secret(host_id), Ok(_))
+    matches!(imp::secret_exists(host_id), Ok(true))
+}
+
+/// Whether the vault folds the case of ids: Windows Credential Manager
+/// resolves target names case-insensitively (`H-1` and `h-1` are one entry);
+/// the macOS Keychain and the Secret Service do not. The frontend asks for
+/// this (`vault_id_rule`) so it compares ids exactly as the vault does.
+pub const fn vault_folds_case() -> bool {
+    cfg!(windows)
+}
+
+/// The key under which the vault identifies `id`: ASCII-folded on Windows
+/// (ids there are ASCII-only, see `validate_id`), the id itself elsewhere.
+pub fn vault_id_key(id: &str) -> String {
+    if vault_folds_case() {
+        id.to_ascii_lowercase()
+    } else {
+        id.to_string()
+    }
 }
 
 pub use imp::{delete_secret, read_secret, write_secret};
@@ -217,6 +241,30 @@ mod imp {
         Ok(())
     }
 
+    /// Whether a credential exists. Credential Manager has no metadata-only
+    /// lookup by name, but its DPAPI decrypt is silent (no prompt); the blob is
+    /// wiped and freed without being copied.
+    pub fn secret_exists(host_id: &str) -> Result<bool, CredError> {
+        let target_w = wide(&target_name(host_id));
+        let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: as in read_secret.
+        let ok = unsafe { CredReadW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0, &mut ptr) };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return if code == ERROR_NOT_FOUND { Ok(false) } else { Err(CredError::Win32(code)) };
+        }
+        // SAFETY: ptr is a live CredReadW allocation, wiped then freed once.
+        unsafe {
+            let cred = &*ptr;
+            let len = cred.CredentialBlobSize as usize;
+            if !cred.CredentialBlob.is_null() && len > 0 {
+                std::slice::from_raw_parts_mut(cred.CredentialBlob, len).zeroize();
+            }
+            CredFree(ptr as *mut c_void);
+        }
+        Ok(true)
+    }
+
     /// Remove a stored password. Used when a host is deleted, so the vault does
     /// not accumulate orphaned secrets.
     pub fn delete_secret(host_id: &str) -> Result<(), CredError> {
@@ -278,6 +326,47 @@ mod imp {
             Err(KeyringError::NoEntry) => Err(CredError::NotFound(target_name(host_id))),
             Err(e) => Err(CredError::Backend(e.to_string())),
         }
+    }
+
+    /// Existence without decryption: an attributes-only Keychain search for
+    /// the item keyring writes (generic password, service + account). No
+    /// `kSecReturnData`, so no "allow access" prompt.
+    #[cfg(target_os = "macos")]
+    pub fn secret_exists(host_id: &str) -> Result<bool, CredError> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+        let account = target_name(host_id);
+        let mut q = ItemSearchOptions::new();
+        q.class(ItemClass::generic_password())
+            .service(SERVICE)
+            .account(&account)
+            .load_attributes(true)
+            .load_data(false)
+            .limit(Limit::Max(1));
+        match q.search() {
+            Ok(found) => Ok(!found.is_empty()),
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(false),
+            Err(e) => Err(CredError::Backend(e.to_string())),
+        }
+    }
+
+    /// Existence without unlocking: a Secret Service search for the item
+    /// keyring writes. The search lists locked items too, and never unlocks
+    /// them (keyring's own `get_attributes` does, which can prompt). Plain
+    /// session: no secret crosses the bus.
+    #[cfg(not(target_os = "macos"))]
+    pub fn secret_exists(host_id: &str) -> Result<bool, CredError> {
+        use dbus_secret_service::{EncryptionType, SecretService};
+        let account = target_name(host_id);
+        let ss = SecretService::connect(EncryptionType::Plain).map_err(|e| CredError::Backend(e.to_string()))?;
+        // keyring's attributes for Entry::new(service, user): target "default".
+        let attrs = std::collections::HashMap::from([
+            ("service", SERVICE),
+            ("username", account.as_str()),
+            ("target", "default"),
+        ]);
+        let found = ss.search_items(attrs).map_err(|e| CredError::Backend(e.to_string()))?;
+        Ok(!(found.unlocked.is_empty() && found.locked.is_empty()))
     }
 }
 

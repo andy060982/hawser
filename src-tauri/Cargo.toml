@@ -56,10 +56,19 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 # libdbus needed to build; crypto-rust keeps the encrypted session pure-Rust too.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+# Direct, at keyring's version, only for an existence search that never
+# unlocks an item (credentials::secret_exists).
+dbus-secret-service = "4.1"
+# Only to pre-check the session-bus address the single-instance plugin
+# unwraps (lib.rs): a malformed one would panic inside the plugin.
+zbus = { version = "5.9", default-features = false }
 
 # macOS: native Keychain, no extra system libraries.
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# Direct, at keyring's version, only for an attributes-only Keychain search
+# that never decrypts an item (credentials::secret_exists).
+security-framework = "3"
 
 [profile.release]
 # Size-first, because a desktop SSH client is latency-bound on the network, not

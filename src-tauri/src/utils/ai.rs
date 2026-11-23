@@ -242,6 +242,14 @@ trait KeyStore {
     fn write(&self, slot: &str, key: &str) -> Result<(), credentials::CredError>;
     fn delete(&self, slot: &str) -> Result<(), credentials::CredError>;
     fn bind(&self, profile: &str, kind: &str, base_url: &str) -> Result<(), String>;
+    /// Where a save journals its intent (`ai.intent`); `None`: not journaled.
+    fn journal(&self) -> Option<PathBuf> {
+        None
+    }
+    /// The origin `profile`'s key is bound to now.
+    fn origin(&self, profile: &str) -> Option<(String, String)> {
+        saved_origin(profile)
+    }
 }
 
 struct VaultKeys;
@@ -259,17 +267,183 @@ impl KeyStore for VaultKeys {
     fn bind(&self, profile: &str, kind: &str, base_url: &str) -> Result<(), String> {
         snapshot_origin(profile, kind, base_url)
     }
+    fn journal(&self) -> Option<PathBuf> {
+        data_dir().map(|d| d.join(AI_INTENT))
+    }
+}
+
+/* ------------------------------------------------------ key save journal */
+
+// The same crash window as a host password (utils::hosts, "vault intent
+// journal"): the key and its origin are two stores. A save journals its
+// intent in `ai.intent` before the vault write, notes when the key has
+// landed, and clears the journal once the origin is bound. At startup
+// `repair_ai_intent` finishes the origin when the new key is known to be in
+// the vault, and otherwise removes the key. Never a new key behind an old
+// origin.
+
+const AI_INTENT: &str = "ai.intent";
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AiPhase {
+    Staged,
+    Written,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiIntent {
+    profile: String,
+    kind: String,
+    base_url: String,
+    phase: AiPhase,
+}
+
+const INJECTED_CRASH: &str = "injected crash";
+
+#[cfg(test)]
+thread_local! {
+    static CRASH_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn crashed(step: u8) -> bool {
+    #[cfg(test)]
+    {
+        CRASH_AT.with(|c| c.get() == step)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = step;
+        false
+    }
+}
+
+fn note_intent(journal: &Option<PathBuf>, intent: &AiIntent) -> Result<(), String> {
+    let Some(p) = journal else { return Ok(()) };
+    let text = serde_json::to_string(intent).map_err(|e| e.to_string())?;
+    crate::utils::hosts::write_atomic(p, &text).map_err(|e| e.to_string())
+}
+
+fn clear_intent(journal: &Option<PathBuf>) {
+    if let Some(p) = journal {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Settle a key save a crash interrupted (see above). Startup, before the
+/// webview loads. `Some(message)` when something was repaired.
+pub fn repair_ai_intent() -> Result<Option<String>, String> {
+    let _binding = binding_lock();
+    repair_ai_intent_with(&VaultKeys)
+}
+
+fn repair_ai_intent_with(store: &impl KeyStore) -> Result<Option<String>, String> {
+    let journal = store.journal();
+    let Some(path) = journal.as_ref() else { return Ok(None) };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let Ok(intent) = serde_json::from_str::<AiIntent>(&text) else {
+        clear_intent(&journal);
+        return Err(format!("{} was not a valid journal and was removed", path.display()));
+    };
+    let want = (intent.kind.clone(), intent.base_url.clone());
+    if intent.phase != AiPhase::Ambiguous && store.origin(&intent.profile).as_ref() == Some(&want) {
+        clear_intent(&journal);
+        return Ok(Some("an interrupted AI key save had completed".into()));
+    }
+    if intent.phase == AiPhase::Written && store.bind(&intent.profile, &intent.kind, &intent.base_url).is_ok() {
+        clear_intent(&journal);
+        set_poisoned(false);
+        return Ok(Some("finished binding an AI key whose save was interrupted".into()));
+    }
+    match store.delete(&vault_profile(&intent.profile)) {
+        Ok(()) | Err(credentials::CredError::NotFound(_)) => {
+            clear_intent(&journal);
+            set_poisoned(false);
+            Ok(Some("removed an AI key whose save was interrupted; save it again".into()))
+        }
+        Err(e) => {
+            set_poisoned(true);
+            Err(format!("an interrupted AI key save could not be repaired ({e}); AI chats are blocked until the key is saved again"))
+        }
+    }
 }
 
 /// `save_key` with the binding lock held.
 fn save_key_locked(profile: &str, key: &str, kind: &str, base_url: &str, store: &impl KeyStore) -> Result<(), String> {
     let slot = vault_profile(profile);
     let previous = store.read(&slot);
-    store.write(&slot, key).map_err(|e| e.to_string())?;
-    if let Err(e) = store.bind(profile, kind, base_url) {
+    let journal = store.journal();
+    let mut intent =
+        AiIntent { profile: profile.to_string(), kind: kind.to_string(), base_url: base_url.to_string(), phase: AiPhase::Staged };
+    note_intent(&journal, &intent).map_err(|e| format!("could not record the key save before making it ({e}); nothing was changed"))?;
+    if crashed(1) {
+        return Err(INJECTED_CRASH.into());
+    }
+    if let Err(e) = store.write(&slot, key) {
+        clear_intent(&journal);
+        return Err(e.to_string());
+    }
+    if crashed(2) {
+        return Err(INJECTED_CRASH.into());
+    }
+    intent.phase = AiPhase::Written;
+    let _ = note_intent(&journal, &intent);
+    if crashed(3) {
+        return Err(INJECTED_CRASH.into());
+    }
+    let bound = store.bind(profile, kind, base_url);
+    if bound.is_ok() && crashed(4) {
+        return Err(INJECTED_CRASH.into());
+    }
+    if bound.is_err() {
+        intent.phase = AiPhase::Ambiguous;
+        let _ = note_intent(&journal, &intent);
+        if crashed(5) {
+            return Err(INJECTED_CRASH.into());
+        }
+    }
+    let (result, stuck) = finish_key_save(&slot, previous, bound, store);
+    if crashed(6) {
+        return Err(INJECTED_CRASH.into());
+    }
+    // A stuck outcome (the key could be neither restored nor removed) keeps
+    // the Ambiguous journal: the next start removes the key.
+    if !stuck {
+        clear_intent(&journal);
+    }
+    result
+}
+
+/// The rest of a key save once the bind was attempted (rollback included).
+/// The flag: the vault was left holding a key it could not remove.
+fn finish_key_save(
+    slot: &str,
+    previous: Option<zeroize::Zeroizing<String>>,
+    bound: Result<(), String>,
+    store: &impl KeyStore,
+) -> (Result<(), String>, bool) {
+    let mut stuck = false;
+    let r = finish_key_save_inner(slot, previous, bound, store, &mut stuck);
+    (r, stuck)
+}
+
+fn finish_key_save_inner(
+    slot: &str,
+    previous: Option<zeroize::Zeroizing<String>>,
+    bound: Result<(), String>,
+    store: &impl KeyStore,
+    stuck: &mut bool,
+) -> Result<(), String> {
+    if let Err(e) = bound {
         let restored = match previous {
-            Some(old) => store.write(&slot, &old),
-            None => match store.delete(&slot) {
+            Some(old) => store.write(slot, &old),
+            None => match store.delete(slot) {
                 Err(credentials::CredError::NotFound(_)) => Ok(()),
                 r => r,
             },
@@ -279,7 +453,7 @@ fn save_key_locked(profile: &str, key: &str, kind: &str, base_url: &str, store: 
             // so the vault may hold the NEW key under the OLD origin. Fail
             // closed: remove the key, so no chat can send it anywhere until
             // it is saved again.
-            return Err(match store.delete(&slot) {
+            return Err(match store.delete(slot) {
                 Ok(()) | Err(credentials::CredError::NotFound(_)) => format!(
                     "could not bind the key to its provider ({e}) or restore the previous key ({rollback}); the key was removed, save it again"
                 ),
@@ -288,6 +462,7 @@ fn save_key_locked(profile: &str, key: &str, kind: &str, base_url: &str, store: 
                     // nothing more can be done about it now: refuse every chat
                     // until a save or delete succeeds (or a restart).
                     set_poisoned(true);
+                    *stuck = true;
                     format!(
                         "could not bind the key to its provider ({e}), restore the previous key ({rollback}) or remove it ({del}); AI chats are blocked until the key is saved again or removed"
                     )
@@ -1505,6 +1680,77 @@ mod tests {
         // A successful save clears it.
         save_key_locked("default", "new", "openai", "https://api.openai.com/v1", &Fine).unwrap();
         assert!(!is_poisoned());
+    }
+
+    /// W4b: an AI key save that dies after any step is repaired at the next
+    /// start: the new key ends up with its new origin, or is removed.
+    #[test]
+    fn a_crash_at_any_step_of_a_key_save_is_repaired_consistently() {
+        #[derive(Default)]
+        struct MemStore {
+            key: Mutex<Option<String>>,
+            origin: Mutex<Option<(String, String)>>,
+            fail_bind: std::sync::atomic::AtomicBool,
+            dir: PathBuf,
+        }
+        impl KeyStore for MemStore {
+            fn read(&self, _: &str) -> Option<zeroize::Zeroizing<String>> {
+                self.key.lock().unwrap().clone().map(zeroize::Zeroizing::new)
+            }
+            fn write(&self, _: &str, key: &str) -> Result<(), credentials::CredError> {
+                *self.key.lock().unwrap() = Some(key.into());
+                Ok(())
+            }
+            fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
+                self.key.lock().unwrap().take().map(|_| ()).ok_or(credentials::CredError::NotFound(slot.into()))
+            }
+            fn bind(&self, _: &str, kind: &str, base_url: &str) -> Result<(), String> {
+                if self.fail_bind.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("disk full".into());
+                }
+                *self.origin.lock().unwrap() = Some((kind.into(), base_url.into()));
+                Ok(())
+            }
+            fn journal(&self) -> Option<PathBuf> {
+                Some(self.dir.join(AI_INTENT))
+            }
+            fn origin(&self, _: &str) -> Option<(String, String)> {
+                self.origin.lock().unwrap().clone()
+            }
+        }
+        let _binding = binding_lock();
+        let old = ("openai".to_string(), "https://api.openai.com/v1".to_string());
+        let new = ("anthropic".to_string(), "https://api.anthropic.com".to_string());
+        for step in 1..=6u8 {
+            let dir = std::env::temp_dir().join(format!("hawser-ai-intent-{}-{step}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let st = MemStore { dir, ..Default::default() };
+            save_key_locked("default", "old-key", &old.0, &old.1, &st).unwrap();
+            st.fail_bind.store(step >= 5, std::sync::atomic::Ordering::SeqCst);
+            CRASH_AT.with(|c| c.set(step));
+            let r = save_key_locked("default", "new-key", &new.0, &new.1, &st);
+            CRASH_AT.with(|c| c.set(0));
+            assert_eq!(r.unwrap_err(), INJECTED_CRASH, "step {step}");
+            st.fail_bind.store(false, std::sync::atomic::Ordering::SeqCst);
+            set_poisoned(false); // a restart
+            assert!(repair_ai_intent_with(&st).unwrap().is_some(), "step {step}");
+            assert!(!st.journal().unwrap().exists(), "step {step}");
+            let key = st.key.lock().unwrap().clone();
+            let origin = st.origin.lock().unwrap().clone();
+            match key.as_deref() {
+                Some("new-key") => assert_eq!(origin, Some(new.clone()), "step {step}"),
+                Some("old-key") => assert_eq!(origin, Some(old.clone()), "step {step}"),
+                None => {}
+                k => panic!("step {step}: {k:?}"),
+            }
+            if matches!(step, 1 | 2 | 5 | 6) {
+                assert_eq!(key, None, "step {step}: ambiguous, removed");
+            } else {
+                assert_eq!(key.as_deref(), Some("new-key"), "step {step}");
+            }
+        }
+        set_poisoned(false);
     }
 
     fn loopback(raw: &str) -> bool {

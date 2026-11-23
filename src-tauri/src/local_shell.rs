@@ -243,7 +243,7 @@ fn appimage_env_fixups(vars: impl IntoIterator<Item = (String, String)>) -> Vec<
 struct LocalShell {
     /// Replaced by a sink once the session is finished, closing our copy of
     /// the PTY so a lingering background job sees the terminal go away.
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Mutex<Box<dyn TermWriter>>,
     /// None once the shell has exited: dropping the master closes the PTY.
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     /// The shell process; None once reaped. Reaping (the waiter) and killing
@@ -339,9 +339,10 @@ impl LocalShells {
         // portable-pty's writer, whose Drop types newline + EOF into the
         // terminal (a background job still on it would read them).
         #[cfg(unix)]
-        let writer: Box<dyn Write + Send> = Box::new(PtyWriter(ReadyFd::dup_nonblocking(&*pair.master)?));
+        let writer: Box<dyn TermWriter> = Box::new(PtyWriter(ReadyFd::dup_nonblocking(&*pair.master)?));
         #[cfg(not(unix))]
-        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+        let writer: Box<dyn TermWriter> =
+            Box::new(ThreadWriter::spawn(pair.master.take_writer().map_err(|e| e.to_string())?)?);
         #[cfg(unix)]
         let wake = ReadyFd::dup(&*pair.master)?;
         let mut cmd = CommandBuilder::new(&prof.program);
@@ -487,7 +488,15 @@ impl LocalShells {
             return Err("the terminal is closing".to_string());
         }
         let mut w = shell.writer.lock().map_err(|_| "terminal writer poisoned")?;
-        w.write_all(data).and_then(|_| w.flush()).map_err(|e| e.to_string())
+        // Re-checked under the lock: a write queued behind a stalled one must
+        // not reach the terminal once closing (or finishing) has begun.
+        if shell.closing.load(Ordering::SeqCst) || shell.finished.load(Ordering::SeqCst) {
+            return Err("the terminal is closing".to_string());
+        }
+        // One deadline for the whole write, however it is split: a terminal
+        // that accepts a trickle cannot hold the writer lock (and Ctrl+C
+        // behind it) for longer than this.
+        w.write_all_by(data, std::time::Instant::now() + WRITE_DEADLINE).map_err(|e| e.to_string())
     }
 
     pub fn resize(&self, session_id: &str, cols: u32, rows: u32) -> Result<(), String> {
@@ -786,13 +795,32 @@ impl ReadyFd {
     }
 }
 
-/// How long a write may make no progress (the terminal's input queue full:
-/// the program on it stopped reading) before it gives up, so a stuck terminal
-/// can never hold the writer lock forever.
-#[cfg(all(unix, not(test)))]
-const WRITE_STALL: Duration = Duration::from_secs(5);
-#[cfg(all(unix, test))]
-const WRITE_STALL: Duration = Duration::from_millis(400);
+/// The longest one input write may take in total (however many partial
+/// writes it needs) before it gives up, so a terminal that stopped reading,
+/// or reads only a trickle, can never hold the writer lock for longer.
+#[cfg(not(test))]
+const WRITE_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const WRITE_DEADLINE: Duration = Duration::from_millis(400);
+
+fn write_timed_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the terminal is not accepting input (the program in it stopped reading)",
+    )
+}
+
+/// Input to a terminal, written in full by `deadline` or not at all past it.
+trait TermWriter: Send {
+    fn write_all_by(&mut self, data: &[u8], deadline: std::time::Instant) -> std::io::Result<()>;
+}
+
+/// What a finished session's writer becomes.
+impl TermWriter for std::io::Sink {
+    fn write_all_by(&mut self, data: &[u8], _deadline: std::time::Instant) -> std::io::Result<()> {
+        self.write_all(data)
+    }
+}
 
 /// Writes to the PTY master through our own non-blocking descriptor. Dropping
 /// it only closes that descriptor — unlike portable-pty's writer, it never
@@ -801,29 +829,23 @@ const WRITE_STALL: Duration = Duration::from_millis(400);
 struct PtyWriter(ReadyFd);
 
 #[cfg(unix)]
-impl Write for PtyWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl TermWriter for PtyWriter {
+    fn write_all_by(&mut self, mut buf: &[u8], deadline: std::time::Instant) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let deadline = std::time::Instant::now() + WRITE_STALL;
-        loop {
+        while !buf.is_empty() {
             // SAFETY: writing from a live slice to a descriptor we own.
             let n = unsafe { libc::write(self.0 .0.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
-            if n >= 0 {
-                return Ok(n as usize);
+            if n > 0 {
+                buf = &buf[n as usize..];
+                continue;
             }
-            let err = std::io::Error::last_os_error();
+            let err = if n == 0 { std::io::Error::from(std::io::ErrorKind::WriteZero) } else { std::io::Error::last_os_error() };
             match err.kind() {
-                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::Interrupted => {}
                 std::io::ErrorKind::WouldBlock => {
                     let left = deadline.saturating_duration_since(std::time::Instant::now());
                     if left.is_zero() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "the terminal is not accepting input (the program in it stopped reading)",
-                        ));
+                        return Err(write_timed_out());
                     }
                     if self.0.writable(left.min(Duration::from_millis(200))) == Wait::Failed {
                         return Err(err);
@@ -831,11 +853,75 @@ impl Write for PtyWriter {
                 }
                 _ => return Err(err),
             }
+            // Partial progress never extends the deadline.
+            if std::time::Instant::now() >= deadline && !buf.is_empty() {
+                return Err(write_timed_out());
+            }
         }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Windows: portable-pty's writer blocks with no timeout (ConPTY input is a
+/// pipe). It runs on a dedicated thread; a caller waits for it only until its
+/// deadline. A write that has not STARTED by its deadline is skipped, so a
+/// timed-out keystroke never arrives late; one already inside the blocking
+/// call cannot be cancelled and completes whenever the terminal reads (later
+/// writes time out meanwhile, as the queue is a single slot).
+#[cfg(not(unix))]
+struct ThreadWriter {
+    tx: std::sync::mpsc::SyncSender<WriteJob>,
+}
+
+#[cfg(not(unix))]
+type WriteJob = (Vec<u8>, std::time::Instant, std::sync::mpsc::Sender<std::io::Result<()>>);
+
+#[cfg(not(unix))]
+impl ThreadWriter {
+    fn spawn(mut inner: Box<dyn Write + Send>) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriteJob>(1);
+        std::thread::Builder::new()
+            .name("hawser-local-input".into())
+            .spawn(move || {
+                // Ends when the ThreadWriter is dropped (the session finished).
+                for (data, deadline, reply) in rx {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = reply.send(Err(write_timed_out()));
+                        continue;
+                    }
+                    let _ = reply.send(inner.write_all(&data).and_then(|_| inner.flush()));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self { tx })
+    }
+}
+
+#[cfg(not(unix))]
+impl TermWriter for ThreadWriter {
+    fn write_all_by(&mut self, data: &[u8], deadline: std::time::Instant) -> std::io::Result<()> {
+        use std::sync::mpsc::TrySendError;
+        let (reply, answer) = std::sync::mpsc::channel();
+        let mut job = (data.to_vec(), deadline, reply);
+        loop {
+            match self.tx.try_send(job) {
+                Ok(()) => break,
+                Err(TrySendError::Full(j)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(write_timed_out());
+                    }
+                    job = j;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the terminal input thread stopped"))
+                }
+            }
+        }
+        match answer.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(r) => r,
+            Err(_) => Err(write_timed_out()),
+        }
     }
 }
 
@@ -1229,9 +1315,85 @@ mod tests {
         };
         let mut w = PtyWriter(ReadyFd(wr));
         let started = std::time::Instant::now();
-        let err = w.write_all(&vec![b'x'; 4 * 1024 * 1024]).unwrap_err();
+        let err = w.write_all_by(&vec![b'x'; 4 * 1024 * 1024], started + WRITE_DEADLINE).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// W4b: the deadline covers the whole write. A terminal that keeps
+    /// accepting a trickle (each partial write makes progress) used to reset a
+    /// per-write timer forever; now the write ends at its one deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_trickling_terminal_cannot_stretch_a_write_past_its_deadline() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: as above.
+        let (rd, wr) = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let flags = libc::fcntl(fds[1], libc::F_GETFL);
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut f = std::fs::File::from(rd);
+                let mut b = [0u8; 4096];
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = f.read(&mut b);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        let mut w = PtyWriter(ReadyFd(wr));
+        let started = std::time::Instant::now();
+        // ~200 KB/s drained, so 8 MiB would take ~40 s with a resetting timer.
+        let err = w.write_all_by(&vec![b'x'; 8 * 1024 * 1024], started + WRITE_DEADLINE).unwrap_err();
+        let took = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        drop(w);
+        let _ = reader.join();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(took < WRITE_DEADLINE + Duration::from_millis(600), "took {took:?}");
+    }
+
+    /// W4b: a write that was waiting for the writer lock when closing began
+    /// is refused once it gets the lock, never sent to the old terminal.
+    #[test]
+    fn a_write_queued_behind_the_lock_is_refused_once_closing() {
+        struct Record(Arc<Mutex<Vec<u8>>>);
+        impl TermWriter for Record {
+            fn write_all_by(&mut self, d: &[u8], _: std::time::Instant) -> std::io::Result<()> {
+                self.0.lock().unwrap().extend_from_slice(d);
+                Ok(())
+            }
+        }
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let shells = LocalShells::default();
+        let pair = native_pty_system().openpty(size(80, 24)).unwrap();
+        let shell = Arc::new(LocalShell {
+            writer: Mutex::new(Box::new(Record(Arc::clone(&got)))),
+            master: Mutex::new(Some(pair.master)),
+            child: Mutex::new(None),
+            exit_reason: Mutex::new(None),
+            gate: Mutex::new(false),
+            finished: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+        });
+        shells.shells.insert("s-q".into(), Arc::clone(&shell));
+        shells.write("s-q", b"a").unwrap();
+        let held = shell.writer.lock().unwrap(); // a stalled write holds it
+        let queued = {
+            let shells_map = Arc::clone(&shells.shells);
+            std::thread::spawn(move || LocalShells { shells: shells_map, ..Default::default() }.write("s-q", b"b"))
+        };
+        std::thread::sleep(Duration::from_millis(100)); // the write is now waiting
+        shell.closing.store(true, Ordering::SeqCst);
+        drop(held);
+        assert!(queued.join().unwrap().is_err());
+        assert_eq!(*got.lock().unwrap(), b"a");
     }
 
     /// Dropping our writer (what `finish` does) must not type newline + EOF
