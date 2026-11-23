@@ -95,9 +95,13 @@ pub enum SshError {
     ChangedHostKey { host: String, line: usize },
     #[error("{0}")]
     PartialTransfer(String),
-    /// A folder transfer stopped early because its SFTP channel died.
+    /// A transfer stopped because its SFTP channel died or stopped answering.
+    /// The text says what was left where (a backup, a staged copy, the rest
+    /// of a folder). A variant of its own, not a `PartialTransfer`, so
+    /// `sftp_dead` still sees it: the folder walk stops and the cached
+    /// session is reopened.
     #[error("{0}")]
-    TreeAborted(String),
+    ChannelLost(String),
     /// A connect stage ran past its deadline (see the `*_TIMEOUT` constants).
     #[error("{host}: {stage} timed out after {secs}s")]
     Timeout { host: String, stage: &'static str, secs: u64 },
@@ -196,6 +200,11 @@ pub struct TransferProgress {
     pub total_bytes: u64,
     pub direction: &'static str,
     pub done: bool,
+    /// A warning the user must see while the transfer is still running: a
+    /// fallback to a non-atomic in-place write, sent BEFORE the destination
+    /// is truncated. It is also among the transfer's final notes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// One file a recursive transfer could not move, pushed on `sftp://failure` so
@@ -2158,40 +2167,38 @@ impl Registry {
     /// or stopped answering (the sftp-server process exited, was killed or
     /// hangs while the SSH transport stayed up). Without this every later file
     /// operation reuses the dead session and fails until the whole tab is
-    /// reconnected; with it the next call reopens the subsystem.
-    async fn check_sftp<T>(&self, session_id: &str, r: Result<T, SshError>) -> Result<T, SshError> {
+    /// reconnected; with it the next call reopens the subsystem. `used` is the
+    /// connection that produced `r`: only that one is ever forgotten (see
+    /// `forget_sftp`).
+    async fn check_sftp<T>(
+        &self,
+        session_id: &str,
+        used: &Arc<SftpConn>,
+        r: Result<T, SshError>,
+    ) -> Result<T, SshError> {
         if let Err(e) = &r {
-            if sftp_dead(e) {
-                if let Ok(session) = self.get(session_id) {
-                    *session.sftp.lock().await = None;
-                }
+            if let Ok(session) = self.get(session_id) {
+                forget_sftp(&session.sftp, used, e).await;
             }
         }
         r
     }
 
     pub async fn list_dir(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
-        let first = self.list_dir_once(session_id, path).await;
+        let sftp = self.sftp(session_id).await?;
+        let first = list_dir_with(&sftp, path).await;
+        let first = self.check_sftp(session_id, &sftp, first).await;
         if matches!(&first, Err(e) if sftp_dead(e)) {
-            // A dead cached channel is dropped by check_sftp; one retry then
-            // runs on a fresh subsystem, so the pane recovers by itself.
-            let cleared = match self.get(session_id) {
-                Ok(s) => s.sftp.lock().await.is_none(),
-                Err(_) => false,
-            };
-            if cleared {
-                return self.list_dir_once(session_id, path).await;
+            // The dead channel was dropped by check_sftp; one retry then runs
+            // on a fresh subsystem (or a replacement another call already
+            // opened), so the pane recovers by itself.
+            let again = self.sftp(session_id).await?;
+            if !Arc::ptr_eq(&again, &sftp) {
+                let r = list_dir_with(&again, path).await;
+                return self.check_sftp(session_id, &again, r).await;
             }
         }
         first
-    }
-
-    async fn list_dir_once(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
-        let r = match self.sftp(session_id).await {
-            Ok(sftp) => list_dir_with(&sftp, path).await,
-            Err(e) => Err(e),
-        };
-        self.check_sftp(session_id, r).await
     }
 
     /// Whether anything is at a remote path — the overwrite guard asks before
@@ -2206,7 +2213,7 @@ impl Registry {
             Err(e) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => Ok(false),
             Err(e) => Err(SshError::from(e)),
         };
-        self.check_sftp(session_id, r).await
+        self.check_sftp(session_id, &sftp, r).await
     }
 
     /// Rename a remote file or directory. SFTP rename is not a copy — it is
@@ -2214,7 +2221,7 @@ impl Registry {
     pub async fn sftp_rename(&self, session_id: &str, from: &str, to: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
         let r = sftp.hi.rename(from, to).await.map_err(SshError::from);
-        self.check_sftp(session_id, r).await
+        self.check_sftp(session_id, &sftp, r).await
     }
 
     /// Delete a remote file, or an EMPTY remote directory.
@@ -2230,14 +2237,14 @@ impl Registry {
         } else {
             sftp.hi.remove_file(path).await
         };
-        self.check_sftp(session_id, r.map_err(SshError::from)).await
+        self.check_sftp(session_id, &sftp, r.map_err(SshError::from)).await
     }
 
     /// Create a remote directory.
     pub async fn sftp_mkdir(&self, session_id: &str, path: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
         let r = sftp.hi.create_dir(path).await.map_err(SshError::from);
-        self.check_sftp(session_id, r).await
+        self.check_sftp(session_id, &sftp, r).await
     }
 
     /* ------------------------------------------------------------ phase 2 */
@@ -2309,17 +2316,19 @@ impl Registry {
         overwrite: Overwrite,
     ) -> Result<TransferOutcome, SshError> {
         let (seq, cancel) = self.transfer_begin(transfer_id)?;
-        let r = match self.sftp(session_id).await {
-            Ok(sftp) => {
-                let mut p = Progress::new(app, session_id, transfer_id, remote, "download", cancel);
-                download_tree(&sftp, &mut p, remote, local, overwrite).await.map(|bytes| {
-                    TransferOutcome { bytes, notes: p.take_notes() }
-                })
+        let sftp = match self.sftp(session_id).await {
+            Ok(sftp) => sftp,
+            Err(e) => {
+                self.transfer_end(transfer_id, seq);
+                return Err(e);
             }
-            Err(e) => Err(e),
         };
+        let mut p = Progress::new(app, session_id, transfer_id, remote, "download", cancel);
+        let r = download_tree(&sftp, &mut p, remote, local, overwrite)
+            .await
+            .map(|bytes| TransferOutcome { bytes, notes: p.take_notes() });
         self.transfer_end(transfer_id, seq);
-        self.check_sftp(session_id, r).await
+        self.check_sftp(session_id, &sftp, r).await
     }
 
     /// Upload, same streaming, reporting and overwrite contract, directory-aware.
@@ -2333,17 +2342,19 @@ impl Registry {
         overwrite: Overwrite,
     ) -> Result<TransferOutcome, SshError> {
         let (seq, cancel) = self.transfer_begin(transfer_id)?;
-        let r = match self.sftp(session_id).await {
-            Ok(sftp) => {
-                let mut p = Progress::new(app, session_id, transfer_id, local, "upload", cancel);
-                upload_tree(&sftp, &mut p, local, remote, overwrite).await.map(|bytes| {
-                    TransferOutcome { bytes, notes: p.take_notes() }
-                })
+        let sftp = match self.sftp(session_id).await {
+            Ok(sftp) => sftp,
+            Err(e) => {
+                self.transfer_end(transfer_id, seq);
+                return Err(e);
             }
-            Err(e) => Err(e),
         };
+        let mut p = Progress::new(app, session_id, transfer_id, local, "upload", cancel);
+        let r = upload_tree(&sftp, &mut p, local, remote, overwrite)
+            .await
+            .map(|bytes| TransferOutcome { bytes, notes: p.take_notes() });
         self.transfer_end(transfer_id, seq);
-        self.check_sftp(session_id, r).await
+        self.check_sftp(session_id, &sftp, r).await
     }
 }
 
@@ -3747,9 +3758,49 @@ pub struct SftpConn {
     raw: RawSftpSession,
     /// The server advertised `posix-rename@openssh.com` version 1.
     posix_rename: bool,
-    /// Whether this server's plain RENAME replaces an existing target, once
-    /// probed (see `rename_replaces`).
-    rename_replaces: std::sync::Mutex<Option<bool>>,
+    /// Per folder (`remote_parent`): whether this server's plain RENAME
+    /// replaces an existing target there (`true`) or refuses it (`false`).
+    /// Only CONFIRMED verdicts are kept (see `probe_rename`); a folder on
+    /// another mount can behave differently, so one folder's answer is never
+    /// used for another.
+    rename_verdicts: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    /// The tasks carrying both sessions over the channel. Stopped, and the
+    /// channel CLOSED, when this connection is dropped or evicted.
+    mux: SftpMux,
+}
+
+impl SftpConn {
+    /// Stop the channel now, even while other holders still have this
+    /// connection (they then fail fast): an evicted connection must give its
+    /// session slot back at once, not when its last straggler gives up.
+    fn shutdown(&self) {
+        self.mux.shutdown();
+    }
+}
+
+/// Forget `failed` from a session's SFTP cache if `e` says its channel is
+/// dead — but only if it is still the cached connection. A straggler failing
+/// on an old channel (one already replaced after an earlier failure) must not
+/// evict the healthy replacement: on a server allowing one SFTP channel, that
+/// would make the next open fail while live operations still hold the
+/// replacement. Returns whether it was forgotten; a forgotten connection is
+/// shut down (see `SftpConn::shutdown`).
+async fn forget_sftp(
+    slot: &Mutex<Option<Arc<SftpConn>>>,
+    failed: &Arc<SftpConn>,
+    e: &SshError,
+) -> bool {
+    if !sftp_dead(e) {
+        return false;
+    }
+    let mut cached = slot.lock().await;
+    if !cached.as_ref().is_some_and(|c| Arc::ptr_eq(c, failed)) {
+        return false;
+    }
+    *cached = None;
+    drop(cached);
+    failed.shutdown();
+    true
 }
 
 /// Open the `sftp` subsystem on a fresh session channel and wait for the
@@ -3789,7 +3840,11 @@ async fn open_sftp_channel<H: client::Handler>(
             Ok((r, w, early))
         }
         other => {
-            let _ = tokio::time::timeout(EXEC_CLOSE_GRACE, channel.close()).await;
+            // Enqueued from its own task, with no deadline: a full command
+            // queue must delay the CLOSE, never discard it.
+            tokio::spawn(async move {
+                let _ = channel.close().await;
+            });
             Err(match other {
                 Ok(Ok(_)) => {
                     refused.store(true, Ordering::SeqCst);
@@ -3814,7 +3869,8 @@ async fn open_sftp_conn<H: client::Handler>(
     refused: &AtomicBool,
 ) -> Result<SftpConn, SshError> {
     let (r, w, early) = open_sftp_channel(handle, refused).await?;
-    let (hi_io, raw_io) = spawn_sftp_mux(r, w, early);
+    // Dropped on any failure below, which stops the mux and closes the channel.
+    let (hi_io, raw_io, mux) = spawn_sftp_mux(r, w, early);
     let setup = async {
         let hi = SftpSession::new(hi_io).await?;
         let raw = RawSftpSession::new(raw_io);
@@ -3825,7 +3881,7 @@ async fn open_sftp_conn<H: client::Handler>(
         .await
         .map_err(|_| SshError::Connect("the SFTP server did not answer its INIT".into()))??;
     let posix_rename = version.extensions.get(POSIX_RENAME).is_some_and(|v| v == "1");
-    Ok(SftpConn { hi, raw, posix_rename, rename_replaces: std::sync::Mutex::new(None) })
+    Ok(SftpConn { hi, raw, posix_rename, rename_verdicts: Default::default(), mux })
 }
 
 /// Largest SFTP packet the mux relays (the protocol's own limits are far
@@ -3833,6 +3889,90 @@ async fn open_sftp_conn<H: client::Handler>(
 const MUX_MAX_PACKET: usize = 4 << 20;
 const SSH_FXP_INIT: u8 = 1;
 const SSH_FXP_VERSION: u8 = 2;
+
+/// The one stop switch of a mux: every task watches it, and the first to stop
+/// (or the owner) CLOSES the channel.
+struct MuxStop {
+    stop: watch::Sender<bool>,
+    write: Arc<ChannelWriteHalf<client::Msg>>,
+    closed: AtomicBool,
+}
+
+impl MuxStop {
+    /// Stop every task and CLOSE the channel, once. The CLOSE is enqueued from
+    /// a detached task with no deadline: behind a full SSH command queue (a
+    /// stalled peer) it waits its turn instead of being dropped after a grace
+    /// period, which would leave the channel holding a session slot.
+    fn shutdown(&self) {
+        self.stop.send_replace(true);
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let write = Arc::clone(&self.write);
+                rt.spawn(async move {
+                    let _ = write.close().await;
+                });
+            }
+        }
+    }
+}
+
+/// Resolves once the mux is told to stop.
+async fn mux_stopped(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|stop| *stop).await;
+}
+
+/// The running mux: its stop switch and its tasks. Dropping it (with the
+/// `SftpConn` that owns it) stops everything.
+struct SftpMux {
+    stop: Arc<MuxStop>,
+    tasks: Vec<tokio::task::AbortHandle>,
+    /// How many of its tasks are still running.
+    #[cfg_attr(not(test), allow(dead_code))]
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SftpMux {
+    /// Stop the channel: signal every task, CLOSE the channel, and abort the
+    /// tasks outright, so even one parked inside an SSH send (a zero window,
+    /// a full queue) is gone at once.
+    fn shutdown(&self) {
+        self.stop.shutdown();
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SftpMux {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Spawn one mux task, counted in `live` until it ends or is aborted.
+fn mux_task(
+    live: &Arc<std::sync::atomic::AtomicUsize>,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::AbortHandle {
+    struct Live(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Live {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    live.fetch_add(1, Ordering::SeqCst);
+    let live = Live(Arc::clone(live));
+    tokio::spawn(async move {
+        let _live = live;
+        fut.await;
+    })
+    .abort_handle()
+}
 
 /// Two SFTP client sessions over one subsystem channel.
 ///
@@ -3844,14 +3984,17 @@ const SSH_FXP_VERSION: u8 = 2;
 /// delivered and ignored by that session, as a late reply on a private
 /// channel would be.
 ///
-/// The channel is CLOSED (not just dropped, which sends nothing) when both
-/// sessions are gone or the server ends it; either way both sessions then see
-/// end-of-stream and fail fast (see `sftp_dead`).
+/// Every task races its work against one stop switch (`MuxStop`). The first
+/// task to end (both sessions gone, the server ended the stream, a send
+/// failed) throws it, and the returned `SftpMux` throws it and aborts every
+/// task when dropped: so the channel is CLOSED (not just dropped, which sends
+/// nothing) even while the writer is parked on a peer that stopped reading,
+/// and both sessions then see end-of-stream and fail fast (see `sftp_dead`).
 fn spawn_sftp_mux(
     mut read: russh::ChannelReadHalf,
     write: ChannelWriteHalf<client::Msg>,
     early: Vec<u8>,
-) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+) -> (tokio::io::DuplexStream, tokio::io::DuplexStream, SftpMux) {
     use tokio::io::AsyncWriteExt as _;
     struct Routes {
         next: u32,
@@ -3865,7 +4008,10 @@ fn spawn_sftp_mux(
         version: None,
         raw_waiting: false,
     }));
-    let write = Arc::new(write);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let ctl = Arc::new(MuxStop { stop: stop_tx, write: Arc::new(write), closed: AtomicBool::new(false) });
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = Vec::new();
     let (hi_app, hi_mux) = tokio::io::duplex(1 << 20);
     let (raw_app, raw_mux) = tokio::io::duplex(1 << 20);
     let (hi_r, hi_w) = tokio::io::split(hi_mux);
@@ -3889,58 +4035,93 @@ fn spawn_sftp_mux(
     }
     for (ep, mut r) in [(0usize, Box::new(hi_r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>), (1, Box::new(raw_r))] {
         let tx = up_tx.clone();
-        tokio::spawn(async move {
-            while let Some(f) = frame(&mut r).await {
-                if tx.send((ep, f)).await.is_err() {
-                    break;
+        let mut stop = stop_rx.clone();
+        tasks.push(mux_task(&live, async move {
+            loop {
+                let f = tokio::select! {
+                    biased;
+                    _ = mux_stopped(&mut stop) => break,
+                    f = frame(&mut r) => f,
+                };
+                let Some(f) = f else { break };
+                tokio::select! {
+                    biased;
+                    _ = mux_stopped(&mut stop) => break,
+                    sent = tx.send((ep, f)) => if sent.is_err() { break },
                 }
             }
-        });
+        }));
     }
     drop(up_tx);
 
-    // Upstream: one writer, so two sessions' packets never interleave.
+    // Upstream: one writer, so two sessions' packets never interleave. Every
+    // send races the stop switch: a send parked on the SSH window must not
+    // keep the channel alive after everyone left.
     let up_routes = Arc::clone(&routes);
-    let up_write = Arc::clone(&write);
-    tokio::spawn(async move {
-        while let Some((ep, mut f)) = up_rx.recv().await {
-            if f[4] == SSH_FXP_INIT {
-                if ep == 0 {
-                    if up_write.data(&f[..]).await.is_err() {
-                        break;
-                    }
-                } else {
-                    let _ = init_tx.try_send(());
-                }
-                continue;
-            }
-            if f.len() < 9 {
-                continue;
-            }
-            let orig = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
-            let wire = {
-                let mut r = up_routes.lock().unwrap_or_else(|p| p.into_inner());
-                let mut id = r.next;
-                while r.pending.contains_key(&id) {
-                    id = id.wrapping_add(1);
-                }
-                r.next = id.wrapping_add(1);
-                r.pending.insert(id, (ep, orig));
-                id
+    let up_ctl = Arc::clone(&ctl);
+    let mut up_stop = stop_rx.clone();
+    tasks.push(mux_task(&live, async move {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = mux_stopped(&mut up_stop) => None,
+                next = up_rx.recv() => next,
             };
-            f[5..9].copy_from_slice(&wire.to_be_bytes());
-            if up_write.data(&f[..]).await.is_err() {
+            // None: both sessions gone (or told to stop).
+            let Some((ep, mut f)) = next else { break };
+            if f[4] == SSH_FXP_INIT {
+                if ep != 0 {
+                    let _ = init_tx.try_send(());
+                    continue;
+                }
+            } else {
+                if f.len() < 9 {
+                    continue;
+                }
+                let orig = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
+                let wire = {
+                    let mut r = up_routes.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut id = r.next;
+                    while r.pending.contains_key(&id) {
+                        id = id.wrapping_add(1);
+                    }
+                    r.next = id.wrapping_add(1);
+                    r.pending.insert(id, (ep, orig));
+                    id
+                };
+                f[5..9].copy_from_slice(&wire.to_be_bytes());
+            }
+            let sent = tokio::select! {
+                biased;
+                _ = mux_stopped(&mut up_stop) => break,
+                sent = up_ctl.write.data(&f[..]) => sent,
+            };
+            if sent.is_err() {
                 break;
             }
         }
-        // Both sessions gone (or the channel broke): end the channel.
-        let _ = tokio::time::timeout(EXEC_CLOSE_GRACE, up_write.close()).await;
-    });
+        up_ctl.shutdown();
+    }));
 
     // Downstream: route each reply to its session.
-    tokio::spawn(async move {
+    let down_ctl = Arc::clone(&ctl);
+    let mut down_stop = stop_rx;
+    tasks.push(mux_task(&live, async move {
         let mut outs = [hi_w, raw_w];
         let mut buf = early;
+        // Deliver one frame to a session; false if the mux is stopping. A
+        // session that is gone just misses it.
+        async fn deliver(
+            stop: &mut watch::Receiver<bool>,
+            out: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            f: &[u8],
+        ) -> bool {
+            tokio::select! {
+                biased;
+                _ = mux_stopped(stop) => false,
+                _ = out.write_all(f) => true,
+            }
+        }
         'run: loop {
             // Every complete frame in the buffer.
             loop {
@@ -3961,10 +4142,12 @@ fn spawn_sftp_mux(
                         r.version = Some(f.clone());
                         std::mem::take(&mut r.raw_waiting)
                     };
-                    if raw_waiting {
-                        let _ = outs[1].write_all(&f).await;
+                    if raw_waiting && !deliver(&mut down_stop, &mut outs[1], &f).await {
+                        break 'run;
                     }
-                    let _ = outs[0].write_all(&f).await;
+                    if !deliver(&mut down_stop, &mut outs[0], &f).await {
+                        break 'run;
+                    }
                     continue;
                 }
                 if f.len() < 9 {
@@ -3974,11 +4157,14 @@ fn spawn_sftp_mux(
                 let route = routes.lock().unwrap_or_else(|p| p.into_inner()).pending.remove(&wire);
                 if let Some((ep, orig)) = route {
                     f[5..9].copy_from_slice(&orig.to_be_bytes());
-                    // A session that is gone just misses its reply.
-                    let _ = outs[ep].write_all(&f).await;
+                    if !deliver(&mut down_stop, &mut outs[ep], &f).await {
+                        break 'run;
+                    }
                 }
             }
             tokio::select! {
+                biased;
+                _ = mux_stopped(&mut down_stop) => break 'run,
                 msg = read.wait() => match msg {
                     Some(ChannelMsg::Data { data }) => buf.extend_from_slice(&data),
                     Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break 'run,
@@ -3994,20 +4180,22 @@ fn spawn_sftp_mux(
                         v
                     };
                     if let Some(v) = version {
-                        let _ = outs[1].write_all(&v).await;
+                        if !deliver(&mut down_stop, &mut outs[1], &v).await {
+                            break 'run;
+                        }
                     }
                 }
             }
         }
-        // The server ended the stream: both sessions see EOF, and the channel
-        // is closed from our side too.
+        // Both sessions see EOF (bounded: a session that stopped reading must
+        // not hold this up), and the channel is closed from our side too.
         for o in outs.iter_mut() {
-            let _ = o.shutdown().await;
+            let _ = tokio::time::timeout(EXEC_CLOSE_GRACE, o.shutdown()).await;
         }
         drop(outs);
-        let _ = tokio::time::timeout(EXEC_CLOSE_GRACE, write.close()).await;
-    });
-    (hi_app, raw_app)
+        down_ctl.shutdown();
+    }));
+    (hi_app, raw_app, SftpMux { stop: ctl, tasks, live })
 }
 
 const POSIX_RENAME: &str = "posix-rename@openssh.com";
@@ -4030,7 +4218,7 @@ fn sftp_dead(e: &SshError) -> bool {
     }
     match e {
         SshError::Sftp(s) => dead(s),
-        SshError::TransferStalled(_) | SshError::TreeAborted(_) => true,
+        SshError::TransferStalled(_) | SshError::ChannelLost(_) => true,
         // Errors from an SFTP `File` (AsyncRead/AsyncWrite) arrive as io::Error
         // carrying the SFTP error inside.
         SshError::Io(io) => {
@@ -4276,6 +4464,9 @@ struct Progress<'a> {
     cancel: watch::Receiver<bool>,
     notes: Vec<String>,
     notes_dropped: usize,
+    /// Tests: every event, as it would have been emitted.
+    #[cfg(test)]
+    sent: Option<Arc<std::sync::Mutex<Vec<TransferProgress>>>>,
 }
 
 const MAX_NOTES: usize = 20;
@@ -4300,6 +4491,7 @@ impl<'a> Progress<'a> {
                 total_bytes: 0,
                 direction,
                 done: false,
+                note: None,
             },
             last: None,
             base: 0,
@@ -4308,6 +4500,8 @@ impl<'a> Progress<'a> {
             cancel,
             notes: Vec::new(),
             notes_dropped: 0,
+            #[cfg(test)]
+            sent: None,
         }
     }
 
@@ -4329,6 +4523,7 @@ impl<'a> Progress<'a> {
                 total_bytes: 0,
                 direction: "upload",
                 done: false,
+                note: None,
             },
             last: None,
             base: 0,
@@ -4337,14 +4532,36 @@ impl<'a> Progress<'a> {
             cancel,
             notes: Vec::new(),
             notes_dropped: 0,
+            sent: None,
         }
+    }
+
+    /// What a detached transfer would have emitted, from now on.
+    #[cfg(test)]
+    fn record(&mut self) -> Arc<std::sync::Mutex<Vec<TransferProgress>>> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.sent = Some(Arc::clone(&log));
+        log
     }
 
     fn emit(&mut self) {
         self.last = Some(Instant::now());
+        #[cfg(test)]
+        if let Some(log) = &self.sent {
+            log.lock().unwrap().push(self.payload.clone());
+        }
         if let Some(app) = self.app {
             let _ = app.emit("sftp://progress", self.payload.clone());
         }
+    }
+
+    /// A warning: shown NOW (an unthrottled event carrying it), and kept
+    /// among the final notes.
+    fn warn(&mut self, text: String) {
+        self.payload.note = Some(text.clone());
+        self.emit();
+        self.payload.note = None;
+        self.note(text);
     }
 
     /// A file starts. A single file emits at once, so the row gets its
@@ -4437,7 +4654,7 @@ fn partial_summary(total: u64, failed: &[String], dead: bool) -> SshError {
         failed[0]
     );
     if dead {
-        SshError::TreeAborted(text)
+        SshError::ChannelLost(text)
     } else {
         SshError::PartialTransfer(text)
     }
@@ -4819,6 +5036,47 @@ trait CommitFs {
     fn hard_link(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>;
     fn remove(&self, p: &std::path::Path) -> std::io::Result<()>;
     fn kind(&self, p: &std::path::Path) -> Option<LocalKind>;
+    /// Swap two names atomically (see `exchange_paths`).
+    fn exchange(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()>;
+}
+
+/// Swap what two paths name, in one atomic step: Linux `renameat2`
+/// `RENAME_EXCHANGE`, macOS `renamex_np` `RENAME_SWAP`. Neither name is ever
+/// missing, nothing is replaced, and a failure changes nothing. `Unsupported`
+/// elsewhere (Windows); a kernel or filesystem without it reports its own
+/// error (ENOSYS, EINVAL, ENOTSUP), also with nothing changed.
+fn exchange_paths(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+        let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+        // Linux: through syscall(), not the glibc wrapper (renameat2 joined
+        // glibc only in 2.28; see `utils::artifacts::rename_noreplace`).
+        #[cfg(target_os = "linux")]
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                a.as_ptr(),
+                libc::AT_FDCWD,
+                b.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (a, b);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no atomic exchange on this platform"))
+    }
 }
 
 struct RealFs;
@@ -4835,6 +5093,9 @@ impl CommitFs for RealFs {
     }
     fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
         std::fs::remove_file(p)
+    }
+    fn exchange(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+        exchange_paths(a, b)
     }
     fn kind(&self, p: &std::path::Path) -> Option<LocalKind> {
         let m = std::fs::symlink_metadata(p).ok()?;
@@ -4886,11 +5147,17 @@ fn place_noreplace(fs: &dyn CommitFs, from: &std::path::Path, to: &std::path::Pa
 ///   copy is then removed. A filesystem with no atomic no-replace fails the
 ///   download instead (choose Replace there).
 /// - `replace == true`: an atomic rename over `dest`. If the platform refuses
-///   (Windows: something holds the file open), the original — if it is still
-///   a regular file — is moved aside to `bak`, the new copy put in place
-///   (never over something that appeared meanwhile), and the backup dropped;
-///   if putting the new copy in place fails, the original is moved back, never
-///   over anything either, or both copies are kept and named.
+///   (Windows: something holds the file open), and the original is still a
+///   regular file: where the platform can, the two are EXCHANGED atomically
+///   (Linux, macOS), so the original never leaves a name; then what came out
+///   is checked to be that regular file — if something else had taken its
+///   place in between, it is exchanged straight back. Elsewhere the original
+///   is moved aside to `bak` (no-replace), checked the same way and put back
+///   (no-replace) if it was not the file, the new copy put in place (never
+///   over something that appeared meanwhile), and the backup dropped; if
+///   putting the new copy in place fails, the original is moved back, never
+///   over anything either. Whatever cannot be put back is named with its
+///   path.
 fn commit_download(
     fs: &dyn CommitFs,
     tmp: &std::path::Path,
@@ -4933,6 +5200,31 @@ fn commit_download(
                  was kept at {t}"
             ))
         }
+    }
+    // One atomic step where the platform has it: the new copy at `dest`, the
+    // original at `tmp`. Any failure changed nothing: the move-aside below.
+    if fs.exchange(tmp, dest).is_ok() {
+        if fs.kind(tmp) == Some(LocalKind::File) {
+            return match fs.remove(tmp) {
+                Ok(()) => Ok(None),
+                Err(e) => Ok(Some(format!(
+                    "{d} was replaced, but its previous version could not be removed ({e}) and \
+                     was left at {t}"
+                ))),
+            };
+        }
+        // A folder or link took the file's place between the check and the
+        // exchange: swap it straight back.
+        return match fs.exchange(tmp, dest) {
+            Ok(()) => Err(format!(
+                "{d} changed while it was being replaced; it was left as it was and the \
+                 downloaded copy kept at {t}"
+            )),
+            Err(e) => Err(format!(
+                "{d} changed while it was being replaced and could not be put back ({e}): \
+                 what was there is now at {t}, and the downloaded copy at {d}"
+            )),
+        };
     }
     if let Err(e2) = fs.rename_noreplace(dest, bak).or_else(|e| {
         if e.kind() == ErrorKind::AlreadyExists {
@@ -5245,11 +5537,16 @@ async fn copy_local_file(
         RemoteDest::Unknown => (None, false),
     };
 
-    // Never: a commit by plain RENAME is only no-clobber on a server whose
-    // RENAME refuses an existing target. Found out before any byte moves (and
-    // checked again at the commit).
-    if !replace && rename_replaces(sftp, &target).await == Some(true) {
-        return Err(cannot_guarantee_noclobber(&target));
+    // Never: a commit by plain RENAME is only no-clobber in a folder where
+    // RENAME is confirmed to refuse an existing target. Found out before any
+    // byte moves (and checked again at the commit). An unwritable folder is
+    // written in place with an exclusive create instead (below).
+    if !replace {
+        match probe_rename(sftp, &target).await {
+            RenameProbe::Refuses | RenameProbe::Unwritable => {}
+            RenameProbe::Replaces => return Err(cannot_guarantee_noclobber(&target)),
+            RenameProbe::Unknown => return Err(cannot_check_noclobber(&target)),
+        }
     }
 
     let mut src = tokio::fs::File::open(local).await?;
@@ -5272,7 +5569,7 @@ async fn copy_local_file(
         Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::PermissionDenied) => {
             // The folder is not writable, only (perhaps) the file.
             let why = "the folder is not writable";
-            p.note(in_place_warning(&target, why));
+            p.warn(in_place_warning(&target, why));
             let done = write_in_place(sftp, p, &mut src, &target, replace, mode)
                 .await
                 .map_err(|e| in_place_failed(&target, why, e, None))?;
@@ -5348,19 +5645,9 @@ async fn copy_local_file(
     };
 
     // Replacing: what is at the destination now must still be what the user
-    // agreed to replace. A link or folder that took its place during the copy
-    // is neither replaced nor followed.
+    // agreed to replace (see `recheck_target`); a check that fails refuses.
     if replace {
-        match step(&uncancellable(), sftp.hi.symlink_metadata(target.clone())).await {
-            Ok(m) if m.file_type().is_symlink() || m.file_type().is_dir() => {
-                remove_remote_quietly(sftp, &tmp).await;
-                return Err(SshError::PartialTransfer(format!(
-                    "{target} became a {} during the upload; not replacing it",
-                    if m.file_type().is_dir() { "directory" } else { "symlink" }
-                )));
-            }
-            _ => {}
-        }
+        recheck_target(sftp, &tmp, &target, true).await?;
     }
 
     // The commit runs as its own task: neither a cancel nor the caller going
@@ -5381,7 +5668,7 @@ async fn copy_local_file(
             // The complete upload stays at `tmp` until the in-place write has
             // fully succeeded.
             let why = "the server would not rename the uploaded copy into place";
-            p.note(in_place_warning(&target, why));
+            p.warn(in_place_warning(&target, why));
             use tokio::io::AsyncSeekExt;
             step(&p.cancel, src.seek(std::io::SeekFrom::Start(0)))
                 .await
@@ -5413,9 +5700,10 @@ fn in_place_failed(target: &str, why: &str, e: SshError, staged: Option<&str>) -
     let kept = staged
         .map(|t| format!("; the complete upload is kept on the server at {t}"))
         .unwrap_or_default();
-    SshError::PartialTransfer(format!(
-        "{target} was being written in place ({why}) and may be incomplete: {e}{kept}"
-    ))
+    transfer_error(
+        sftp_dead(&e),
+        format!("{target} was being written in place ({why}) and may be incomplete: {e}{kept}"),
+    )
 }
 
 fn cannot_guarantee_noclobber(target: &str) -> SshError {
@@ -5423,6 +5711,64 @@ fn cannot_guarantee_noclobber(target: &str) -> SshError {
         "this server's rename replaces existing files, so Hawser can't guarantee {target} is \
          not overwritten; choose Replace to upload anyway"
     ))
+}
+
+fn cannot_check_noclobber(target: &str) -> SshError {
+    SshError::PartialTransfer(format!(
+        "could not confirm that this server's rename refuses to overwrite existing files, so \
+         Hawser can't guarantee {target} is not overwritten; choose Replace to upload anyway"
+    ))
+}
+
+/// A path-rich transfer error. `ChannelLost` when the channel failed (`dead`),
+/// so `sftp_dead` still sees it; a `PartialTransfer` otherwise.
+fn transfer_error(dead: bool, text: String) -> SshError {
+    if dead {
+        SshError::ChannelLost(text)
+    } else {
+        SshError::PartialTransfer(text)
+    }
+}
+
+/// "a directory", "a symlink"… for a remote entry that is not a regular file.
+fn remote_kind(m: &russh_sftp::protocol::FileAttributes) -> &'static str {
+    let t = m.file_type();
+    if t.is_dir() {
+        "a directory"
+    } else if t.is_symlink() {
+        "a symlink"
+    } else if t.is_file() {
+        "a regular file"
+    } else {
+        "something other than a regular file"
+    }
+}
+
+/// Before replacing `target`: it must still be a regular file (LSTAT, so a
+/// link is seen as one). A link or folder that took its place is neither
+/// replaced nor followed, and a check that FAILS refuses too. `missing_ok`:
+/// a destination that disappeared may be created. The staged copy `tmp` is
+/// removed on refusal, or kept and named if the channel failed.
+async fn recheck_target(sftp: &SftpConn, tmp: &str, target: &str, missing_ok: bool) -> Result<(), SshError> {
+    let why = match step(&uncancellable(), sftp.hi.symlink_metadata(target)).await {
+        Ok(m) if m.file_type().is_file() => return Ok(()),
+        Ok(m) => format!("{target} became {} during the upload; not replacing it", remote_kind(&m)),
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => {
+            if missing_ok {
+                return Ok(());
+            }
+            format!("{target} disappeared during the upload; not replacing it")
+        }
+        Err(e) if sftp_dead(&e) => {
+            return Err(SshError::ChannelLost(format!(
+                "could not check {target} again before replacing it ({e}); it was not replaced, \
+                 and the new copy is at {tmp}"
+            )))
+        }
+        Err(e) => format!("could not check {target} again before replacing it ({e}); not replacing it"),
+    };
+    remove_remote_quietly(sftp, tmp).await;
+    Err(SshError::PartialTransfer(why))
 }
 
 /// The folder part of a remote path, with its trailing '/' ("" for a bare
@@ -5436,19 +5782,42 @@ fn remote_parent(path: &str) -> &str {
 
 const PROBE_SUFFIX: &str = ".hawserprobe";
 
-/// Whether this server's plain RENAME replaces an existing target, found once
-/// per session: create two scratch files beside `target` and RENAME one onto
-/// the other. SFTPv3 says RENAME refuses an existing target (OpenSSH links,
-/// then unlinks); some servers replace instead, and on those a plain RENAME is
-/// no "never overwrite" commit. `None`: it could not be found out (the folder
-/// is not writable, the channel failed); not remembered.
-async fn rename_replaces(sftp: &SftpConn, target: &str) -> Option<bool> {
+/// What `probe_rename` found out about a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameProbe {
+    /// A plain RENAME replaced an existing file.
+    Replaces,
+    /// A plain RENAME was refused with the status that means "the target
+    /// exists" (SFTPv3 has no dedicated code: OpenSSH answers FAILURE), AND
+    /// both files were then seen still in place. The only verdict that lets a
+    /// RENAME serve as a no-clobber commit.
+    Refuses,
+    /// The folder refused even the probe files (permission denied): nothing
+    /// can be staged there either, so the upload writes in place, exclusively.
+    Unwritable,
+    /// Anything else (another status, a lost reply, a probe file that moved
+    /// anyway): it could not be found out, which counts as "may replace".
+    Unknown,
+}
+
+/// Whether this server's plain RENAME replaces an existing target in
+/// `target`'s folder: create two scratch files there and RENAME one onto the
+/// other. SFTPv3 says RENAME refuses an existing target (OpenSSH links, then
+/// unlinks); some servers replace instead, and on those a plain RENAME is no
+/// "never overwrite" commit. A rename refused for some other reason (a policy
+/// on these names, an unsupported operation) proves nothing, so only a
+/// refusal with both files confirmed in place is `Refuses`.
+///
+/// Confirmed verdicts are remembered per session and folder; `Unknown` and
+/// `Unwritable` are asked again next time.
+async fn probe_rename(sftp: &SftpConn, target: &str) -> RenameProbe {
     use russh_sftp::protocol::{FileAttributes, OpenFlags};
-    if let Some(v) = *sftp.rename_replaces.lock().unwrap_or_else(|p| p.into_inner()) {
-        return Some(v);
+    let dir = remote_parent(target).to_string();
+    if let Some(&replaces) = sftp.rename_verdicts.lock().unwrap_or_else(|p| p.into_inner()).get(&dir) {
+        return if replaces { RenameProbe::Replaces } else { RenameProbe::Refuses };
     }
     let never = uncancellable();
-    let stem = format!("{}hawser", remote_parent(target));
+    let stem = format!("{dir}hawser");
     let (a, b) = (remote_staging(&stem, PROBE_SUFFIX), remote_staging(&stem, PROBE_SUFFIX));
     let mut made = Vec::new();
     for path in [&a, &b] {
@@ -5466,31 +5835,50 @@ async fn rename_replaces(sftp: &SftpConn, target: &str) -> Option<bool> {
                 let _ = step(&never, f.shutdown()).await;
                 made.push(path.clone());
             }
-            Err(_) => {
+            Err(e) => {
+                let status = match &e {
+                    SshError::Sftp(s) => sftp_status(s),
+                    _ => None,
+                };
+                if status.is_none() {
+                    // No answer: the server may have created it anyway.
+                    made.push(path.clone());
+                }
                 for m in &made {
                     remove_remote_quietly(sftp, m).await;
                 }
-                return None;
+                return if path == &a && status == Some(StatusCode::PermissionDenied) {
+                    RenameProbe::Unwritable
+                } else {
+                    RenameProbe::Unknown
+                };
             }
         }
     }
     let verdict = match step(&never, sftp.hi.rename(a.clone(), b.clone())).await {
-        Ok(()) => Some(true),
-        Err(e) if sftp_dead(&e) => None,
-        Err(_) => Some(false),
+        Ok(()) => RenameProbe::Replaces,
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::Failure) => {
+            match (remote_present(sftp, &a).await, remote_present(sftp, &b).await) {
+                (Ok(true), Ok(true)) => RenameProbe::Refuses,
+                _ => RenameProbe::Unknown,
+            }
+        }
+        Err(_) => RenameProbe::Unknown,
     };
-    if verdict != Some(true) {
-        remove_remote_quietly(sftp, &a).await;
-    }
+    remove_remote_quietly(sftp, &a).await;
     remove_remote_quietly(sftp, &b).await;
-    if let Some(v) = verdict {
-        *sftp.rename_replaces.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
+    if matches!(verdict, RenameProbe::Replaces | RenameProbe::Refuses) {
+        sftp.rename_verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(dir, verdict == RenameProbe::Replaces);
     }
     verdict
 }
 
 /// After an install rename whose reply never came (`e`): it happened if the
-/// staged copy is gone.
+/// staged copy is gone. Anything else is no proof that it did NOT happen — the
+/// server may still be working on it — so the staged copy is kept and named.
 async fn after_lost_install(
     sftp: &SftpConn,
     tmp: &str,
@@ -5499,13 +5887,10 @@ async fn after_lost_install(
 ) -> Result<UploadCommit, SshError> {
     match remote_present(sftp, tmp).await {
         Ok(false) => Ok(UploadCommit::Done(None)),
-        Ok(true) => {
-            remove_remote_quietly(sftp, tmp).await;
-            Err(e)
-        }
-        Err(_) => Err(SshError::PartialTransfer(format!(
-            "the connection failed while putting the upload in place ({e}); {target} holds \
-             either its old or its new version, and if not the new one, the new copy is at {tmp}"
+        _ => Err(SshError::ChannelLost(format!(
+            "the connection failed while putting the upload in place ({e}), and the server may \
+             still complete it: {target} holds either its old or its new version, and if not \
+             the new one, the new copy is at {tmp}"
         ))),
     }
 }
@@ -5521,39 +5906,50 @@ async fn remove_backup(sftp: &SftpConn, bak: &str, target: &str) -> Option<Strin
     }
 }
 
+/// Move the original back from `bak` to `target` after a failed replace —
+/// only by a RENAME confirmed to refuse an existing target in that folder, so
+/// whatever appeared at `target` meanwhile is never overwritten.
+async fn put_back(sftp: &SftpConn, bak: &str, target: &str) -> Result<(), SshError> {
+    if probe_rename(sftp, target).await != RenameProbe::Refuses {
+        return Err(SshError::PartialTransfer(
+            "this server's rename may overwrite, so it was not moved back automatically".into(),
+        ));
+    }
+    step(&uncancellable(), sftp.hi.rename(bak, target)).await
+}
+
 /// Put a staged upload at `target`. See `copy_local_file`, which runs this as
 /// a shielded task: none of its steps can be cancelled.
 ///
-/// - `replace == false`: a plain RENAME, on a server whose RENAME refuses an
-///   existing target (`rename_replaces`), so a file that appeared since the
-///   check is never replaced. A server that replaces, or one that cannot be
-///   probed, fails the upload: no check-then-rename.
+/// - `replace == false`: a plain RENAME, in a folder where RENAME is confirmed
+///   to refuse an existing target (`probe_rename`), so a file that appeared
+///   since the check is never replaced. Any other verdict fails the upload:
+///   no check-then-rename.
 /// - `replace == true`: `posix-rename@openssh.com` (atomic replace) where
 ///   offered; else a RENAME (which replaces on some servers); else the
-///   original is moved ASIDE (never deleted), the new copy put in place and
-///   the backup dropped. Every error after the move-aside names the backup.
-///   The original is moved back only by a RENAME known to refuse an existing
-///   target; otherwise both copies are kept and named.
+///   original — re-checked to be a regular file — is moved ASIDE (never
+///   deleted), checked again under its backup name, the new copy put in
+///   place and the backup dropped. Every error after the move-aside names the
+///   backup. The original is moved back only by a RENAME confirmed to refuse
+///   an existing target; otherwise both copies are kept and named.
 ///
 /// A step whose reply is lost (the channel stalled or died) is followed by a
-/// look at the server to learn whether it happened. The staging file is
-/// removed on failure unless the error names it; on `InPlace` it is kept.
+/// look at the server, and only a POSITIVE sign that it happened is trusted:
+/// a "not there yet" may just mean the server has not got to it. Every other
+/// case keeps the staged copy and names every path involved. The staging file
+/// is removed on failure unless the error names it; on `InPlace` it is kept.
 async fn commit_upload(sftp: &SftpConn, tmp: &str, target: &str, replace: bool) -> Result<UploadCommit, SshError> {
     let never = uncancellable();
     if !replace {
-        match rename_replaces(sftp, target).await {
-            Some(false) => {}
-            Some(true) => {
+        match probe_rename(sftp, target).await {
+            RenameProbe::Refuses => {}
+            RenameProbe::Replaces => {
                 remove_remote_quietly(sftp, tmp).await;
                 return Err(cannot_guarantee_noclobber(target));
             }
-            None => {
+            RenameProbe::Unknown | RenameProbe::Unwritable => {
                 remove_remote_quietly(sftp, tmp).await;
-                return Err(SshError::PartialTransfer(format!(
-                    "could not check whether this server's rename overwrites existing files, so \
-                     Hawser can't guarantee {target} is not overwritten; choose Replace to \
-                     upload anyway"
-                )));
+                return Err(cannot_check_noclobber(target));
             }
         }
         return match step(&never, sftp.hi.rename(tmp, target)).await {
@@ -5564,7 +5960,12 @@ async fn commit_upload(sftp: &SftpConn, tmp: &str, target: &str, replace: bool) 
                     remove_remote_quietly(sftp, tmp).await;
                     Err(already_exists(target))
                 }
+                // Written in place with an exclusive create: still no clobber.
                 Ok(false) => Ok(UploadCommit::InPlace),
+                Err(e) if sftp_dead(&e) => Err(SshError::ChannelLost(format!(
+                    "the server would not rename the upload into place, and checking {target} \
+                     failed ({e}); the new copy is at {tmp}"
+                ))),
                 Err(e) => {
                     remove_remote_quietly(sftp, tmp).await;
                     Err(e)
@@ -5586,6 +5987,10 @@ async fn commit_upload(sftp: &SftpConn, tmp: &str, target: &str, replace: bool) 
         Err(e) if sftp_dead(&e) => return after_lost_install(sftp, tmp, target, e).await,
         Err(_) => {}
     }
+    // Only a regular file is ever moved aside: checked again right before the
+    // move (a link or folder may have taken its place during the attempts
+    // above).
+    recheck_target(sftp, tmp, target, false).await?;
     // Move the original ASIDE (never delete it) before putting the new one in
     // place, so a second failure or a dropped connection cannot destroy it
     // with nothing to recover.
@@ -5595,48 +6000,74 @@ async fn commit_upload(sftp: &SftpConn, tmp: &str, target: &str, replace: bool) 
         Err(e) if sftp_dead(&e) => match remote_present(sftp, &bak).await {
             // The reply was lost, but the move happened: carry on.
             Ok(true) => {}
-            Ok(false) => {
-                remove_remote_quietly(sftp, tmp).await;
-                return Err(e);
-            }
-            Err(_) => {
-                return Err(SshError::PartialTransfer(format!(
-                    "the connection failed while moving {target} aside ({e}): if {target} is \
-                     missing, the original is at {bak}; the new copy is at {tmp}"
+            // Not proof that it did not happen: the server may still be
+            // processing that rename. Keep everything, name everything.
+            _ => {
+                return Err(SshError::ChannelLost(format!(
+                    "the connection failed while moving {target} aside ({e}), and the server may \
+                     still complete that move: if {target} is missing, the original is at {bak}. \
+                     The new copy is kept at {tmp}"
                 )))
             }
         },
         // Cannot even move the original: the server does not rename here.
         Err(_) => return Ok(UploadCommit::InPlace),
     }
-    // The original is at `bak`: every error from here names it.
+    // The original is at `bak`: every error from here names it. What was
+    // moved must be the regular file that was checked; something swapped in
+    // between the check and the move is put back.
+    match step(&never, sftp.hi.symlink_metadata(bak.clone())).await {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(m) => {
+            let why = format!(
+                "{target} changed while it was being replaced (what was moved aside is {})",
+                remote_kind(&m)
+            );
+            return Err(match put_back(sftp, &bak, target).await {
+                Ok(()) => {
+                    remove_remote_quietly(sftp, tmp).await;
+                    SshError::PartialTransfer(format!("{why}; it was put back as it was and not replaced"))
+                }
+                Err(e2) => transfer_error(
+                    sftp_dead(&e2),
+                    format!("{why}, and could not be put back ({e2}): it is at {bak}, and the new copy at {tmp}"),
+                ),
+            });
+        }
+        Err(e) => {
+            return Err(transfer_error(
+                sftp_dead(&e),
+                format!(
+                    "could not check what was moved aside from {target} ({e}): the original is \
+                     at {bak}, and the new copy at {tmp}"
+                ),
+            ))
+        }
+    }
     let e = match step(&never, sftp.hi.rename(tmp, target)).await {
         Ok(()) => return Ok(UploadCommit::Done(remove_backup(sftp, &bak, target).await)),
         Err(e) => e,
     };
-    if sftp_dead(&e) && matches!(remote_present(sftp, tmp).await, Ok(false)) {
-        // The reply was lost, but the new copy went in.
-        return Ok(UploadCommit::Done(remove_backup(sftp, &bak, target).await));
+    if sftp_dead(&e) {
+        return match remote_present(sftp, tmp).await {
+            // The reply was lost, but the new copy went in.
+            Ok(false) => Ok(UploadCommit::Done(remove_backup(sftp, &bak, target).await)),
+            _ => Err(SshError::ChannelLost(format!(
+                "the connection failed while putting the upload in place ({e}): the original is \
+                 at {bak}, and the new copy at {tmp} (or at {target}, if the server still \
+                 completes that rename)"
+            ))),
+        };
     }
-    if rename_replaces(sftp, target).await != Some(false) {
-        return Err(SshError::PartialTransfer(format!(
-            "could not put the upload in place ({e}), and this server's rename may overwrite, so \
-             the original was not moved back automatically: it is at {bak}, and the new copy \
-             at {tmp}"
-        )));
-    }
-    match step(&never, sftp.hi.rename(bak.clone(), target)).await {
-        Ok(()) if !sftp_dead(&e) => Ok(UploadCommit::InPlace),
-        Ok(()) => {
-            remove_remote_quietly(sftp, tmp).await;
-            Err(SshError::PartialTransfer(format!(
-                "could not put the upload in place ({e}); the original {target} was restored"
-            )))
-        }
-        Err(e2) => Err(SshError::PartialTransfer(format!(
-            "could not replace {target} ({e}) or restore it ({e2}): the original is at {bak}, \
-             and the new copy at {tmp}"
-        ))),
+    match put_back(sftp, &bak, target).await {
+        Ok(()) => Ok(UploadCommit::InPlace),
+        Err(e2) => Err(transfer_error(
+            sftp_dead(&e2),
+            format!(
+                "could not put the upload in place ({e}) or move the original back ({e2}): the \
+                 original is at {bak}, and the new copy at {tmp}"
+            ),
+        )),
     }
 }
 
@@ -7015,11 +7446,30 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
         /// Fail the Nth call (0-based) of each kind, by kind name.
         fail: Vec<(&'static str, usize)>,
         calls: std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
+        /// Offer the atomic exchange; off, it is `Unsupported` (Windows), so
+        /// the move-aside path runs.
+        swap: bool,
+        /// Run just before the Nth exchange (0-based).
+        before_exchange: Option<(usize, Box<dyn Fn() + Send + Sync>)>,
+        /// Run just before a no-replace rename FROM this path.
+        before_noreplace_from: Option<(std::path::PathBuf, Box<dyn Fn() + Send + Sync>)>,
     }
 
     impl FailFs {
         fn new(fail: &[(&'static str, usize)]) -> Self {
-            Self { fail: fail.to_vec(), calls: Default::default() }
+            Self {
+                fail: fail.to_vec(),
+                calls: Default::default(),
+                swap: false,
+                before_exchange: None,
+                before_noreplace_from: None,
+            }
+        }
+        fn with_exchange(fail: &[(&'static str, usize)]) -> Self {
+            Self { swap: true, ..Self::new(fail) }
+        }
+        fn calls(&self, kind: &'static str) -> usize {
+            self.calls.lock().unwrap().get(kind).copied().unwrap_or(0)
         }
         fn hit(&self, kind: &'static str) -> std::io::Result<()> {
             let mut c = self.calls.lock().unwrap();
@@ -7040,8 +7490,25 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
             std::fs::rename(a, b)
         }
         fn rename_noreplace(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            if let Some((from, f)) = &self.before_noreplace_from {
+                if a == from {
+                    f();
+                }
+            }
             self.hit("noreplace")?;
             RealFs.rename_noreplace(a, b)
+        }
+        fn exchange(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            if !self.swap {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no exchange here"));
+            }
+            if let Some((n, f)) = &self.before_exchange {
+                if self.calls("exchange") == *n {
+                    f();
+                }
+            }
+            self.hit("exchange")?;
+            exchange_paths(a, b)
         }
         fn hard_link(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
             self.hit("link")?;
@@ -7081,6 +7548,9 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
         }
         fn kind(&self, p: &std::path::Path) -> Option<LocalKind> {
             RealFs.kind(p)
+        }
+        fn exchange(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no exchange here"))
         }
     }
 
@@ -7173,6 +7643,99 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
         // Force the move-aside path even where rename(file, dir) would fail anyway.
         let e = commit_download(&FailFs::new(&[("rename", 0)]), &tmp, &dest, &bak, true).unwrap_err();
         assert!(e.contains("no longer a regular file") && e.contains(&tmp.display().to_string()), "{e}");
+        assert_eq!(read(&dest.join("inside")).as_deref(), Some("keep"));
+        assert!(!bak.exists());
+        assert_eq!(read(&tmp).as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// W3c item 3: the platform's atomic exchange swaps the original and the
+    /// download in one step: no moment where `dest` is missing, no backup.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn download_commit_replaces_by_atomic_exchange() {
+        let d = commit_dir("xchg");
+        let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dest, "old").unwrap();
+        // The plain replacing rename refused (as Windows does for an open file).
+        let fs = FailFs::with_exchange(&[("rename", 0)]);
+        assert_eq!(commit_download(&fs, &tmp, &dest, &bak, true).unwrap(), None);
+        assert_eq!(read(&dest).as_deref(), Some("new"));
+        assert!(!tmp.exists() && !bak.exists());
+        assert_eq!((fs.calls("exchange"), fs.calls("noreplace")), (1, 0), "no move-aside");
+        // The primitive itself: both names swap, neither is ever replaced.
+        std::fs::write(d.join("a"), "A").unwrap();
+        std::fs::write(d.join("b"), "B").unwrap();
+        exchange_paths(&d.join("a"), &d.join("b")).unwrap();
+        assert_eq!((read(&d.join("a")).as_deref(), read(&d.join("b")).as_deref()), (Some("B"), Some("A")));
+        assert!(exchange_paths(&d.join("a"), &d.join("missing")).is_err());
+        assert_eq!(read(&d.join("a")).as_deref(), Some("B"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// W3c item 3: a folder that takes the file's place between the type
+    /// check and the exchange is swapped straight back; the download is kept
+    /// and named. If even that fails, both paths are named.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn download_commit_swaps_back_a_folder_that_raced_in() {
+        for fail_back in [false, true] {
+            let d = commit_dir("xrace");
+            let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+            std::fs::write(&tmp, "new").unwrap();
+            std::fs::write(&dest, "old").unwrap();
+            let fail: &[(&str, usize)] = if fail_back { &[("rename", 0), ("exchange", 1)] } else { &[("rename", 0)] };
+            let mut fs = FailFs::with_exchange(fail);
+            let racer = dest.clone();
+            fs.before_exchange = Some((
+                0,
+                Box::new(move || {
+                    std::fs::remove_file(&racer).unwrap();
+                    std::fs::create_dir(&racer).unwrap();
+                    std::fs::write(racer.join("inside"), "keep").unwrap();
+                }),
+            ));
+            let e = commit_download(&fs, &tmp, &dest, &bak, true).unwrap_err();
+            assert!(!bak.exists(), "fail_back={fail_back}");
+            if fail_back {
+                // The folder is at the staging name, the download at dest: both named.
+                assert!(e.contains(&tmp.display().to_string()) && e.contains(&dest.display().to_string()), "{e}");
+                assert_eq!(read(&tmp.join("inside")).as_deref(), Some("keep"));
+                assert_eq!(read(&dest).as_deref(), Some("new"));
+            } else {
+                assert!(e.contains("left as it was") && e.contains(&tmp.display().to_string()), "{e}");
+                assert_eq!(read(&dest.join("inside")).as_deref(), Some("keep"));
+                assert_eq!(read(&tmp).as_deref(), Some("new"));
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// W3c item 3, no exchange (Windows): a folder that takes the file's place
+    /// right before the move-aside is moved, seen for what it is under the
+    /// backup name, and put back with a no-replace rename; the download is
+    /// kept and named.
+    #[test]
+    fn download_commit_puts_back_a_folder_moved_aside_by_a_race() {
+        let d = commit_dir("mrace");
+        let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dest, "old").unwrap();
+        let mut fs = FailFs::new(&[("rename", 0)]);
+        let racer = dest.clone();
+        fs.before_noreplace_from = Some((
+            dest.clone(),
+            Box::new(move || {
+                if racer.is_file() {
+                    std::fs::remove_file(&racer).unwrap();
+                    std::fs::create_dir(&racer).unwrap();
+                    std::fs::write(racer.join("inside"), "keep").unwrap();
+                }
+            }),
+        ));
+        let e = commit_download(&fs, &tmp, &dest, &bak, true).unwrap_err();
+        assert!(e.contains("left as it was") && e.contains(&tmp.display().to_string()), "{e}");
         assert_eq!(read(&dest.join("inside")).as_deref(), Some("keep"));
         assert!(!bak.exists());
         assert_eq!(read(&tmp).as_deref(), Some("new"));

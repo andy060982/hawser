@@ -13,8 +13,12 @@
 //!
 //! Faults can be injected per operation (see `Fault`): fail it, delay it
 //! before or after it takes effect (a reply that comes too late is a lost
-//! reply), or run a hook first (cancel the transfer, plant a file). The
-//! server can also refuse the `sftp` subsystem, leaving the channel open.
+//! reply), lose its reply outright, defer its effect until after later
+//! requests were answered (a server working on requests concurrently), or run
+//! a hook first (cancel the transfer, plant a file). The server can also
+//! refuse the `sftp` subsystem, leaving the channel open, or stall it: stop
+//! reading the channel, so the SSH window and every buffer fill and the
+//! client's sends park (see `relay`).
 //!
 //! The client side is the app's own: an `SftpConn` from `open_sftp_conn`, as
 //! `Registry::sftp` opens it, driven through the same functions the transfer
@@ -43,6 +47,21 @@ enum Act {
     Fail(StatusCode),
     /// Let the operation take effect, then wait this long before replying.
     After(Duration),
+    /// Take effect, but never send the reply; later requests are still
+    /// answered.
+    LoseReply,
+    /// RENAME only: lose the reply, and take effect only this long after the
+    /// request — after later requests on the channel were answered.
+    Defer(Duration),
+}
+
+/// What a matching fault asks of an operation that goes ahead.
+#[derive(Default)]
+struct Hit {
+    /// Hold the reply this long after taking effect.
+    after: Option<Duration>,
+    /// Take effect this long from now, in the background (see `Act::Defer`).
+    defer: Option<Duration>,
 }
 
 /// A fault for operation `op` ("open", "close", "read", "write", "lstat",
@@ -69,6 +88,7 @@ struct FsSftp {
     dirs: HashMap<String, Vec<(String, FileAttributes)>>,
     next: u64,
     faults: Faults,
+    seen: Arc<Seen>,
 }
 
 fn ok(id: u32) -> Status {
@@ -118,9 +138,9 @@ impl FsSftp {
         self.files.get(h).map(|f| f.1.clone()).unwrap_or_default()
     }
 
-    /// Apply the first matching fault: `Err` refuses the operation; `Ok(d)`
-    /// says how long to hold the reply after it took effect.
-    async fn fault(&self, op: &str, path: &str) -> Result<Option<Duration>, StatusCode> {
+    /// Apply the first matching fault to request `id`: `Err` refuses the
+    /// operation; `Ok` says how it goes ahead.
+    async fn fault(&self, op: &str, path: &str, id: u32) -> Result<Hit, StatusCode> {
         let acts = {
             let mut faults = self.faults.lock().unwrap();
             let hit = faults.iter_mut().find(|f| {
@@ -136,19 +156,26 @@ impl FsSftp {
                     f.times -= 1;
                     f.acts.clone()
                 }
-                None => return Ok(None),
+                None => return Ok(Hit::default()),
             }
         };
-        let mut after = None;
+        let mut hit = Hit::default();
         for a in acts {
             match a {
                 Act::Run(hook) => hook(),
                 Act::Before(d) => tokio::time::sleep(d).await,
                 Act::Fail(c) => return Err(c),
-                Act::After(d) => after = Some(d),
+                Act::After(d) => hit.after = Some(d),
+                Act::LoseReply => {
+                    self.seen.lost_replies.lock().unwrap().insert(id);
+                }
+                Act::Defer(d) => {
+                    self.seen.lost_replies.lock().unwrap().insert(id);
+                    hit.defer = Some(d);
+                }
             }
         }
-        Ok(after)
+        Ok(hit)
     }
 }
 
@@ -180,7 +207,7 @@ impl russh_sftp::server::Handler for FsSftp {
         pflags: OpenFlags,
         attrs: FileAttributes,
     ) -> Result<SftpHandle, Self::Error> {
-        let after = self.fault("open", &filename).await?;
+        let after = self.fault("open", &filename, id).await?.after;
         let mut o = std::fs::OpenOptions::new();
         o.read(pflags.contains(OpenFlags::READ))
             .write(pflags.contains(OpenFlags::WRITE) || pflags.contains(OpenFlags::APPEND))
@@ -203,14 +230,14 @@ impl russh_sftp::server::Handler for FsSftp {
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
-        let after = self.fault("close", &self.path_of(&handle)).await?;
+        let after = self.fault("close", &self.path_of(&handle), id).await?.after;
         self.files.remove(&handle);
         hold(after).await;
         Ok(ok(id))
     }
 
     async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
-        let after = self.fault("read", &self.path_of(&handle)).await?;
+        let after = self.fault("read", &self.path_of(&handle), id).await?.after;
         hold(after).await;
         let f = self.file(&handle)?;
         let mut buf = vec![0u8; len as usize];
@@ -223,14 +250,14 @@ impl russh_sftp::server::Handler for FsSftp {
     }
 
     async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
-        let after = self.fault("write", &self.path_of(&handle)).await?;
+        let after = self.fault("write", &self.path_of(&handle), id).await?.after;
         self.file(&handle)?.write_all_at(&data, offset).map_err(|e| code(&e))?;
         hold(after).await;
         Ok(ok(id))
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let after = self.fault("lstat", &path).await?;
+        let after = self.fault("lstat", &path, id).await?.after;
         let m = std::fs::symlink_metadata(self.real(&path)).map_err(|e| code(&e))?;
         hold(after).await;
         Ok(Attrs { id, attrs: attrs_of(&m) })
@@ -264,7 +291,7 @@ impl russh_sftp::server::Handler for FsSftp {
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
-        let after = self.fault("remove", &filename).await?;
+        let after = self.fault("remove", &filename, id).await?.after;
         std::fs::remove_file(self.real(&filename)).map_err(|e| code(&e))?;
         hold(after).await;
         Ok(ok(id))
@@ -300,13 +327,23 @@ impl russh_sftp::server::Handler for FsSftp {
     /// SFTPv3 RENAME, as OpenSSH does it: an existing target is refused —
     /// unless the server is in `rename_replaces` mode.
     async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, Self::Error> {
-        let after = self.fault("rename", &format!("{oldpath} -> {newpath}")).await?;
-        let to = self.real(&newpath);
-        if !self.rename_replaces && std::fs::symlink_metadata(&to).is_ok() {
-            return Err(StatusCode::Failure);
+        let hit = self.fault("rename", &format!("{oldpath} -> {newpath}"), id).await?;
+        let (from, to, replaces) = (self.real(&oldpath), self.real(&newpath), self.rename_replaces);
+        let rename = move || -> Result<(), StatusCode> {
+            if !replaces && std::fs::symlink_metadata(&to).is_ok() {
+                return Err(StatusCode::Failure);
+            }
+            std::fs::rename(&from, &to).map_err(|e| code(&e))
+        };
+        if let Some(d) = hit.defer {
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                let _ = rename();
+            });
+            return Ok(ok(id));
         }
-        std::fs::rename(self.real(&oldpath), to).map_err(|e| code(&e))?;
-        hold(after).await;
+        rename()?;
+        hold(hit.after).await;
         Ok(ok(id))
     }
 
@@ -333,7 +370,7 @@ impl russh_sftp::server::Handler for FsSftp {
             Some(s)
         };
         let (from, to) = take().zip(take()).ok_or(StatusCode::BadMessage)?;
-        let after = self.fault("posix-rename", &format!("{from} -> {to}")).await?;
+        let after = self.fault("posix-rename", &format!("{from} -> {to}"), id).await?.after;
         // rename(2): replaces an existing target atomically.
         std::fs::rename(self.real(&from), self.real(&to)).map_err(|e| code(&e))?;
         hold(after).await;
@@ -353,11 +390,84 @@ struct Opts {
     refuse_sftp: bool,
 }
 
-/// What the server saw.
+/// What the server saw, and how its SFTP channel behaves.
 #[derive(Default)]
 struct Seen {
     channels_opened: AtomicUsize,
     channels_closed: AtomicUsize,
+    /// Request ids whose reply is never sent (see `Act::LoseReply`).
+    lost_replies: std::sync::Mutex<std::collections::HashSet<u32>>,
+    /// The subsystem stopped reading its channel (see `relay`).
+    stalled: AtomicBool,
+    unstalled: tokio::sync::Notify,
+}
+
+impl Seen {
+    fn stall(&self) {
+        self.stalled.store(true, Ordering::SeqCst);
+    }
+
+    fn unstall(&self) {
+        self.stalled.store(false, Ordering::SeqCst);
+        self.unstalled.notify_waiters();
+    }
+}
+
+/// Carry an SFTP channel to and from the server's SFTP handler, dropping
+/// lost replies, and not reading the channel at all while `stalled`: the
+/// russh server then stops reading the connection, the client's SSH window
+/// and queues fill, and its sends park, as on a wedged sftp-server.
+async fn relay(ch: russh::ChannelStream<russh::server::Msg>, srv: tokio::io::DuplexStream, seen: Arc<Seen>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (mut ch_r, mut ch_w) = tokio::io::split(ch);
+    let (mut srv_r, mut srv_w) = tokio::io::split(srv);
+    let seen_up = Arc::clone(&seen);
+    let requests = async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            loop {
+                let resumed = seen_up.unstalled.notified();
+                if !seen_up.stalled.load(Ordering::SeqCst) {
+                    break;
+                }
+                resumed.await;
+            }
+            let n = match ch_r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if srv_w.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+        let _ = srv_w.shutdown().await;
+    };
+    let replies = async move {
+        let mut first = true;
+        loop {
+            let mut len = [0u8; 4];
+            if srv_r.read_exact(&mut len).await.is_err() {
+                break;
+            }
+            let mut f = len.to_vec();
+            f.resize(4 + u32::from_be_bytes(len) as usize, 0);
+            if srv_r.read_exact(&mut f[4..]).await.is_err() {
+                break;
+            }
+            // Every reply but the VERSION carries its request id.
+            if !std::mem::take(&mut first) && f.len() >= 9 {
+                let id = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
+                if seen.lost_replies.lock().unwrap().remove(&id) {
+                    continue;
+                }
+            }
+            if ch_w.write_all(&f).await.is_err() {
+                break;
+            }
+        }
+        let _ = ch_w.shutdown().await;
+    };
+    tokio::join!(requests, replies);
 }
 
 struct SshServer {
@@ -418,8 +528,11 @@ impl russh::server::Handler for SshServer {
                     dirs: HashMap::new(),
                     next: 0,
                     faults: Arc::clone(&self.faults),
+                    seen: Arc::clone(&self.seen),
                 };
-                russh_sftp::server::run(ch.into_stream(), handler).await;
+                let (srv, relayed) = tokio::io::duplex(1 << 20);
+                tokio::spawn(relay(ch.into_stream(), relayed, Arc::clone(&self.seen)));
+                russh_sftp::server::run(srv, handler).await;
             }
             None => session.channel_failure(channel)?,
         }
@@ -1041,6 +1154,410 @@ async fn nested_copy_stall_counts_as_a_dead_channel() {
         .scope(Duration::from_millis(300), download_tree(&h.conn, &mut p, "/d", &local, Overwrite::Never))
         .await
         .unwrap_err();
-    assert!(matches!(e, SshError::TreeAborted(_)), "{e}");
+    assert!(matches!(e, SshError::ChannelLost(_)), "{e}");
     assert!(sftp_dead(&e));
+}
+
+/* --------------------------------------------------- W3c regression tests */
+
+/// The probe files in the remote root, oldest name first.
+fn probe_files(root: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(PROBE_SUFFIX))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Wait up to `limit` for `cond`.
+async fn eventually(limit: Duration, cond: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
+/// Item 1: a probe RENAME refused for some other reason (a policy on these
+/// names, an unsupported operation) proves nothing about ordinary targets. On
+/// a server whose RENAME does replace, `Never` must then refuse rather than
+/// trust it, and the doubt is not remembered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_does_not_trust_a_probe_refused_for_another_reason() {
+    for status in [StatusCode::PermissionDenied, StatusCode::OpUnsupported, StatusCode::NoSuchFile] {
+        let h = harness_with(Opts { rename_replaces: true, ..Default::default() }).await;
+        h.put_local("n.txt", b"new", 0o644);
+        h.fault("rename", PROBE_SUFFIX, 1, vec![Act::Fail(status)]);
+        let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err().to_string();
+        assert!(e.contains("could not confirm") && e.contains("choose Replace"), "{status:?}: {e}");
+        assert!(!h.remote.join("n.txt").exists());
+        Harness::assert_clean(&h.remote);
+        // Asked again (the fault is used up): now the truth comes out.
+        let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err().to_string();
+        assert!(e.contains("rename replaces existing files"), "{status:?}: {e}");
+        assert!(!h.remote.join("n.txt").exists());
+    }
+}
+
+/// Item 1: a refusal is proof only if both probe files are still in place
+/// afterwards. Here the server reports a failure but did the rename.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_trusts_a_probe_refusal_only_if_both_files_remain() {
+    let h = harness_with(Opts { rename_replaces: true, ..Default::default() }).await;
+    h.put_local("n.txt", b"new", 0o644);
+    let root = h.remote.clone();
+    h.fault(
+        "rename",
+        PROBE_SUFFIX,
+        1,
+        vec![
+            hook(move || {
+                let p = probe_files(&root);
+                std::fs::rename(&p[0], &p[1]).unwrap();
+            }),
+            Act::Fail(StatusCode::Failure),
+        ],
+    );
+    let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err().to_string();
+    assert!(e.contains("could not confirm"), "{e}");
+    assert!(!h.remote.join("n.txt").exists());
+    Harness::assert_clean(&h.remote);
+}
+
+/// Item 1: a verdict holds for its own folder only (another folder can be
+/// another mount, with other semantics).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_probe_verdicts_are_per_folder() {
+    let h = harness(false).await;
+    std::fs::create_dir(h.remote.join("a")).unwrap();
+    std::fs::create_dir(h.remote.join("b")).unwrap();
+    h.put_local("x", b"x", 0o644);
+    h.upload("x", "/a/x", Overwrite::Never).await.unwrap();
+    // From now on no probe in any folder can be confirmed.
+    h.fault("rename", PROBE_SUFFIX, usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    h.upload("x", "/a/y", Overwrite::Never).await.unwrap();
+    let e = h.upload("x", "/b/z", Overwrite::Never).await.unwrap_err().to_string();
+    assert!(e.contains("could not confirm"), "{e}");
+    assert!(!h.remote.join("b/z").exists());
+    for d in ["a", "b"] {
+        Harness::assert_clean(&h.remote.join(d));
+    }
+}
+
+/// Item 1: after a failed install, the original is moved back only by a
+/// RENAME CONFIRMED to refuse an existing target; an unconfirmable probe
+/// leaves both copies, named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_restore_needs_a_confirmed_probe() {
+    let h = harness(false).await;
+    h.put_remote("cfg.txt", b"old", 0o600);
+    h.put_local("cfg.txt", b"new contents", 0o644);
+    h.fault("rename", "hawserpart -> /cfg.txt", usize::MAX, vec![Act::Fail(StatusCode::Failure)]);
+    h.fault("rename", PROBE_SUFFIX, usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let e = h.upload("cfg.txt", "/cfg.txt", Overwrite::Replace).await.unwrap_err().to_string();
+    let (bak, part) = (h.remote_named(BAK_SUFFIX), h.remote_named(PART_SUFFIX));
+    assert_eq!((bak.len(), part.len()), (1, 1), "{bak:?} {part:?}");
+    assert!(e.contains("not moved back"), "{e}");
+    assert!(e.contains(&format!("/{}", bak[0])) && e.contains(&format!("/{}", part[0])), "{e}");
+    assert_eq!(std::fs::read(h.remote.join(&bak[0])).unwrap(), b"old");
+    assert!(!h.remote.join("cfg.txt").exists(), "nothing was written in its place");
+}
+
+/// Item 2: the move-aside's reply is lost and the server performs it only
+/// AFTER answering the follow-up LSTAT (which then says "no backup"). That
+/// is no proof the move failed: nothing is deleted, and the error names both
+/// the backup and the staged copy — where everything really ends up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_lost_move_aside_not_yet_done_keeps_and_names_everything() {
+    let h = harness(false).await;
+    h.put_remote("cfg.txt", b"old", 0o600);
+    h.put_local("cfg.txt", b"new contents", 0o644);
+    h.fault("rename", "/cfg.txt -> ", 1, vec![Act::Defer(Duration::from_millis(900))]);
+    let e = TEST_STALL
+        .scope(Duration::from_millis(300), h.upload("cfg.txt", "/cfg.txt", Overwrite::Replace))
+        .await
+        .unwrap_err();
+    assert!(sftp_dead(&e), "{e}");
+    let e = e.to_string();
+    let part = h.remote_named(PART_SUFFIX);
+    assert_eq!(part.len(), 1, "the staged copy was kept: {part:?}");
+    assert!(e.contains(&format!("/{}", part[0])) && e.contains(BAK_SUFFIX), "{e}");
+    // The deferred move lands: the original is exactly where the error said.
+    assert!(eventually(Duration::from_secs(3), || h.remote_named(BAK_SUFFIX).len() == 1).await);
+    let bak = h.remote_named(BAK_SUFFIX);
+    assert!(e.contains(&format!("/{}", bak[0])), "{e}");
+    assert_eq!(std::fs::read(h.remote.join(&bak[0])).unwrap(), b"old");
+    assert_eq!(std::fs::read(h.remote.join(&part[0])).unwrap(), b"new contents");
+}
+
+/// Item 2: an install whose reply is lost and that the server performs only
+/// later: the staged copy is not deleted under it, and the error names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_lost_install_not_yet_done_keeps_the_staged_copy() {
+    let h = harness(false).await;
+    h.put_local("n.txt", b"new", 0o644);
+    h.fault("rename", "hawserpart -> /n.txt", 1, vec![Act::Defer(Duration::from_millis(900))]);
+    let e = TEST_STALL
+        .scope(Duration::from_millis(300), h.upload("n.txt", "/n.txt", Overwrite::Never))
+        .await
+        .unwrap_err();
+    assert!(sftp_dead(&e), "{e}");
+    let part = h.remote_named(PART_SUFFIX);
+    assert_eq!(part.len(), 1, "{part:?}");
+    assert!(e.to_string().contains(&format!("/{}", part[0])), "{e}");
+    // The rename still lands, with the complete upload.
+    assert!(eventually(Duration::from_secs(3), || h.remote.join("n.txt").exists()).await);
+    assert_eq!(h.remote_body("n.txt"), b"new");
+    Harness::assert_clean(&h.remote);
+}
+
+/// Item 4: replacing, a re-check of the destination that FAILS refuses (it
+/// does not carry on as if the file were fine).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_replace_refuses_when_the_recheck_fails() {
+    for posix in [true, false] {
+        let h = harness(posix).await;
+        h.put_remote("t.txt", b"regular", 0o644);
+        h.put_local("t.txt", b"new", 0o644);
+        let faults = Arc::clone(&h.faults);
+        // The first LSTAT passes; the re-check after the copy fails.
+        h.fault(
+            "write",
+            "hawserpart",
+            1,
+            vec![hook(move || {
+                faults.lock().unwrap().push(Fault {
+                    op: "lstat",
+                    path: "=/t.txt".into(),
+                    times: 1,
+                    acts: vec![Act::Fail(StatusCode::Failure)],
+                })
+            })],
+        );
+        let e = h.upload("t.txt", "/t.txt", Overwrite::Confirmed).await.unwrap_err().to_string();
+        assert!(e.contains("could not check") && e.contains("not replacing"), "posix={posix}: {e}");
+        assert_eq!(h.remote_body("t.txt"), b"regular");
+        Harness::assert_clean(&h.remote);
+    }
+}
+
+/// Item 4: a link that takes the destination's place between the first
+/// install attempt and the move-aside is seen by the re-check right before
+/// the move, and is neither moved nor replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_replace_rechecks_right_before_the_move_aside() {
+    let h = harness(false).await;
+    h.put_remote("t.txt", b"regular", 0o644);
+    h.put_remote("victim.txt", b"keep", 0o644);
+    h.put_local("t.txt", b"new", 0o644);
+    let root = h.remote.clone();
+    h.fault(
+        "rename",
+        "hawserpart -> /t.txt",
+        1,
+        vec![
+            hook(move || {
+                std::fs::remove_file(root.join("t.txt")).unwrap();
+                std::os::unix::fs::symlink("victim.txt", root.join("t.txt")).unwrap();
+            }),
+            Act::Fail(StatusCode::Failure),
+        ],
+    );
+    let e = h.upload("t.txt", "/t.txt", Overwrite::Confirmed).await.unwrap_err().to_string();
+    assert!(e.contains("symlink") && e.contains("not replacing"), "{e}");
+    assert!(std::fs::symlink_metadata(h.remote.join("t.txt")).unwrap().file_type().is_symlink());
+    assert_eq!(h.remote_body("victim.txt"), b"keep");
+    Harness::assert_clean(&h.remote);
+}
+
+/// Item 4: a folder swapped in between that re-check and the move-aside is
+/// moved, recognised under its backup name, and put back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_replace_puts_back_a_folder_moved_aside_by_a_race() {
+    let h = harness(false).await;
+    h.put_remote("t.txt", b"regular", 0o644);
+    h.put_local("t.txt", b"new", 0o644);
+    let root = h.remote.clone();
+    h.fault(
+        "rename",
+        "/t.txt -> ",
+        1,
+        vec![hook(move || {
+            std::fs::remove_file(root.join("t.txt")).unwrap();
+            std::fs::create_dir(root.join("t.txt")).unwrap();
+            std::fs::write(root.join("t.txt/inside"), "keep").unwrap();
+        })],
+    );
+    let e = h.upload("t.txt", "/t.txt", Overwrite::Confirmed).await.unwrap_err().to_string();
+    assert!(e.contains("changed while it was being replaced") && e.contains("put back"), "{e}");
+    assert_eq!(h.remote_body("t.txt/inside"), b"keep");
+    Harness::assert_clean(&h.remote);
+}
+
+/// Item 6: the in-place warning reaches the UI as a progress event BEFORE the
+/// destination is opened for truncation, not only with the final notes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_place_warning_is_shown_before_the_destination_is_truncated() {
+    let h = harness(false).await;
+    h.put_remote("cfg.bin", b"old", 0o600);
+    h.put_local("cfg.bin", b"new body", 0o644);
+    h.fault("rename", "", usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let (_tx, rx) = watch::channel(false);
+    let mut p = Progress::detached(rx);
+    let log = p.record();
+    let warned_first = Arc::new(AtomicBool::new(false));
+    let (log2, flag) = (Arc::clone(&log), Arc::clone(&warned_first));
+    // The in-place OPEN (with TRUNCATE) of the destination itself.
+    h.fault(
+        "open",
+        "=/cfg.bin",
+        1,
+        vec![hook(move || {
+            let seen = log2.lock().unwrap().iter().any(|ev| {
+                ev.note.as_deref().is_some_and(|n| n.contains("written in place"))
+            });
+            flag.store(seen, Ordering::SeqCst);
+        })],
+    );
+    let local = h.local.join("cfg.bin").to_string_lossy().to_string();
+    copy_local_file(&h.conn, &mut p, &local, "/cfg.bin", Overwrite::Replace).await.unwrap();
+    assert!(warned_first.load(Ordering::SeqCst), "no warning event before the truncating open");
+    assert!(p.take_notes().iter().any(|n| n.contains("written in place")));
+    assert_eq!(h.remote_body("cfg.bin"), b"new body");
+    // Shown once, then cleared from later events.
+    let events = log.lock().unwrap();
+    assert_eq!(events.iter().filter(|ev| ev.note.is_some()).count(), 1);
+    assert!(events.last().unwrap().note.is_none());
+}
+
+/// Item 7/P2: a stalled subsystem (the server stopped reading the channel,
+/// so the mux's writer parks inside its SSH send). Evicting the connection
+/// stops every mux task at once, even with a straggler still holding it; the
+/// CLOSE is not given up on while the peer stays stuck past any grace
+/// period, so the channel is freed, and a replacement opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evicting_a_stalled_channel_frees_it_and_a_replacement_opens() {
+    let Harness { conn, seen, ssh, .. } = harness(false).await;
+    let slot = Mutex::new(Some(Arc::clone(&conn)));
+    let handle = conn
+        .raw
+        .open("/big", OpenFlags::CREATE | OpenFlags::WRITE, FileAttributes::default())
+        .await
+        .unwrap()
+        .handle;
+    seen.stall();
+    // Far more than the SSH window plus every buffer on the way.
+    let chunk = vec![0u8; 200 * 1024];
+    let writes = (0..100u64).map(|i| conn.raw.write(handle.clone(), i * chunk.len() as u64, chunk.clone()));
+    let r = tokio::time::timeout(Duration::from_millis(800), futures_util::future::join_all(writes)).await;
+    assert!(r.is_err(), "a stalled server answered");
+    assert_eq!(conn.mux.running(), 4);
+
+    // The cache evicts it while a straggler (this test) still holds it.
+    assert!(forget_sftp(&slot, &conn, &SshError::TransferStalled(1)).await);
+    assert!(slot.lock().await.is_none());
+    assert!(
+        eventually(Duration::from_secs(1), || conn.mux.running() == 0).await,
+        "{} mux task(s) still running",
+        conn.mux.running()
+    );
+
+    // The peer stays stuck past any grace period, then recovers: the CLOSE,
+    // queued behind everything else, still goes out.
+    tokio::time::sleep(EXEC_CLOSE_GRACE + Duration::from_millis(500)).await;
+    seen.unstall();
+    assert!(
+        eventually(Duration::from_secs(15), || seen.channels_closed.load(Ordering::SeqCst) == 1).await,
+        "the stalled channel was never closed"
+    );
+    let fresh = open_sftp_conn(&ssh, &AtomicBool::new(false)).await.unwrap();
+    assert!(fresh.hi.symlink_metadata("/").await.is_ok());
+    assert_eq!(seen.channels_opened.load(Ordering::SeqCst), 2);
+    // The straggler fails fast instead of waiting out a timeout.
+    let late = tokio::time::timeout(Duration::from_secs(2), conn.hi.symlink_metadata("/")).await;
+    assert!(matches!(late, Ok(Err(_))), "{late:?}");
+    // Dropping a connection stops its mux the same way.
+    let fresh = Arc::new(fresh);
+    let running = Arc::clone(&fresh.mux.live);
+    drop(fresh);
+    assert!(eventually(Duration::from_secs(1), || running.load(Ordering::SeqCst) == 0).await);
+    assert!(eventually(Duration::from_secs(5), || seen.channels_closed.load(Ordering::SeqCst) == 2).await);
+}
+
+/// P2: a straggler failing on an old, already replaced channel must not evict
+/// the healthy replacement; only the cached instance that failed is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_on_an_old_channel_does_not_evict_its_replacement() {
+    let h = harness(true).await;
+    let dead = SshError::TransferStalled(1);
+    let old = Arc::clone(&h.conn);
+    let slot = Mutex::new(Some(Arc::clone(&old)));
+    // An error that is not a dead channel never evicts.
+    assert!(!forget_sftp(&slot, &old, &SshError::PartialTransfer("x exists".into())).await);
+    assert!(slot.lock().await.is_some());
+    // The first failure evicts it, and a replacement is opened.
+    assert!(forget_sftp(&slot, &old, &dead).await);
+    let new = Arc::new(open_sftp_conn(&h.ssh, &AtomicBool::new(false)).await.unwrap());
+    *slot.lock().await = Some(Arc::clone(&new));
+    // A second operation on the old channel fails later: the replacement stays.
+    assert!(!forget_sftp(&slot, &old, &dead).await);
+    assert!(Arc::ptr_eq(slot.lock().await.as_ref().unwrap(), &new));
+    assert!(new.hi.symlink_metadata("/").await.is_ok(), "the replacement was shut down");
+    // Its own death does evict it.
+    assert!(forget_sftp(&slot, &new, &dead).await);
+    assert!(slot.lock().await.is_none());
+}
+
+/// Item 10/P2: an in-place fallback whose write loses its reply ends with a
+/// path-rich error that still counts as a dead channel: a folder transfer
+/// stops there (no second file is attempted) and the session is evicted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_place_failure_on_a_dead_channel_stops_the_tree_and_evicts() {
+    let h = harness(false).await;
+    std::fs::create_dir(h.remote.join("d")).unwrap();
+    std::fs::create_dir(h.local.join("d")).unwrap();
+    for f in ["a.bin", "b.bin"] {
+        h.put_remote(&format!("d/{f}"), b"old", 0o644);
+        h.put_local(&format!("d/{f}"), b"new body", 0o644);
+        // The in-place write's reply never comes.
+        h.fault("write", &format!("=/d/{f}"), 1, vec![Act::LoseReply]);
+    }
+    h.fault("rename", "", usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let (_tx, rx) = watch::channel(false);
+    let mut p = Progress::detached(rx);
+    let local = h.local.join("d").to_string_lossy().to_string();
+    let e = TEST_STALL
+        .scope(Duration::from_millis(300), upload_tree(&h.conn, &mut p, &local, "/d", Overwrite::Replace))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SshError::ChannelLost(_)) && sftp_dead(&e), "{e}");
+    // The failed file and "the rest was skipped": nothing else was tried.
+    assert!(e.to_string().contains("2 item(s) not transferred"), "{e}");
+    let parts: Vec<String> = std::fs::read_dir(h.remote.join("d"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(PART_SUFFIX))
+        .collect();
+    assert_eq!(parts.len(), 1, "a second file was attempted: {parts:?}");
+    // A single file's in-place failure is dead too, and names its staged copy.
+    let mut p = Progress::detached(watch::channel(false).1);
+    h.put_local("c.bin", b"new body", 0o644);
+    h.put_remote("c.bin", b"old", 0o644);
+    h.fault("write", "=/c.bin", 1, vec![Act::LoseReply]);
+    let one = h.local.join("c.bin").to_string_lossy().to_string();
+    let e = TEST_STALL
+        .scope(Duration::from_millis(300), copy_local_file(&h.conn, &mut p, &one, "/c.bin", Overwrite::Replace))
+        .await
+        .unwrap_err();
+    assert!(sftp_dead(&e) && e.to_string().contains(PART_SUFFIX), "{e}");
+    // ...so the cache drops the session.
+    let slot = Mutex::new(Some(Arc::clone(&h.conn)));
+    assert!(forget_sftp(&slot, &h.conn, &e).await);
 }
