@@ -549,6 +549,8 @@ mod tests {
         assert_eq!(short, "ok\n");
     }
 
+    // Unix-only: Windows has no mode bits to make a file unreadable this way.
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_baseline_is_an_error_not_an_empty_file() {
         use std::os::unix::fs::PermissionsExt;
