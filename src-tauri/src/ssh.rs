@@ -1751,13 +1751,13 @@ impl Registry {
         // it authorized is what authentication later uses.
         let target_secret = match one_shot_password {
             Some(p) => {
-                authorize_stored_password(&auth, &host_id, host, port, username, true)?;
+                authorize_stored_password(&auth, &host_id, host, port, username, true).await?;
                 Some(p)
             }
-            None => authorize_stored_password(&auth, &host_id, host, port, username, false)?,
+            None => authorize_stored_password(&auth, &host_id, host, port, username, false).await?,
         };
         let jump_secret = match jump.as_ref() {
-            Some(j) => authorize_stored_password(&j.auth, &j.host_id, &j.host, j.port, &j.username, false)?,
+            Some(j) => authorize_stored_password(&j.auth, &j.host_id, &j.host, j.port, &j.username, false).await?,
             None => None,
         };
 
@@ -2829,7 +2829,13 @@ async fn run_exec(
 /// saved for that credential (its own record, or one that borrows it via
 /// `credentialId`); otherwise a compromised frontend could pair the id with an
 /// attacker's host and read the secret off the wire.
-fn authorize_stored_password(
+///
+/// The vault read and the binding check happen together, under the lock every
+/// credential save and delete holds (utils::hosts::read_authorized), so the
+/// secret returned is always checked against ITS OWN binding — never a
+/// replacement secret against the previous binding mid-save. The read runs on
+/// the blocking pool: it is a keychain call that can show a prompt.
+async fn authorize_stored_password(
     auth: &str,
     host_id: &str,
     host: &str,
@@ -2837,6 +2843,7 @@ fn authorize_stored_password(
     username: &str,
     one_shot: bool,
 ) -> Result<Option<zeroize::Zeroizing<String>>, SshError> {
+    use crate::utils::hosts::{Dest, StoredSecret};
     // Ids in a reserved vault namespace (the AI provider key lives at `ai:…`)
     // are never host credentials: refuse them for every auth method, so no
     // host id can address — and send, or use as a passphrase — that secret.
@@ -2845,29 +2852,36 @@ fn authorize_stored_password(
             "refusing to use '{host_id}' as a host credential: it is a reserved vault id"
         )));
     }
+    if let Err(e) = credentials::validate_id(host_id) {
+        return Err(SshError::AuthFailed(format!("refusing to use '{host_id}' as a host credential: {e}")));
+    }
     if one_shot || auth == "agent" {
         return Ok(None);
     }
+    // A key passphrase is used locally and never transmitted: no binding.
+    let check_binding = auth != "key";
+    let dest = Dest { host: host.to_string(), port, username: username.to_string() };
+    let id = host_id.to_string();
+    let read = tokio::task::spawn_blocking(move || {
+        crate::utils::hosts::read_authorized(&id, &dest, check_binding)
+    })
+    .await
+    .map_err(|e| SshError::Connect(format!("vault read task failed: {e}")))?;
     // No saved secret for this id → nothing to leak (a password is then asked
     // for). Only a definite NotFound counts as "no secret": any other vault
     // error (a locked keyring, a dismissed unlock prompt) fails CLOSED and is
     // reported as the vault problem it is.
-    let secret = match credentials::read_secret(host_id) {
-        Err(credentials::CredError::NotFound(_)) => return Ok(None),
-        Err(e) => return Err(vault_error(host_id, e)),
-        Ok(s) => s,
-    };
-    if auth == "key" {
-        // A local passphrase: never transmitted, so no destination binding.
-        return Ok(Some(secret));
-    }
-    if crate::utils::hosts::binding_is_authorized(host_id, host, port, username) {
-        Ok(Some(secret))
-    } else {
-        Err(SshError::AuthFailed(format!(
+    match read.map_err(|e| vault_error(host_id, e))? {
+        StoredSecret::None => Ok(None),
+        StoredSecret::Authorized(secret) => Ok(Some(secret)),
+        StoredSecret::Unbound => Err(SshError::AuthFailed(format!(
             "refusing to send the saved credential '{host_id}' to {host}:{port} as {username}: \
              it is not an authorized saved destination for that credential"
-        )))
+        ))),
+        StoredSecret::Poisoned => Err(SshError::AuthFailed(format!(
+            "the saved credential '{host_id}' is not used: an earlier save of it failed half-way, \
+             so it may not match where it is allowed to go. Save the password again."
+        ))),
     }
 }
 
@@ -3026,23 +3040,18 @@ async fn authenticate(
             // otherwise-good session, so it is logged, not propagated.
             if matches!(result, russh::client::AuthResult::Success) {
                 if let Some(secret) = &save_typed {
-                    if let Err(e) = credentials::write_secret(host_id, username, secret.as_str()) {
+                    // Secret and binding as one unit (utils::hosts::save_credential):
+                    // a failed binding write restores the previous secret. On the
+                    // blocking pool: keychain calls can show a prompt.
+                    let (id, user, secret) = (host_id.to_string(), username.to_string(), secret.clone());
+                    let owner = crate::utils::hosts::Dest { host: host.to_string(), port, username: username.to_string() };
+                    let saved = tokio::task::spawn_blocking(move || {
+                        crate::utils::hosts::save_credential(&id, &user, secret.as_str(), &owner, None)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                    if let Err(e) = saved {
                         eprintln!("hawser: could not save password for {host_id}: {e}");
-                    } else if let Err(e) =
-                        crate::utils::hosts::snapshot_binding(host_id, host, port, username)
-                    {
-                        // The binding authorizes this exact destination for the
-                        // credential (same pairing the host-editor save records).
-                        // If it fails to persist, a saved secret with no binding is
-                        // refused by the anti-exfiltration guard on the very next
-                        // connect — fail-closed but confusing. Roll the secret back
-                        // so the user is simply prompted again next time.
-                        eprintln!(
-                            "hawser: could not bind saved credential {host_id}: {e}; \
-                             rolling back the saved password"
-                        );
-                        let _ = credentials::delete_secret(host_id);
-                        crate::utils::hosts::remove_binding(host_id);
                     }
                 }
             }
@@ -3939,7 +3948,8 @@ async fn step<T, E: Into<SshError>>(
 /// tree). One clock for the whole transfer: a 100k-file tree must not send
 /// two IPC events per file.
 struct Progress<'a> {
-    app: &'a AppHandle,
+    /// None only in tests that drive a transfer without a Tauri app.
+    app: Option<&'a AppHandle>,
     payload: TransferProgress,
     last: Option<Instant>,
     /// Bytes of files already completed in this transfer.
@@ -3966,7 +3976,7 @@ impl<'a> Progress<'a> {
         cancel: watch::Receiver<bool>,
     ) -> Self {
         Self {
-            app,
+            app: Some(app),
             payload: TransferProgress {
                 session_id: session_id.to_string(),
                 transfer_id: transfer_id.to_string(),
@@ -3991,9 +4001,36 @@ impl<'a> Progress<'a> {
         *self.cancel.borrow()
     }
 
+    /// A transfer with nobody to report to (the SFTP harness tests).
+    #[cfg(test)]
+    fn detached(cancel: watch::Receiver<bool>) -> Progress<'static> {
+        Progress {
+            app: None,
+            payload: TransferProgress {
+                session_id: String::new(),
+                transfer_id: String::new(),
+                root: String::new(),
+                file_path: String::new(),
+                bytes_transferred: 0,
+                total_bytes: 0,
+                direction: "upload",
+                done: false,
+            },
+            last: None,
+            base: 0,
+            file_total: 0,
+            tree: false,
+            cancel,
+            notes: Vec::new(),
+            notes_dropped: 0,
+        }
+    }
+
     fn emit(&mut self) {
         self.last = Some(Instant::now());
-        let _ = self.app.emit("sftp://progress", self.payload.clone());
+        if let Some(app) = self.app {
+            let _ = app.emit("sftp://progress", self.payload.clone());
+        }
     }
 
     /// A file starts. A single file emits at once, so the row gets its
@@ -4055,7 +4092,8 @@ impl<'a> Progress<'a> {
     }
 
     fn failure(&self, name: &str, local: &str, remote: &str, reason: String) {
-        let _ = self.app.emit(
+        let Some(app) = self.app else { return };
+        let _ = app.emit(
             "sftp://failure",
             TransferFailure {
                 session_id: self.payload.session_id.clone(),
@@ -6503,3 +6541,9 @@ AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
         assert!(port_free(tunnel_port).await, "a tunnel outlived its teardown");
     }
 }
+
+/// An in-process SFTP server (russh + russh-sftp over a real SSH session),
+/// for the transfer commit paths.
+#[cfg(all(test, unix))]
+#[path = "tests/sftp_harness.rs"]
+mod sftp_harness;

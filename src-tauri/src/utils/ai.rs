@@ -135,6 +135,24 @@ fn binding_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Set when a key save could neither bind the new key, nor put the previous
+/// key back, nor remove the new key: the vault may then hold the NEW key while
+/// the origin map still names the OLD provider. Chats refuse while it is set —
+/// until a key save or delete succeeds, or the app restarts (the user was told
+/// to remove or re-save the key). In process only, read and written under the
+/// binding lock.
+static KEY_BINDING_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const POISONED_MESSAGE: &str = "The AI key is not used: saving it failed half-way, so it may not match the provider it is allowed to go to. Save the key again (or remove it) in the AI panel settings.";
+
+fn set_poisoned(on: bool) {
+    KEY_BINDING_POISONED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn is_poisoned() -> bool {
+    KEY_BINDING_POISONED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn write_ai_origins(map: &serde_json::Value) -> Result<(), String> {
     // Through the shared atomic writer (unique temp, serialised, never deletes
     // the original before the replacement is in place).
@@ -214,30 +232,71 @@ pub fn migrate_ai_origins() {
 /// or an unbound key behind.
 pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
     let _binding = binding_lock();
+    save_key_locked(profile, key, kind, base_url, &VaultKeys)
+}
+
+/// The vault and origin-map operations a key save needs, behind a seam so the
+/// failure paths (and the poisoned latch) are testable.
+trait KeyStore {
+    fn read(&self, slot: &str) -> Option<zeroize::Zeroizing<String>>;
+    fn write(&self, slot: &str, key: &str) -> Result<(), credentials::CredError>;
+    fn delete(&self, slot: &str) -> Result<(), credentials::CredError>;
+    fn bind(&self, profile: &str, kind: &str, base_url: &str) -> Result<(), String>;
+}
+
+struct VaultKeys;
+
+impl KeyStore for VaultKeys {
+    fn read(&self, slot: &str) -> Option<zeroize::Zeroizing<String>> {
+        credentials::read_secret(slot).ok()
+    }
+    fn write(&self, slot: &str, key: &str) -> Result<(), credentials::CredError> {
+        credentials::write_secret(slot, "api-key", key)
+    }
+    fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
+        credentials::delete_secret(slot)
+    }
+    fn bind(&self, profile: &str, kind: &str, base_url: &str) -> Result<(), String> {
+        snapshot_origin(profile, kind, base_url)
+    }
+}
+
+/// `save_key` with the binding lock held.
+fn save_key_locked(profile: &str, key: &str, kind: &str, base_url: &str, store: &impl KeyStore) -> Result<(), String> {
     let slot = vault_profile(profile);
-    let previous = credentials::read_secret(&slot).ok();
-    credentials::write_secret(&slot, "api-key", key).map_err(|e| e.to_string())?;
-    if let Err(e) = snapshot_origin(profile, kind, base_url) {
+    let previous = store.read(&slot);
+    store.write(&slot, key).map_err(|e| e.to_string())?;
+    if let Err(e) = store.bind(profile, kind, base_url) {
         let restored = match previous {
-            Some(old) => credentials::write_secret(&slot, "api-key", &old),
-            None => credentials::delete_secret(&slot),
+            Some(old) => store.write(&slot, &old),
+            None => match store.delete(&slot) {
+                Err(credentials::CredError::NotFound(_)) => Ok(()),
+                r => r,
+            },
         };
         if let Err(rollback) = restored {
             // Neither the new binding nor the old key could be put in place,
             // so the vault may hold the NEW key under the OLD origin. Fail
             // closed: remove the key, so no chat can send it anywhere until
             // it is saved again.
-            return Err(match credentials::delete_secret(&slot) {
+            return Err(match store.delete(&slot) {
                 Ok(()) | Err(credentials::CredError::NotFound(_)) => format!(
                     "could not bind the key to its provider ({e}) or restore the previous key ({rollback}); the key was removed, save it again"
                 ),
-                Err(del) => format!(
-                    "could not bind the key to its provider ({e}), restore the previous key ({rollback}) or remove it ({del}); remove the AI key before using AI"
-                ),
+                Err(del) => {
+                    // The vault may hold the new key under the old origin, and
+                    // nothing more can be done about it now: refuse every chat
+                    // until a save or delete succeeds (or a restart).
+                    set_poisoned(true);
+                    format!(
+                        "could not bind the key to its provider ({e}), restore the previous key ({rollback}) or remove it ({del}); AI chats are blocked until the key is saved again or removed"
+                    )
+                }
             });
         }
         return Err(format!("could not bind the key to its provider: {e}"));
     }
+    set_poisoned(false);
     Ok(())
 }
 
@@ -264,6 +323,8 @@ pub fn delete_key(profile: &str) -> Result<(), String> {
         // Unreadable map: deleting means no binding survives, so reset it.
         Err(_) => write_ai_origins(&json!({}))?,
     }
+    // No key, no binding: nothing left that could pair up wrongly.
+    set_poisoned(false);
     Ok(())
 }
 
@@ -560,15 +621,26 @@ async fn run(
             AiEvent { run_id: run_id.to_string(), delta, done: false, error: None },
         );
     };
+    if is_poisoned() {
+        return Err(POISONED_MESSAGE.into());
+    }
     if cfg.kind == CLI_KIND {
         return run_cli(&emit, cli_prompt(system_context, &messages)).await;
     }
     // Key and origin read as one unit, under the lock a key save holds (see
-    // binding_lock), so they always belong together.
-    let (key, origin) = {
+    // binding_lock), so they always belong together. On the blocking pool: a
+    // keychain read can show a prompt, and the lock can wait on a save's.
+    let slot = vault_profile(profile);
+    let prof = profile.to_string();
+    let (key, origin, poisoned) = tokio::task::spawn_blocking(move || {
         let _binding = binding_lock();
-        (credentials::read_secret(&vault_profile(profile)).ok(), saved_origin(profile))
-    };
+        (credentials::read_secret(&slot).ok(), saved_origin(&prof), is_poisoned())
+    })
+    .await
+    .map_err(|e| format!("could not read the AI key: {e}"))?;
+    if poisoned {
+        return Err(POISONED_MESSAGE.into());
+    }
     let scrub_with = key.clone();
     run_http(&emit, cfg, system_context, messages, key, origin)
         .await
@@ -1370,6 +1442,70 @@ async fn check_managed_policy() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key store whose every write after the first, every delete and every
+    /// bind fail: the triple failure a save cannot recover from.
+    #[derive(Default)]
+    struct Broken {
+        writes: std::sync::atomic::AtomicUsize,
+        fail_delete: bool,
+    }
+
+    impl KeyStore for Broken {
+        fn read(&self, _: &str) -> Option<zeroize::Zeroizing<String>> {
+            Some(zeroize::Zeroizing::new("old-key".into()))
+        }
+        fn write(&self, slot: &str, _: &str) -> Result<(), credentials::CredError> {
+            if self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(credentials::CredError::Malformed(slot.into()))
+            }
+        }
+        fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
+            if self.fail_delete {
+                Err(credentials::CredError::Malformed(slot.into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn bind(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Err("disk full".into())
+        }
+    }
+
+    struct Fine;
+    impl KeyStore for Fine {
+        fn read(&self, _: &str) -> Option<zeroize::Zeroizing<String>> {
+            None
+        }
+        fn write(&self, _: &str, _: &str) -> Result<(), credentials::CredError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), credentials::CredError> {
+            Ok(())
+        }
+        fn bind(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_save_that_cannot_bind_restore_or_remove_poisons_ai_until_saved() {
+        let _binding = binding_lock();
+        // Recoverable: the new key is removed, nothing is poisoned.
+        let removable = Broken { fail_delete: false, ..Default::default() };
+        assert!(save_key_locked("default", "new", "openai", "https://api.openai.com/v1", &removable).is_err());
+        assert!(!is_poisoned());
+        // Bind, restore and remove all fail: chats refuse.
+        let stuck = Broken { fail_delete: true, ..Default::default() };
+        let e = save_key_locked("default", "new", "openai", "https://api.openai.com/v1", &stuck).unwrap_err();
+        assert!(e.contains("blocked"), "{e}");
+        assert!(is_poisoned());
+        // A successful save clears it.
+        save_key_locked("default", "new", "openai", "https://api.openai.com/v1", &Fine).unwrap();
+        assert!(!is_poisoned());
+    }
 
     fn loopback(raw: &str) -> bool {
         is_loopback(&parse_base_url(raw).unwrap())

@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DialIdentity, Host, HostNode, Session, Transfer, TransferProgressEvent, TransferFailureEvent, WorkspaceView } from '../types'
 import {
-  addFolder, allFolders, allHosts, countHosts, findHost, moveHost, reidentify,
+  addFolder, allFolders, allHosts, bindingChanged, catalogueProblem, countHosts,
+  credentialDestinations, findHost, moveHost, reidentify, sanitizeImport,
   effectiveHostColor, removeFolder, removeHost, renameFolder, setFolderColor, upsertHost,
 } from '../lib/tree'
+import { setLocalRoot } from '../lib/localPath'
 import { resolveStartupCommands } from '../lib/startupPresets'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { transfer as runTransfer, cancelTransfer } from '../lib/sftp'
@@ -248,20 +250,47 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     void safeInvoke('sessions_save', { list: open })
   }, [sessions])
 
-  /* Catalogue load. A missing file is a first run, not an error: keep the seed
-     and write it out so the next launch has something to read. */
+  /* Catalogue load. Only a MISSING file (the backend's null) is a first run:
+     keep the seed and write it out. A file that exists but cannot be read,
+     decoded or parsed, or whose entries are malformed, is an error: the demo
+     hosts are NOT shown, nothing is saved this session (so the real file can
+     never be overwritten), and the user is told where the file and its backup
+     copy are. The backend keeps that copy; the file itself is left alone. */
   useEffect(() => {
-    void safeInvoke<HostNode[] | null>('hosts_load')
+    // Where the local file pane starts (the system drive on Windows).
+    void safeInvoke<string>('local_root').then(setLocalRoot).catch(() => {})
+    const failed = (why: string) => {
+      setHosts([])
+      void alert(
+        `Your saved hosts could not be loaded, so none are shown and changes will NOT be saved until this is fixed (restart Hawser after repairing the file).\n\n${why}`,
+        { title: 'Host catalogue not loaded' },
+      )
+    }
+    void safeInvoke<unknown>('hosts_load')
       .then((tree) => {
-        // An EMPTY saved list is the user's choice (they deleted every host),
-        // not a first run — only a missing file seeds the demo catalogue.
-        if (Array.isArray(tree)) setHosts(tree)
-        else void safeInvoke('hosts_save', { tree: seedHosts })
-      })
-      .finally(() => {
+        if (tree === null || tree === undefined) {
+          // First run (or no backend): seed. An EMPTY saved list is the
+          // user's choice (they deleted every host), not a first run.
+          loadedRef.current = true
+          setCatalogueLoaded(true)
+          if (tree === null) {
+            safeInvoke('hosts_save', { tree: seedHosts }).catch((e) =>
+              void alert(`Could not save the host catalogue: ${e instanceof Error ? e.message : e}`),
+            )
+          }
+          return
+        }
+        const problem = catalogueProblem(tree)
+        if (problem) {
+          failed(`hosts.json is not a valid host catalogue: ${problem}.`)
+          return
+        }
+        setHosts(tree as HostNode[])
         loadedRef.current = true
         setCatalogueLoaded(true)
       })
+      .catch((e) => failed(e instanceof Error ? e.message : String(e)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seedHosts])
 
   /* Reopen last session's tabs once the REAL catalogue is in memory. Runs
@@ -305,9 +334,35 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     })
   }, [catalogueLoaded])
 
+  /** Last save failure already reported, so a run of failing saves (a full
+   *  disk) does not stack one dialog per edit. Cleared by the next success. */
+  const saveFailedRef = useRef(false)
   const persistHosts = useCallback((next: HostNode[]) => {
     setHosts(next)
-    if (loadedRef.current) void safeInvoke('hosts_save', { tree: next })
+    if (!loadedRef.current) return
+    safeInvoke('hosts_save', { tree: next })
+      .then(() => {
+        saveFailedRef.current = false
+      })
+      .catch((e) => {
+        if (saveFailedRef.current) return
+        saveFailedRef.current = true
+        void alert(
+          `Your change to the host list could not be saved, and will be lost when Hawser closes unless a later save succeeds.\n\n${e instanceof Error ? e.message : e}`,
+          { title: 'Hosts not saved' },
+        )
+      })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  /** Revoke destinations a saved password no longer serves: keep, in the
+   *  backend's binding for vault entry `credKey`, only the hosts in `tree`
+   *  that still use it. Never adds one (that needs the password typed). */
+  const narrowBinding = useCallback((credKey: string, tree: HostNode[]) => {
+    safeInvoke('credential_binding_narrow', {
+      hostId: credKey,
+      destinations: credentialDestinations(tree, credKey),
+    }).catch((e) => console.warn(`could not narrow the binding of ${credKey}:`, e))
   }, [])
 
   /* Byte-progress and per-file failure streams from Rust, matched on the
@@ -739,21 +794,39 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   }, [connectPending, lookupHost])
 
   const saveHost = useCallback(
-    (host: Host) => persistHosts(upsertHost(hosts, host)),
-    [hosts, persistHosts],
+    (host: Host) => {
+      const before = findHost(hosts, host.id)
+      const next = upsertHost(hosts, host)
+      persistHosts(next)
+      // An edited address, account or shared credential: the old
+      // destination must stop receiving the saved password.
+      if (before && bindingChanged(before, host)) narrowBinding(before.credentialId ?? before.id, next)
+    },
+    [hosts, persistHosts, narrowBinding],
   )
 
   const deleteHost = useCallback(
     (hostId: string) => {
+      const before = findHost(hosts, hostId)
       const next = removeHost(hosts, hostId)
       persistHosts(next)
       // Remove its saved password (and binding) from the OS vault too — unless
-      // another host still borrows that entry via credentialId.
-      if (!allHosts(next).some((h) => h.credentialId === hostId)) {
-        void safeInvoke('credential_delete', { hostId }).catch(() => {})
+      // another host still borrows that entry via credentialId (compared
+      // case-folded: the Windows vault folds case, so `H-1` borrows `h-1`).
+      const same = (a?: string) => a !== undefined && a.toLowerCase() === hostId.toLowerCase()
+      if (!allHosts(next).some((h) => same(h.credentialId))) {
+        safeInvoke('credential_delete', { hostId }).catch((e) =>
+          void alert(
+            `The host was removed, but its saved password could not be deleted from the system credential store: ${e instanceof Error ? e.message : e}`,
+          ),
+        )
+      } else {
+        narrowBinding(hostId, next)
       }
+      // A borrower going away: the lender's password stops going to it.
+      if (before?.credentialId) narrowBinding(before.credentialId, next)
     },
-    [hosts, persistHosts],
+    [hosts, persistHosts, narrowBinding, alert],
   )
 
   /** Closes a whole tab: every pane in that session's group. */
@@ -1264,7 +1337,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
               if (p) void alert(`Host catalogue exported to:
 ${p}
 
-Passwords are NOT included — they stay in Windows Credential Manager.`)
+Passwords are NOT included — they stay in the system's credential store. On-connect commands and snippets ARE included: check them before sharing the file.`)
             })
             .catch((err) =>
               void alert(`Export failed: ${err instanceof Error ? err.message : err}`),
@@ -1276,7 +1349,10 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
       },
       {
         label: 'Open logs folder',
-        onSelect: () => void safeInvoke('open_logs_folder'),
+        onSelect: () =>
+          void safeInvoke('open_logs_folder').catch((err) =>
+            void alert(`Could not open the logs folder: ${err instanceof Error ? err.message : err}`),
+          ),
       },
       {
         label: 'Close current tab',
@@ -1676,21 +1752,41 @@ Passwords are NOT included — they stay in Windows Credential Manager.`)
           const file = e.target.files?.[0]
           e.target.value = '' // same file can be picked again later
           if (!file) return
-          void file.text().then((text) => {
+          void file.text().then(async (text) => {
             try {
-              const tree = JSON.parse(text) as HostNode[]
-              // Minimal shape check: an array whose entries look like nodes.
-              // Merging is deliberate — import ADDS to the catalogue rather
-              // than replacing it, so a bad file cannot wipe existing hosts.
-              if (!Array.isArray(tree) || tree.some((n) => typeof n !== 'object' || !('kind' in n))) {
-                throw new Error('not a Hawser host export')
+              if (!loadedRef.current) {
+                throw new Error('your own host catalogue is not loaded, so nothing can be added to it')
               }
+              const parsed: unknown = JSON.parse(text.replace(/^\uFEFF/, ''))
+              // The whole tree is checked, at every depth. Merging is
+              // deliberate — import ADDS to the catalogue rather than
+              // replacing it, so a bad file cannot wipe existing hosts.
+              const problem = catalogueProblem(parsed)
+              if (problem) throw new Error(`not a Hawser host export (${problem})`)
+              // Only known fields are kept. Fields that make a host act on
+              // its own (commands on connect, a hidden config capture, AI
+              // access, a local shell) need an explicit yes, host by host.
+              const { risky } = sanitizeImport(parsed as HostNode[], false)
+              let allowRisky = false
+              if (risky.length > 0) {
+                const list = risky
+                  .slice(0, 12)
+                  .map((r) => `• ${r.name}: ${r.enables.join('; ')}`)
+                  .join('\n')
+                const more = risky.length > 12 ? `\n…and ${risky.length - 12} more` : ''
+                allowRisky = await confirm(
+                  `These imported hosts would act on their own once you connect:\n\n${list}${more}\n\nKeep these settings? Choose Cancel to import the hosts without them.`,
+                  { title: 'Imported hosts run commands', confirmLabel: 'Keep these settings' },
+                )
+              }
+              const { tree } = sanitizeImport(parsed as HostNode[], allowRisky)
               // Colliding ids (importing the same export twice, or an export
               // from this machine) get fresh ids at every depth, so a re-import
               // can never corrupt the tree or silently drop nested hosts.
               const fresh = reidentify(tree, hostsRef.current)
               persistHosts([...hostsRef.current, ...fresh])
-              void alert(`Imported ${fresh.length} top-level entr${fresh.length === 1 ? 'y' : 'ies'}. Passwords are never in exports — set them per host after importing.`)
+              const dropped = risky.length > 0 && !allowRisky ? ' Their on-connect commands, config checks, AI access and local-shell settings were left out.' : ''
+              void alert(`Imported ${fresh.length} top-level entr${fresh.length === 1 ? 'y' : 'ies'}. Passwords are never in exports — set them per host after importing.${dropped}`)
             } catch (err) {
               void alert(`Import failed: ${err instanceof Error ? err.message : err}`)
             }

@@ -10,18 +10,14 @@ import { onFileDrop, safeInvoke } from '../lib/tauri'
 import { ContextMenu, type MenuState } from './ContextMenu'
 import { X } from 'lucide-react'
 import { sep } from '@tauri-apps/api/path'
+import { defaultLocalRoot, localBaseName, unsafeTransferName } from '../lib/localPath'
 
-/** A valid, listable local starting directory for the current OS. The app opens
- *  the local pane at the filesystem root (as it already did on Windows with
- *  "C:\\"); this returns the correct root per platform instead of a hardcoded
- *  "C:\\" that doesn't exist on macOS/Linux. `sep()` distinguishes Windows
- *  ("\\") from POSIX ("/"). */
+/** A valid, listable local starting directory for the current OS: the
+ *  filesystem root, which on Windows is the system drive's (the backend's
+ *  `local_root`, cached at startup; not always C:). `sep()` distinguishes
+ *  Windows ("\\") from POSIX ("/"). */
 function defaultLocal(): string {
-  try {
-    return sep() === '\\' ? 'C:\\' : '/'
-  } catch {
-    return '/'
-  }
+  return defaultLocalRoot(localIsWindows())
 }
 /** True when the LOCAL side is Windows, where ':' in a file name means a drive
  *  letter or an alternate data stream. */
@@ -294,7 +290,7 @@ export function SftpView({
     let dead = false
     void onFileDrop((paths) => {
       const jobs = paths.map((p) => {
-        const name = p.split(/[\\/]/).filter(Boolean).pop() ?? p
+        const name = localBaseName(p, localIsWindows())
         return { name, local: p, remote: joinPath('remote', remoteRef.current, name), overwrite: 'never' as const }
       })
       // Route through the shared guard so an Explorer drop honours the same
@@ -319,21 +315,14 @@ export function SftpView({
     jobs: TransferJob[],
   ) => {
     // A download turns a server-chosen name into a LOCAL path. Reject any name
-    // that is not a plain component — EITHER separator (`\` is the traversal
-    // char on the Windows local side) or `.`/`..` — so a malicious server
-    // cannot write outside the target folder. The backend enforces this too;
-    // this is the friendly front-line message. ':' (drive letter / ADS) is a
-    // hazard only for a download onto a Windows machine: on macOS/Linux it is
-    // an ordinary name character (timestamped logs), and an upload's name
-    // becomes a remote POSIX component.
-    const colonUnsafe = direction === 'download' && localIsWindows()
-    const unsafe = jobs.filter(
-      (j) =>
-        /[\\/]/.test(j.name) ||
-        j.name === '.' ||
-        j.name === '..' ||
-        (colonUnsafe && j.name.includes(':')),
-    )
+    // that is not a single plain local component (`.`/`..`, `/` or `\`, and on
+    // Windows `:` — a drive letter or alternate data stream), so a malicious
+    // server cannot write outside the target folder. The backend enforces
+    // this too; this is the friendly front-line message. An upload's name
+    // becomes a remote POSIX component, where `\` and `:` are ordinary name
+    // characters (lib/localPath).
+    const windows = localIsWindows()
+    const unsafe = jobs.filter((j) => unsafeTransferName(j.name, direction, windows))
     if (unsafe.length > 0) {
       void alert(`Refusing unsafe name(s): ${unsafe.map((j) => j.name).join(', ')}`)
       jobs = jobs.filter((j) => !unsafe.includes(j))

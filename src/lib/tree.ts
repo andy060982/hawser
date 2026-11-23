@@ -1,4 +1,8 @@
-import { type HostFolder, type HostNode, isFolder } from '../types'
+import type { Host, HostFolder, HostNode } from '../types'
+
+/* A local copy of types.ts's guard: this module imports types only, so the
+   node test runner (npm test) can load it without resolving '../types'. */
+const isFolder = (n: HostNode): n is HostFolder => n.kind === 'folder'
 import type { HostColor } from './hostColors'
 
 /** Parse a dotted-quad to a u32, or null if it isn't a valid IPv4. */
@@ -247,10 +251,14 @@ export function allFolders(nodes: HostNode[]): HostFolder[] {
  *  saved credential on this machine either way, so a new id costs nothing.
  */
 export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode[] {
+  // Ids are compared case-folded: the Windows credential vault folds case, so
+  // `H-ABC` beside an existing `h-abc` would address (and on delete, remove)
+  // the existing host's saved password.
+  const key = (id: string) => id.toLowerCase()
   const taken = new Set<string>()
   const collect = (list: HostNode[]) => {
     for (const n of list) {
-      taken.add(n.id)
+      taken.add(key(n.id))
       if (isFolder(n)) collect(n.children)
     }
   }
@@ -261,8 +269,8 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
     let id: string
     do {
       id = `${prefix}-imp-${Date.now().toString(36)}-${counter++}`
-    } while (taken.has(id))
-    taken.add(id)
+    } while (taken.has(key(id)))
+    taken.add(key(id))
     return id
   }
 
@@ -272,7 +280,10 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
 
   const walk = (list: HostNode[]): HostNode[] =>
     list.map((n) => {
-      const id = taken.has(n.id) ? freshId(isFolder(n) ? 'f' : 'h') : (taken.add(n.id), n.id)
+      const id =
+        taken.has(key(n.id)) || !usableImportedId(n.id)
+          ? freshId(isFolder(n) ? 'f' : 'h')
+          : (taken.add(key(n.id)), n.id)
       if (!remap.has(n.id)) remap.set(n.id, id)
       return isFolder(n)
         ? { ...n, id, children: walk(n.children) }
@@ -287,7 +298,7 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
   const fix = (ref: string | undefined): string | undefined => {
     if (ref === undefined) return undefined
     if (remap.has(ref)) return remap.get(ref)
-    return existingIds.has(ref) ? undefined : ref
+    return existingIds.has(key(ref)) || !usableImportedId(ref) ? undefined : ref
   }
   const relink = (list: HostNode[]): HostNode[] =>
     list.map((n) =>
@@ -297,4 +308,178 @@ export function reidentify(imported: HostNode[], existing: HostNode[]): HostNode
     )
 
   return relink(walk(imported))
+}
+
+/** Whether an id from an imported file may be kept as is: printable ASCII
+ *  (what the app generates, and what every credential vault stores the same
+ *  way), and outside the namespaces the app uses for synthetic tabs and its
+ *  own vault items (quick connect `qc-`, local terminals `local-`, `ai:`,
+ *  `hawser:`). Anything else is given a fresh id. */
+export function usableImportedId(id: string): boolean {
+  return /^[\x21-\x7e]{1,200}$/.test(id) && !/^(qc-|local-|ai:|hawser:)/i.test(id)
+}
+
+/* ------------------------------------------------------ catalogue checks */
+
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** Why a parsed hosts.json cannot be used, or null when it can. Checks, at
+ *  every depth, the shape the tree helpers rely on — each node an object with
+ *  a known kind and a string id (unique across the tree); a folder with a name
+ *  and a children list; a host with name, hostname, username and a valid port
+ *  — so a hand-edited file with a `null` entry or a folder without children is
+ *  reported instead of blanking the UI. Optional fields, when present, must
+ *  have their types. */
+export function catalogueProblem(value: unknown): string | null {
+  if (!Array.isArray(value)) return 'the top level is not a list of hosts and folders'
+  const ids = new Set<string>()
+  const optional: Record<string, (v: unknown) => boolean> = {
+    keyPath: (v) => typeof v === 'string',
+    jumpHostId: (v) => typeof v === 'string',
+    credentialId: (v) => typeof v === 'string',
+    tag: (v) => typeof v === 'string',
+    color: (v) => typeof v === 'string',
+    startupCommand: (v) => typeof v === 'string',
+    startupCommands: (v) => Array.isArray(v) && v.every((c) => typeof c === 'string'),
+    aiAllowed: (v) => typeof v === 'boolean',
+    configCommand: (v) => typeof v === 'string',
+    checkConfigOnConnect: (v) => typeof v === 'boolean',
+    snippets: (v) =>
+      Array.isArray(v) &&
+      v.every((s) => isObj(s) && typeof s.command === 'string' && typeof s.label === 'string'),
+    local: (v) => isObj(v) && typeof v.profile === 'string',
+  }
+  const walk = (list: unknown[], where: string, depth: number): string | null => {
+    if (depth > 64) return `${where}: folders are nested too deeply`
+    for (let i = 0; i < list.length; i++) {
+      const n = list[i]
+      const at = `${where}[${i}]`
+      if (!isObj(n)) return `${at} is not a host or folder`
+      if (typeof n.id !== 'string' || n.id === '') return `${at} has no id`
+      if (ids.has(n.id)) return `${at}: the id "${n.id}" is used twice`
+      ids.add(n.id)
+      if (n.kind === 'folder') {
+        if (typeof n.name !== 'string') return `${at} (folder) has no name`
+        if (!Array.isArray(n.children)) return `${at} (folder "${n.name}") has no children list`
+        const inner = walk(n.children, `${at}.children`, depth + 1)
+        if (inner) return inner
+      } else if (n.kind === 'host') {
+        for (const f of ['name', 'hostname', 'username'] as const) {
+          if (typeof n[f] !== 'string') return `${at} (host) has no ${f}`
+        }
+        if (!Number.isInteger(n.port) || (n.port as number) < 1 || (n.port as number) > 65535) {
+          return `${at} (host "${n.name}") has an invalid port`
+        }
+        if (n.auth !== undefined && !['agent', 'password', 'key'].includes(n.auth as string)) {
+          return `${at} (host "${n.name}") has an unknown auth method`
+        }
+        for (const [f, ok] of Object.entries(optional)) {
+          if (n[f] !== undefined && !ok(n[f])) return `${at} (host "${n.name}"): ${f} has the wrong type`
+        }
+      } else {
+        return `${at} has an unknown kind`
+      }
+    }
+    return null
+  }
+  return walk(value, 'entry', 0)
+}
+
+/** What an imported host would do on its own, without the user clicking
+ *  anything visible: run commands on connect, a hidden config capture, send
+ *  output to the AI, or open a local shell instead of SSH. */
+export interface ImportRisk {
+  name: string
+  enables: string[]
+}
+
+const HOST_FIELDS = [
+  'kind', 'id', 'name', 'hostname', 'port', 'username', 'auth', 'keyPath', 'jumpHostId',
+  'tag', 'color', 'credentialId', 'snippets',
+] as const
+const RISKY_FIELDS = [
+  'startupCommands', 'startupCommand', 'configCommand', 'checkConfigOnConnect', 'aiAllowed', 'local',
+] as const
+const FOLDER_FIELDS = ['kind', 'id', 'name', 'color', 'children'] as const
+
+/** Copy an imported tree keeping only the fields a host or folder may carry
+ *  (anything else in the file is dropped), and list the hosts whose import
+ *  would turn on something that acts without a visible click. With
+ *  `allowRisky` false those fields are dropped too. Call on a tree that
+ *  passed `catalogueProblem`. */
+export function sanitizeImport(
+  tree: HostNode[],
+  allowRisky: boolean,
+): { tree: HostNode[]; risky: ImportRisk[] } {
+  const risky: ImportRisk[] = []
+  const pick = (n: Record<string, unknown>, fields: readonly string[]) => {
+    const out: Record<string, unknown> = {}
+    for (const f of fields) if (n[f] !== undefined) out[f] = n[f]
+    return out
+  }
+  const walk = (list: HostNode[]): HostNode[] =>
+    list.map((node) => {
+      const n = node as unknown as Record<string, unknown>
+      if (node.kind === 'folder') {
+        const f = pick(n, FOLDER_FIELDS) as unknown as HostFolder
+        return { ...f, children: walk(node.children) }
+      }
+      const h = pick(n, HOST_FIELDS) as Record<string, unknown>
+      if (Array.isArray(h.snippets)) {
+        h.snippets = (h.snippets as Record<string, unknown>[]).map((s) => ({
+          label: s.label,
+          command: s.command,
+          slot: Number.isInteger(s.slot) && (s.slot as number) >= 1 && (s.slot as number) <= 9 ? s.slot : null,
+          ...(s.autoRun === true ? { autoRun: true } : {}),
+        }))
+      }
+      const enables: string[] = []
+      const cmds = [
+        ...(Array.isArray(n.startupCommands) ? (n.startupCommands as string[]) : []),
+        ...(typeof n.startupCommand === 'string' ? [n.startupCommand] : []),
+      ].filter((c) => c.trim() !== '')
+      if (cmds.length) enables.push(`runs on connect: ${cmds.join(' ; ')}`)
+      if (typeof n.configCommand === 'string' && n.configCommand.trim() !== '') {
+        enables.push(
+          `${n.checkConfigOnConnect === true ? 'runs on every connect (hidden)' : 'config snapshot command'}: ${n.configCommand}`,
+        )
+      }
+      if (n.aiAllowed === true) enables.push('shares its terminal output with the AI assistant')
+      if (isObj(n.local)) enables.push(`opens a local shell (${String(n.local.profile)}) instead of SSH`)
+      if (enables.length) {
+        risky.push({ name: String(n.name), enables })
+        if (allowRisky) Object.assign(h, pick(n, RISKY_FIELDS))
+      }
+      return h as unknown as HostNode
+    })
+  return { tree: walk(tree), risky }
+}
+
+/** The destinations (host, port, username) that use vault entry `credKey`:
+ *  every host whose effective credential (its `credentialId`, else its own
+ *  id) is that entry. The exact set a saved password may be sent to; passed
+ *  to the backend when it is saved or narrowed, so an edited host's old
+ *  address is revoked. */
+export function credentialDestinations(
+  nodes: HostNode[],
+  credKey: string,
+): { host: string; port: number; username: string }[] {
+  const out: { host: string; port: number; username: string }[] = []
+  for (const h of allHosts(nodes)) {
+    if ((h.credentialId ?? h.id) !== credKey) continue
+    const d = { host: h.hostname, port: h.port, username: h.username }
+    if (!out.some((o) => o.host === d.host && o.port === d.port && o.username === d.username)) out.push(d)
+  }
+  return out
+}
+
+/** Whether an edit changed anything a credential binding depends on. */
+export function bindingChanged(before: Host, after: Host): boolean {
+  return (
+    before.hostname !== after.hostname ||
+    before.port !== after.port ||
+    before.username !== after.username ||
+    (before.credentialId ?? before.id) !== (after.credentialId ?? after.id)
+  )
 }

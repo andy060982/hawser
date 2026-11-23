@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { KeyRound, Plus, Server, Trash2, X } from 'lucide-react'
 import type { AuthMethod, Host, HostNode, Snippet } from '../types'
-import { allHosts } from '../lib/tree'
+import { allHosts, credentialDestinations, upsertHost } from '../lib/tree'
 import {
   STARTUP_PRESETS,
   customCommands,
@@ -184,6 +184,13 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           // hosts that borrow it), regardless of later hosts.json edits.
           host: draft.hostname,
           port: draft.port,
+          // Exactly the hosts that will use this entry once this edit is
+          // saved: it replaces the binding, so this host's OLD address (or
+          // a borrower that went away) no longer receives the password.
+          destinations: credentialDestinations(
+            upsertHost(catalogue, { ...draft, kind: 'host' }),
+            credKey,
+          ),
         })
       }
       // Write the array and clear the legacy single-command field, so the two

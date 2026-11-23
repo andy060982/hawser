@@ -109,6 +109,49 @@ pub struct SessionLog {
     written: u64,
     /// Set once the cap is hit so the truncation notice is written only once.
     capped: bool,
+    /// Inside an over-long string sequence (OSC/DCS/APC/SOS/PM: an OSC 52
+    /// clipboard blob, an inline image, sixel), whose body is being dropped
+    /// until its terminator; see `skip_string`.
+    in_string: bool,
+    /// The previous chunk ended with ESC while dropping such a body (the first
+    /// half of an `ESC \` terminator).
+    string_esc: bool,
+    /// Bytes of the current string body dropped so far.
+    string_skipped: usize,
+}
+
+/// Longest string-sequence body (OSC/DCS/APC/SOS/PM) carried between chunks
+/// while waiting for its terminator. Titles and hyperlinks are far shorter; a
+/// longer one is an image or clipboard payload and is dropped in a streaming
+/// way instead of being buffered (or, as before, leaked into the transcript as
+/// text once the carry-over was cleared mid-payload).
+const MAX_STRING_CARRY: usize = 4096;
+
+/// After this much of a single unterminated string body, give up dropping it
+/// (a stray `ESC P` in binary output must not silence the transcript forever).
+const MAX_STRING_SKIP: usize = 64 * 1024 * 1024;
+
+/// Whether `seq` starts a string sequence: ESC followed by `]` (OSC), `P`
+/// (DCS), `X` (SOS), `^` (PM) or `_` (APC).
+fn is_string_start(seq: &[u8]) -> bool {
+    seq.len() >= 2 && seq[0] == 0x1b && matches!(seq[1], b']' | b'P' | b'X' | b'^' | b'_')
+}
+
+/// Scan a dropped string body for its terminator: BEL, `ESC \` (ST), or the
+/// CAN / SUB that abort a sequence. Returns the offset just past it, or None
+/// if `data` ends inside the body. `esc` carries a trailing ESC across calls.
+fn skip_string(data: &[u8], esc: &mut bool) -> Option<usize> {
+    for (i, &b) in data.iter().enumerate() {
+        if std::mem::take(esc) && b == b'\\' {
+            return Some(i + 1);
+        }
+        match b {
+            0x07 | 0x18 | 0x1a => return Some(i + 1),
+            0x1b => *esc = true,
+            _ => {}
+        }
+    }
+    None
 }
 
 impl SessionLog {
@@ -195,6 +238,9 @@ impl SessionLog {
             partial: Vec::new(),
             written: 0,
             capped: false,
+            in_string: false,
+            string_esc: false,
+            string_skipped: 0,
         })
     }
 
@@ -216,6 +262,26 @@ impl SessionLog {
             return;
         }
 
+        let mut chunk = chunk;
+        if self.in_string {
+            match skip_string(chunk, &mut self.string_esc) {
+                Some(end) => {
+                    self.in_string = false;
+                    self.string_skipped = 0;
+                    chunk = &chunk[end..];
+                }
+                None => {
+                    self.string_skipped = self.string_skipped.saturating_add(chunk.len());
+                    if self.string_skipped > MAX_STRING_SKIP {
+                        // Never terminated: resume recording from here.
+                        self.in_string = false;
+                        self.string_skipped = 0;
+                    }
+                    return;
+                }
+            }
+        }
+
         let mut buf = std::mem::take(&mut self.partial);
         buf.extend_from_slice(chunk);
 
@@ -223,9 +289,16 @@ impl SessionLog {
         // Bound the pending-escape carry-over. A real control sequence is a
         // handful of bytes; a multi-KB "unterminated sequence" is a broken or
         // hostile server growing this buffer without bound, so drop it rather
-        // than re-prepend it on every future chunk.
+        // than re-prepend it on every future chunk. A string sequence (an
+        // image, a clipboard blob) is instead dropped up to its terminator:
+        // clearing it mid-body made the rest of its payload print as text.
         const MAX_PENDING: usize = 64 * 1024;
-        if leftover.len() > MAX_PENDING {
+        if is_string_start(&leftover) && leftover.len() > MAX_STRING_CARRY {
+            self.in_string = true;
+            self.string_esc = leftover.last() == Some(&0x1b);
+            self.string_skipped = leftover.len();
+            leftover.clear();
+        } else if leftover.len() > MAX_PENDING {
             leftover.clear();
         }
         self.partial = leftover;
@@ -284,24 +357,31 @@ pub(crate) fn strip_ansi(input: &[u8]) -> (Vec<u8>, Vec<u8>) {
                     }
                     i = j + 1;
                 }
-                // OSC: ESC ] ... terminated by BEL or ESC \
-                b']' => {
+                // String sequences, whose body is dropped whole: OSC (ESC ]),
+                // DCS (ESC P: sixel, tmux passthrough), SOS (ESC X), PM (ESC ^)
+                // and APC (ESC _: kitty graphics). Ended by BEL, ST (ESC \),
+                // or CAN / SUB, which abort a sequence. Unterminated: carried
+                // to the next chunk.
+                b']' | b'P' | b'X' | b'^' | b'_' => {
                     let mut j = i + 2;
+                    let mut end = None;
                     while j < input.len() {
-                        if input[j] == 0x07 {
-                            j += 1;
-                            break;
+                        match input[j] {
+                            0x07 | 0x18 | 0x1a => {
+                                end = Some(j + 1);
+                                break;
+                            }
+                            0x1b if j + 1 < input.len() && input[j + 1] == b'\\' => {
+                                end = Some(j + 2);
+                                break;
+                            }
+                            _ => j += 1,
                         }
-                        if input[j] == 0x1b && j + 1 < input.len() && input[j + 1] == b'\\' {
-                            j += 2;
-                            break;
-                        }
-                        j += 1;
                     }
-                    if j >= input.len() && !input.ends_with(&[0x07]) {
-                        return (out, input[i..].to_vec());
+                    match end {
+                        Some(e) => i = e,
+                        None => return (out, input[i..].to_vec()),
                     }
-                    i = j;
                 }
                 // nF escapes: ESC, one or more intermediates (0x20..=0x2f), then
                 // a final byte — charset designators like ESC ( B (emitted by
@@ -1210,6 +1290,50 @@ GROẞ
     fn strips_osc_title_sequences() {
         let (out, _) = strip_ansi(b"\x1b]0;my title\x07prompt$ ");
         assert_eq!(String::from_utf8_lossy(&out), "prompt$ ");
+    }
+
+    #[test]
+    fn strips_dcs_apc_sos_pm_bodies_and_st_terminated_osc() {
+        let (out, rest) = strip_ansi(b"a\x1bPq#0;2;0;0;0~~\x1b\\b\x1b_Gf=24;AAAA\x1b\\c\x1bXsos\x07d\x1b^pm\x1b\\e\x1b]2;t\x1b\\f");
+        assert_eq!(String::from_utf8_lossy(&out), "abcdef");
+        assert!(rest.is_empty(), "an ST at the very end is complete, not carried: {rest:?}");
+        // CAN aborts a sequence.
+        let (out, _) = strip_ansi(b"x\x1bPjunk\x18y");
+        assert_eq!(String::from_utf8_lossy(&out), "xy");
+    }
+
+    /// An OSC 52 clipboard blob or an inline image (megabytes of base64) split
+    /// across many chunks never lands in the transcript as text.
+    #[test]
+    fn large_escape_payloads_never_reach_the_transcript() {
+        let dir = std::env::temp_dir().join(format!("hawser-osc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.log");
+        let file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut log = SessionLog {
+            file,
+            path: path.clone(),
+            partial: Vec::new(),
+            written: 0,
+            capped: false,
+            in_string: false,
+            string_esc: false,
+            string_skipped: 0,
+        };
+        let body = "QUJD".repeat(512 * 1024); // 2 MiB of base64
+        for (intro, end) in [("\x1b]52;c;", "\x07"), ("\x1b]1337;File=inline=1:", "\x1b\\"), ("\x1b_Ga=T;", "\x1b\\"), ("\x1bPq", "\x1b\\")] {
+            let stream = format!("before {intro}{body}{end} after\n");
+            // 16 KiB chunks, as the PTY reader delivers them; the ST split
+            // across two chunks as well.
+            for c in stream.as_bytes().chunks(16 * 1024 - 1) {
+                log.append(c);
+            }
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("QUJD"), "payload leaked ({} bytes written)", text.len());
+        assert_eq!(text.matches("before  after").count(), 4, "{text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

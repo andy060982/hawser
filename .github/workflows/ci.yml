@@ -10,14 +10,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        # Linux on 22.04, the oldest base with webkit2gtk-4.1: the same glibc
+        # floor the release builds use (see release.yml).
+        os: [windows-latest, ubuntu-22.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
+      # 22: npm test runs the TypeScript sources with --experimental-strip-types.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +38,7 @@ jobs:
       # Secret Service backend talks D-Bus over pure-Rust zbus, so no libdbus
       # dev package is required to compile.
       - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -49,6 +52,9 @@ jobs:
 
       - name: Typecheck frontend
         run: npx tsc -b --pretty false
+
+      - name: Frontend tests
+        run: npm test
 
       - name: Rust tests
         working-directory: src-tauri

@@ -39,7 +39,10 @@ export function onLocal(sessionId: string, handler: Handler): () => void {
 
   return () => {
     subs.delete(handler)
-    if (subs.size === 0) subscribers.delete(sessionId)
+    // Only if the id still maps to THIS set: after clearLocal and a new pane
+    // subscribing under the same id, deleting by id would drop the new
+    // pane's set and its notices would be buffered forever.
+    if (subs.size === 0 && subscribers.get(sessionId) === subs) subscribers.delete(sessionId)
   }
 }
 

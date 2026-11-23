@@ -19,6 +19,7 @@ pub enum CredError {
     #[error("no saved credential for {0}")]
     NotFound(String),
     #[error("stored secret for {0} is not valid text")]
+    #[cfg_attr(not(windows), allow(dead_code))]
     Malformed(String),
     #[cfg(windows)]
     #[error("credential manager error 0x{0:08X}")]
@@ -49,6 +50,36 @@ const RESERVED_PREFIXES: [&str; 2] = ["ai:", "hawser:"];
 pub fn is_reserved_id(id: &str) -> bool {
     let folded = id.to_uppercase().to_lowercase();
     RESERVED_PREFIXES.iter().any(|p| folded.starts_with(p))
+}
+
+/// Longest vault id accepted. Generated ids are ~20 characters; this is room
+/// for any hand-made one, far below every backend's target-name limit.
+const MAX_ID: usize = 200;
+
+/// Refuse vault ids no backend can store faithfully, BEFORE any lookup,
+/// namespace check, or binding operation, so a vault item and its binding can
+/// never disagree about which id they belong to:
+/// - empty or over-long ids;
+/// - NUL and other control characters. The Windows backend passes ids as
+///   NUL-terminated UTF-16, so `a\0b` would address the vault item `a` while
+///   its binding is keyed by the whole string;
+/// - on Windows, non-ASCII ids. Credential Manager folds case with its own
+///   Unicode tables, which no Rust fold reproduces exactly; with ASCII ids the
+///   binding key's ASCII fold is exactly the vault's.
+pub fn validate_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("a vault id must not be empty".into());
+    }
+    if id.len() > MAX_ID {
+        return Err(format!("a vault id must be at most {MAX_ID} bytes"));
+    }
+    if id.chars().any(char::is_control) {
+        return Err("a vault id must not contain control characters".into());
+    }
+    if cfg!(windows) && !id.is_ascii() {
+        return Err(format!("'{id}' cannot be a vault id on Windows: use ASCII letters, digits and punctuation"));
+    }
+    Ok(())
 }
 
 /// Whether a secret exists, without exposing it. Lets the UI show "password
@@ -263,6 +294,18 @@ mod reserved_tests {
         assert!(!is_reserved_id("ai")); // too short to carry the prefix
         assert!(!is_reserved_id("air-1"));
         assert!(!is_reserved_id("h1:ai:"));
+    }
+
+    #[test]
+    fn vault_ids_with_nul_or_control_characters_are_refused() {
+        use super::validate_id;
+        assert!(validate_id("h-lq3x-01").is_ok());
+        assert!(validate_id("").is_err());
+        assert!(validate_id("h-1\0evil").is_err());
+        assert!(validate_id("h-1\nx").is_err());
+        assert!(validate_id("h-1\u{85}x").is_err()); // C1 control
+        assert!(validate_id(&"x".repeat(201)).is_err());
+        assert_eq!(validate_id("h-\u{e9}").is_ok(), !cfg!(windows));
     }
 
     #[test]

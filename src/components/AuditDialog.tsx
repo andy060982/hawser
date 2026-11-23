@@ -62,10 +62,20 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
   const [report, setReport] = useState<VerifyReport | null>(null)
   const [verifying, setVerifying] = useState(false)
   const [archiving, setArchiving] = useState(false)
+  /** A failed list / verify / archive, shown in the banner. Never swallowed:
+   *  for a tamper-evidence tool a check that fails silently is worse than
+   *  one that fails visibly. */
+  const [error, setError] = useState<string | null>(null)
   const { confirm } = useDialogs()
+  const why = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
   const refresh = useCallback(() => {
-    void safeInvoke<AuditView[]>('audit_list', { limit: 500 }).then((l) => setEntries(l ?? []))
+    void safeInvoke<AuditView[]>('audit_list', { limit: 500 })
+      .then((l) => setEntries(l ?? []))
+      .catch((e) => {
+        setEntries([])
+        setError(`Could not read the audit log: ${e instanceof Error ? e.message : String(e)}`)
+      })
   }, [])
 
   useEffect(refresh, [refresh])
@@ -79,10 +89,12 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
   const verify = () => {
     setVerifying(true)
     setReport(null)
+    setError(null)
     void safeInvoke<VerifyReport>('audit_verify')
       .then((r) => {
         if (r) setReport(r)
       })
+      .catch((e) => setError(`The integrity check could not run: ${why(e)}`))
       .finally(() => setVerifying(false))
   }
 
@@ -93,10 +105,18 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
     )
     if (!ok) return
     setArchiving(true)
+    setError(null)
     void safeInvoke<string>('audit_archive')
       .then(() => {
         refresh()
         verify()
+      })
+      .catch((e) => {
+        // The old verdict no longer describes the log (an archive can fail
+        // after it committed): drop it, show why, and re-read what is there.
+        setReport(null)
+        setError(`Archiving failed: ${why(e)}`)
+        refresh()
       })
       .finally(() => setArchiving(false))
   }
@@ -136,6 +156,16 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
             <X size={14} />
           </button>
         </header>
+
+        {error && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 border-b border-warn bg-warn/20 px-4 py-2 text-[12px] text-ink"
+          >
+            <ShieldAlert size={14} className="mt-0.5 shrink-0 text-warn" aria-hidden />
+            <span className="min-w-0 flex-1 break-words">{error}</span>
+          </div>
+        )}
 
         {/* Verify result banner */}
         {report && (
@@ -199,11 +229,12 @@ export function AuditDialog({ onClose }: { onClose: () => void }) {
               saved credentials are all recorded here.
             </p>
           ) : (
-            entries.map((e) => {
+            entries.map((e, i) => {
               const line = detailLine(e.detail)
               return (
                 <div
-                  key={e.seq}
+                  // Not the seq alone: a damaged log can repeat one.
+                  key={`${e.seq}-${i}`}
                   className="flex items-start gap-2.5 border-b border-line/50 px-3 py-1.5"
                 >
                   <span className="w-[136px] shrink-0 pt-0.5 text-[10.5px] tabular-nums text-ink-faint">

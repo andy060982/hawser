@@ -106,11 +106,19 @@ pub fn profiles() -> Vec<ShellProfile> {
 /// shell, then any other common shell listed in /etc/shells.
 #[cfg(not(windows))]
 pub fn profiles() -> Vec<ShellProfile> {
-    let fallback = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/bash" };
+    // $SHELL when it names a real program; otherwise the first of the usual
+    // shells that exists here (minimal Linux images have no bash), ending at
+    // /bin/sh, which POSIX guarantees.
+    let fallbacks: &[&str] = if cfg!(target_os = "macos") {
+        &["/bin/zsh", "/bin/bash", "/bin/sh"]
+    } else {
+        &["/bin/bash", "/usr/bin/bash", "/bin/sh"]
+    };
     let login = std::env::var_os("SHELL")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute() && p.is_file())
-        .unwrap_or_else(|| PathBuf::from(fallback));
+        .or_else(|| fallbacks.iter().map(PathBuf::from).find(|p| p.is_file()))
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
     let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
     // `-l`: a login shell, so a GUI-launched app still gets the user's PATH and
@@ -128,6 +136,104 @@ pub fn profiles() -> Vec<ShellProfile> {
             if name(&p) != name(&login) {
                 out.push(profile(want, want, p, &["-l"]));
             }
+        }
+    }
+    out
+}
+
+/// The profile a saved id refers to. A pane saved with "zsh" while zsh was a
+/// second shell keeps working after the user makes zsh their login shell (it
+/// is then folded into "login" and no longer listed under its own name).
+fn resolve_profile(list: Vec<ShellProfile>, id: &str) -> Option<ShellProfile> {
+    let name = |p: &ShellProfile| p.program.file_name().map(|n| n.to_string_lossy().to_string());
+    let mut login = None;
+    for p in list {
+        if p.id == id {
+            return Some(p);
+        }
+        if p.id == "login" {
+            login = Some(p);
+        }
+    }
+    login.filter(|l| matches!(id, "zsh" | "bash" | "fish") && name(l).as_deref() == Some(id))
+}
+
+/// A UTF-8 locale for a shell started with none at all. Apps launched from
+/// Finder or the Dock get no LANG/LC_*; bash and fish then run in the C locale
+/// (readline shows escapes for `é`, `ls` prints `?`). Terminal.app and iTerm
+/// set LANG in exactly this case. Only when LANG, LC_ALL and LC_CTYPE are all
+/// unset: an explicit choice, even "C", is the user's.
+/// - macOS: the user's region from AppleLocale when that locale exists, else
+///   en_US.UTF-8, which every macOS has.
+/// - Linux: C.UTF-8 (glibc 2.35+, musl, Debian/Ubuntu/Fedora), which needs no
+///   generated locale, unlike en_US.UTF-8.
+/// - Windows: none (consoles do not use LANG).
+fn fallback_lang(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String> {
+    let set = |k: &str| get(k).is_some_and(|v| !v.is_empty());
+    if cfg!(windows) || set("LANG") || set("LC_ALL") || set("LC_CTYPE") {
+        return None;
+    }
+    if cfg!(target_os = "macos") {
+        Some(mac_locale().clone())
+    } else {
+        Some("C.UTF-8".to_string())
+    }
+}
+
+/// `<lang>_<REGION>.UTF-8` from an AppleLocale value ("en_GB",
+/// "de_DE@currency=EUR", "zh-Hans_CN"), or None if it has no region.
+fn locale_from_apple(apple: &str) -> Option<String> {
+    let base = apple.trim().split('@').next()?;
+    let (lang, region) = base.split_once('_')?;
+    let lang = lang.split('-').next()?;
+    let ok = |s: &str, n: std::ops::RangeInclusive<usize>| n.contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphabetic());
+    (ok(lang, 2..=3) && ok(region, 2..=2)).then(|| format!("{}_{}.UTF-8", lang.to_ascii_lowercase(), region.to_ascii_uppercase()))
+}
+
+fn mac_locale() -> &'static String {
+    static L: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        std::process::Command::new("/usr/bin/defaults")
+            .args(["read", "-g", "AppleLocale"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .and_then(|o| locale_from_apple(&String::from_utf8_lossy(&o.stdout)))
+            .filter(|l| Path::new("/usr/share/locale").join(l).is_dir())
+            .unwrap_or_else(|| "en_US.UTF-8".to_string())
+    })
+}
+
+/// Environment changes that undo an AppImage launcher's, so programs run in a
+/// local terminal do not load the bundle's GTK/GIO modules and libraries.
+/// AppRun and its hooks export APPDIR/APPIMAGE/ARGV0/OWD and point GTK_*,
+/// GDK_PIXBUF_*, GIO_*, GSETTINGS_* and friends into the mounted bundle, and
+/// prepend bundle directories to PATH, LD_LIBRARY_PATH and XDG_DATA_DIRS.
+/// Returns (name, new value) pairs; None removes the variable. Nothing when
+/// not running from an AppImage.
+fn appimage_env_fixups(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(String, Option<String>)> {
+    let vars: Vec<(String, String)> = vars.into_iter().collect();
+    let get = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let (Some(_), Some(appdir)) = (get("APPIMAGE"), get("APPDIR").filter(|d| d.len() > 1)) else {
+        return Vec::new();
+    };
+    let appdir = appdir.trim_end_matches('/').to_string();
+    let inside = |p: &str| p == appdir || p.starts_with(&format!("{appdir}/"));
+    let mut out = Vec::new();
+    for (k, v) in &vars {
+        if matches!(k.as_str(), "APPDIR" | "APPIMAGE" | "ARGV0" | "OWD") {
+            out.push((k.clone(), None));
+            continue;
+        }
+        if !v.contains(&appdir) {
+            continue;
+        }
+        if v.contains(':') || inside(v) && matches!(k.as_str(), "PATH" | "LD_LIBRARY_PATH" | "XDG_DATA_DIRS" | "XDG_CONFIG_DIRS") {
+            let kept: Vec<&str> = v.split(':').filter(|e| !e.is_empty() && !inside(e)).collect();
+            out.push((k.clone(), (!kept.is_empty()).then(|| kept.join(":"))));
+        } else {
+            out.push((k.clone(), None));
         }
     }
     out
@@ -218,9 +324,7 @@ impl LocalShells {
         rows: u32,
         record: bool,
     ) -> Result<ShellProfile, String> {
-        let prof = profiles()
-            .into_iter()
-            .find(|p| p.id == profile_id)
+        let prof = resolve_profile(profiles(), profile_id)
             .ok_or_else(|| format!("no local shell profile '{profile_id}' on this machine"))?;
         self.ensure_free(session_id)?;
 
@@ -231,6 +335,12 @@ impl LocalShells {
             .openpty(size(cols, rows))
             .map_err(|e| format!("could not open a terminal: {e}"))?;
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        // Unix: our own non-blocking duplicate of the master, never
+        // portable-pty's writer, whose Drop types newline + EOF into the
+        // terminal (a background job still on it would read them).
+        #[cfg(unix)]
+        let writer: Box<dyn Write + Send> = Box::new(PtyWriter(ReadyFd::dup_nonblocking(&*pair.master)?));
+        #[cfg(not(unix))]
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         #[cfg(unix)]
         let wake = ReadyFd::dup(&*pair.master)?;
@@ -242,6 +352,15 @@ impl LocalShells {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Hawser");
+        if let Some(lang) = fallback_lang(|k| std::env::var_os(k)) {
+            cmd.env("LANG", lang);
+        }
+        for (k, v) in appimage_env_fixups(std::env::vars()) {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            }
+        }
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -268,7 +387,8 @@ impl LocalShells {
             }
         };
         if !registered {
-            terminate(&shell);
+            // No waiter exists for this shell: this path is its reaper.
+            terminate_and_reap(&shell);
             return Err(format!("session {session_id} is already running"));
         }
 
@@ -317,7 +437,8 @@ impl LocalShells {
                 fin_waiter.finish(&reason);
             });
         if let Err(e) = waiter {
-            terminate(&shell);
+            // The waiter would have reaped it; with none, this path does.
+            terminate_and_reap(&shell);
             self.shells.remove_if(session_id, |_, s| Arc::ptr_eq(s, &shell));
             return Err(format!("could not start the exit watcher: {e}"));
         }
@@ -334,6 +455,7 @@ impl LocalShells {
             });
         if let Err(e) = reader_thread {
             self.readers.fetch_sub(1, Ordering::SeqCst);
+            // The waiter is running and stays this shell's only reaper.
             terminate(&shell);
             return Err(format!("could not start the output reader: {e}"));
         }
@@ -410,6 +532,13 @@ impl LocalShells {
 fn collect(slot: &mut Option<Box<dyn Child + Send + Sync>>, shell: &LocalShell) -> bool {
     let reason = match slot.as_mut().map(|c| c.try_wait()) {
         None => return true,
+        // Windows: try_wait reads the exit code, and a process that exited
+        // WITH code 259 (STILL_ACTIVE) looks alive forever. Whether the
+        // process object is signalled is the real test.
+        #[cfg(windows)]
+        Some(Ok(None)) if slot.as_ref().is_some_and(|c| process_signalled(&**c)) => {
+            "shell exited with code 259".to_string()
+        }
         Some(Ok(None)) => return false,
         Some(Ok(Some(status))) => exit_reason(status),
         Some(Err(_)) => "terminal closed".to_string(),
@@ -437,6 +566,38 @@ fn terminate(shell: &LocalShell) {
         let _ = c.kill();
     }
     collect(&mut g, shell);
+}
+
+/// Whether the process has exited, by its handle (WaitForSingleObject with a
+/// zero timeout), independent of its exit code.
+#[cfg(windows)]
+fn process_signalled(c: &(dyn Child + Send + Sync)) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    match c.as_raw_handle() {
+        // SAFETY: the handle is owned by the child object and alive for this call.
+        Some(h) => unsafe { WaitForSingleObject(h as _, 0) == WAIT_OBJECT_0 },
+        None => false,
+    }
+}
+
+/// `terminate`, then wait for the exit if the kill did not already collect it.
+/// For the paths where no waiter thread exists: every spawned shell has exactly
+/// one reaper, and without this a shell that ignores SIGHUP (and so dies only
+/// at the SIGKILL, asynchronously) was dropped unreaped — a zombie until exit.
+fn terminate_and_reap(shell: &LocalShell) {
+    terminate(shell);
+    let Ok(mut g) = shell.child.lock() else { return };
+    if let Some(mut c) = g.take() {
+        // After SIGKILL / TerminateProcess the exit is imminent.
+        let reason = match c.wait() {
+            Ok(status) => exit_reason(status),
+            Err(_) => "terminal closed".to_string(),
+        };
+        if let Ok(mut r) = shell.exit_reason.lock() {
+            r.get_or_insert(reason);
+        }
+    }
 }
 
 /// Wait for the shell to exit (polling under the child lock) and say why.
@@ -515,9 +676,16 @@ impl<R: Runtime> Finisher<R> {
         );
         // Only if the id still maps to THIS shell.
         self.registry.remove_if(&self.sid, |_, s| Arc::ptr_eq(s, &self.shell));
+        // The gate is released BEFORE the writer is touched: a write blocked
+        // on a full terminal holds the writer lock, and waiting for it under
+        // the gate wedged the reader's final `finish`/`emit_output` with it.
+        drop(gate);
         // Drop our write handle so a background job left on the terminal sees
-        // it close rather than keeping it alive through us.
-        if let Ok(mut w) = self.shell.writer.lock() {
+        // it close rather than keeping it alive through us. If a write holds
+        // it right now, that write times out on its own (PtyWriter) and every
+        // later one is refused (`finished`); the handle then closes with the
+        // last reference to the shell.
+        if let Ok(mut w) = self.shell.writer.try_lock() {
             *w = Box::new(std::io::sink());
         }
     }
@@ -554,19 +722,47 @@ impl ReadyFd {
         Ok(Self(owned))
     }
 
+    /// A duplicate for writing, switched to non-blocking. O_NONBLOCK lives on
+    /// the open file description, which the reader's duplicate shares, so the
+    /// reader treats EAGAIN as "wait again" (see `pump`).
+    fn dup_nonblocking(master: &dyn MasterPty) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+        let fd = Self::dup(master)?;
+        let raw = fd.0.as_raw_fd();
+        // SAFETY: fcntl on a descriptor we own.
+        let ok = unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+        };
+        if !ok {
+            return Err(format!("could not prepare the terminal: {}", std::io::Error::last_os_error()));
+        }
+        Ok(fd)
+    }
+
     /// Wait up to `timeout` for the terminal to become readable (data, hang-up,
     /// or an error condition that the following read() will surface).
-    #[cfg(target_os = "linux")]
     fn ready(&self, timeout: Duration) -> Wait {
+        self.wait_for(false, timeout)
+    }
+
+    /// Wait up to `timeout` until a write would make progress.
+    fn writable(&self, timeout: Duration) -> Wait {
+        self.wait_for(true, timeout)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for(&self, write: bool, timeout: Duration) -> Wait {
         use std::os::fd::AsRawFd;
-        let mut p = libc::pollfd { fd: self.0.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let events = if write { libc::POLLOUT } else { libc::POLLIN };
+        let mut p = libc::pollfd { fd: self.0.as_raw_fd(), events, revents: 0 };
         // SAFETY: one valid pollfd on the stack for the duration of the call.
         let n = unsafe { libc::poll(&mut p, 1, timeout.as_millis() as libc::c_int) };
         Wait::classify(n)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn ready(&self, timeout: Duration) -> Wait {
+    fn wait_for(&self, write: bool, timeout: Duration) -> Wait {
         use std::os::fd::AsRawFd;
         let fd = self.0.as_raw_fd();
         // SAFETY: fd < FD_SETSIZE (checked in `dup`); fd_set is plain data and
@@ -579,9 +775,67 @@ impl ReadyFd {
                 tv_sec: timeout.as_secs() as _,
                 tv_usec: timeout.subsec_micros() as _,
             };
-            let n = libc::select(fd + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv);
+            let (r, w) = if write {
+                (std::ptr::null_mut(), &mut set as *mut libc::fd_set)
+            } else {
+                (&mut set as *mut libc::fd_set, std::ptr::null_mut())
+            };
+            let n = libc::select(fd + 1, r, w, std::ptr::null_mut(), &mut tv);
             Wait::classify(n)
         }
+    }
+}
+
+/// How long a write may make no progress (the terminal's input queue full:
+/// the program on it stopped reading) before it gives up, so a stuck terminal
+/// can never hold the writer lock forever.
+#[cfg(all(unix, not(test)))]
+const WRITE_STALL: Duration = Duration::from_secs(5);
+#[cfg(all(unix, test))]
+const WRITE_STALL: Duration = Duration::from_millis(400);
+
+/// Writes to the PTY master through our own non-blocking descriptor. Dropping
+/// it only closes that descriptor — unlike portable-pty's writer, it never
+/// types newline + EOF into the terminal.
+#[cfg(unix)]
+struct PtyWriter(ReadyFd);
+
+#[cfg(unix)]
+impl Write for PtyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let deadline = std::time::Instant::now() + WRITE_STALL;
+        loop {
+            // SAFETY: writing from a live slice to a descriptor we own.
+            let n = unsafe { libc::write(self.0 .0.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the terminal is not accepting input (the program in it stopped reading)",
+                        ));
+                    }
+                    if self.0.writable(left.min(Duration::from_millis(200))) == Wait::Failed {
+                        return Err(err);
+                    }
+                }
+                _ => return Err(err),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -634,6 +888,11 @@ fn pump<R: Runtime>(
             Wait::Failed => break,
         }
         match reader.read(&mut buf) {
+            // A signal, or nothing there after all (the descriptor is
+            // non-blocking, shared with the writer): wait again.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => {
+                continue
+            }
             // EOF, or EIO on Linux once the shell is gone: either way, done.
             Ok(0) | Err(_) => break,
             Ok(n) => {
@@ -880,6 +1139,162 @@ mod tests {
         assert_eq!(outcome, Wait::Again);
         assert_eq!(Wait::classify(1), Wait::Ready);
         assert_eq!(Wait::classify(0), Wait::Again);
+    }
+
+    #[test]
+    fn saved_profile_ids_survive_a_login_shell_change() {
+        let p = |id: &str, prog: &str| profile(id, id, PathBuf::from(prog), &[]);
+        let list = || vec![p("login", "/bin/zsh"), p("bash", "/bin/bash")];
+        assert_eq!(resolve_profile(list(), "bash").unwrap().id, "bash");
+        // zsh became the login shell: a pane saved as "zsh" opens "login".
+        assert_eq!(resolve_profile(list(), "zsh").unwrap().id, "login");
+        assert!(resolve_profile(list(), "fish").is_none());
+        assert!(resolve_profile(list(), "nope").is_none());
+    }
+
+    #[test]
+    fn a_shell_with_no_locale_gets_a_utf8_one() {
+        use std::ffi::OsString;
+        let none = |_: &str| None::<OsString>;
+        let with = |k: &'static str| move |q: &str| (q == k).then(|| OsString::from("C"));
+        if cfg!(windows) {
+            assert_eq!(fallback_lang(none), None);
+            return;
+        }
+        let lang = fallback_lang(none).unwrap();
+        assert!(lang.ends_with(".UTF-8"), "{lang}");
+        if cfg!(target_os = "linux") {
+            assert_eq!(lang, "C.UTF-8");
+        }
+        // Any explicit setting, even C, is left alone.
+        assert_eq!(fallback_lang(with("LANG")), None);
+        assert_eq!(fallback_lang(with("LC_ALL")), None);
+        assert_eq!(fallback_lang(with("LC_CTYPE")), None);
+        // An empty value counts as unset.
+        assert!(fallback_lang(|k: &str| (k == "LANG").then(OsString::new)).is_some());
+    }
+
+    #[test]
+    fn apple_locales_map_to_posix_names() {
+        assert_eq!(locale_from_apple("en_GB\n").as_deref(), Some("en_GB.UTF-8"));
+        assert_eq!(locale_from_apple("de_DE@currency=EUR").as_deref(), Some("de_DE.UTF-8"));
+        assert_eq!(locale_from_apple("zh-Hans_CN").as_deref(), Some("zh_CN.UTF-8"));
+        assert_eq!(locale_from_apple("en").as_deref(), None);
+        assert_eq!(locale_from_apple("x_../..").as_deref(), None);
+    }
+
+    #[test]
+    fn appimage_launcher_environment_is_undone() {
+        let v = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        assert!(appimage_env_fixups(v(&[("PATH", "/usr/bin"), ("APPDIR", "/tmp/.mount_x")])).is_empty(), "not an AppImage");
+        let mut got = appimage_env_fixups(v(&[
+            ("APPIMAGE", "/home/u/Hawser.AppImage"),
+            ("APPDIR", "/tmp/.mount_x/"),
+            ("OWD", "/home/u"),
+            ("PATH", "/tmp/.mount_x/usr/bin:/usr/bin:/bin"),
+            ("LD_LIBRARY_PATH", "/tmp/.mount_x/usr/lib"),
+            ("GDK_PIXBUF_MODULE_FILE", "/tmp/.mount_x/usr/lib/loaders.cache"),
+            ("XDG_DATA_DIRS", "/tmp/.mount_x/usr/share:/usr/share"),
+            ("HOME", "/home/u"),
+            ("EDITOR", "vim"),
+        ]));
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("APPDIR".into(), None),
+                ("APPIMAGE".into(), None),
+                ("GDK_PIXBUF_MODULE_FILE".into(), None),
+                ("LD_LIBRARY_PATH".into(), None),
+                ("OWD".into(), None),
+                ("PATH".into(), Some("/usr/bin:/bin".into())),
+                ("XDG_DATA_DIRS".into(), Some("/usr/share".into())),
+            ]
+        );
+    }
+
+    /// A write to a terminal that stopped reading gives up instead of holding
+    /// the writer lock forever. A pipe nobody reads stands in for the PTY.
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_write_times_out() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe() fills two fds we then own; fcntl sets O_NONBLOCK.
+        let (_rd, wr) = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let flags = libc::fcntl(fds[1], libc::F_GETFL);
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        };
+        let mut w = PtyWriter(ReadyFd(wr));
+        let started = std::time::Instant::now();
+        let err = w.write_all(&vec![b'x'; 4 * 1024 * 1024]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Dropping our writer (what `finish` does) must not type newline + EOF
+    /// into the terminal, as portable-pty's own writer does on drop: a
+    /// background job still reading the terminal would take that as input.
+    /// The slave side is opened directly to see what arrives.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_writer_types_nothing_into_the_terminal() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _serial = serial();
+        let pair = native_pty_system().openpty(size(80, 24)).unwrap();
+        let name = pair.master.tty_name().expect("a tty name");
+        let mut slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(&name)
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let mut pending = || {
+            std::thread::sleep(Duration::from_millis(200));
+            match slave.read(&mut buf) {
+                Ok(n) => buf[..n].to_vec(),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Vec::new(),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        drop(PtyWriter(ReadyFd::dup_nonblocking(&*pair.master).unwrap()));
+        assert_eq!(pending(), Vec::<u8>::new(), "our writer typed something on drop");
+        // Control: portable-pty's writer does inject, so the probe works.
+        drop(pair.master.take_writer().unwrap());
+        assert!(pending().contains(&b'\n'), "control: expected the injected newline");
+        drop(pair.slave);
+    }
+
+    /// The rollback paths (no waiter thread) reap the shell themselves, even
+    /// one that ignores SIGHUP and so only dies at the SIGKILL.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_reaps_a_shell_that_ignores_sighup() {
+        let _serial = serial();
+        let pair = native_pty_system().openpty(size(80, 24)).unwrap();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "trap '' HUP; while :; do sleep 1; done"]);
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let pid = child.process_id().unwrap() as i32;
+        std::thread::sleep(Duration::from_millis(300)); // let the trap install
+        let shell = LocalShell {
+            writer: Mutex::new(Box::new(std::io::sink())),
+            master: Mutex::new(Some(pair.master)),
+            child: Mutex::new(Some(child)),
+            exit_reason: Mutex::new(None),
+            gate: Mutex::new(false),
+            finished: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+        };
+        terminate_and_reap(&shell);
+        assert!(shell.child.lock().unwrap().is_none());
+        // Reaped: not even a zombie answers signal 0.
+        // SAFETY: signal 0 only probes for existence.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "pid {pid} still exists (zombie?)");
     }
 
     #[test]

@@ -50,11 +50,14 @@
 //! - If an archive was interrupted after its commit and the keychain is then
 //!   unreadable, records are refused (and lost, with a stderr line) until the
 //!   keychain can be read, because it is unknown which file is live.
-//! - The app assumes a single running instance. Two instances writing the same
-//!   log would race on `seq` and produce a (false) failed verify.
-//! - Each append writes the keychain synchronously; a keychain that prompts
-//!   (e.g. after a macOS keychain lock) delays the audited command until it is
-//!   answered.
+//! - One instance runs at a time (the app enforces it), and every append,
+//!   verify and archive also holds a cross-process lock on `audit.jsonl.lock`
+//!   and re-reads the head if the file grew under it, so even a forced second
+//!   process cannot fork the chain.
+//! - Appends are queued to one writer thread, which syncs the file and seals
+//!   the keychain; an audited command never waits on either. A keychain that
+//!   prompts delays the *writer*: records queue meanwhile, and if the queue
+//!   fills, the overflow is dropped and an `audit.dropped` record says how many.
 //! - Deleting *both* the file and the seal is indistinguishable from a first
 //!   run. Detecting that needs a witness that lives off the machine, which is out
 //!   of scope for a local tool. Verify reports this state as "empty", not
@@ -71,18 +74,25 @@
 //! # Durability
 //!
 //! Each append is one `write` of the whole line, followed by `fsync`. A failed
-//! write is rolled back to the previous length where the platform allows it. A
-//! torn final line left by a crash is dropped at the next start, and that is
-//! recorded in the log. Auditing never fails the operation being audited:
-//! errors go to stderr and are swallowed.
+//! write is rolled back to the previous length where the platform allows it.
+//! The file is read as bytes and streamed (memory stays bounded however long
+//! the log grows): a final line that is incomplete or not valid UTF-8 — a crash
+//! mid-append, or a stray byte — is a torn tail. It is moved aside as evidence
+//! (`audit.jsonl.torn-<time>`), dropped from the log by a synced rewrite, and
+//! that is recorded (`audit.torn`). An invalid line anywhere else is a broken
+//! chain that verify reports, never an error that stops the log. Auditing
+//! never fails the operation being audited: errors go to stderr and are
+//! swallowed.
 //!
 //! On Unix the file is created 0600 and its directory restricted to 0700. On
 //! Windows both inherit the per-user `%APPDATA%` ACL; no extra ACL is applied.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -109,6 +119,18 @@ pub const SEAL_ID: &str = "hawser:audit-head";
 /// path or error message, short enough that a pasted blob cannot bloat the log.
 const MAX_FIELD: usize = 512;
 
+/// Longest line the app could have written. Anything longer is not one of its
+/// records, and is never buffered whole (a file-only attacker could otherwise
+/// make every read allocate the whole file).
+const MAX_LINE: usize = 1 << 20;
+
+/// Largest staged rotation file that can hold the single opening record.
+const MAX_STAGED: u64 = 64 * 1024;
+
+/// At most this many gap notes are quoted in a verify message; the rest are
+/// counted.
+const MAX_NOTES: usize = 8;
+
 /// Event tag of the record noting entries that were written without an anchor.
 const EV_UNANCHORED: &str = "audit.unanchored";
 /// Event tag of the record noting a discarded incomplete trailing line.
@@ -117,6 +139,8 @@ const EV_TORN: &str = "audit.torn";
 const EV_INTEGRITY: &str = "audit.integrity_failed";
 /// Event tag that opens a fresh log after the old one was archived.
 const EV_ARCHIVED: &str = "audit.archived";
+/// Event tag noting records the writer had to drop (its queue was full).
+const EV_DROPPED: &str = "audit.dropped";
 
 /// One audit record. Serialized as a single line of JSON (JSON Lines).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,7 +239,7 @@ fn sanitize(detail: Value) -> BTreeMap<String, Value> {
         }
     };
     match detail {
-        Value::Object(map) => map.into_iter().map(|(k, v)| (k, prim(v))).collect(),
+        Value::Object(map) => map.into_iter().map(|(k, v)| (cap(k), prim(v))).collect(),
         Value::Null => BTreeMap::new(),
         other => BTreeMap::from([("value".to_string(), prim(other))]),
     }
@@ -304,76 +328,211 @@ impl Anchor for Keychain {
     }
 }
 
-/* ------------------------------------------------------------ chain + seal */
+/* ------------------------------------------------------------ reading lines */
 
-/// The result of walking the file: either every record's hash in order, or the
-/// first break.
-struct Chain {
-    /// `hashes[i]` is the hash of record seq `i + 1`. Only valid up to a break.
-    hashes: Vec<String>,
-    /// The first problem, as (1-based line, sentence), if the chain is broken.
-    broken: Option<(u64, String)>,
-    /// `audit.unanchored` / `audit.torn` / `audit.integrity_failed` records seen.
-    notes: Vec<String>,
-    /// The last parseable record, for continuing a log that is already broken.
-    last: Option<(u64, String)>,
+/// One line of the log as the reader classifies it.
+enum Row {
+    /// Empty or whitespace-only: skipped, as `str::lines` + trim did.
+    Blank,
+    /// Exactly what the app writes for this record.
+    Record(AuditEntry),
+    /// Anything else: too long, not UTF-8, not a record, or a record with
+    /// bytes outside the hash (extra fields, duplicate keys, other spacing).
+    Bad,
 }
 
-impl Chain {
-    fn tip(&self) -> (u64, &str) {
-        match self.hashes.last() {
-            Some(h) => (self.hashes.len() as u64, h.as_str()),
-            None => (0, GENESIS),
+/// Classify one line's bytes (without its `\n`). The exact-bytes rule matters:
+/// extra fields or duplicate keys parse fine but sit outside the hash, so
+/// raw-file readers (grep, a SIEM) could be shown unverified text.
+fn classify(line: Option<&[u8]>) -> Row {
+    let Some(mut line) = line else { return Row::Bad };
+    if let Some(stripped) = line.strip_suffix(b"\r") {
+        line = stripped;
+    }
+    let Ok(text) = std::str::from_utf8(line) else { return Row::Bad };
+    if text.trim().is_empty() {
+        return Row::Blank;
+    }
+    match serde_json::from_str::<AuditEntry>(text) {
+        Ok(e) if serde_json::to_string(&e).is_ok_and(|canon| canon == text) => Row::Record(e),
+        _ => Row::Bad,
+    }
+}
+
+/// Feed every line of `r` to `f` without ever buffering more than
+/// [`MAX_LINE`] bytes of one: a longer line arrives as `None`. A final line
+/// without a newline is delivered too. Memory stays bounded however large the
+/// file is.
+fn for_each_line(r: impl Read, mut f: impl FnMut(Option<&[u8]>)) -> std::io::Result<()> {
+    let mut reader = BufReader::with_capacity(64 * 1024, r);
+    let mut line: Vec<u8> = Vec::new();
+    let mut overlong = false;
+    let mut pending = false;
+    loop {
+        let avail = match reader.fill_buf() {
+            Ok(a) => a,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if avail.is_empty() {
+            if pending {
+                f(if overlong { None } else { Some(&line) });
+            }
+            return Ok(());
+        }
+        let (chunk, used, ends) = match avail.iter().position(|&b| b == b'\n') {
+            Some(i) => (&avail[..i], i + 1, true),
+            None => (avail, avail.len(), false),
+        };
+        pending = true;
+        if !overlong {
+            if line.len() + chunk.len() > MAX_LINE {
+                overlong = true;
+                line = Vec::new();
+            } else {
+                line.extend_from_slice(chunk);
+            }
+        }
+        reader.consume(used);
+        if ends {
+            f(if overlong { None } else { Some(&line) });
+            line.clear();
+            overlong = false;
+            pending = false;
         }
     }
 }
 
-/// Recompute every hash and check contiguity and links.
-fn walk(rows: &[Result<AuditEntry, usize>]) -> Chain {
-    let mut c = Chain {
-        hashes: Vec::new(),
-        broken: None,
-        notes: Vec::new(),
-        last: None,
-    };
-    let mut prev = GENESIS.to_string();
-    for (idx, row) in rows.iter().enumerate() {
-        let line = (idx + 1) as u64;
-        let e = match row {
-            Ok(e) => e,
-            Err(_) => {
-                c.broken.get_or_insert((line, format!("Entry {line} is not a record as the app writes it — the log was edited or corrupted.")));
-                continue;
-            }
-        };
-        c.last = Some((e.seq, e.hash.clone()));
-        if c.broken.is_some() {
-            continue;
+/* ------------------------------------------------------------ chain + seal */
+
+/// The result of walking the file, kept to a bounded size: the tip, the
+/// hashes the caller asked for, the first break, and the notes.
+#[derive(Clone)]
+struct Chain {
+    /// Number of contiguous valid records before any break.
+    n: u64,
+    /// Hash of record `n` (GENESIS when n is 0).
+    tip: String,
+    /// `at[s]` is the hash of record seq `s`, for each seq that was asked for
+    /// (and exists before any break).
+    at: BTreeMap<u64, String>,
+    /// The first problem, as (1-based row, sentence), if the chain is broken.
+    broken: Option<(u64, String)>,
+    /// `audit.unanchored` / `audit.torn` / `audit.integrity_failed` /
+    /// `audit.dropped` records seen (at most MAX_NOTES kept; `more` counts the rest).
+    notes: Vec<String>,
+    more_notes: usize,
+    /// The last parseable record, for continuing a log that is already broken.
+    last: Option<(u64, String)>,
+    /// Rows seen (records plus bad lines; blank lines excluded).
+    rows: u64,
+    /// The first row, when it is a record (for following archive pins).
+    first: Option<AuditEntry>,
+}
+
+impl Chain {
+    fn tip(&self) -> (u64, &str) {
+        (self.n, self.tip.as_str())
+    }
+    fn hash_at(&self, seq: u64) -> Option<&str> {
+        if seq == self.n {
+            return Some(self.tip.as_str());
         }
-        let expect = c.hashes.len() as u64 + 1;
+        self.at.get(&seq).map(String::as_str)
+    }
+}
+
+/// Recompute every hash and check contiguity and links, one row at a time.
+struct Walker {
+    c: Chain,
+    prev: String,
+    want: Vec<u64>,
+}
+
+impl Walker {
+    fn new(want: &[u64]) -> Self {
+        Self {
+            c: Chain {
+                n: 0,
+                tip: GENESIS.to_string(),
+                at: BTreeMap::new(),
+                broken: None,
+                notes: Vec::new(),
+                more_notes: 0,
+                last: None,
+                rows: 0,
+                first: None,
+            },
+            prev: GENESIS.to_string(),
+            want: want.to_vec(),
+        }
+    }
+
+    fn push(&mut self, row: Row) {
+        let e = match row {
+            Row::Blank => return,
+            Row::Bad => {
+                self.c.rows += 1;
+                let line = self.c.rows;
+                self.c.broken.get_or_insert((line, format!("Entry {line} is not a record as the app writes it — the log was edited or corrupted.")));
+                return;
+            }
+            Row::Record(e) => e,
+        };
+        self.c.rows += 1;
+        let line = self.c.rows;
+        if line == 1 {
+            self.c.first = Some(e.clone());
+        }
+        self.c.last = Some((e.seq, e.hash.clone()));
+        if self.c.broken.is_some() {
+            return;
+        }
+        let expect = self.c.n + 1;
         let problem = if e.seq != expect {
             Some(format!(
                 "Entry {line} has sequence {} but {expect} was expected — an entry was inserted or removed.",
                 e.seq
             ))
-        } else if e.prev != prev {
+        } else if e.prev != self.prev {
             Some(format!("Entry {line} does not link to the previous entry — the chain was broken here."))
-        } else if hash_entry(e) != e.hash {
+        } else if hash_entry(&e) != e.hash {
             Some(format!("Entry {line} was modified after it was written — its contents no longer match its hash."))
         } else {
             None
         };
         if let Some(p) = problem {
-            c.broken = Some((line, p));
-            continue;
+            self.c.broken = Some((line, p));
+            return;
         }
-        if matches!(e.event.as_str(), EV_UNANCHORED | EV_TORN | EV_INTEGRITY) {
-            c.notes.push(e.summary.clone());
+        if matches!(e.event.as_str(), EV_UNANCHORED | EV_TORN | EV_INTEGRITY | EV_DROPPED) {
+            if self.c.notes.len() < MAX_NOTES {
+                self.c.notes.push(e.summary.clone());
+            } else {
+                self.c.more_notes += 1;
+            }
         }
-        prev = e.hash.clone();
-        c.hashes.push(e.hash.clone());
+        self.c.n = e.seq;
+        if self.want.contains(&e.seq) {
+            self.c.at.insert(e.seq, e.hash.clone());
+        }
+        self.prev = e.hash.clone();
+        self.c.tip = e.hash;
     }
-    c
+
+    fn finish(self) -> Chain {
+        self.c
+    }
+}
+
+/// Walk the first `limit` bytes of `r` (the whole of it when `None`).
+fn walk_reader(r: impl Read, limit: Option<u64>, want: &[u64]) -> std::io::Result<Chain> {
+    let mut w = Walker::new(want);
+    match limit {
+        Some(n) => for_each_line(r.take(n), |l| w.push(classify(l)))?,
+        None => for_each_line(r, |l| w.push(classify(l)))?,
+    }
+    Ok(w.finish())
 }
 
 /// How the file stands against the seal. Shared by the writer (deciding whether
@@ -420,7 +579,7 @@ fn reconcile(chain: &Chain, seal: &SealRead) -> Decision {
                 Decision::Mismatch(format!(
                     "the keychain anchor is ahead of the file (sealed up to entry {s}, file ends at {n}) — entries were deleted from the end"
                 ))
-            } else if s >= 1 && chain.hashes[(s - 1) as usize] == *h {
+            } else if s >= 1 && chain.hash_at(s) == Some(h.as_str()) {
                 Decision::Unanchored {
                     from: s + 1,
                     to: n,
@@ -432,6 +591,14 @@ fn reconcile(chain: &Chain, seal: &SealRead) -> Decision {
                 )
             }
         }
+    }
+}
+
+/// The seq whose hash `reconcile` will need for this seal.
+fn wanted(seal: &SealRead) -> Vec<u64> {
+    match seal {
+        SealRead::Present(s, _) => vec![*s],
+        _ => Vec::new(),
     }
 }
 
@@ -450,15 +617,27 @@ enum Mode {
     Pending,
 }
 
+/// What a `Pending` session still has to reconcile: the chain head as it was
+/// loaded, before this session appended anything.
+#[derive(Clone)]
+struct Loaded {
+    n: u64,
+    tip: String,
+    broken: Option<(u64, String)>,
+}
+
 struct Session {
     seq: u64,
     hash: String,
     mode: Mode,
-    /// The chain as loaded at startup, for resolving a `Pending` check later.
-    loaded: Option<Chain>,
+    loaded: Option<Loaded>,
     last_warn: Option<Instant>,
     /// A freeze marker that still has to reach the keychain (retried per append).
     freeze_pending: Option<String>,
+    /// The file's length after this session's last write. Anything else on
+    /// disk means another writer (a second instance) appended, and the session
+    /// must be re-read before chaining from its cached head.
+    len: u64,
 }
 
 struct Log<A: Anchor> {
@@ -466,7 +645,7 @@ struct Log<A: Anchor> {
     anchor: A,
     session: Mutex<Option<Session>>,
     /// Test-only fault injection: fail the next fsync / stop an archive after
-    /// step N, to prove the failure paths leave a recoverable state.
+    /// step N / make the commit's seal write land but report failure.
     #[cfg(test)]
     faults: Faults,
 }
@@ -476,24 +655,7 @@ struct Log<A: Anchor> {
 struct Faults {
     fail_sync: std::sync::atomic::AtomicBool,
     crash_archive_after: std::sync::atomic::AtomicU8,
-}
-
-/// Read and parse every line. Missing file → empty. A line that does not parse,
-/// or is not byte-for-byte what the app would have written for that record, is
-/// kept as its 1-based line number so verify can point at it. The exact-bytes
-/// rule matters: extra fields or duplicate keys parse fine but sit outside the
-/// hash, so raw-file readers (grep, a SIEM) could be shown unverified text.
-fn parse_text(text: &str) -> Vec<Result<AuditEntry, usize>> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty())
-        .map(|(i, l)| {
-            serde_json::from_str::<AuditEntry>(l)
-                .ok()
-                .filter(|e| serde_json::to_string(e).is_ok_and(|canon| canon == l))
-                .ok_or(i + 1)
-        })
-        .collect()
+    fail_newline_repair: std::sync::atomic::AtomicBool,
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> KnownHostsError + '_ {
@@ -501,6 +663,150 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> KnownHostsError + '_ {
         path: path.to_path_buf(),
         source,
     }
+}
+
+/// A cross-process exclusive lock on `<log>.lock`, held for one transaction
+/// (reconcile + append + seal, a verify, an archive). The OS releases it if the
+/// holder dies, so a stale lock file is harmless. One instance is the norm (the
+/// app enforces it), but a forced second process must still never interleave
+/// its appends with ours.
+struct FileLock(#[allow(dead_code)] File);
+
+impl FileLock {
+    fn acquire(log: &Path) -> Result<Self, KnownHostsError> {
+        let path = log.with_extension("jsonl.lock");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io_err(dir))?;
+            super::platform::restrict_perms(dir, 0o700);
+        }
+        let mut opts = OpenOptions::new();
+        opts.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let f = opts.open(&path).map_err(io_err(&path))?;
+        f.lock().map_err(io_err(&path))?;
+        Ok(Self(f))
+    }
+}
+
+/// Current length of `path`, 0 when it does not exist.
+fn file_len(path: &Path) -> Result<u64, KnownHostsError> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(io_err(path)(e)),
+    }
+}
+
+/// Where the last line of `path` starts, and whether that line is a torn
+/// tail: no final newline and not a complete record. Returns (file length,
+/// length to keep, torn). Reads only the tail.
+fn split_torn(path: &Path) -> Result<(u64, u64, bool), KnownHostsError> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, false)),
+        Err(e) => return Err(io_err(path)(e)),
+    };
+    let len = f.metadata().map_err(io_err(path))?.len();
+    if len == 0 {
+        return Ok((0, 0, false));
+    }
+    // Find the last newline, scanning backwards in chunks.
+    let mut pos = len;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut last_nl: Option<u64> = None;
+    let mut first = true;
+    while pos > 0 {
+        let take = (pos.min(buf.len() as u64)) as usize;
+        pos -= take as u64;
+        f.seek(SeekFrom::Start(pos)).map_err(io_err(path))?;
+        f.read_exact(&mut buf[..take]).map_err(io_err(path))?;
+        if first {
+            first = false;
+            if buf[take - 1] == b'\n' {
+                return Ok((len, len, false));
+            }
+        }
+        if let Some(i) = buf[..take].iter().rposition(|&b| b == b'\n') {
+            last_nl = Some(pos + i as u64);
+            break;
+        }
+    }
+    let cut = last_nl.map_or(0, |i| i + 1);
+    let tail_len = len - cut;
+    if tail_len as usize <= MAX_LINE {
+        let mut tail = vec![0u8; tail_len as usize];
+        f.seek(SeekFrom::Start(cut)).map_err(io_err(path))?;
+        f.read_exact(&mut tail).map_err(io_err(path))?;
+        // Complete record, only its newline missing.
+        if let Row::Record(_) = classify(Some(&tail)) {
+            return Ok((len, len, false));
+        }
+    }
+    Ok((len, cut, true))
+}
+
+/// A name beside `base` that does not exist yet: `<base>-<ts>`, then
+/// `<base>-<ts>-1`, … .
+fn unused_sibling(dir_of: &Path, base: &str) -> PathBuf {
+    let ts = now_secs();
+    (0u32..)
+        .map(|n| match n {
+            0 => dir_of.with_file_name(format!("{base}-{ts}")),
+            n => dir_of.with_file_name(format!("{base}-{ts}-{n}")),
+        })
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .expect("an unused name exists")
+}
+
+/// SHA-256 of a file, streamed, plus its first line classified (for following
+/// archive pins). Memory stays bounded.
+fn hash_file(path: &Path) -> std::io::Result<(String, Option<AuditEntry>)> {
+    let f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut first: Option<Option<AuditEntry>> = None;
+    let mut line: Vec<u8> = Vec::new();
+    let mut reader = BufReader::with_capacity(64 * 1024, f);
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            break;
+        }
+        hasher.update(avail);
+        if first.is_none() {
+            match avail.iter().position(|&b| b == b'\n') {
+                Some(i) if line.len() + i <= MAX_LINE => {
+                    line.extend_from_slice(&avail[..i]);
+                    first = Some(match classify(Some(&line)) {
+                        Row::Record(e) => Some(e),
+                        _ => None,
+                    });
+                }
+                Some(_) => first = Some(None),
+                None if line.len() + avail.len() <= MAX_LINE => line.extend_from_slice(avail),
+                None => first = Some(None),
+            }
+        }
+        let n = avail.len();
+        reader.consume(n);
+    }
+    if first.is_none() && !line.is_empty() {
+        first = Some(match classify(Some(&line)) {
+            Row::Record(e) => Some(e),
+            _ => None,
+        });
+    }
+    Ok((hex(&hasher.finalize()), first.flatten()))
+}
+
+/// A problem with the archive pins, and whether it fails the log or only
+/// warns.
+struct PinProblem {
+    fatal: bool,
+    message: String,
 }
 
 impl<A: Anchor> Log<A> {
@@ -514,31 +820,20 @@ impl<A: Anchor> Log<A> {
         }
     }
 
-    fn read_text(&self) -> Result<String, KnownHostsError> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(t) => Ok(t),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+    fn walk_file(&self, limit: Option<u64>, want: &[u64]) -> Result<Chain, KnownHostsError> {
+        match File::open(&self.path) {
+            Ok(f) => walk_reader(f, limit, want).map_err(io_err(&self.path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                walk_reader(std::io::empty(), None, want).map_err(io_err(&self.path))
+            }
             Err(e) => Err(io_err(&self.path)(e)),
         }
     }
 
-    /// Text minus an incomplete final line (no trailing newline, won't parse).
-    /// Returns the kept text and whether a torn tail was found.
-    fn split_torn(text: &str) -> (&str, bool) {
-        if text.is_empty() || text.ends_with('\n') {
-            return (text, false);
-        }
-        let cut = text.rfind('\n').map_or(0, |i| i + 1);
-        if serde_json::from_str::<AuditEntry>(&text[cut..]).is_ok() {
-            (text, false) // complete record, only its newline is missing
-        } else {
-            (&text[..cut], true)
-        }
-    }
-
     /// Append one line (newline included) in a single write, then fsync. On a
-    /// failed write, roll the file back to its previous length.
-    fn append_line(&self, line: &str) -> Result<(), KnownHostsError> {
+    /// failed write, roll the file back to its previous length. Returns the
+    /// file's length afterwards.
+    fn append_line(&self, line: &str) -> Result<u64, KnownHostsError> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(io_err(dir))?;
             super::platform::restrict_perms(dir, 0o700);
@@ -579,44 +874,77 @@ impl<A: Anchor> Log<A> {
             }
             return Err(io_err(&self.path)(e));
         }
-        Ok(())
+        file.metadata().map(|m| m.len()).map_err(io_err(&self.path))
     }
 
-    /// Replace the log's contents via a synced temp file + rename, so a crash
-    /// mid-rewrite leaves either the old file or the new one, never a stub.
-    fn replace_atomically(&self, text: &str) -> Result<(), KnownHostsError> {
+    /// Drop a torn tail: the bytes past `keep` are first saved as evidence
+    /// (`audit.jsonl.torn-<ts>`, never deleted), then the log is rewritten to
+    /// its first `keep` bytes via a synced temp file + rename + directory
+    /// sync, so a crash mid-rewrite leaves either the old file or the new one.
+    fn drop_torn_tail(&self, keep: u64) -> Result<(), KnownHostsError> {
+        let mut src = File::open(&self.path).map_err(io_err(&self.path))?;
+        let create = |p: &Path| {
+            let mut opts = OpenOptions::new();
+            opts.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(p)
+        };
+        // Evidence first: a tampered last line must not simply vanish.
+        let evidence = unused_sibling(&self.path, "audit.jsonl.torn");
+        let mut ev = create(&evidence).map_err(io_err(&evidence))?;
+        src.seek(SeekFrom::Start(keep)).map_err(io_err(&self.path))?;
+        std::io::copy(&mut src, &mut ev)
+            .and_then(|_| ev.sync_all())
+            .map_err(io_err(&evidence))?;
+        drop(ev);
+
         let tmp = self.path.with_extension("jsonl.tmp");
-        let mut opts = OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp).map_err(io_err(&tmp))?;
-        f.write_all(text.as_bytes())
-            .and_then(|_| f.sync_all())
+        let _ = std::fs::remove_file(&tmp);
+        let mut out = create(&tmp).map_err(io_err(&tmp))?;
+        src.seek(SeekFrom::Start(0)).map_err(io_err(&self.path))?;
+        let copied = std::io::copy(&mut (&mut src).take(keep), &mut out)
+            .and_then(|n| out.sync_all().map(|_| n))
             .map_err(io_err(&tmp))?;
-        std::fs::rename(&tmp, &self.path).map_err(io_err(&self.path))
+        drop((src, out));
+        if copied != keep {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(KnownHostsError::Parse(
+                "the audit log shrank while its torn tail was being dropped".into(),
+            ));
+        }
+        std::fs::rename(&tmp, &self.path).map_err(io_err(&self.path))?;
+        sync_dir(&self.path).map_err(io_err(&self.path))
+    }
+
+    /// Finish the last line when it is a complete record missing only its
+    /// newline. Its failure is an error: the next record would otherwise be
+    /// glued onto that line.
+    fn repair_newline(&self) -> Result<(), KnownHostsError> {
+        #[cfg(test)]
+        if self.faults.fail_newline_repair.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(KnownHostsError::Parse("injected newline repair failure".into()));
+        }
+        // An empty line: append_line adds the newline.
+        self.append_line("").map(|_| ())
     }
 
     /// Load and reconcile the chain for the first append of the session. May
     /// rewrite the file once, to drop a torn tail, and may append notes.
     fn open_session(&self) -> Result<Session, KnownHostsError> {
-        let text = self.read_text()?;
-        let (kept, torn) = Self::split_torn(&text);
+        let (len, keep, torn) = split_torn(&self.path)?;
         if torn {
-            self.replace_atomically(kept)?;
-        } else if !text.is_empty() && !text.ends_with('\n') {
-            // A complete record missing only its newline: finish the line.
-            self.append_line("").ok();
+            self.drop_torn_tail(keep)?;
+        } else if len > 0 && !self.ends_with_newline()? {
+            self.repair_newline()?;
         }
-        let chain = walk(&parse_text(kept));
+        let seal = self.anchor.read();
+        let chain = self.walk_file(None, &wanted(&seal))?;
         let (seq, hash) = match (&chain.broken, chain.last.clone()) {
-            (None, _) => {
-                let (n, h) = chain.tip();
-                (n, h.to_string())
-            }
+            (None, _) => (chain.n, chain.tip.clone()),
             (Some(_), Some(last)) => last,
             (Some(_), None) => (0, GENESIS.to_string()),
         };
@@ -627,28 +955,80 @@ impl<A: Anchor> Log<A> {
             loaded: None,
             last_warn: None,
             freeze_pending: None,
+            len: file_len(&self.path)?,
         };
         if torn {
             self.write_record(
                 &mut s,
                 EV_TORN,
-                "an incomplete trailing entry left by an interrupted write was discarded",
+                "an incomplete trailing entry left by an interrupted write was discarded (kept beside the log as audit.jsonl.torn-*)",
                 BTreeMap::new(),
             )?;
         }
-        s.loaded = Some(chain);
-        self.resolve(&mut s)?;
+        let decision = reconcile(&chain, &seal);
+        if decision == Decision::Unknown {
+            s.loaded = Some(Loaded {
+                n: chain.n,
+                tip: chain.tip.clone(),
+                broken: chain.broken.clone(),
+            });
+            return Ok(s);
+        }
+        self.apply(&mut s, decision, &seal)?;
         Ok(s)
+    }
+
+    fn ends_with_newline(&self) -> Result<bool, KnownHostsError> {
+        let mut f = File::open(&self.path).map_err(io_err(&self.path))?;
+        let len = f.metadata().map_err(io_err(&self.path))?.len();
+        if len == 0 {
+            return Ok(true);
+        }
+        let mut b = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1)).map_err(io_err(&self.path))?;
+        f.read_exact(&mut b).map_err(io_err(&self.path))?;
+        Ok(b[0] == b'\n')
     }
 
     /// Settle a `Pending` session against the seal: trust it (writing an
     /// `audit.unanchored` note first if needed), freeze it, or leave it pending.
+    ///
+    /// The file is re-walked rather than the startup chain kept in memory
+    /// (memory stays bounded). The records this session appended while pending
+    /// must still end at its head, and the prefix that was loaded must be
+    /// unchanged; otherwise the file changed under it and it is a mismatch.
     fn resolve(&self, s: &mut Session) -> Result<(), KnownHostsError> {
-        let Some(chain) = s.loaded.as_ref() else {
+        let Some(loaded) = s.loaded.clone() else {
             return Ok(());
         };
         let seal = self.anchor.read();
-        match reconcile(chain, &seal) {
+        if seal == SealRead::Unavailable {
+            return Ok(());
+        }
+        let mut want = wanted(&seal);
+        want.push(loaded.n);
+        let walked = self.walk_file(None, &want)?;
+        let chain = if loaded.broken.is_some() {
+            Chain { broken: loaded.broken.clone(), ..walked }
+        } else if walked.broken.is_some() {
+            walked
+        } else if walked.hash_at(loaded.n).unwrap_or(GENESIS) != loaded.tip
+            || (walked.n, walked.tip.as_str()) != (s.seq, s.hash.as_str())
+        {
+            Chain {
+                broken: Some((0, "the log changed on disk while its keychain check was pending".into())),
+                ..walked
+            }
+        } else {
+            // The chain as it was loaded, with the hashes asked for.
+            Chain { n: loaded.n, tip: loaded.tip.clone(), ..walked }
+        };
+        let decision = reconcile(&chain, &seal);
+        self.apply(s, decision, &seal)
+    }
+
+    fn apply(&self, s: &mut Session, decision: Decision, seal: &SealRead) -> Result<(), KnownHostsError> {
+        match decision {
             Decision::Unknown => return Ok(()),
             Decision::Anchored => s.mode = Mode::Trusted,
             Decision::Unanchored { from, to, why } => {
@@ -705,7 +1085,7 @@ impl<A: Anchor> Log<A> {
         e.hash = hash_entry(&e);
         // One line: serde_json never emits interior newlines for this shape.
         let line = serde_json::to_string(&e).unwrap_or_default();
-        self.append_line(&line)?;
+        s.len = self.append_line(&line)?;
         s.seq = e.seq;
         s.hash = e.hash;
 
@@ -717,7 +1097,6 @@ impl<A: Anchor> Log<A> {
         if s.mode == Mode::Trusted {
             if let Err(err) = self.anchor.write(s.seq, &s.hash) {
                 // Retry on the next append; just don't spam stderr meanwhile.
-                // (Not `is_none_or`: that needs Rust 1.82; MSRV is 1.77.)
                 let due = !matches!(s.last_warn, Some(t) if t.elapsed() <= Duration::from_secs(60));
                 if due {
                     s.last_warn = Some(Instant::now());
@@ -731,6 +1110,12 @@ impl<A: Anchor> Log<A> {
     fn record(&self, event: &str, summary: &str, detail: Value) -> Result<(), String> {
         let mut guard = self.session.lock().map_err(|_| "audit lock poisoned".to_string())?;
         let res = (|| {
+            let _lock = FileLock::acquire(&self.path)?;
+            // Another process (a forced second instance) may have appended
+            // since our last write: never chain from a head it moved past.
+            if guard.as_ref().is_some_and(|s| file_len(&self.path).ok() != Some(s.len)) {
+                *guard = None;
+            }
             if guard.is_none() {
                 if self.recover_rotation()? == Rotation::Pending {
                     return Err(KnownHostsError::Parse(ROTATION_PENDING.to_string()));
@@ -752,31 +1137,69 @@ impl<A: Anchor> Log<A> {
         res.map_err(|e| e.to_string())
     }
 
+    /// The newest `limit` records, newest first, from a tail window of the
+    /// file (never the whole history): records are read backwards until
+    /// `limit` lines are in hand or 32 MiB has been read.
     fn list(&self, limit: usize) -> Result<Vec<AuditView>, KnownHostsError> {
-        let text = self.read_text()?;
-        let mut out: Vec<AuditView> = parse_text(&text)
-            .into_iter()
-            .filter_map(Result::ok)
-            .map(|e| AuditView {
-                seq: e.seq,
-                ts: e.ts,
-                event: e.event,
-                summary: e.summary,
-                detail: e.detail,
-            })
-            .collect();
+        const MAX_WINDOW: u64 = 32 * 1024 * 1024;
+        let mut f = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&self.path)(e)),
+        };
+        let len = f.metadata().map_err(io_err(&self.path))?.len();
+        let mut start = len;
+        let mut window: Vec<u8> = Vec::new();
+        let chunk = 256 * 1024u64;
+        while start > 0 && (len - start) < MAX_WINDOW {
+            let take = start.min(chunk);
+            start -= take;
+            let mut buf = vec![0u8; take as usize];
+            f.seek(SeekFrom::Start(start)).map_err(io_err(&self.path))?;
+            f.read_exact(&mut buf).map_err(io_err(&self.path))?;
+            buf.extend_from_slice(&window);
+            window = buf;
+            if window.iter().filter(|&&b| b == b'\n').count() > limit {
+                break;
+            }
+        }
+        // Unless the window reaches the start of the file, its first line may
+        // be cut: skip it.
+        let body: &[u8] = if start > 0 {
+            match window.iter().position(|&b| b == b'\n') {
+                Some(i) => &window[i + 1..],
+                None => &[],
+            }
+        } else {
+            &window
+        };
+        let mut out: Vec<AuditView> = Vec::new();
+        for_each_line(body, |l| {
+            if let Row::Record(e) = classify(l) {
+                out.push(AuditView {
+                    seq: e.seq,
+                    ts: e.ts,
+                    event: e.event,
+                    summary: e.summary,
+                    detail: e.detail,
+                });
+            }
+        })
+        .map_err(io_err(&self.path))?;
         out.sort_by(|a, b| b.seq.cmp(&a.seq));
         out.truncate(limit);
         Ok(out)
     }
 
-    /// Walk the chain and compare it with the seal. Holds the writer lock, so it
-    /// never sees the file and the seal at different stages of one append.
+    /// Walk the chain and compare it with the seal. Holds the writer lock (and
+    /// the cross-process lock), so it never sees the file and the seal at
+    /// different stages of one append.
     fn verify(&self) -> Result<VerifyReport, KnownHostsError> {
         let _guard = self.session.lock().map_err(|_| KnownHostsError::Io {
             path: self.path.clone(),
             source: std::io::Error::other("audit lock poisoned"),
         })?;
+        let _lock = FileLock::acquire(&self.path)?;
         if self.recover_rotation()? == Rotation::Pending {
             return Ok(VerifyReport {
                 ok: false,
@@ -787,19 +1210,22 @@ impl<A: Anchor> Log<A> {
                 seal_status: "unavailable".to_string(),
             });
         }
-        self.verify_locked()
+        self.verify_locked().map(|(r, _)| r)
     }
 
-    /// Walk the archive pins back through every generation: the current log's
-    /// opening `audit.archived` record pins its predecessor by SHA-256, whose own
-    /// opening record pins the one before, and so on. Returns the first archive
-    /// that is missing or no longer matches its pin.
-    fn archived_log_problem(&self, rows: &[Result<AuditEntry, usize>]) -> Option<String> {
-        let mut first = match rows.first() {
-            Some(Ok(e)) => e.clone(),
-            _ => return None,
-        };
+    /// Walk the archive pins back through the generations: the current log's
+    /// opening `audit.archived` record pins its predecessor by SHA-256, whose
+    /// own opening record pins the one before, and so on.
+    ///
+    /// The immediate predecessor must be present and intact (fatal otherwise).
+    /// An older archive that is missing is only a warning: deleting old logs to
+    /// free space is ordinary, and making it fatal would leave a log that no
+    /// archive could ever clear. An archive that is present but modified fails
+    /// at any depth (delete it to downgrade that to the warning).
+    fn archived_log_problem(&self, first: Option<&AuditEntry>) -> Option<PinProblem> {
+        let mut first = first?.clone();
         let mut seen = std::collections::HashSet::new();
+        let mut depth = 0u32;
         while first.event == EV_ARCHIVED {
             let (Some(name), Some(want)) = (
                 first.detail.get("archivedAs").and_then(Value::as_str),
@@ -807,46 +1233,72 @@ impl<A: Anchor> Log<A> {
             ) else {
                 return None; // the log before this one was empty: nothing pinned
             };
+            let fatal = |message: String| Some(PinProblem { fatal: true, message });
             // Only a bare file name beside the log: a crafted record cannot point
             // the check elsewhere (it is hashed and anchored, but be strict anyway).
-            if name.contains(['/', '\\', ':']) || name.starts_with('.') {
-                return Some(format!("the archive name {name:?} is not a plain file name"));
+            if name.contains(['/', '\\', ':', '\0']) || name.starts_with('.') {
+                return fatal(format!("the archive name {name:?} is not a plain file name"));
             }
             if !seen.insert(name.to_string()) {
-                return Some(format!("the archive chain loops back to {name}"));
+                return fatal(format!("the archive chain loops back to {name}"));
             }
-            let bytes = match std::fs::read(self.path.with_file_name(name)) {
-                Ok(b) => b,
-                Err(_) => return Some(format!("the archived log {name} is missing or unreadable")),
+            let path = self.path.with_file_name(name);
+            let (sha, opening) = match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_file() => match hash_file(&path) {
+                    Ok(r) => r,
+                    Err(_) => return fatal(format!("the archived log {name} is unreadable")),
+                },
+                Ok(_) => return fatal(format!("the archived log {name} is not a regular file")),
+                Err(_) if depth == 0 => {
+                    return fatal(format!("the archived log {name} (the previous log) is missing"))
+                }
+                Err(_) => {
+                    return Some(PinProblem {
+                        fatal: false,
+                        message: format!("an older archived log, {name}, has been deleted, so the history before it can no longer be checked"),
+                    })
+                }
             };
-            if hex(&Sha256::digest(&bytes)) != want {
-                return Some(format!("the archived log {name} was modified after it was archived"));
+            if sha != want {
+                return fatal(format!("the archived log {name} was modified after it was archived"));
+            }
+            // The archiving record pinned the predecessor's verdict too. If that
+            // was not a clean pass, its problems (an older archive deleted or
+            // modified, gaps) were already judged and sealed into this record:
+            // archiving is the documented way past them, so stop here.
+            if !matches!(first.detail.get("priorStatus").and_then(Value::as_str), Some("verified" | "empty")) {
+                return None;
             }
             // Pinned and intact: its own first record is now trusted, so follow it.
-            match parse_text(&String::from_utf8_lossy(&bytes)).into_iter().next() {
-                Some(Ok(e)) => first = e,
-                _ => return None,
+            match opening {
+                Some(e) => first = e,
+                None => return None,
             }
+            depth += 1;
         }
         None
     }
 
-    fn verify_locked(&self) -> Result<VerifyReport, KnownHostsError> {
-        let text = self.read_text()?;
-        let (kept, torn) = Self::split_torn(&text);
-        let rows = parse_text(kept);
-        let count = rows.len() as u64;
-        let chain = walk(&rows);
+    /// The report, plus the last parseable record (for an archive's pin).
+    fn verify_locked(&self) -> Result<(VerifyReport, Option<(u64, String)>), KnownHostsError> {
+        let (_, keep, torn) = split_torn(&self.path)?;
         let seal = self.anchor.read();
+        let chain = self.walk_file(Some(keep), &wanted(&seal))?;
+        let count = chain.rows;
         let mut decision = reconcile(&chain, &seal);
-        if matches!(decision, Decision::Anchored) {
-            if let Some(why) = self.archived_log_problem(&rows) {
-                decision = Decision::Mismatch(why);
+        let pin = self.archived_log_problem(chain.first.as_ref());
+        if let Some(p) = pin.as_ref().filter(|p| p.fatal) {
+            if !matches!(decision, Decision::Mismatch(_)) {
+                decision = Decision::Mismatch(p.message.clone());
             }
         }
         let entries = |n: u64| format!("{n} entr{}", if n == 1 { "y" } else { "ies" });
+        let mut notes = chain.notes.clone();
+        if chain.more_notes > 0 {
+            notes.push(format!("and {} more", chain.more_notes));
+        }
 
-        let (status, message, broken_at) = match decision {
+        let (status, mut message, broken_at) = match decision {
             Decision::Mismatch(why) => (
                 Status::Failed,
                 match &chain.broken {
@@ -876,15 +1328,18 @@ impl<A: Anchor> Log<A> {
                 "The audit log is empty. (If an earlier log and its anchor were both deleted, that cannot be detected locally.)".to_string(),
                 None,
             ),
-            Decision::Anchored if torn || !chain.notes.is_empty() => {
-                let mut why = chain.notes.clone();
+            Decision::Anchored if torn || !notes.is_empty() || pin.is_some() => {
+                let mut why = notes.clone();
                 if torn {
                     why.push("an incomplete trailing line is present".to_string());
+                }
+                if let Some(p) = &pin {
+                    why.push(p.message.clone());
                 }
                 (
                     Status::Warning,
                     format!(
-                        "Verified {} against the keychain anchor, with earlier gaps recorded in the log: {}. Archive the log to start a fully verified one.",
+                        "Verified {} against the keychain anchor, with gaps: {}. Archive the log to start a fully verified one.",
                         entries(count),
                         why.join("; ")
                     ),
@@ -900,6 +1355,12 @@ impl<A: Anchor> Log<A> {
                 None,
             ),
         };
+        // Whatever the verdict, an archive problem is never hidden behind it.
+        if let Some(p) = &pin {
+            if !message.contains(&p.message) {
+                message.push_str(&format!(" Also: {}.", p.message));
+            }
+        }
         let seal_status = match seal {
             SealRead::Absent => "absent",
             SealRead::Unavailable => "unavailable",
@@ -907,19 +1368,35 @@ impl<A: Anchor> Log<A> {
             SealRead::Present(..) => "present",
             SealRead::Frozen(_) => "frozen",
         };
-        Ok(VerifyReport {
-            ok: status == Status::Verified,
-            status,
-            count,
-            message,
-            broken_at,
-            seal_status: seal_status.to_string(),
-        })
+        Ok((
+            VerifyReport {
+                ok: status == Status::Verified,
+                status,
+                count,
+                message,
+                broken_at,
+                seal_status: seal_status.to_string(),
+            },
+            chain.last,
+        ))
     }
 
     /// Where an archive's replacement log is staged until the rotation commits.
     fn rotating_path(&self) -> PathBuf {
         self.path.with_extension("jsonl.rotating")
+    }
+
+    /// Move a staged file that can never commit out of the way, kept as
+    /// evidence. Best effort: such a file cannot commit anyway (only a valid
+    /// opening record can match the seal), so failing to move it must not
+    /// block the log.
+    fn quarantine(&self, staged: &Path, why: &str) {
+        let dest = unused_sibling(staged, "audit.jsonl.rotating.bad");
+        if let Err(e) = std::fs::rename(staged, &dest) {
+            eprintln!("hawser: could not set aside the unusable staged audit log ({why}): {e}");
+        } else {
+            eprintln!("hawser: set aside an unusable staged audit log ({why}) as {}", dest.display());
+        }
     }
 
     /// Finish or discard an archive interrupted by a crash or an I/O error.
@@ -935,32 +1412,57 @@ impl<A: Anchor> Log<A> {
     /// A forged `.rotating` cannot commit itself, because only the app can
     /// write the seal.
     ///
-    /// Returns [`Rotation::Pending`] while that cannot be decided (the seal is
-    /// unreadable). Nothing may open or append to the log in that state: it is
-    /// unknown whether the old or the staged file is the live one.
+    /// A staged file that is not exactly one valid opening record (torn by a
+    /// crash during step 1, not UTF-8, a directory, junk) cannot have
+    /// committed, whatever the keychain says, so it is set aside without
+    /// consulting the keychain.
+    ///
+    /// Returns [`Rotation::Pending`] while a valid staged record exists and the
+    /// seal is unreadable: it is unknown whether the old or the staged file is
+    /// the live one, so nothing may open or append to the log.
     fn recover_rotation(&self) -> Result<Rotation, KnownHostsError> {
         let staged = self.rotating_path();
-        let text = match std::fs::read_to_string(&staged) {
-            Ok(t) => t,
+        let meta = match std::fs::symlink_metadata(&staged) {
+            Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Rotation::Clear),
-            Err(e) => return Err(io_err(&staged)(e)),
+            Err(_) => {
+                self.quarantine(&staged, "unreadable");
+                return Ok(Rotation::Clear);
+            }
         };
-        let rows = parse_text(&text);
+        if !meta.is_file() || meta.len() > MAX_STAGED {
+            self.quarantine(&staged, "not a staged record");
+            return Ok(Rotation::Clear);
+        }
+        let bytes = match std::fs::read(&staged) {
+            Ok(b) => b,
+            Err(_) => {
+                self.quarantine(&staged, "unreadable");
+                return Ok(Rotation::Clear);
+            }
+        };
+        let mut rows = Vec::new();
+        let _ = for_each_line(&bytes[..], |l| match classify(l) {
+            Row::Blank => {}
+            r => rows.push(r),
+        });
         let opening = match rows.as_slice() {
-            [Ok(e)] if e.seq == 1 && e.event == EV_ARCHIVED && hash_entry(e) == e.hash => Some(e),
-            _ => None,
+            [Row::Record(e)] if e.seq == 1 && e.event == EV_ARCHIVED && hash_entry(e) == e.hash => e,
+            _ => {
+                self.quarantine(&staged, "not one valid opening record");
+                return Ok(Rotation::Clear);
+            }
         };
-        let committed = match (opening, self.anchor.read()) {
-            (Some(e), SealRead::Present(1, h)) => h == e.hash,
-            (_, SealRead::Unavailable) => return Ok(Rotation::Pending),
+        let committed = match self.anchor.read() {
+            SealRead::Present(1, h) => h == opening.hash,
+            SealRead::Unavailable => return Ok(Rotation::Pending),
             _ => false,
         };
         if !committed {
             std::fs::remove_file(&staged).map_err(io_err(&staged))?;
             return Ok(Rotation::Clear);
         }
-        let e = opening.expect("committed implies a valid opening record");
-        if let Some(name) = e.detail.get("archivedAs").and_then(Value::as_str) {
+        if let Some(name) = opening.detail.get("archivedAs").and_then(Value::as_str) {
             let dest = self.path.with_file_name(name);
             if self.path.exists() && std::fs::symlink_metadata(&dest).is_err() {
                 std::fs::rename(&self.path, &dest).map_err(io_err(&dest))?;
@@ -990,30 +1492,31 @@ impl<A: Anchor> Log<A> {
         let mut guard = self.session.lock().map_err(|_| "audit lock poisoned".to_string())?;
         // Whatever happens below, the next append re-reads the disk.
         *guard = None;
+        let _lock = FileLock::acquire(&self.path).map_err(|e| e.to_string())?;
         if self.recover_rotation().map_err(|e| e.to_string())? == Rotation::Pending {
             return Err(ROTATION_PENDING.to_string());
         }
         if matches!(self.anchor.read(), SealRead::Unavailable) {
             return Err("the keychain is unavailable; cannot archive without moving the anchor".into());
         }
-        let prior = self.verify_locked().map_err(|e| e.to_string())?;
-        let bytes = match std::fs::read(&self.path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(format!("could not read the audit log: {e}")),
+        let (prior, last) = self.verify_locked().map_err(|e| e.to_string())?;
+        let bytes_len = file_len(&self.path).map_err(|e| e.to_string())?;
+        let sha = if bytes_len > 0 {
+            Some(hash_file(&self.path).map_err(|e| format!("could not read the audit log: {e}"))?.0)
+        } else {
+            None
         };
-        let last = parse_text(&String::from_utf8_lossy(&bytes))
-            .into_iter()
-            .rev()
-            .find_map(Result::ok);
 
-        // A name that is not already taken: two archives in the same second (or
-        // after a clock change) must never overwrite an earlier one.
+        // A name never used before: the timestamp plus the archived file's
+        // hash, so a deleted archive's name is never handed to a different
+        // file (a pin naming it must keep meaning that file), and two archives
+        // in the same second cannot collide.
         let ts = now_secs();
+        let tag = sha.as_deref().map_or("empty".to_string(), |s| s[..12].to_string());
         let name = (0u32..)
             .map(|n| match n {
-                0 => format!("audit-{ts}.archived.jsonl"),
-                n => format!("audit-{ts}-{n}.archived.jsonl"),
+                0 => format!("audit-{ts}-{tag}.archived.jsonl"),
+                n => format!("audit-{ts}-{tag}-{n}.archived.jsonl"),
             })
             .find(|name| std::fs::symlink_metadata(self.path.with_file_name(name)).is_err())
             .expect("an unused archive name exists");
@@ -1023,17 +1526,18 @@ impl<A: Anchor> Log<A> {
         d.insert("priorStatus".to_string(), status);
         d.insert("priorMessage".to_string(), Value::String(cap(prior.message)));
         d.insert("priorSeal".to_string(), Value::String(prior.seal_status));
-        let summary = if bytes.is_empty() {
-            "started a new log (the previous one was empty)".to_string()
-        } else {
-            d.insert("archivedAs".to_string(), Value::String(name.clone()));
-            d.insert("archivedSha256".to_string(), Value::String(hex(&Sha256::digest(&bytes))));
-            d.insert("archivedBytes".to_string(), Value::from(bytes.len() as u64));
-            if let Some(e) = last {
-                d.insert("archivedLastSeq".to_string(), Value::from(e.seq));
-                d.insert("archivedLastHash".to_string(), Value::String(e.hash));
+        let summary = match &sha {
+            None => "started a new log (the previous one was empty)".to_string(),
+            Some(sha) => {
+                d.insert("archivedAs".to_string(), Value::String(name.clone()));
+                d.insert("archivedSha256".to_string(), Value::String(sha.clone()));
+                d.insert("archivedBytes".to_string(), Value::from(bytes_len));
+                if let Some((seq, hash)) = last {
+                    d.insert("archivedLastSeq".to_string(), Value::from(seq));
+                    d.insert("archivedLastHash".to_string(), Value::String(hash));
+                }
+                format!("started a new log; the previous one was kept as {name}")
             }
-            format!("started a new log; the previous one was kept as {name}")
         };
         let mut e = AuditEntry {
             seq: 1,
@@ -1070,16 +1574,33 @@ impl<A: Anchor> Log<A> {
         #[cfg(test)]
         self.crash_point(1)?;
 
-        // 2. Commit: move the seal to the staged record.
+        // 2. Commit: move the seal to the staged record. An error does not
+        // prove the write did not land (a keychain call can time out after it
+        // stored the item), so the seal decides: if it names the staged record
+        // the rotation committed and is finished; if it plainly does not, the
+        // staged file is discarded; if it cannot be read, the staged file stays
+        // for `recover_rotation` to decide later. Deleting it unconditionally
+        // destroyed the only copy of the record a landed seal named, and the
+        // old log then read as rewritten.
         if let Err(err) = self.anchor.write(1, &e.hash) {
-            let _ = std::fs::remove_file(&staged);
-            return Err(format!("could not move the keychain anchor: {err}"));
+            match self.anchor.read() {
+                SealRead::Present(1, h) if h == e.hash => {}
+                SealRead::Unavailable => {
+                    return Err(format!(
+                        "could not move the keychain anchor ({err}); the archive finishes or is discarded once the keychain can be read"
+                    ))
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&staged);
+                    return Err(format!("could not move the keychain anchor: {err}"));
+                }
+            }
         }
         #[cfg(test)]
         self.crash_point(2)?;
 
         // 3–4. Committed: finish the renames (also what recovery would do).
-        if !bytes.is_empty() {
+        if sha.is_some() {
             std::fs::rename(&self.path, self.path.with_file_name(&name))
                 .map_err(|err| format!("could not archive the audit log: {err}"))?;
         }
@@ -1116,28 +1637,218 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/* ------------------------------------------------------------------ public */
+/* ------------------------------------------------------------ writer thread */
 
-fn global() -> Result<&'static Log<Keychain>, String> {
-    static LOG: OnceLock<Result<Log<Keychain>, String>> = OnceLock::new();
-    LOG.get_or_init(|| {
-        let store = store_path().map_err(|e| e.to_string())?;
-        let dir = store.parent().ok_or("no app data directory")?;
-        Ok(Log::new(dir.join(AUDIT_FILE), Keychain))
-    })
-    .as_ref()
-    .map_err(Clone::clone)
+/// Work for the writer thread. One thread owns the log and handles these in
+/// the order they were queued, so a verify sees every record queued before it.
+enum Job {
+    Record { event: String, summary: String, detail: Value },
+    Verify(mpsc::Sender<Result<VerifyReport, String>>),
+    Archive(mpsc::Sender<Result<String, String>>),
+    Flush(mpsc::Sender<()>),
 }
 
-/// Append one record. Fire-and-forget: errors are logged to stderr and
-/// swallowed, so auditing can never break a working operation. Pass `detail`
-/// from `serde_json::json!`; it is flattened by [`sanitize`]. Never pass a
-/// password, key, command text, or command output.
-pub fn record(event: &str, summary: impl Into<String>, detail: Value) {
-    let summary = summary.into();
-    if let Err(e) = global().and_then(|log| log.record(event, &summary, detail)) {
-        eprintln!("hawser: audit append failed ({event}): {e}");
+/// Records may queue up while the keychain shows a prompt (each seal waits on
+/// it). Beyond this many the newest are dropped, counted, and the count is
+/// itself recorded once the writer catches up, so a drop is never silent.
+const QUEUE: usize = 16 * 1024;
+
+struct Writer {
+    tx: SyncSender<Job>,
+    dropped: std::sync::Arc<AtomicU64>,
+}
+
+impl Writer {
+    /// `open` runs on the writer thread (resolving the path may copy files).
+    fn spawn<A: Anchor + 'static>(
+        open: impl FnOnce() -> Result<Log<A>, String> + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<Job>(QUEUE);
+        let dropped = std::sync::Arc::new(AtomicU64::new(0));
+        let lost = std::sync::Arc::clone(&dropped);
+        std::thread::Builder::new()
+            .name("hawser-audit".into())
+            .spawn(move || serve(open(), rx, &lost))?;
+        Ok(Self { tx, dropped })
     }
+
+    fn record(&self, event: &str, summary: String, detail: Value) {
+        let job = Job::Record { event: event.to_string(), summary, detail };
+        match self.tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                if self.dropped.fetch_add(1, Ordering::SeqCst) == 0 {
+                    eprintln!("hawser: audit queue full; dropping records until the writer catches up ({event})");
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                eprintln!("hawser: audit writer is gone; dropped ({event})");
+            }
+        }
+    }
+
+    fn ask<T>(&self, make: impl FnOnce(mpsc::Sender<T>) -> Job) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        self.tx.send(make(tx)).ok()?;
+        rx.recv().ok()
+    }
+}
+
+fn serve<A: Anchor>(log: Result<Log<A>, String>, rx: Receiver<Job>, dropped: &AtomicU64) {
+    for job in rx {
+        let log = match &log {
+            Ok(l) => l,
+            Err(e) => {
+                match job {
+                    Job::Record { event, .. } => eprintln!("hawser: audit append failed ({event}): {e}"),
+                    Job::Verify(r) => drop(r.send(Err(e.clone()))),
+                    Job::Archive(r) => drop(r.send(Err(e.clone()))),
+                    Job::Flush(r) => drop(r.send(())),
+                }
+                continue;
+            }
+        };
+        let lost = dropped.swap(0, Ordering::SeqCst);
+        if lost > 0 {
+            let res = log.record(
+                EV_DROPPED,
+                &format!("{lost} audit entr{} could not be recorded: the writer was blocked (a keychain prompt?) and its queue was full", if lost == 1 { "y" } else { "ies" }),
+                serde_json::json!({ "count": lost }),
+            );
+            if let Err(e) = res {
+                eprintln!("hawser: audit append failed ({EV_DROPPED}): {e}");
+            }
+        }
+        match job {
+            Job::Record { event, summary, detail } => {
+                if let Err(e) = log.record(&event, &summary, detail) {
+                    eprintln!("hawser: audit append failed ({event}): {e}");
+                }
+            }
+            Job::Verify(r) => drop(r.send(log.verify().map_err(|e| e.to_string()))),
+            Job::Archive(r) => drop(r.send(log.archive())),
+            Job::Flush(r) => drop(r.send(())),
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ public */
+
+/// Where the live log is. Beside hosts.json, except on Windows, where that is
+/// the ROAMING profile while the keychain seal (CRED_PERSIST_LOCAL_MACHINE)
+/// is per machine: a roaming log would be checked against another machine's
+/// seal. There it lives under %LOCALAPPDATA%, copied once from the roaming
+/// folder (archives included, so their pins still resolve).
+fn audit_path() -> Result<PathBuf, String> {
+    static PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    PATH.get_or_init(resolve_audit_path).clone()
+}
+
+fn resolve_audit_path() -> Result<PathBuf, String> {
+    let store = store_path().map_err(|e| e.to_string())?;
+    let roaming = store.parent().ok_or("no app data directory")?.to_path_buf();
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            let local = PathBuf::from(local).join("hawser");
+            if local != roaming {
+                if let Err(e) = migrate_audit_files(&roaming, &local) {
+                    eprintln!("hawser: could not move the audit log to the local profile: {e}");
+                    return Ok(roaming.join(AUDIT_FILE));
+                }
+            }
+            return Ok(local.join(AUDIT_FILE));
+        }
+    }
+    Ok(roaming.join(AUDIT_FILE))
+}
+
+/// Copy the audit files (`audit.jsonl`, its archives, torn evidence and a
+/// staged rotation) from `from` into `to`, once: skipped when `to` already has
+/// a log or a migration marker. The originals are left in place, since a
+/// roaming profile shares them with other machines.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn migrate_audit_files(from: &Path, to: &Path) -> std::io::Result<()> {
+    let marker = to.join("audit.migrated");
+    if marker.exists() || to.join(AUDIT_FILE).exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to)?;
+    super::platform::restrict_perms(to, 0o700);
+    if let Ok(dir) = std::fs::read_dir(from) {
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let ours = name == AUDIT_FILE
+                || (name.starts_with("audit-") && name.ends_with(".archived.jsonl"))
+                || name.starts_with("audit.jsonl.");
+            if !ours || name.ends_with(".lock") || !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let dest = to.join(&*name);
+            if !dest.exists() {
+                std::fs::copy(entry.path(), &dest)?;
+            }
+        }
+    }
+    std::fs::write(&marker, b"1\n")
+}
+
+fn writer() -> Option<&'static Writer> {
+    static W: OnceLock<Option<Writer>> = OnceLock::new();
+    W.get_or_init(|| {
+        match Writer::spawn(|| audit_path().map(|p| Log::new(p, Keychain))) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!("hawser: could not start the audit writer: {e}");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Start the writer thread now (at app startup) rather than on the first
+/// record. Never blocks on the file or the keychain.
+pub fn start() {
+    let _ = writer();
+}
+
+/// Append one record. Fire-and-forget and non-blocking: the record is queued
+/// for the writer thread, which does the file sync and the keychain seal, so
+/// an audited command never waits on either (a keychain prompt included).
+/// Errors are logged to stderr. Pass `detail` from `serde_json::json!`; it is
+/// flattened by [`sanitize`]. Never pass a password, key, command text, or
+/// command output.
+pub fn record(event: &str, summary: impl Into<String>, detail: Value) {
+    match writer() {
+        Some(w) => w.record(event, summary.into(), detail),
+        None => eprintln!("hawser: audit append failed ({event}): no audit writer"),
+    }
+}
+
+/// Wait (up to `timeout`) for every record queued so far to be written. Called
+/// on exit, so the last actions of a session are not lost with the process.
+pub fn flush(timeout: Duration) {
+    let Some(w) = writer() else { return };
+    let (tx, rx) = mpsc::channel();
+    // std's SyncSender has no send_timeout: retry try_send until the deadline.
+    let deadline = Instant::now() + timeout;
+    let mut job = Job::Flush(tx);
+    loop {
+        match w.tx.try_send(job) {
+            Ok(()) => break,
+            Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(j)) => {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                job = j;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
 /// A record as handed to the UI (the chain fields are not interesting there).
@@ -1151,9 +1862,11 @@ pub struct AuditView {
     pub detail: BTreeMap<String, Value>,
 }
 
-/// Most recent `limit` records, newest first.
+/// Most recent `limit` records, newest first. Reads only a tail window of the
+/// file; blocking, so call it off the async runtime.
 pub fn list(limit: usize) -> Result<Vec<AuditView>, String> {
-    global()?.list(limit).map_err(|e| e.to_string())
+    let path = audit_path()?;
+    Log::new(path, Keychain).list(limit).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -1183,12 +1896,20 @@ pub struct VerifyReport {
     pub seal_status: String,
 }
 
+/// Verify on the writer thread, after every record queued before it. Blocking.
 pub fn verify() -> Result<VerifyReport, String> {
-    global()?.verify().map_err(|e| e.to_string())
+    writer()
+        .ok_or("no audit writer")?
+        .ask(Job::Verify)
+        .unwrap_or_else(|| Err("the audit writer stopped".into()))
 }
 
+/// Archive on the writer thread. Blocking.
 pub fn archive() -> Result<String, String> {
-    global()?.archive()
+    writer()
+        .ok_or("no audit writer")?
+        .ask(Job::Archive)
+        .unwrap_or_else(|| Err("the audit writer stopped".into()))
 }
 
 #[cfg(test)]
@@ -1205,6 +1926,9 @@ mod tests {
         seal: Arc<Mutex<Option<String>>>,
         fail_writes: Arc<AtomicBool>,
         unavailable: Arc<AtomicBool>,
+        /// The next write lands, then reports failure (a keychain call that
+        /// timed out after storing the item).
+        land_then_fail: Arc<AtomicBool>,
     }
 
     impl Mem {
@@ -1238,6 +1962,9 @@ mod tests {
                 return Err("locked".into());
             }
             *self.seal.lock().unwrap() = Some(seal_payload(seq, hash));
+            if self.land_then_fail.swap(false, Ordering::SeqCst) {
+                return Err("timed out".into());
+            }
             Ok(())
         }
         fn freeze(&self, reason: &str) -> Result<(), String> {
@@ -1610,8 +2337,16 @@ mod tests {
         let r = log.verify().unwrap();
         assert_eq!(r.status, Status::Failed, "{}", r.message);
         assert!(r.message.contains(&a), "{}", r.message);
+        // Deleting an OLDER archive (to free space) is only a warning, and the
+        // message names it; archiving once more clears it.
         std::fs::remove_file(&pa).unwrap();
-        assert_eq!(status(&log), Status::Failed);
+        let r = log.verify().unwrap();
+        assert_eq!(r.status, Status::Warning, "{}", r.message);
+        assert!(r.message.contains(&a), "{}", r.message);
+        log.archive().unwrap();
+        rec(&log, 1);
+        let r = log.verify().unwrap();
+        assert_eq!(r.status, Status::Verified, "{}", r.message);
         let _ = b;
     }
 
@@ -1741,6 +2476,248 @@ mod tests {
         assert_eq!(d["obj"], json!("{\"x\":1}"));
         assert!(d["long"].as_str().unwrap().len() <= MAX_FIELD + '…'.len_utf8());
         assert_eq!(sanitize(json!("bare"))["value"], json!("bare"));
+    }
+
+    /* ---------------------------------------------------------- W4 regressions */
+
+    fn append_raw(p: &Path, bytes: &[u8]) {
+        let mut f = OpenOptions::new().append(true).open(p).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    fn siblings(p: &Path, prefix: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
+            .collect()
+    }
+
+    #[test]
+    fn invalid_utf8_tail_is_torn_and_kept_as_evidence() {
+        // A crash cut an append inside a multibyte character, or an attacker
+        // appended one 0xFF byte: either way, a torn tail, not a dead log.
+        for tail in [&b"{\"seq\":3,\"summary\":\"caf\xc3"[..], &b"\xff"[..]] {
+            let (p, m) = (tmp(), Mem::default());
+            rec(&restart(&p, &m), 2);
+            append_raw(&p, tail);
+            let log = restart(&p, &m);
+            assert_eq!(status(&log), Status::Warning);
+            rec(&log, 1);
+            let ls = lines(&p);
+            assert!(ls.iter().all(|l| serde_json::from_str::<AuditEntry>(l).is_ok()));
+            assert!(ls.iter().any(|l| l.contains(EV_TORN)));
+            let ev = siblings(&p, "audit.jsonl.torn-");
+            assert_eq!(ev.len(), 1);
+            assert_eq!(std::fs::read(&ev[0]).unwrap(), tail, "the dropped bytes are kept");
+            let r = log.verify().unwrap();
+            assert_eq!((r.status, r.count), (Status::Warning, 4), "{}", r.message);
+            assert_eq!(log.list(10).unwrap().len(), 4);
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_inside_the_log_is_a_failed_verify_not_an_error() {
+        let (p, m) = (tmp(), Mem::default());
+        rec(&restart(&p, &m), 3);
+        let mut ls: Vec<Vec<u8>> = lines(&p).into_iter().map(String::into_bytes).collect();
+        ls[1] = b"\xff\xfe not text".to_vec();
+        let mut body = ls.join(&b'\n');
+        body.push(b'\n');
+        std::fs::write(&p, body).unwrap();
+        let log = restart(&p, &m);
+        let r = log.verify().expect("a report, never an error");
+        assert_eq!((r.status, r.broken_at), (Status::Failed, Some(2)), "{}", r.message);
+        // Listing and recording keep working; archiving is the way out.
+        assert_eq!(log.list(10).unwrap().len(), 2);
+        rec(&log, 1);
+        log.archive().unwrap();
+        rec(&log, 1);
+        assert_eq!(status(&log), Status::Verified);
+    }
+
+    #[test]
+    fn unusable_staged_rotation_is_quarantined_even_with_the_keychain_locked() {
+        for kind in 0..3 {
+            let (p, m) = (tmp(), Mem::default());
+            rec(&restart(&p, &m), 2);
+            let log = restart(&p, &m);
+            let staged = log.rotating_path();
+            match kind {
+                0 => std::fs::write(&staged, b"\xff").unwrap(),
+                1 => std::fs::create_dir(&staged).unwrap(),
+                _ => std::fs::write(&staged, b"{\"seq\":1,\"ev").unwrap(),
+            }
+            // A junk file can never have committed: the keychain need not be
+            // read, so a locked keychain does not block the log either.
+            m.unavailable.store(true, Ordering::SeqCst);
+            assert!(log.record("connect", "while locked", json!({})).is_ok(), "kind {kind}");
+            m.unavailable.store(false, Ordering::SeqCst);
+            assert!(!staged.exists(), "kind {kind}");
+            assert_eq!(siblings(&p, "audit.jsonl.rotating.bad-").len(), 1, "kind {kind}");
+            rec(&log, 1);
+            assert_eq!(status(&log), Status::Verified, "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn a_seal_that_landed_despite_an_error_completes_the_archive() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        rec(&log, 3);
+        m.land_then_fail.store(true, Ordering::SeqCst);
+        let name = log.archive().expect("the seal names the staged record: committed");
+        assert!(p.with_file_name(&name).exists());
+        rec(&log, 1);
+        let r = restart(&p, &m).verify().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 2), "{}", r.message);
+    }
+
+    #[test]
+    fn a_seal_write_that_did_not_land_discards_the_staged_log() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        rec(&log, 3);
+        m.fail_writes.store(true, Ordering::SeqCst);
+        assert!(log.archive().is_err());
+        m.fail_writes.store(false, Ordering::SeqCst);
+        assert!(!log.rotating_path().exists());
+        rec(&log, 1);
+        let r = log.verify().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 4), "{}", r.message);
+    }
+
+    #[test]
+    fn archive_names_carry_the_archived_hash_and_are_never_reused() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        rec(&log, 2);
+        let a = log.archive().unwrap();
+        let first: AuditEntry = serde_json::from_str(&lines(&p)[0]).unwrap();
+        let sha = first.detail["archivedSha256"].as_str().unwrap();
+        assert!(a.contains(&sha[..12]), "{a}");
+        rec(&log, 2);
+        let b = log.archive().unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_second_process_appending_never_forks_the_chain() {
+        // Two Logs over one file and one seal = two app instances.
+        let (p, m) = (tmp(), Mem::default());
+        let a = restart(&p, &m);
+        let b = restart(&p, &m);
+        for i in 0..10 {
+            let w = if i % 2 == 0 { &a } else { &b };
+            w.record("connect", &format!("event {i}"), json!({})).unwrap();
+        }
+        // Concurrently too (the cross-process lock serialises the appends).
+        let (a, b) = (Arc::new(a), Arc::new(b));
+        let ts: Vec<_> = [Arc::clone(&a), Arc::clone(&b)]
+            .into_iter()
+            .map(|l| std::thread::spawn(move || rec(&l, 20)))
+            .collect();
+        for t in ts {
+            t.join().unwrap();
+        }
+        let r = restart(&p, &m).verify().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 50), "{}", r.message);
+        assert!(!m.frozen());
+    }
+
+    #[test]
+    fn a_failed_newline_repair_never_glues_two_records() {
+        let (p, m) = (tmp(), Mem::default());
+        rec(&restart(&p, &m), 2);
+        // Strip the final newline: a complete record missing only that.
+        let text = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, text.trim_end_matches('\n')).unwrap();
+        let log = restart(&p, &m);
+        log.faults.fail_newline_repair.store(true, Ordering::SeqCst);
+        assert!(log.record("connect", "x", json!({})).is_err(), "the session does not open");
+        rec(&log, 1);
+        let r = log.verify().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 3), "{}", r.message);
+    }
+
+    #[test]
+    fn list_reads_a_tail_window_newest_first() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        rec(&log, 60);
+        let l = log.list(10).unwrap();
+        assert_eq!(l.iter().map(|v| v.seq).collect::<Vec<_>>(), (51..=60).rev().collect::<Vec<_>>());
+        assert_eq!(log.list(1000).unwrap().len(), 60);
+        assert!(restart(&tmp(), &m).list(5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlong_lines_are_bad_rows_not_allocations() {
+        let (p, m) = (tmp(), Mem::default());
+        rec(&restart(&p, &m), 1);
+        append_raw(&p, &vec![b'x'; MAX_LINE + 10]);
+        append_raw(&p, b"\n");
+        let r = restart(&p, &m).verify().unwrap();
+        assert_eq!((r.status, r.broken_at), (Status::Failed, Some(2)), "{}", r.message);
+    }
+
+    #[test]
+    fn the_writer_thread_keeps_order_and_answers_verify() {
+        let (p, m) = (tmp(), Mem::default());
+        let log = restart(&p, &m);
+        let w = Writer::spawn(move || Ok(log)).unwrap();
+        for i in 0..20 {
+            w.record("connect", format!("event {i}"), json!({ "n": i }));
+        }
+        // Queued after the records, so it sees all of them.
+        let r = w.ask(Job::Verify).unwrap().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 20), "{}", r.message);
+        let seqs: Vec<u64> = lines(&p)
+            .iter()
+            .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap().seq)
+            .collect();
+        assert_eq!(seqs, (1..=20).collect::<Vec<_>>());
+        // Dropped records (a full queue) are themselves recorded.
+        w.dropped.store(3, Ordering::SeqCst);
+        w.record("connect", "after".into(), json!({}));
+        let r = w.ask(Job::Verify).unwrap().unwrap();
+        assert_eq!((r.status, r.count), (Status::Warning, 22), "{}", r.message);
+        assert!(lines(&p).iter().any(|l| l.contains(EV_DROPPED)));
+        assert!(w.ask(Job::Flush).is_some());
+    }
+
+    #[test]
+    fn a_pending_session_seals_only_an_unchanged_file() {
+        let (p, m) = (tmp(), Mem::default());
+        rec(&restart(&p, &m), 2);
+        m.unavailable.store(true, Ordering::SeqCst);
+        let log = restart(&p, &m);
+        rec(&log, 2); // pending: written, not sealed
+        m.unavailable.store(false, Ordering::SeqCst);
+        rec(&log, 1); // resolves: anchored at 2, seals 5
+        let r = log.verify().unwrap();
+        assert_eq!((r.status, r.count), (Status::Verified, 5), "{}", r.message);
+        assert_eq!(m.get().unwrap().0, 5);
+    }
+
+    #[test]
+    fn audit_files_migrate_once_and_originals_stay() {
+        let from = tmp().parent().unwrap().to_path_buf();
+        let to = tmp().parent().unwrap().join("local");
+        std::fs::write(from.join(AUDIT_FILE), b"log\n").unwrap();
+        std::fs::write(from.join("audit-1-abc.archived.jsonl"), b"old\n").unwrap();
+        std::fs::write(from.join("hosts.json"), b"[]").unwrap();
+        migrate_audit_files(&from, &to).unwrap();
+        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"log\n");
+        assert!(to.join("audit-1-abc.archived.jsonl").exists());
+        assert!(!to.join("hosts.json").exists());
+        assert!(from.join(AUDIT_FILE).exists());
+        // Once: a later run never overwrites the local log.
+        std::fs::write(to.join(AUDIT_FILE), b"newer\n").unwrap();
+        std::fs::write(from.join(AUDIT_FILE), b"roamed\n").unwrap();
+        migrate_audit_files(&from, &to).unwrap();
+        assert_eq!(std::fs::read(to.join(AUDIT_FILE)).unwrap(), b"newer\n");
     }
 
     #[test]
