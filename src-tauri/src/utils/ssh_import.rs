@@ -304,7 +304,15 @@ impl Reader {
         let shown = path.display().to_string();
         // No metadata() before the open: the opened handle is what is checked
         // (a FIFO cannot block the open, see open_top).
-        let file = open_top(path).map_err(|e| format!("{shown}: {e}"))?;
+        let file = open_top(path).map_err(|e| {
+            // Windows refuses to open a folder with "Access is denied"; say
+            // what it is instead. Only classifies after the open has failed.
+            if std::fs::metadata(path).map(|m| !m.is_file()).unwrap_or(false) {
+                format!("{shown}: not a regular file, not read")
+            } else {
+                format!("{shown}: {e}")
+            }
+        })?;
         let key = match file_key_top(&file, path) {
             Ok(k) => k,
             Err(e) => return Err(format!("{shown}: {e}")),
@@ -2214,8 +2222,11 @@ Host *
         };
         let inc = resolve(&real);
         assert!(open_included(&inc, &t.0).is_ok());
+        // The validated file is moved aside, not deleted, so it stays alive
+        // and the filesystem cannot hand its inode number to a replacement
+        // (Linux does reuse freed inodes immediately).
+        fs::rename(&real, t.0.join(".ssh/real.conf.kept")).unwrap();
         // Swapped for a symlink after validation: O_NOFOLLOW refuses it.
-        fs::remove_file(&real).unwrap();
         symlink(&other, &real).unwrap();
         assert!(open_included(&inc, &t.0).is_err());
         // Swapped for another regular file: fstat identity differs.
