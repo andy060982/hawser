@@ -46,6 +46,7 @@ import { AuthPromptDialog } from './AuthPromptDialog'
 import { HostEditor } from './HostEditor'
 import { HistoryBrowser } from './HistoryBrowser'
 import { SettingsDialog } from './SettingsDialog'
+import { UpdateBanner } from './UpdateBanner'
 import { TunnelDialog } from './TunnelDialog'
 import { FindBar } from './FindBar'
 import { TransferBar } from './TransferBar'
@@ -54,6 +55,7 @@ import { NetToolsDialog } from './NetToolsDialog'
 import { AiPanel } from './AiPanel'
 import { ConfigHistoryDialog } from './ConfigHistoryDialog'
 import { AuditDialog } from './AuditDialog'
+import { ImportHostsDialog } from './ImportHostsDialog'
 import { QuickConnect } from './QuickConnect'
 
 /* ---------------------------------------------------------------------------
@@ -125,6 +127,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   const [editing, setEditing] = useState<{ host: Host | null } | null>(null)
   const [showHistory, setShowHistory] = useState(false)
   const [showAudit, setShowAudit] = useState(false)
+  const [showImportHosts, setShowImportHosts] = useState(false)
   const [showFind, setShowFind] = useState(false)
   /** Bumped by each Ctrl+Shift+F, so an open find bar re-focuses its input. */
   const [findNonce, setFindNonce] = useState(0)
@@ -1625,6 +1628,7 @@ Passwords are NOT included — they stay in the system's credential store. On-co
         label: 'Import hosts…',
         onSelect: () => importInputRef.current?.click(),
       },
+      { label: 'Import from SSH config / PuTTY…', onSelect: () => setShowImportHosts(true) },
       {
         label: 'Open logs folder',
         onSelect: () =>
@@ -1647,6 +1651,7 @@ Passwords are NOT included — they stay in the system's credential store. On-co
   const openSidebarMenu = useCallback((x: number, y: number) => {
     const items: MenuItem[] = [
       { label: 'New Connection…', onSelect: () => setEditing({ host: null }) },
+      { label: 'Import from SSH config / PuTTY…', onSelect: () => setShowImportHosts(true) },
       {
         label: 'New Folder…',
         onSelect: async () => {
@@ -1985,6 +1990,7 @@ Passwords are NOT included — they stay in the system's credential store. On-co
           onHostMenu={openHostMenu}
           onFolderMenu={openFolderMenu}
           onSidebarMenu={openSidebarMenu}
+          onImportHosts={() => setShowImportHosts(true)}
           onProbe={() => void probeAll()}
           probing={probing}
           reachability={reachability}
@@ -2093,9 +2099,30 @@ Passwords are NOT included — they stay in the system's credential store. On-co
           self-hides until the backend raises a prompt. */}
       <HostKeyDialog />
       <AuthPromptDialog />
+      <UpdateBanner sessions={() => sessionsRef.current} />
 
       {showHistory && <HistoryBrowser onClose={() => setShowHistory(false)} />}
       {showAudit && <AuditDialog onClose={() => setShowAudit(false)} />}
+      {showImportHosts && (
+        <ImportHostsDialog
+          catalogue={hosts}
+          onClose={() => setShowImportHosts(false)}
+          onImport={(build, source) => {
+            if (!loadedRef.current) {
+              void alert('Import failed: your own host catalogue is not loaded, so nothing can be added to it')
+              return
+            }
+            // Built against the catalogue as it is now; saved through the
+            // normal catalogue path (no credential is created).
+            const { catalogue, added, notes } = build(hostsRef.current)
+            persistHosts(catalogue)
+            void safeInvoke('hosts_import_record', { source, count: added }).catch(() => {})
+            setShowImportHosts(false)
+            const extra = notes.length ? `\n\n${notes.slice(0, 12).join('\n')}${notes.length > 12 ? `\n…and ${notes.length - 12} more` : ''}` : ''
+            void alert(`Imported ${added} host${added === 1 ? '' : 's'}. No passwords or key passphrases were imported; Hawser asks for them when you connect.${extra}`)
+          }}
+        />
+      )}
 
       {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
 
@@ -2143,6 +2170,7 @@ Passwords are NOT included — they stay in the system's credential store. On-co
               // can never corrupt the tree or silently drop nested hosts.
               const fresh = reidentify(tree, hostsRef.current)
               persistHosts([...hostsRef.current, ...fresh])
+              void safeInvoke('hosts_import_record', { source: 'json', count: countHosts(fresh) }).catch(() => {})
               const dropped = risky.length > 0 && !allowRisky ? ' Their on-connect commands, config checks, AI access and local-shell settings were left out.' : ''
               void alert(`Imported ${fresh.length} top-level entr${fresh.length === 1 ? 'y' : 'ies'}. Passwords are never in exports — set them per host after importing.${dropped}`)
             } catch (err) {

@@ -2,6 +2,7 @@ mod credentials;
 mod local_shell;
 mod utils;
 mod ssh;
+mod updater;
 
 use std::time::UNIX_EPOCH;
 
@@ -1016,6 +1017,58 @@ async fn hosts_export() -> CmdResult<String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+/// What the "Import from SSH config / PuTTY" dialog can offer here: the
+/// default ssh config path, and whether PuTTY sessions can be read (Windows).
+#[tauri::command]
+fn hosts_import_sources() -> serde_json::Value {
+    let ssh_config = utils::platform::home_dir()
+        .map(|h| utils::ssh_import::default_ssh_config_path(&h).to_string_lossy().into_owned());
+    serde_json::json!({ "sshConfig": ssh_config, "putty": cfg!(windows) })
+}
+
+/// Scan an import source into candidate hosts for the preview. Reads only:
+/// nothing is saved here (the frontend saves the checked rows through
+/// `hosts_save`), and no secret is read or created.
+#[tauri::command]
+async fn hosts_import_scan(source: String, path: Option<String>) -> CmdResult<utils::ssh_import::ImportReport> {
+    off(move || {
+        let user = utils::ssh_import::local_user_name();
+        match source.as_str() {
+            "ssh-config" => {
+                let home = utils::platform::home_dir().ok_or("cannot resolve your home folder")?;
+                let file = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                    Some(p) => utils::platform::expand_home(p, Some(&home)),
+                    None => utils::ssh_import::default_ssh_config_path(&home),
+                };
+                utils::ssh_import::scan_ssh_config(&file, &home, &user)
+            }
+            "putty" => {
+                let sessions = utils::ssh_import::read_putty_sessions()?;
+                Ok(utils::ssh_import::putty_report(&sessions, &user))
+            }
+            _ => Err("unknown import source".to_string()),
+        }
+    })
+    .await
+}
+
+/// Audit a completed host import: source and count only, never the hosts.
+#[tauri::command]
+fn hosts_import_record(source: String, count: u32) -> CmdResult<()> {
+    let label = match source.as_str() {
+        "ssh-config" => "the SSH config",
+        "putty" => "PuTTY sessions",
+        "json" => "a Hawser export",
+        _ => return Err("unknown import source".to_string()),
+    };
+    utils::audit::record(
+        "hosts.import",
+        format!("imported {count} host(s) from {label}"),
+        serde_json::json!({ "source": source, "count": count, "ok": true }),
+    );
+    Ok(())
+}
+
 /* ---------------------------------------------------------------- network */
 
 /// Start ping or traceroute against a target; output streams on `net://{run_id}`.
@@ -1598,7 +1651,7 @@ pub fn run() {
     // Fails CLOSED: only "another live instance holds it" hands off; any
     // other failure to take the lock is shown and the app exits, never runs
     // unguarded.
-    let _instance = match utils::instance::decide(utils::instance::acquire()) {
+    let _instance = match utils::instance::decide(updater::acquire_instance()) {
         utils::instance::Startup::Run(lock) => lock,
         utils::instance::Startup::HandOff => return run_second_instance(context),
         utils::instance::Startup::Refuse(message) => {
@@ -1613,6 +1666,9 @@ pub fn run() {
             let _ = w.set_focus();
         }
     })
+        // Self-update: signature-checked against plugins.updater.pubkey.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             app.manage(Registry::default());
             app.manage(Arc::new(local_shell::LocalShells::default()));
@@ -1722,6 +1778,9 @@ pub fn run() {
             hosts_keep_backup,
             vault_id_rule,
             hosts_export,
+            hosts_import_sources,
+            hosts_import_scan,
+            hosts_import_record,
             sessions_load,
             sessions_save,
             session_history,
@@ -1739,10 +1798,16 @@ pub fn run() {
             credential_status,
             credential_delete,
             credential_binding_narrow,
+            updater::update_install_kind,
+            updater::update_open_releases,
+            updater::update_prepare_install,
         ])
         .build(context)
         .expect("error while running tauri application");
     app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { code, .. } = &event {
+            updater::mark_relaunch(*code);
+        }
         // Audit records are written by a background thread: give the queue
         // up to 10 s to drain, then spill whatever is still pending to
         // audit.pending-<ts>.jsonl, recorded at the next start.

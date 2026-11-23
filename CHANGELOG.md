@@ -14,6 +14,13 @@ All notable changes to Hawser are documented here. Format follows
 
 ### Added
 
+- **Signed auto-update.** Hawser checks GitHub releases at startup (at most
+  once a day; Settings → Updates turns it off, and has a manual "Check for
+  updates"). A new version shows a banner with its release notes; nothing
+  installs until you click "Install and restart", and live sessions are
+  confirmed first. Every update is verified against Hawser's signing key
+  before it installs. The portable Windows exe and the Linux .deb can't
+  replace themselves, so for those the banner links to the download page.
 - **Tamper-evident audit log** (menu → Audit log…). Connects, logins, file
   transfers, deletes, key generation/installs, credential changes, and host
   exports are recorded as a hash chain whose head is sealed in the OS keychain.

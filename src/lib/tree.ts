@@ -744,3 +744,254 @@ export function vaultSlotSharing(
   )
   return { shared: borrowing || others.length > 0, lender, others, orphaned: borrowing && !lender }
 }
+
+/* ------------------------------------------ ssh config / PuTTY import */
+
+/** Where an "Import from SSH config / PuTTY" scan came from. */
+export type ImportSource = 'ssh-config' | 'putty'
+
+/** A scanned host's ProxyJump, as the backend reports it (ssh_import.rs). */
+export type ScannedJump =
+  | { kind: 'alias'; alias: string }
+  | { kind: 'literal'; host: string; port: number; user: string | null }
+
+export interface ScannedHost {
+  name: string
+  hostname: string
+  port: number
+  user: string | null
+  keyPath: string | null
+  jump: ScannedJump | null
+  warnings: string[]
+  origin: string
+}
+
+export interface ScanReport {
+  source: ImportSource
+  hosts: ScannedHost[]
+  warnings: string[]
+  skipped: string[]
+  unsupportedKeys: string[]
+  filesRead: string[]
+  localUser: string
+}
+
+/** One row of the import preview. */
+export interface ImportRow {
+  index: number
+  scanned: ScannedHost
+  /** The login the host gets: the scanned user, else the local account
+   *  name (what OpenSSH would use). */
+  username: string
+  userDefaulted: boolean
+  /** An existing catalogue host with the same host, port and user. */
+  duplicateOf?: { id: string; name: string }
+  /** What the jump column shows; undefined for no jump. */
+  jumpLabel?: string
+  warnings: string[]
+  status: 'new' | 'duplicate' | 'warning'
+  /** Whether the row starts checked: everything except duplicates. */
+  checked: boolean
+}
+
+/** Same destination: hostname (case-insensitive), port, user. */
+export const importEndpointKey = (host: string, port: number, user: string): string =>
+  `${user}@${host.toLowerCase()}:${port}`
+
+export const importFolderName = (source: ImportSource): string =>
+  source === 'putty' ? 'Imported (PuTTY)' : 'Imported (ssh config)'
+
+const hostKey = (h: Host) => importEndpointKey(h.hostname, h.port, h.username)
+
+/** The literal jump's endpoint key, with the local account as the default
+ *  user, as for the hosts themselves. */
+const literalJumpKey = (j: Extract<ScannedJump, { kind: 'literal' }>, localUser: string) =>
+  importEndpointKey(j.host, j.port, j.user ?? localUser)
+
+const literalLabel = (j: Extract<ScannedJump, { kind: 'literal' }>, localUser: string) =>
+  `${j.user ?? localUser}@${j.host}${j.port !== 22 ? `:${j.port}` : ''}`
+
+/** Turn a scan into preview rows: the effective user, duplicates of existing
+ *  catalogue hosts (unchecked by default), and a jump label. Pure. */
+export function planImport(report: ScanReport, existing: HostNode[]): ImportRow[] {
+  const byKey = new Map<string, Host>()
+  for (const h of allHosts(existing)) if (!byKey.has(hostKey(h))) byKey.set(hostKey(h), h)
+  const local = report.localUser
+  const rowKeys = report.hosts.map((s) => importEndpointKey(s.hostname, s.port, s.user ?? local))
+  return report.hosts.map((s, index) => {
+    const username = s.user ?? local
+    const warnings = [...s.warnings]
+    if (s.user === null && !local) warnings.push('no user name; set it after importing')
+    const dup = byKey.get(rowKeys[index])
+    let jumpLabel: string | undefined
+    if (s.jump?.kind === 'alias') {
+      jumpLabel = s.jump.alias
+    } else if (s.jump?.kind === 'literal') {
+      const key = literalJumpKey(s.jump, local)
+      const ex = byKey.get(key)
+      const row = rowKeys.indexOf(key)
+      jumpLabel = ex
+        ? `${ex.name} (existing)`
+        : row >= 0 && row !== index
+          ? report.hosts[row].name
+          : `${literalLabel(s.jump, local)} (new)`
+    }
+    const status: ImportRow['status'] = dup ? 'duplicate' : warnings.length ? 'warning' : 'new'
+    return {
+      index,
+      scanned: s,
+      username,
+      userDefaulted: s.user === null,
+      duplicateOf: dup ? { id: dup.id, name: dup.name } : undefined,
+      jumpLabel,
+      warnings,
+      status,
+      checked: !dup,
+    }
+  })
+}
+
+/** Where imported hosts go. */
+export type ImportTarget =
+  | { kind: 'new-folder'; name: string }
+  | { kind: 'folder'; id: string }
+  | { kind: 'top' }
+
+/** Temp ids are deliberately not usable as kept ids (a NUL is not printable
+ *  ASCII), so reidentify gives every imported node a fresh catalogue id. */
+const TEMP = '\u0000imp-'
+
+/** Put `children` at the end of folder `folderId` (anywhere in the tree). */
+function appendToFolder(nodes: HostNode[], folderId: string, children: HostNode[]): HostNode[] {
+  return nodes.map((n) =>
+    isFolder(n)
+      ? n.id === folderId
+        ? { ...n, children: [...n.children, ...children] }
+        : { ...n, children: appendToFolder(n.children, folderId, children) }
+      : n,
+  )
+}
+
+/** Build the catalogue that results from importing the checked rows.
+ *
+ *  Imported hosts carry only address fields (name, hostname, port, user,
+ *  auth, key path, jump host): never on-connect commands, config checks, an
+ *  AI opt-in or a local shell, and no credential reference. AI access is left
+ *  unset so the default colour policy applies. Auth is `key` when a key file
+ *  was found, else `password` (asked for on connect, never stored here).
+ *
+ *  Jump hosts: an alias of the same import links to that row when it is
+ *  checked, or to the existing host it duplicates; a literal `user@host:port`
+ *  links to an existing host with that endpoint, else a checked row with it,
+ *  else a jump host entry is created (once per endpoint). Every node gets a
+ *  fresh id through `reidentify`. */
+export function buildImport(
+  rows: ImportRow[],
+  checked: ReadonlySet<number>,
+  existing: HostNode[],
+  target: ImportTarget,
+  localUser: string,
+): { catalogue: HostNode[]; added: number; notes: string[] } {
+  const notes: string[] = []
+  const picked = rows.filter((r) => checked.has(r.index))
+  const tempId = (i: number) => `${TEMP}${i}`
+  const byName = new Map<string, ImportRow>()
+  for (const r of rows) if (!byName.has(r.scanned.name.toLowerCase())) byName.set(r.scanned.name.toLowerCase(), r)
+  const pickedByKey = new Map<string, ImportRow>()
+  for (const r of picked) {
+    const k = importEndpointKey(r.scanned.hostname, r.scanned.port, r.username)
+    if (!pickedByKey.has(k)) pickedByKey.set(k, r)
+  }
+  const existingByKey = new Map<string, Host>()
+  for (const h of allHosts(existing)) if (!existingByKey.has(hostKey(h))) existingByKey.set(hostKey(h), h)
+
+  /** temp id -> existing catalogue id, applied after reidentify (which
+   *  drops references that leave the import). */
+  const external = new Map<string, string>()
+  const created = new Map<string, Host>()
+  const hosts: Host[] = picked.map((r) => {
+    const s = r.scanned
+    const id = tempId(r.index)
+    const h: Host = {
+      kind: 'host',
+      id,
+      name: s.name,
+      hostname: s.hostname,
+      port: s.port,
+      username: r.username,
+      auth: s.keyPath ? 'key' : 'password',
+      ...(s.keyPath ? { keyPath: s.keyPath } : {}),
+    }
+    if (s.jump?.kind === 'alias') {
+      const target = byName.get(s.jump.alias.toLowerCase())
+      if (target && target.index !== r.index && checked.has(target.index)) {
+        h.jumpHostId = tempId(target.index)
+      } else if (target?.duplicateOf) {
+        external.set(id, target.duplicateOf.id)
+      } else {
+        notes.push(`${s.name}: its jump host ${s.jump.alias} was not selected, so it was imported without one`)
+      }
+    } else if (s.jump?.kind === 'literal') {
+      const key = literalJumpKey(s.jump, localUser)
+      const ex = existingByKey.get(key)
+      const row = pickedByKey.get(key)
+      if (ex) {
+        external.set(id, ex.id)
+      } else if (row && row.index !== r.index) {
+        h.jumpHostId = tempId(row.index)
+      } else if (!row) {
+        let jh = created.get(key)
+        if (!jh) {
+          jh = {
+            kind: 'host',
+            id: `${TEMP}j${created.size}`,
+            name: literalLabel(s.jump, localUser),
+            hostname: s.jump.host,
+            port: s.jump.port,
+            username: s.jump.user ?? localUser,
+            auth: 'password',
+          }
+          created.set(key, jh)
+          notes.push(`created jump host ${jh.name}`)
+        }
+        h.jumpHostId = jh.id
+      }
+    }
+    return h
+  })
+  const all: HostNode[] = [...hosts, ...created.values()]
+  // Defence in depth: the same allowlist as a JSON import, risky fields off.
+  const { tree: clean } = sanitizeImport(all, false)
+  const wrapped: HostNode[] =
+    target.kind === 'new-folder'
+      ? [{ kind: 'folder', id: `${TEMP}folder`, name: target.name.trim() || 'Imported', children: clean }]
+      : clean
+  const fresh = reidentify(wrapped, existing)
+
+  // Map temp ids to fresh ones (same shape, same order) and apply the links
+  // to existing hosts.
+  const renamed = new Map<string, string>()
+  const zip = (a: HostNode[], b: HostNode[]) =>
+    a.forEach((n, i) => {
+      renamed.set(n.id, b[i].id)
+      if (isFolder(n)) zip(n.children, (b[i] as HostFolder).children)
+    })
+  zip(wrapped, fresh)
+  const linkTo = new Map<string, string>()
+  for (const [t, ex] of external) linkTo.set(renamed.get(t) ?? t, ex)
+  const link = (list: HostNode[]): HostNode[] =>
+    list.map((n) =>
+      isFolder(n)
+        ? { ...n, children: link(n.children) }
+        : linkTo.has(n.id)
+          ? { ...n, jumpHostId: linkTo.get(n.id) }
+          : n,
+    )
+  const linked = link(fresh)
+
+  const catalogue =
+    target.kind === 'folder' && allFolders(existing).some((f) => f.id === target.id)
+      ? appendToFolder(existing, target.id, linked)
+      : [...existing, ...linked]
+  return { catalogue, added: all.length, notes }
+}

@@ -1,7 +1,10 @@
 name: Release
 
 # Push a version tag (e.g. v0.2.0) and this builds Hawser on Windows and Linux
-# and attaches every installer/bundle to a GitHub release for that tag.
+# and attaches every installer/bundle to a GitHub release for that tag, with
+# the updater signatures, then publishes latest.json for the in-app updater.
+# macOS is built, notarized and added to latest.json on Andy's Mac afterwards
+# (scripts/add-macos-to-latest.mjs; see RELEASING.md).
 on:
   push:
     tags: ['v*']
@@ -87,12 +90,47 @@ jobs:
 
       - run: npm ci
 
+      # The cargo cache restores src-tauri/target, bundles from an earlier
+      # version included. Clear them so only this build's installers and
+      # signatures are uploaded (the manifest job expects exactly one of each).
+      - name: Clear cached bundles
+        shell: bash
+        run: rm -rf src-tauri/target/release/bundle
+
       - name: Build release bundles
         # APPIMAGE_EXTRACT_AND_RUN lets appimagetool run without FUSE on the
         # GitHub runner. On Windows the flag is simply ignored.
+        # createUpdaterArtifacts signs the NSIS installer and the AppImage with
+        # the minisign key from the repo secrets (the CLI reads both variables
+        # itself; they are never echoed). A missing key fails the build.
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
+
+      # Tauri 2 (createUpdaterArtifacts: true, not "v1Compatible") signs the
+      # installers themselves: <name>-setup.exe.sig and <name>.AppImage.sig. No
+      # .nsis.zip or .AppImage.tar.gz is made.
+      - name: Check updater signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            bundles=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          else
+            bundles=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          fi
+          if [ "${#bundles[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one updater bundle, found ${#bundles[@]}: ${bundles[*]:-none}"
+            exit 1
+          fi
+          if [ ! -s "${bundles[0]}.sig" ]; then
+            echo "::error::${bundles[0]}.sig is missing: is TAURI_SIGNING_PRIVATE_KEY set?"
+            exit 1
+          fi
+          echo "signed: ${bundles[0]}"
 
       - name: Upload artifacts to the release
         uses: softprops/action-gh-release@v2
@@ -106,6 +144,50 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
             src-tauri/target/release/hawser.exe
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+
+  # latest.json for tauri-plugin-updater, once both platforms are on the
+  # release. The app fetches releases/latest/download/latest.json, and
+  # "latest" never resolves to a pre-release, so a hyphenated tag's manifest
+  # is published but offered to nobody. Signatures are public; no secret is
+  # used here beyond the job's own GITHUB_TOKEN.
+  manifest:
+    needs: release
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sigs prev
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir sigs
+          # A re-run keeps the macOS entries already merged into latest.json.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'latest.json' --dir prev || true
+          ls -l sigs
+
+      - name: Build latest.json
+        run: >-
+          node scripts/latest-json.mjs build
+          --tag "$TAG" --repo "$GITHUB_REPOSITORY" --sigdir sigs
+          --changelog CHANGELOG.md --conf src-tauri/tauri.conf.json
+          --existing prev/latest.json --out latest.json
+
+      - name: Upload latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber

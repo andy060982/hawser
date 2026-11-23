@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronsDownUp, Clock, Plus, Radar, Search, X } from 'lucide-react'
+import { ChevronsDownUp, Clock, Download, Plus, Radar, Search, X } from 'lucide-react'
 import { type Host, type HostNode } from '../types'
 import { HostTree } from './HostTree'
 import { allFolderIds, filterTree } from '../lib/tree'
@@ -17,6 +17,8 @@ interface Props {
   onFolderMenu: (folderId: string, name: string, x: number, y: number) => void
   /** Right-click on the sidebar's empty area (not on a host/folder row). */
   onSidebarMenu: (x: number, y: number) => void
+  /** "Import from SSH config / PuTTY…" (offered in the empty state). */
+  onImportHosts?: () => void
   onProbe: () => void
   probing: boolean
   reachability: Record<string, { ok: boolean; ms?: number }>
@@ -26,7 +28,7 @@ interface Props {
 
 export function HostSidebar({
   hosts, width, onOpenHost, onSelectHost, onAddHost, onEditHost, onOpenHistory,
-  onHostMenu, onFolderMenu, onSidebarMenu, onProbe, probing, reachability, openHostIds, activeHostId,
+  onHostMenu, onFolderMenu, onSidebarMenu, onImportHosts, onProbe, probing, reachability, openHostIds, activeHostId,
 }: Props) {
   const [query, setQuery] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
@@ -147,6 +149,16 @@ export function HostSidebar({
               <Plus size={12} aria-hidden />
               Add host
             </button>
+            {onImportHosts && (
+              <button
+                type="button"
+                onClick={onImportHosts}
+                className="mt-2 flex w-full items-center justify-center gap-1 text-[11.5px] text-ink-dim hover:text-ink"
+              >
+                <Download size={12} aria-hidden />
+                Import from SSH config / PuTTY…
+              </button>
+            )}
           </div>
         ) : tree.length === 0 ? (
           <p className="px-3 py-6 text-center text-[12px] text-ink-faint">

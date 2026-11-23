@@ -47,6 +47,9 @@ export interface Settings {
   /** Keep a transcript of local terminals, like SSH sessions, so session
    *  search covers them. Everything shown on screen is written to disk. */
   recordLocalTranscripts: boolean
+  /** Check GitHub for a new release at startup (at most once a day). Never
+   *  installs on its own: an update waits for "Install and restart". */
+  autoUpdateCheck: boolean
 }
 
 const PERMISSIVE: ColorPolicy = { ai: 'on', confirmConnect: false, excludeFromBroadcast: false }
@@ -78,6 +81,7 @@ export function defaultSettings(): Settings {
     middleClickPaste: true,
     localShellOnStartup: false,
     recordLocalTranscripts: true,
+    autoUpdateCheck: true,
   }
 }
 
@@ -99,6 +103,7 @@ function hydrate(raw: unknown): Settings {
   if (typeof r.localShellOnStartup === 'boolean') base.localShellOnStartup = r.localShellOnStartup
   if (typeof r.defaultLocalShell === 'string') base.defaultLocalShell = r.defaultLocalShell
   if (typeof r.recordLocalTranscripts === 'boolean') base.recordLocalTranscripts = r.recordLocalTranscripts
+  if (typeof r.autoUpdateCheck === 'boolean') base.autoUpdateCheck = r.autoUpdateCheck
   return base
 }
 

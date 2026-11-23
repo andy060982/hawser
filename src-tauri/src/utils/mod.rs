@@ -13,3 +13,4 @@ pub mod platform;
 pub mod remote_edit;
 pub mod vault_item;
 pub mod session_log;
+pub mod ssh_import;

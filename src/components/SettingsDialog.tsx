@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react'
 import { Settings2, X } from 'lucide-react'
 import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { policyFor, useSettings } from '../lib/settings'
-import { safeInvoke } from '../lib/tauri'
+import { inTauri, safeInvoke } from '../lib/tauri'
 import { useModalLayer } from '../lib/useModalLayer'
+import { checkForUpdates, readLastCheck, useUpdateState } from '../lib/updateClient'
+import { statusLine } from '../lib/updater'
 import type { EditorView } from '../types'
 
 /* ---------------------------------------------------------------------------
@@ -47,6 +49,17 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       .catch((e) => setEditorError(e instanceof Error ? e.message : String(e)))
   }
   const editorDirty = editor.trim() !== (editorSaved?.command ?? '')
+
+  // Updates: the shared update state the banner also shows.
+  const updateState = useUpdateState()
+  const [appVersion, setAppVersion] = useState<string | null>(null)
+  useEffect(() => {
+    void import('@tauri-apps/api/app')
+      .then(({ getVersion }) => (inTauri() ? getVersion() : null))
+      .then((v) => setAppVersion(v ?? null))
+      .catch(() => setAppVersion(null))
+  }, [])
+  const updateBusy = ['checking', 'downloading', 'installing'].includes(updateState.phase)
 
   // Escape closes this dialog only while it is the top modal.
   useModalLayer(true, onClose)
@@ -340,6 +353,40 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 </span>
               </span>
             </label>
+          </section>
+
+          {/* --- Updates --- */}
+          <section className="mt-4">
+            <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">Updates</h3>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.autoUpdateCheck}
+                onChange={(e) => update({ autoUpdateCheck: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Check for updates at startup</span>
+                <span className="block text-[11px] text-ink-faint">
+                  At most once a day, from GitHub releases. Updates are signed and checked before they install,
+                  and nothing installs until you click Install and restart.
+                </span>
+              </span>
+            </label>
+            <div className="flex items-center gap-2 px-1 py-1">
+              <button
+                type="button"
+                disabled={updateBusy}
+                onClick={() => void checkForUpdates(true)}
+                className="rounded border border-line px-2.5 py-1 text-[12px] text-ink hover:bg-surface-3 disabled:opacity-50"
+              >
+                Check for updates
+              </button>
+              <span className="min-w-0 flex-1 break-words text-[11px] text-ink-faint">
+                {appVersion ? `Hawser ${appVersion}. ` : ''}
+                {statusLine(updateState, readLastCheck(), Date.now())}
+              </span>
+            </div>
           </section>
         </div>
       </div>

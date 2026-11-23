@@ -1039,3 +1039,122 @@ test('kept copies merge by id, the backend list first', () => {
   const b = { id: 's/b', remotePath: '/b', localPath: '/l/b', name: 'b' }
   assert.deepEqual(mergeLeftovers([a], [b, { ...a, name: 'A' }]).map((l) => [l.id, l.name]), [['s/b', 'b'], ['s/a', 'A']])
 })
+
+/* ------------------------------------------ ssh config / PuTTY import */
+
+import { buildImport, importFolderName, planImport } from './tree.ts'
+
+const scanned = (over) => ({
+  name: 'h', hostname: 'h.example', port: 22, user: 'me', keyPath: null, jump: null, warnings: [], origin: 'config:1',
+  ...over,
+})
+const report = (hosts, localUser = 'local') => ({
+  source: 'ssh-config', hosts, warnings: [], skipped: [], unsupportedKeys: [], filesRead: [], localUser,
+})
+const existingCatalogue = () => [
+  {
+    kind: 'folder', id: 'f-1', name: 'Prod', children: [
+      { kind: 'host', id: 'h-bastion', name: 'Old bastion', hostname: 'Bastion.Example', port: 22, username: 'ops', auth: 'agent' },
+    ],
+  },
+  { kind: 'host', id: 'h-web', name: 'web', hostname: 'web.example', port: 2222, username: 'deploy', auth: 'password' },
+]
+const allOf = (nodes) => nodes.flatMap((n) => (n.kind === 'folder' ? allOf(n.children) : [n]))
+
+test('import preview: duplicates by host+port+user are unchecked, user defaults to local', () => {
+  const rows = planImport(
+    report([
+      scanned({ name: 'web', hostname: 'WEB.example', port: 2222, user: 'deploy' }),
+      scanned({ name: 'web-other-user', hostname: 'web.example', port: 2222, user: 'root' }),
+      scanned({ name: 'nouser', hostname: 'n.example', user: null }),
+      scanned({ name: 'warned', warnings: ['ProxyCommand is not supported'] }),
+    ]),
+    existingCatalogue(),
+  )
+  assert.deepEqual(rows.map((r) => [r.status, r.checked]), [
+    ['duplicate', false], ['new', true], ['new', true], ['warning', true],
+  ])
+  assert.deepEqual(rows[0].duplicateOf, { id: 'h-web', name: 'web' })
+  assert.equal(rows[2].username, 'local')
+  assert.equal(rows[2].userDefaulted, true)
+  const noLocal = planImport(report([scanned({ user: null })], ''), [])
+  assert.equal(noLocal[0].status, 'warning')
+  assert.equal(importFolderName('putty'), 'Imported (PuTTY)')
+  assert.equal(importFolderName('ssh-config'), 'Imported (ssh config)')
+})
+
+test('import build: fresh ids, new folder, address fields only, no secrets or risky fields', () => {
+  const existing = existingCatalogue()
+  const rows = planImport(report([
+    scanned({ name: 'a', hostname: 'a.example', keyPath: '/home/me/.ssh/id' }),
+    scanned({ name: 'b', hostname: 'b.example' }),
+  ]), existing)
+  const { catalogue, added } = buildImport(rows, new Set([0, 1]), existing, { kind: 'new-folder', name: 'Imported (ssh config)' }, 'local')
+  assert.equal(added, 2)
+  assert.equal(catalogue.length, 3)
+  assert.deepEqual(catalogue.slice(0, 2), existing)
+  const folder = catalogue[2]
+  assert.equal(folder.kind, 'folder')
+  assert.equal(folder.name, 'Imported (ssh config)')
+  const [a, b] = folder.children
+  assert.equal(a.auth, 'key')
+  assert.equal(a.keyPath, '/home/me/.ssh/id')
+  assert.equal(b.auth, 'password')
+  for (const n of [folder, a, b]) assert.ok(usableImportedId(n.id) && !n.id.includes('\u0000'), n.id)
+  assert.equal(new Set([folder.id, a.id, b.id, 'f-1', 'h-bastion', 'h-web']).size, 6)
+  const allowed = new Set(['kind', 'id', 'name', 'hostname', 'port', 'username', 'auth', 'keyPath', 'jumpHostId'])
+  for (const h of [a, b]) {
+    for (const [k, v] of Object.entries(h)) if (v !== undefined) assert.ok(allowed.has(k), `unexpected field ${k}`)
+    assert.equal(h.aiAllowed, undefined) // default colour policy
+    assert.equal(h.credentialId, undefined)
+  }
+  // Unchecked rows are not imported; top-level and existing-folder targets.
+  const top = buildImport(rows, new Set([1]), existing, { kind: 'top' }, 'local')
+  assert.equal(top.added, 1)
+  assert.equal(top.catalogue.length, 3)
+  assert.equal(top.catalogue[2].name, 'b')
+  const into = buildImport(rows, new Set([0]), existing, { kind: 'folder', id: 'f-1' }, 'local')
+  assert.equal(into.catalogue.length, 2)
+  assert.deepEqual(into.catalogue[0].children.map((h) => h.name), ['Old bastion', 'a'])
+})
+
+test('import build: jump hosts link to the import, an existing host, or a created entry', () => {
+  const existing = existingCatalogue()
+  const rows = planImport(report([
+    scanned({ name: 'bastion', hostname: 'bastion.internal', user: 'jump' }),
+    scanned({ name: 'app', hostname: 'app.internal', jump: { kind: 'alias', alias: 'bastion' } }),
+    scanned({ name: 'viaold', hostname: 'x.internal', jump: { kind: 'literal', host: 'bastion.example', port: 22, user: 'ops' } }),
+    scanned({ name: 'vianew1', hostname: 'y.internal', jump: { kind: 'literal', host: 'gw.example', port: 2222, user: null } }),
+    scanned({ name: 'vianew2', hostname: 'z.internal', jump: { kind: 'literal', host: 'GW.example', port: 2222, user: 'local' } }),
+    scanned({ name: 'viarow', hostname: 'w.internal', jump: { kind: 'literal', host: 'bastion.internal', port: 22, user: 'jump' } }),
+    scanned({ name: 'dupjump', hostname: 'web.example', port: 2222, user: 'deploy' }),
+    scanned({ name: 'viadup', hostname: 'v.internal', jump: { kind: 'alias', alias: 'dupjump' } }),
+  ]), existing)
+  assert.equal(rows[2].jumpLabel, 'Old bastion (existing)')
+  assert.equal(rows[3].jumpLabel, 'local@gw.example:2222 (new)')
+  assert.equal(rows[5].jumpLabel, 'bastion')
+  assert.equal(rows[6].checked, false)
+  const checked = new Set(rows.filter((r) => r.checked).map((r) => r.index))
+  const { catalogue, added, notes } = buildImport(rows, checked, existing, { kind: 'new-folder', name: 'Imported' }, 'local')
+  const hosts = allOf(catalogue)
+  const by = (name) => hosts.find((h) => h.name === name)
+  assert.equal(by('app').jumpHostId, by('bastion').id)
+  assert.equal(by('viaold').jumpHostId, 'h-bastion')
+  assert.equal(by('viarow').jumpHostId, by('bastion').id)
+  // One created jump host for the same endpoint, shared.
+  const gw = by('local@gw.example:2222')
+  assert.ok(gw)
+  assert.equal(by('vianew1').jumpHostId, gw.id)
+  assert.equal(by('vianew2').jumpHostId, gw.id)
+  // An alias that duplicates an existing host links to that host.
+  assert.equal(by('viadup').jumpHostId, 'h-web')
+  assert.equal(added, 8) // 7 checked + 1 created jump host
+  assert.ok(notes.some((n) => n.includes('created jump host')))
+  // Every jumpHostId points at a host that exists in the result.
+  const ids = new Set(hosts.map((h) => h.id))
+  for (const h of hosts) if (h.jumpHostId) assert.ok(ids.has(h.jumpHostId), `${h.name} -> ${h.jumpHostId}`)
+  // A jump alias left unchecked is dropped with a note.
+  const partial = buildImport(rows, new Set([1]), existing, { kind: 'top' }, 'local')
+  assert.equal(allOf(partial.catalogue).find((h) => h.name === 'app').jumpHostId, undefined)
+  assert.ok(partial.notes.some((n) => n.includes('was not selected')))
+})
