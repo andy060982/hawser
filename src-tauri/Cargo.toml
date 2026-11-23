@@ -1,12 +1,12 @@
 [package]
-name = "skiff"
-version = "0.5.0-beta.1"
+name = "hawser"
+version = "0.6.0"
 description = "SSH and SFTP client"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.89"
 
 [lib]
-name = "skiff_lib"
+name = "hawser_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -22,34 +22,63 @@ serde_json = "1"
 # default features pull aws-lc-rs, whose build script requires NASM on Windows.
 # "ring" is the pure-Rust alternative: no NASM, no C toolchain beyond MSVC,
 # and it keeps CI reproducible. Drop "rsa" and older servers stop working.
-russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh = { version = "0.65.4", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "3.0.0"
 # Direct dep only to turn on ssh-key's `getrandom` feature (SysRng), used by the
 # in-app Ed25519 keygen. Version-matched to what russh pulls so features unify
 # rather than duplicating the crate.
-ssh-key = { version = "0.7.0-rc.11", features = ["getrandom"] }
+ssh-key = { version = "=0.7.0-rc.12", features = ["getrandom"] }
 tokio = { version = "1.53.1", features = ["full"] }
 zeroize = "1.8.2"
 dashmap = "6.2.1"
+# SHA-256 for the tamper-evident audit-log hash chain (utils::audit). Already in
+# the dependency tree transitively, so naming it here adds no new download.
+sha2 = "0.10"
 thiserror = "2.0.20"
 similar = "2.7.0"
 futures-util = "0.3.34"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "rustls"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+portable-pty = "0.9"
+# A second launch focuses the running window and exits: two instances would
+# race on the audit chain and every data file (utils::audit also takes a
+# cross-process lock, as a second line of defence). Held below 2.5, which
+# requires tauri 2.12 while @tauri-apps/api here is 2.11 (the CLI refuses
+# mismatched minors).
+tauri-plugin-single-instance = ">=2.4.1, <2.5"
+# Signed self-update (src/updater.rs, src/lib/updater.ts). Held below 2.13 and
+# 2.4 respectively for the same reason as single-instance above: updater 2.13+
+# and process 2.4+ require tauri 2.12. The JS packages are pinned to the same
+# minor (the CLI refuses mismatched plugin minors).
+# No "zip" feature: it only unpacks the Tauri 1 style .zip / .tar.gz updater
+# bundles, which this app does not publish (Tauri 2 signs the NSIS installer
+# and the AppImage directly; macOS .app.tar.gz uses tar/flate2 regardless),
+# and it pulls zip 4.x with open advisories (RUSTSEC-2026-0367 and others).
+tauri-plugin-updater = { version = ">=2.12.0, <2.13", default-features = false, features = ["rustls-tls", "system-proxy"] }
+tauri-plugin-process = ">=2.3.1, <2.4"
 
 # --- Platform credential vaults -------------------------------------------
 # Windows: hand-rolled Credential Manager access (see src/credentials.rs).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # Linux: freedesktop Secret Service over pure-Rust D-Bus (zbus), no system
 # libdbus needed to build; crypto-rust keeps the encrypted session pure-Rust too.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+# Direct, at keyring's version, only for an existence search that never
+# unlocks an item (credentials::secret_exists).
+dbus-secret-service = "4.1"
+# Only to pre-check the session-bus address the single-instance plugin
+# unwraps (lib.rs): a malformed one would panic inside the plugin.
+zbus = { version = "5.9", default-features = false }
 
 # macOS: native Keychain, no extra system libraries.
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# Direct, at keyring's version, only for an attributes-only Keychain search
+# that never decrypts an item (credentials::secret_exists).
+security-framework = "3"
 
 [profile.release]
 # Size-first, because a desktop SSH client is latency-bound on the network, not
@@ -82,3 +111,12 @@ panic = "abort"     # no unwinding tables, no landing pads
 inherits = "release"
 strip = false
 debug = 1
+
+# Mock Tauri runtime for the local-shell end-to-end tests (all Unix-only). Not
+# on Windows: it links comctl32 v6 symbols, and a test exe without an app
+# manifest then fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+[target.'cfg(not(windows))'.dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

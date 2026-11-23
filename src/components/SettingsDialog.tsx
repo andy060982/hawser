@@ -1,7 +1,12 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Settings2, X } from 'lucide-react'
 import { HOST_COLORS, hostColorHex } from '../lib/hostColors'
 import { policyFor, useSettings } from '../lib/settings'
+import { inTauri, safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
+import { checkForUpdates, readLastCheck, useUpdateState } from '../lib/updateClient'
+import { statusLine } from '../lib/updater'
+import type { EditorView } from '../types'
 
 /* ---------------------------------------------------------------------------
    App settings: host-colour policies + safety toggles.
@@ -11,13 +16,53 @@ import { policyFor, useSettings } from '../lib/settings'
    rather than something baked into the code.
 --------------------------------------------------------------------------- */
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
-  const { settings, update, setColorPolicy } = useSettings()
-
+  const { settings, update, setColorPolicy, loadError, saveError, saveAnyway } = useSettings()
+  const [shells, setShells] = useState<{ id: string; label: string; program: string }[]>([])
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+    void safeInvoke<{ id: string; label: string; program: string }[]>('local_shell_profiles').then(
+      (p) => setShells(p ?? []),
+    )
+  }, [])
+
+  // Remote editing: the editor command lives in the backend (editor.json),
+  // which validates it on save and again before each use.
+  const [editor, setEditor] = useState('')
+  const [editorSaved, setEditorSaved] = useState<EditorView | null>(null)
+  const [editorError, setEditorError] = useState<string | null>(null)
+  useEffect(() => {
+    void safeInvoke<EditorView>('edit_editor_load')
+      .then((v) => {
+        if (!v) return
+        setEditor(v.command)
+        setEditorSaved(v)
+      })
+      .catch((e) => setEditorError(String(e)))
+  }, [])
+  const saveEditor = () => {
+    setEditorError(null)
+    void safeInvoke<EditorView>('edit_editor_save', { command: editor })
+      .then((v) => {
+        if (!v) return
+        setEditor(v.command)
+        setEditorSaved(v)
+      })
+      .catch((e) => setEditorError(e instanceof Error ? e.message : String(e)))
+  }
+  const editorDirty = editor.trim() !== (editorSaved?.command ?? '')
+
+  // Updates: the shared update state the banner also shows.
+  const updateState = useUpdateState()
+  const [appVersion, setAppVersion] = useState<string | null>(null)
+  useEffect(() => {
+    void import('@tauri-apps/api/app')
+      .then(({ getVersion }) => (inTauri() ? getVersion() : null))
+      .then((v) => setAppVersion(v ?? null))
+      .catch(() => setAppVersion(null))
+  }, [])
+  const updateBusy = ['checking', 'downloading', 'installing'].includes(updateState.phase)
+
+  // Escape closes this dialog only while it is the top modal.
+  useModalLayer(true, onClose)
 
   return (
     <div className="absolute inset-0 z-50 flex justify-center">
@@ -45,6 +90,25 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          {loadError && (
+            <div className="selectable mb-3 rounded border border-warn/50 bg-warn/10 px-3 py-2 text-[12px] text-warn">
+              Your saved settings could not be read, so the defaults are in use and changes are NOT being
+              saved (that would replace the file).
+              <span className="mt-1 block font-mono text-[11px] text-ink-dim">{loadError}</span>
+              <button
+                type="button"
+                onClick={saveAnyway}
+                className="mt-1.5 rounded border border-warn/60 px-2 py-0.5 text-[11.5px] text-warn hover:bg-warn/20"
+              >
+                Save these settings over it
+              </button>
+            </div>
+          )}
+          {saveError && !loadError && (
+            <p className="selectable mb-3 rounded border border-alert/40 bg-alert/10 px-3 py-2 text-[12px] text-alert">
+              Settings could not be saved; changes last only until Hawser closes. {saveError}
+            </p>
+          )}
           {/* --- Host colour policies --- */}
           <section>
             <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">
@@ -185,6 +249,146 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 </span>
               </span>
             </label>
+          </section>
+
+          {/* --- Remote editing --- */}
+          <section className="mt-4">
+            <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">
+              Remote editing
+            </h3>
+            <label className="flex items-center gap-2 px-1 py-1 text-[12.5px] text-ink">
+              <span className="w-32 shrink-0">Editor command</span>
+              <input
+                type="text"
+                value={editor}
+                onChange={(e) => setEditor(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveEditor()
+                }}
+                placeholder="Empty: the system's default app"
+                spellCheck={false}
+                className="h-7 min-w-0 flex-1 rounded border border-line bg-surface-1 px-1.5 font-mono text-[12px] text-ink focus:border-accent focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={saveEditor}
+                disabled={!editorDirty}
+                className="h-7 shrink-0 rounded border border-line-strong px-2 text-[11.5px] text-ink hover:bg-surface-3 disabled:opacity-40"
+              >
+                Save
+              </button>
+            </label>
+            {editorError && (
+              <p className="selectable px-1 pb-1 text-[11px] text-alert">{editorError}</p>
+            )}
+            {!editorError && editorSaved?.resolved && !editorDirty && (
+              <p className="selectable px-1 pb-1 font-mono text-[11px] text-ink-faint">
+                Runs {editorSaved.resolved}
+              </p>
+            )}
+            <p className="px-1 pb-1 text-[11px] text-ink-faint">
+              &quot;Edit in local editor&quot; on a remote file opens it with this command, with the file
+              added as the last argument — never through a shell. For example{' '}
+              <code className="font-mono">code --wait</code>, <code className="font-mono">subl -w</code> or{' '}
+              <code className="font-mono">open -a TextEdit</code>. Left empty, the system&apos;s default app
+              is used only for plain text and document types (.txt, .log, .md, .conf, .ini, .toml, .yaml,
+              .json, .xml, .csv, .env, .diff…) and files with no extension; anything else (scripts,
+              .html, .wsb, unknown types) needs an editor command here, because its default app could run
+              it instead of opening it.
+            </p>
+          </section>
+
+          {/* --- Local terminal --- */}
+          <section className="mt-4">
+            <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">
+              Local terminal
+            </h3>
+            <label className="flex items-center gap-2 px-1 py-1 text-[12.5px] text-ink">
+              <span className="w-32 shrink-0">Default shell</span>
+              <select
+                // A saved shell that is no longer installed shows (and acts) as
+                // the first available one, which is what openLocal falls back to.
+                value={
+                  shells.some((p) => p.id === settings.defaultLocalShell)
+                    ? settings.defaultLocalShell
+                    : (shells[0]?.id ?? '')
+                }
+                onChange={(e) => update({ defaultLocalShell: e.target.value || undefined })}
+                className="h-7 min-w-0 flex-1 rounded border border-line bg-surface-1 px-1.5 text-[12px] text-ink focus:border-accent focus:outline-none"
+              >
+                {shells.map((p) => (
+                  <option key={p.id} value={p.id} title={p.program}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="px-1 pb-1 text-[11px] text-ink-faint">
+              New local terminal: Ctrl+Shift+T, or the app menu for a specific shell.
+            </p>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.localShellOnStartup}
+                onChange={(e) => update({ localShellOnStartup: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Open a local terminal at startup</span>
+                <span className="block text-[11px] text-ink-faint">
+                  Use Hawser as your everyday terminal: it opens with your default shell ready.
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.recordLocalTranscripts}
+                onChange={(e) => update({ recordLocalTranscripts: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Record local terminal transcripts</span>
+                <span className="block text-[11px] text-ink-faint">
+                  Saves what local terminals show, like SSH sessions, so Session history can search
+                  it. Everything on screen is written to disk. Applies to newly opened terminals.
+                </span>
+              </span>
+            </label>
+          </section>
+
+          {/* --- Updates --- */}
+          <section className="mt-4">
+            <h3 className="mb-1 text-[10.5px] uppercase tracking-wider text-ink-faint">Updates</h3>
+            <label className="flex cursor-pointer items-start gap-2 rounded px-1 py-1 hover:bg-surface-1">
+              <input
+                type="checkbox"
+                checked={settings.autoUpdateCheck}
+                onChange={(e) => update({ autoUpdateCheck: e.target.checked })}
+                className="mt-[3px] h-3.5 w-3.5 accent-[var(--color-accent)]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[12.5px] text-ink">Check for updates at startup</span>
+                <span className="block text-[11px] text-ink-faint">
+                  At most once a day, from GitHub releases. Updates are signed and checked before they install,
+                  and nothing installs until you click Install and restart.
+                </span>
+              </span>
+            </label>
+            <div className="flex items-center gap-2 px-1 py-1">
+              <button
+                type="button"
+                disabled={updateBusy}
+                onClick={() => void checkForUpdates(true)}
+                className="rounded border border-line px-2.5 py-1 text-[12px] text-ink hover:bg-surface-3 disabled:opacity-50"
+              >
+                Check for updates
+              </button>
+              <span className="min-w-0 flex-1 break-words text-[11px] text-ink-faint">
+                {appVersion ? `Hawser ${appVersion}. ` : ''}
+                {statusLine(updateState, readLastCheck(), Date.now())}
+              </span>
+            </div>
           </section>
         </div>
       </div>

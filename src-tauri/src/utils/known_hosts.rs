@@ -25,7 +25,7 @@
 //! `russh::keys::known_hosts::check_known_hosts` resolves to
 //! `%USERPROFILE%\ssh\known_hosts` on Windows — note the missing dot, which is
 //! not where OpenSSH for Windows actually looks. Owning the path explicitly
-//! avoids that quirk and keeps Skiff's trust store separate from the system
+//! avoids that quirk and keeps Hawser's trust store separate from the system
 //! one, so a mistake here can never corrupt the file `ssh` itself depends on.
 //!
 //! Parsing and serialisation are delegated to russh's implementation rather
@@ -53,6 +53,13 @@ pub enum KnownHostsError {
     },
     #[error("known_hosts store is malformed: {0}")]
     Parse(String),
+    /// The store's lock stayed taken for the whole bounded wait (see
+    /// `TRUST_LOCK_WAIT`). Nothing was trusted.
+    #[error(
+        "another Hawser instance is updating known hosts; the key was not trusted. Try again \
+         in a moment"
+    )]
+    Busy,
 }
 
 /// Result of checking a presented host key against the store.
@@ -75,7 +82,7 @@ pub enum HostKeyStatus {
     Revoked { line: usize },
 }
 
-/// `%APPDATA%\skiff\known_hosts` on Windows.
+/// `%APPDATA%\hawser\known_hosts` on Windows.
 ///
 /// Roaming rather than Local on purpose: host trust is a user decision that
 /// should follow the user to another domain-joined machine, unlike the
@@ -83,7 +90,7 @@ pub enum HostKeyStatus {
 #[cfg(target_os = "windows")]
 pub fn store_path() -> Result<PathBuf, KnownHostsError> {
     let appdata = std::env::var_os("APPDATA").ok_or(KnownHostsError::NoAppDataDir)?;
-    Ok(PathBuf::from(appdata).join("skiff").join("known_hosts"))
+    Ok(PathBuf::from(appdata).join("hawser").join("known_hosts"))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -91,7 +98,7 @@ pub fn store_path() -> Result<PathBuf, KnownHostsError> {
     let home = std::env::var_os("HOME").ok_or(KnownHostsError::NoAppDataDir)?;
     Ok(PathBuf::from(home)
         .join(".config")
-        .join("skiff")
+        .join("hawser")
         .join("known_hosts"))
 }
 
@@ -129,17 +136,45 @@ pub fn ensure_store() -> Result<PathBuf, KnownHostsError> {
     Ok(path)
 }
 
-/// Check a presented key against the store.
+/// Key algorithms already pinned for `host:port`, in file order, deduplicated.
 ///
-/// A missing or unreadable store is reported as `Unknown` rather than an error:
-/// a first run has no file, and that must lead to a prompt, not a failure.
-/// Genuine IO problems still surface when `trust` tries to write.
-pub fn check(host: &str, port: u16, key: &PublicKey) -> Result<HostKeyStatus, KnownHostsError> {
-    let path = ensure_store()?;
-    classify(host, port, key, &path)
+/// Offered to the server first during negotiation, as OpenSSH does: a host
+/// pinned as ECDSA that later also offers Ed25519 must keep signing with the
+/// pinned ECDSA key, or the classification below sees "no matching key" and
+/// refuses it as CHANGED although the pinned key is still valid. An unreadable
+/// store yields an empty list; the check itself then fails closed.
+pub fn pinned_algorithms(host: &str, port: u16) -> Vec<russh::keys::Algorithm> {
+    match store_path() {
+        Ok(path) if path.exists() => pinned_algorithms_at(host, port, &path),
+        _ => Vec::new(),
+    }
 }
 
-fn classify(
+pub(crate) fn pinned_algorithms_at(host: &str, port: u16, path: &Path) -> Vec<russh::keys::Algorithm> {
+    let mut out: Vec<russh::keys::Algorithm> = Vec::new();
+    let mut push = |k: &PublicKey| {
+        let alg = k.algorithm();
+        if !out.contains(&alg) {
+            out.push(alg);
+        }
+    };
+    if let Ok(entries) = host_entries(host, port, path) {
+        for k in entries.iter().filter(|e| e.trust_entry).filter_map(|e| e.key.as_ref()) {
+            push(k);
+        }
+    }
+    if let Ok(hashed) = known_host_keys_path(&host.to_ascii_lowercase(), port, path) {
+        for (_, k) in &hashed {
+            push(k);
+        }
+    }
+    out
+}
+
+/// Check a presented key against the store at `path` (from `ensure_store`, so
+/// a first run's empty file reads as `Unknown`). A store that exists but cannot
+/// be read or parsed is an error, never `Unknown`.
+pub(crate) fn classify(
     host: &str,
     port: u16,
     key: &PublicKey,
@@ -327,16 +362,85 @@ fn host_entries(host: &str, port: u16, path: &Path) -> Result<Vec<HostEntry>, Kn
     Ok(out)
 }
 
-/// Append a host's public key to the store, creating the directory and file if
-/// needed. Called only after a human has accepted the fingerprint.
+/// How long `trust_at` waits for the store's locks before failing closed.
+pub(crate) const TRUST_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll interval while those locks are taken.
+const TRUST_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Serialises trust decisions inside this process. The re-classification and
+/// the append must be one step: two sessions approving different unknown keys
+/// for the same host could otherwise both see `Unknown` and both append, and
+/// russh then refuses BOTH keys (it reports any same-algorithm mismatch as
+/// KeyChanged, even when another line matches), locking the user out.
+static TRUST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Append a host's public key to the store at `path`. Called only after a
+/// human has accepted the fingerprint.
 ///
 /// Refuses to append over a *changed* key: re-recording one would leave two
 /// conflicting entries and make every later check ambiguous. Replacing a
-/// changed key is a deliberate, manual act.
-pub fn trust(host: &str, port: u16, key: &PublicKey) -> Result<(), KnownHostsError> {
-    let path = ensure_store()?;
+/// changed key is a deliberate, manual act. A key that is already trusted
+/// (another session pinned the same key while this prompt was open) is a
+/// no-op, not a duplicate line. The re-check and the append run under one
+/// lock, so two sessions approving different keys pin exactly one.
+///
+/// Blocking: run it off the async runtime. The locks are taken with a bounded
+/// wait (`TRUST_LOCK_WAIT`) and never blocked on: a suspended second instance
+/// holding the file lock must not strand an SSH task, nor (by blocking while
+/// holding the process lock) every other approval in this process. On timeout
+/// it fails closed with `Busy`.
+pub(crate) fn trust_at(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+) -> Result<(), KnownHostsError> {
+    trust_at_within(host, port, key, path, TRUST_LOCK_WAIT)
+}
 
-    match classify(host, port, key, &path)? {
+pub(crate) fn trust_at_within(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<(), KnownHostsError> {
+    // Another Hawser instance shares the store, so the process lock alone is
+    // not enough. A sidecar file rather than the store itself: Windows locks are
+    // mandatory, and the append below goes through a separate handle.
+    let lock_path = path.with_file_name("known_hosts.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| KnownHostsError::Io { path: lock_path.clone(), source })?;
+    let deadline = std::time::Instant::now() + wait;
+    // Both locks are only ever TRIED: whichever is taken, release what we hold
+    // and retry until the deadline, so nothing here blocks while holding the
+    // process lock.
+    let _guard = loop {
+        let process = match TRUST_LOCK.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(g) = process {
+            match lock_file.try_lock() {
+                Ok(()) => break g,
+                Err(std::fs::TryLockError::WouldBlock) => drop(g),
+                Err(std::fs::TryLockError::Error(source)) => {
+                    return Err(KnownHostsError::Io { path: lock_path, source })
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(KnownHostsError::Busy);
+        }
+        std::thread::sleep(TRUST_LOCK_POLL);
+    };
+
+    match classify(host, port, key, path)? {
         HostKeyStatus::Changed { line } => {
             return Err(KnownHostsError::Parse(format!(
                 "{host}:{port} already has a different key on line {line}; \
@@ -349,19 +453,21 @@ pub fn trust(host: &str, port: u16, key: &PublicKey) -> Result<(), KnownHostsErr
                  refusing to trust it"
             )))
         }
-        HostKeyStatus::Trusted | HostKeyStatus::Unknown => {}
+        HostKeyStatus::Trusted => return Ok(()),
+        HostKeyStatus::Unknown => {}
     }
 
     // russh handles the details that are easy to get wrong: appending a leading
     // newline when the file does not end in one, and the [host]:port form for
     // non-default ports.
-    learn_known_hosts_path(host, port, key, &path).map_err(|e| match e {
+    learn_known_hosts_path(host, port, key, path).map_err(|e| match e {
         russh::keys::Error::IO(source) => KnownHostsError::Io {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         },
         other => KnownHostsError::Parse(other.to_string()),
     })
+    // Both locks are released on return (`_guard`, then `lock_file`).
 }
 
 #[cfg(test)]
@@ -372,7 +478,7 @@ mod tests {
     fn store_path_is_under_appdata() {
         // Only asserts shape; the directory need not exist.
         let p = store_path().expect("path resolves");
-        assert!(p.ends_with("skiff/known_hosts") || p.ends_with(r"skiff\known_hosts"));
+        assert!(p.ends_with("hawser/known_hosts") || p.ends_with(r"hawser\known_hosts"));
     }
 
     #[test]
@@ -396,7 +502,7 @@ mod tests {
         let k2 = PublicKey::from_openssh(KEY2).expect("k2 parses");
         let k1_body = KEY1.trim_start_matches("ssh-ed25519 ").trim_end_matches(" revtest");
 
-        let dir = std::env::temp_dir().join(format!("skiff-revtest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hawser-revtest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("known_hosts");
         // A wildcard-host @revoked line and a hashed-host one, both for KEY1.
@@ -430,7 +536,7 @@ mod tests {
         let k1 = PublicKey::from_openssh(KEY1).expect("k1 parses");
         let k2 = PublicKey::from_openssh(KEY2).expect("k2 parses");
 
-        let dir = std::env::temp_dir().join(format!("skiff-casetest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hawser-casetest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("known_hosts");
         std::fs::write(
@@ -456,5 +562,130 @@ mod tests {
         assert_eq!(classify("other.corp", 22, &k1, &path).unwrap(), HostKeyStatus::Unknown);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const ED_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1EeRn1nUZ6oQiaSmrlPONbjg1FxJtr35MXzTndFYIe";
+    const ED_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHveLo5tgiTjyNgc98zwmigaaw1vJ/1IN9KDWqa0Z43a";
+
+    fn temp_store(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "hawser-kh-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        std::fs::write(&path, "").unwrap();
+        (dir, path)
+    }
+
+    fn lines_for(path: &Path, needle: &str) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.split_whitespace().next() == Some(needle))
+            .count()
+    }
+
+    // Two sessions approving DIFFERENT unknown keys for one host at the same
+    // moment must end with exactly one pinned key: the loser sees the winner's
+    // line on its re-check and is refused as changed.
+    #[test]
+    fn concurrent_trusts_of_different_keys_pin_one() {
+        let (dir, path) = temp_store("race");
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        let kb = PublicKey::from_openssh(ED_B).unwrap();
+        for _ in 0..20 {
+            std::fs::write(&path, "").unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let spawn = |k: PublicKey| {
+                let (b, p) = (std::sync::Arc::clone(&barrier), path.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    trust_at("race.example", 22, &k, &p).is_ok()
+                })
+            };
+            let (a, b) = (spawn(ka.clone()), spawn(kb.clone()));
+            let oks = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(oks.iter().filter(|o| **o).count(), 1, "exactly one trust wins");
+            assert_eq!(lines_for(&path, "race.example"), 1, "exactly one key pinned");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Trusting a key that is already pinned (a second tab approved the same
+    // fingerprint) is a no-op, not a duplicate line.
+    #[test]
+    fn trusting_an_already_trusted_key_is_a_noop() {
+        let (dir, path) = temp_store("noop");
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        trust_at("dup.example", 2222, &ka, &path).unwrap();
+        trust_at("dup.example", 2222, &ka, &path).unwrap();
+        assert_eq!(lines_for(&path, "[dup.example]:2222"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pinned_algorithms_lists_trust_entries_only() {
+        let (dir, path) = temp_store("algs");
+        const ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBI/gPg4KkOG52SzCdcnggcQk7DG6z1OLSfSAi2LTGk4OFnDnYrkNsxVIWtt/KArpW70Gac7c1im2IEx4u8Bs0MI=";
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        std::fs::write(
+            &path,
+            format!("fw01 {ECDSA}\n@revoked fw01 {ED_A}\nother {ED_A}\n"),
+        )
+        .unwrap();
+        let algs = pinned_algorithms_at("FW01", 22, &path);
+        assert_eq!(algs, vec![PublicKey::from_openssh(ECDSA).unwrap().algorithm()]);
+        assert!(pinned_algorithms_at("nobody", 22, &path).is_empty());
+        assert_ne!(algs[0], ka.algorithm());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Another instance holding the store lock (suspended, say) must not strand
+    // the approving task: the wait is bounded and fails closed, nothing is
+    // pinned, and this process's lock is not held while waiting — another
+    // store's trust in this process goes through meanwhile.
+    #[test]
+    fn trust_fails_closed_while_another_instance_holds_the_lock() {
+        let (dir, path) = temp_store("busy");
+        let (dir2, path2) = temp_store("busy-other");
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        let other_instance = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_file_name("known_hosts.lock"))
+            .unwrap();
+        other_instance.lock().unwrap();
+
+        let waiting = {
+            let (k, p) = (ka.clone(), path.clone());
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let r = trust_at_within("busy.example", 22, &k, &p, std::time::Duration::from_millis(600));
+                (r, t.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let t = std::time::Instant::now();
+        trust_at("free.example", 22, &ka, &path2).unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_millis(400), "blocked on the process lock");
+
+        let (r, took) = waiting.join().unwrap();
+        assert!(matches!(r, Err(KnownHostsError::Busy)), "{r:?}");
+        assert!(took < std::time::Duration::from_secs(2));
+        assert!(r.unwrap_err().to_string().contains("another Hawser instance"));
+        assert_eq!(lines_for(&path, "busy.example"), 0);
+
+        // Released: the same trust now succeeds.
+        drop(other_instance);
+        trust_at("busy.example", 22, &ka, &path).unwrap();
+        assert_eq!(lines_for(&path, "busy.example"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

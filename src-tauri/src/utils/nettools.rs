@@ -92,6 +92,114 @@ async fn emit_lines<R: AsyncRead + Unpin>(pipe: R, app: &AppHandle, rid: &str) {
     }
 }
 
+/// The OS built-in and its arguments for `tool` against `target`.
+///
+/// The built-ins differ per OS in both name and flags. All variants stay
+/// finite (a fixed count / hop cap) so a run can never hang the UI. An IPv6
+/// literal needs the v6 tool where the OS splits them: macOS `ping` and
+/// `traceroute` are IPv4-only (`ping6`/`traceroute6` are separate binaries);
+/// Linux takes `-6`; Windows picks the family from the address itself.
+fn tool_command(tool: &str, target: &str) -> Result<(&'static str, Vec<String>), String> {
+    let v6 = target.parse::<std::net::Ipv6Addr>().is_ok();
+    let _ = v6; // unused on Windows
+    let t = target.to_string();
+    let owned = |a: &[&str]| -> Vec<String> { a.iter().map(|s| s.to_string()).collect() };
+    match tool {
+        "ping" => {
+            // -n/-c 4: four echoes. Windows -w is ms; Linux -W is seconds;
+            // macOS ping has no portable per-reply timeout flag, so rely on
+            // the fixed count there.
+            #[cfg(target_os = "windows")]
+            {
+                let mut a = owned(&["-n", "4", "-w", "1500"]);
+                a.push(t);
+                Ok(("ping", a))
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let mut a = owned(&["-c", "4"]);
+                a.push(t);
+                Ok((if v6 { "ping6" } else { "ping" }, a))
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let mut a = if v6 { owned(&["-6"]) } else { Vec::new() };
+                a.extend(owned(&["-c", "4", "-W", "2"]));
+                a.push(t);
+                Ok(("ping", a))
+            }
+        }
+        "traceroute" => {
+            // No reverse DNS per hop (the usual slowness); cap at 20 hops.
+            #[cfg(target_os = "windows")]
+            {
+                let mut a = owned(&["-d", "-h", "20", "-w", "1000"]);
+                a.push(t);
+                Ok(("tracert", a))
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let mut a = owned(&["-n", "-m", "20", "-w", "1"]);
+                a.push(t);
+                Ok((if v6 { "traceroute6" } else { "traceroute" }, a))
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                let mut a = if v6 { owned(&["-6"]) } else { Vec::new() };
+                a.extend(owned(&["-n", "-m", "20", "-w", "1"]));
+                a.push(t);
+                Ok(("traceroute", a))
+            }
+        }
+        other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// How one TCP connect attempt ended, for the port check's wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortVerdict {
+    Open,
+    /// Actively refused: the host answered, nothing listens.
+    Closed,
+    /// No route (ICMP host/network unreachable, no route, VPN down).
+    Unreachable,
+    /// No answer before the deadline: dropped by a firewall, or host gone.
+    Filtered,
+    /// Anything else (permission denied by a local firewall, ...).
+    Error,
+}
+
+fn classify_connect_error(kind: std::io::ErrorKind) -> PortVerdict {
+    use std::io::ErrorKind as K;
+    match kind {
+        K::ConnectionRefused => PortVerdict::Closed,
+        K::HostUnreachable | K::NetworkUnreachable | K::AddrNotAvailable => PortVerdict::Unreachable,
+        K::TimedOut => PortVerdict::Filtered,
+        _ => PortVerdict::Error,
+    }
+}
+
+/// The user-facing line for one address's result.
+fn port_line(addr: &str, port: u16, v: PortVerdict, detail: &str, timeout_ms: u64) -> String {
+    match v {
+        PortVerdict::Open => format!("{addr}:{port} OPEN ({detail})"),
+        PortVerdict::Closed => format!(
+            "{addr}:{port} CLOSED — connection refused. The host answered; nothing is listening on that port."
+        ),
+        PortVerdict::Unreachable => format!(
+            "{addr}:{port} UNREACHABLE — {detail}. No route to the host (network down, VPN off, or a router said so)."
+        ),
+        PortVerdict::Filtered => format!(
+            "{addr}:{port} FILTERED — no reply in {timeout_ms} ms. A firewall is dropping it, or the host is down."
+        ),
+        PortVerdict::Error => format!("{addr}:{port} ERROR — {detail}"),
+    }
+}
+
+/// How long the port check's name resolution may take, separate from the
+/// connect deadline: a slow resolver is a DNS problem, not a filtered port.
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl NetTools {
     /// Start ping or traceroute, streaming output on `net://{run_id}`.
     pub fn start_process_tool(
@@ -103,39 +211,7 @@ impl NetTools {
     ) -> Result<(), String> {
         validate_target(target)?;
 
-        // The built-ins differ per OS in both name and flags. All variants stay
-        // finite (a fixed count / hop cap) so a run can never hang the UI.
-        let (program, args): (&str, Vec<String>) = match tool {
-            "ping" => {
-                // -n/-c 4: four echoes. Windows -w is ms; Linux -W is seconds;
-                // macOS ping has no portable per-reply timeout flag, so rely on
-                // the fixed count there.
-                #[cfg(target_os = "windows")]
-                {
-                    ("ping", vec!["-n".into(), "4".into(), "-w".into(), "1500".into(), target.into()])
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    ("ping", vec!["-c".into(), "4".into(), target.into()])
-                }
-                #[cfg(all(unix, not(target_os = "macos")))]
-                {
-                    ("ping", vec!["-c".into(), "4".into(), "-W".into(), "2".into(), target.into()])
-                }
-            }
-            "traceroute" => {
-                // No reverse DNS per hop (the usual slowness); cap at 20 hops.
-                #[cfg(target_os = "windows")]
-                {
-                    ("tracert", vec!["-d".into(), "-h".into(), "20".into(), "-w".into(), "1000".into(), target.into()])
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    ("traceroute", vec!["-n".into(), "-m".into(), "20".into(), "-w".into(), "1".into(), target.into()])
-                }
-            }
-            other => return Err(format!("unknown tool: {other}")),
-        };
+        let (program, args) = tool_command(tool, target)?;
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
@@ -191,30 +267,34 @@ impl NetTools {
         Ok(())
     }
 
-    /// TCP port check. Three answers, and the distinction matters in network
-    /// debugging: open (connected), closed (actively refused — the host is
-    /// there, the service is not), filtered (timeout — a firewall is eating
-    /// the SYN, or the host is gone).
+    /// TCP port check. The distinctions matter in network debugging: open
+    /// (connected), closed (actively refused — the host is there, the service
+    /// is not), unreachable (no route), filtered (timeout — a firewall is
+    /// eating the SYN, or the host is gone), and a name that does not resolve
+    /// at all. The name is resolved first, under its own deadline, and each
+    /// address it returns is tried with the full connect budget, so a slow
+    /// resolver or a black-holed first address is reported as what it is.
     pub async fn port_check(target: &str, port: u16, timeout_ms: u64) -> Result<String, String> {
         validate_target(target)?;
-        let started = Instant::now();
-        match tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            tokio::net::TcpStream::connect((target, port)),
-        )
-        .await
-        {
-            Ok(Ok(_)) => Ok(format!(
-                "{target}:{port} OPEN ({} ms)",
-                started.elapsed().as_millis()
-            )),
-            Ok(Err(e)) => Ok(format!(
-                "{target}:{port} CLOSED — connection refused ({e}). The host answered; nothing is listening on that port."
-            )),
-            Err(_) => Ok(format!(
-                "{target}:{port} FILTERED — no reply in {timeout_ms} ms. A firewall is dropping it, or the host is unreachable."
-            )),
+        let addrs: Vec<std::net::SocketAddr> =
+            match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((target, port))).await {
+                Err(_) => {
+                    return Ok(format!(
+                        "{target}:{port} DNS TIMEOUT — the name did not resolve within {}s; the port was not tried.",
+                        DNS_TIMEOUT.as_secs()
+                    ))
+                }
+                Ok(Err(e)) => {
+                    return Ok(format!(
+                        "{target}:{port} DNS FAILED — {e}. The name does not resolve; the port was not tried."
+                    ))
+                }
+                Ok(Ok(a)) => a.collect(),
+            };
+        if addrs.is_empty() {
+            return Ok(format!("{target}:{port} DNS FAILED — no addresses returned."));
         }
+        Ok(check_addrs(target, port, &addrs, timeout_ms).await)
     }
 
     /// DNS resolution via the OS resolver — the same answer every other app on
@@ -288,9 +368,103 @@ pub async fn probe_hosts(targets: Vec<(String, String, u16)>) -> Vec<ProbeResult
     out
 }
 
+/// How many resolved addresses a port check tries.
+const MAX_PORT_ADDRS: usize = 4;
+
+/// Try `addrs` in order (at most `MAX_PORT_ADDRS`), stopping at the first
+/// open one, one line per address tried. When the list was cut short without
+/// finding an open port, say so: a name whose only reachable address is the
+/// fifth must not read as "every address failed".
+async fn check_addrs(target: &str, port: u16, addrs: &[std::net::SocketAddr], timeout_ms: u64) -> String {
+    let mut lines = Vec::new();
+    let mut tried = 0usize;
+    let mut open = false;
+    for addr in addrs.iter().take(MAX_PORT_ADDRS) {
+        tried += 1;
+        let started = Instant::now();
+        let (v, detail) = match tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => (PortVerdict::Open, format!("{} ms", started.elapsed().as_millis())),
+            Ok(Err(e)) => (classify_connect_error(e.kind()), e.to_string()),
+            Err(_) => (PortVerdict::Filtered, String::new()),
+        };
+        let label = if addr.ip().to_string() == target {
+            target.to_string()
+        } else {
+            format!("{target} ({})", addr.ip())
+        };
+        lines.push(port_line(&label, port, v, &detail, timeout_ms));
+        if v == PortVerdict::Open {
+            open = true;
+            break;
+        }
+    }
+    if !open && tried < addrs.len() {
+        lines.push(format!(
+            "tried {tried} of {} addresses for {target}; the other {} were not tried.",
+            addrs.len(),
+            addrs.len() - tried
+        ));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::decode_line;
+    use super::*;
+
+    #[test]
+    fn connect_errors_are_labelled_by_kind() {
+        use std::io::ErrorKind as K;
+        assert_eq!(classify_connect_error(K::ConnectionRefused), PortVerdict::Closed);
+        assert_eq!(classify_connect_error(K::HostUnreachable), PortVerdict::Unreachable);
+        assert_eq!(classify_connect_error(K::NetworkUnreachable), PortVerdict::Unreachable);
+        assert_eq!(classify_connect_error(K::TimedOut), PortVerdict::Filtered);
+        assert_eq!(classify_connect_error(K::PermissionDenied), PortVerdict::Error);
+        // Only a refusal claims the host answered.
+        let refused = port_line("h", 22, PortVerdict::Closed, "", 3000);
+        assert!(refused.contains("CLOSED") && refused.contains("host answered"));
+        for v in [PortVerdict::Unreachable, PortVerdict::Filtered, PortVerdict::Error] {
+            assert!(!port_line("h", 22, v, "x", 3000).contains("answered"), "{v:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn port_check_reports_dns_failure_and_refusal() {
+        // `.invalid` never resolves (RFC 6761).
+        let r = NetTools::port_check("no-such-host.invalid", 22, 1000).await.unwrap();
+        assert!(r.contains("DNS"), "{r}");
+        assert!(!r.contains("CLOSED"), "{r}");
+        // A port we just bound and released: refused, not filtered.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // Windows retries the SYN to a closed loopback port before it reports
+        // the RST (about 2 s), so a 1 s timeout would expire first and read as
+        // FILTERED; the verdict itself is right once the refusal arrives.
+        let timeout = if cfg!(windows) { 5000 } else { 1000 };
+        let r = NetTools::port_check("127.0.0.1", port, timeout).await.unwrap();
+        assert!(r.contains("CLOSED"), "{r}");
+    }
+
+    #[test]
+    fn ipv6_literals_use_the_v6_tool() {
+        let (prog, args) = tool_command("ping", "2001:db8::1").unwrap();
+        assert_eq!(args.last().map(String::as_str), Some("2001:db8::1"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(prog, "ping6");
+            assert_eq!(tool_command("traceroute", "::1").unwrap().0, "traceroute6");
+            assert_eq!(tool_command("ping", "10.0.0.1").unwrap().0, "ping");
+        } else if cfg!(all(unix, not(target_os = "macos"))) {
+            assert_eq!(args[0], "-6");
+        }
+        assert!(tool_command("nmap", "h").is_err());
+    }
 
     #[test]
     fn decode_line_strips_crlf_and_keeps_utf8() {
@@ -309,5 +483,23 @@ mod tests {
         assert!(line.starts_with("Ping wird ausgef"));
         assert!(line.ends_with("r 1.1.1.1"));
         assert!(line.contains('\u{FFFD}'));
+    }
+
+    /// Six addresses, none open: four are tried and the result says the other
+    /// two were not, rather than reading as "every address failed".
+    #[tokio::test]
+    async fn port_check_says_when_addresses_were_skipped() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let out = check_addrs("h.example", port, &[addr; 6], 2000).await;
+        assert_eq!(out.lines().count(), 5, "{out}");
+        assert!(out.contains("tried 4 of 6 addresses"), "{out}");
+        assert!(out.contains("other 2 were not tried"), "{out}");
+        // All tried: nothing to report.
+        let out = check_addrs("h.example", port, &[addr; 2], 2000).await;
+        assert!(!out.contains("tried"), "{out}");
     }
 }

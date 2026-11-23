@@ -10,7 +10,7 @@
 #
 # There is no fixed release of the `rsa` crate yet, so this cannot be resolved
 # by an upgrade. It is tracked, not dismissed:
-#   - Skiff uses `rsa` only transitively via the SSH stack, and only for SSH
+#   - Hawser uses `rsa` only transitively via the SSH stack, and only for SSH
 #     *signature* verification/creation, never RSA *decryption*. The Marvin
 #     attack is a decryption/PKCS#1v1.5-unpadding timing oracle; a security
 #     review (2026-09-24) found no reachable RSA-decryption oracle in this app.

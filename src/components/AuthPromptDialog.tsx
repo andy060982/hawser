@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { KeyRound, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 
 interface AuthPromptField {
   prompt: string
@@ -13,6 +15,14 @@ interface AuthPromptRequest {
   name: string
   instruction: string
   prompts: AuthPromptField[]
+  /** Which connection is asking, from the backend's dial parameters (the
+   *  name is the catalogue label). Shown apart from the server's own text. */
+  hostName?: string | null
+  target: string
+  via?: string | null
+  /** 'password': Hawser's own up-front password prompt (carries no server
+   *  text). 'challenge': a keyboard-interactive round the server wrote. */
+  kind?: 'password' | 'challenge'
   /** When true, offer a "save to the OS vault" checkbox (up-front password
    *  prompt only — never for a single-use server challenge). */
   offerSave?: boolean
@@ -81,18 +91,15 @@ export function AuthPromptDialog() {
     setBusy(false)
     firstRef.current?.focus()
 
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        void cancel()
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request?.requestId])
 
+  // Escape cancels authentication, while this prompt is the top modal.
+  const cancelRef = useRef<() => Promise<void>>(async () => {})
+  useModalLayer(!!request, () => void cancelRef.current(), LAYER.sshPrompt)
+
   if (!request) return null
+  cancelRef.current = cancel
 
   async function submit(vals: string[]) {
     if (!request) return
@@ -118,7 +125,7 @@ export function AuthPromptDialog() {
   }
 
   return (
-    <div className="absolute inset-0 z-50 flex justify-center">
+    <div className="absolute inset-0 z-[80] flex justify-center">
       <div
         className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]"
         aria-hidden
@@ -142,26 +149,77 @@ export function AuthPromptDialog() {
           </div>
           <div className="min-w-0">
             <h2 id="ap-title" className="text-[14px] font-medium text-ink">
-              Additional authentication
+              {request.kind === 'password' ? 'Password required' : 'Additional authentication'}
             </h2>
-            <p className="mt-0.5 text-[12.5px] text-ink-dim">
-              {request.name.trim() || 'The server is asking for another factor.'}
-            </p>
           </div>
         </header>
 
-        {request.instruction.trim() && (
-          <p className="mx-5 mb-1 whitespace-pre-wrap text-[12px] leading-relaxed text-ink-faint">
-            {request.instruction}
+        {/* Who is asking. From the backend's dial parameters, never from the
+            server, so a server cannot word its prompt as another host's. */}
+        <dl className="mx-5 mb-2 grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1 rounded border border-line bg-surface-1 px-3 py-2 text-[12px]">
+          {request.hostName && (
+            <>
+              <dt className="text-ink-faint">Host</dt>
+              <dd className="truncate text-ink" title={request.hostName}>
+                {request.hostName}
+              </dd>
+            </>
+          )}
+          <dt className="text-ink-faint">Account</dt>
+          <dd className="selectable truncate font-mono text-ink" title={request.target}>
+            {request.target}
+          </dd>
+          {request.via && (
+            <>
+              <dt className="text-ink-faint">Via</dt>
+              <dd className="selectable truncate font-mono text-ink-dim" title={request.via}>
+                {request.via}
+              </dd>
+            </>
+          )}
+        </dl>
+
+        {request.kind !== 'password' && !request.name.trim() && !request.instruction.trim() && (
+          <p className="mx-5 mb-1 text-[12.5px] text-ink-dim">
+            The server is asking for another factor.
           </p>
         )}
-
+        {request.kind !== 'password' && (request.name.trim() || request.instruction.trim()) && (
+          <div className="mx-5 mb-1">
+            <p className="text-[10.5px] uppercase tracking-wider text-ink-faint">
+              Message from the server
+            </p>
+            {request.name.trim() && (
+              <p className="mt-0.5 whitespace-pre-wrap text-[12.5px] text-ink-dim">{request.name}</p>
+            )}
+            {request.instruction.trim() && (
+              <p className="mt-0.5 whitespace-pre-wrap text-[12px] leading-relaxed text-ink-faint">
+                {request.instruction}
+              </p>
+            )}
+          </div>
+        )}
         <div className="mx-5 mt-2 space-y-3">
           {request.prompts.map((p, i) => (
             <label key={i} className="block">
-              <span className="mb-1 block text-[12px] text-ink-dim">
-                {p.prompt.trim() || 'Response'}
-              </span>
+              {request.kind === 'password' ? (
+                <span className="mb-1 block text-[12px] text-ink-dim">
+                  {p.prompt.trim() || 'Response'}
+                </span>
+              ) : (
+                // A challenge's field labels are server-written text too, so
+                // they carry the same marking as the server's message: a
+                // server must not be able to label an input as another
+                // host's or account's, right above where the user types.
+                <span className="mb-1 block text-[12px]">
+                  <span className="text-[10.5px] uppercase tracking-wider text-ink-faint">
+                    Server asks:
+                  </span>{' '}
+                  <span className="whitespace-pre-wrap text-ink-dim">
+                    {p.prompt.trim() || 'a response'}
+                  </span>
+                </span>
+              )}
               <input
                 ref={i === 0 ? firstRef : undefined}
                 type={p.echo ? 'text' : 'password'}

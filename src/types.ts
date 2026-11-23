@@ -53,6 +53,10 @@ export interface Host {
    *  `cat /etc/network/interfaces` (Linux). Runs over a fresh exec channel,
    *  never through the visible terminal. */
   configCommand?: string
+  /** Run `configCommand` on every connect and report whether the config
+   *  changed since the last snapshot ("what changed since my last visit").
+   *  Opt-in: it executes a command on the device, so never on by default. */
+  checkConfigOnConnect?: boolean
   /** Borrow another host's Credential Manager entry ("same password as
    *  fw-01"). One vault edit then covers every host that points here —
    *  the TACACS/AD-account case. */
@@ -64,6 +68,9 @@ export interface Host {
    *  a Palo Alto, `df -h` on a Linux box. Slot digits are chosen by the user so
    *  the same finger memory can mean the same *kind* of thing across hosts. */
   snippets?: Snippet[]
+  /** Set on the synthetic hosts behind local terminal tabs (never saved to the
+   *  catalogue): the shell profile id to start instead of dialling SSH. */
+  local?: { profile: string }
 }
 
 export interface Snippet {
@@ -94,6 +101,12 @@ export const isFolder = (n: HostNode): n is HostFolder => n.kind === 'folder'
 /* -------------------------------------------------------------------------- */
 
 export type SessionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
+
+/** What `ssh_connect` resolves to: the endpoint identity the backend actually
+ *  dialled (target and bastion as sent, see lib/endpoint). Anything keyed by
+ *  that connection after the dial uses this, not the catalogue as it stands
+ *  then. Undefined outside Tauri or from a backend that returned nothing. */
+export type DialIdentity = string
 
 /** Which surface a tab is showing. Stored per-session, not globally: switching
  *  tabs should restore whatever that tab was last doing. */
@@ -139,30 +152,54 @@ export interface FileEntry {
 export interface DirListing {
   path: string
   entries: FileEntry[]
+  /** The server listed more entries than the backend keeps; this is a prefix. */
+  truncated?: boolean
 }
 
 export type PaneSide = 'local' | 'remote'
 
 export type TransferDirection = 'upload' | 'download'
 
+/** What a transfer may do to a file already at its destination. Mirrors
+ *  `Overwrite` in src-tauri/src/ssh.rs. `never` is enforced when each file is
+ *  committed, so a file that appears after the prompt is never clobbered;
+ *  `confirmed` means the user was asked about that existing file and agreed. */
+export type OverwritePolicy = 'never' | 'replace' | 'confirmed'
+
 export interface Transfer {
+  /** Also the backend's transfer id: progress and failure events carry it,
+   *  and `sftp_cancel` takes it. */
   id: string
-  /** Which session this transfer belongs to, so the global queue can attribute
-   *  progress events correctly when several sessions transfer at once. */
+  /** Which session this transfer belongs to. */
   sessionId: string
   direction: TransferDirection
   name: string
-  /** Full path, used to correlate `sftp://progress` events with this row. The
-   *  backend keys progress by path because it has no notion of our row ids. */
+  /** Full source path (display, and the job a retry rebuilds). */
   path: string
+  /** The other side, for rebuilding the job. */
+  dest: string
+  overwrite: OverwritePolicy
   bytesDone: number
   bytesTotal: number
-  status: 'active' | 'done' | 'error'
+  /** `queued`: waiting for an earlier job of the same batch. */
+  status: 'queued' | 'active' | 'done' | 'error' | 'cancelled'
   error?: string
+  /** Notes from a successful transfer (written through a symlink, a
+   *  non-atomic in-place fallback). */
+  notes?: string[]
+  /** The latest live warning from a progress event (see
+   *  TransferProgressEvent.note), shown while the row is active. */
+  note?: string
   /** Per-file failures accumulated from `sftp://failure` events during a
    *  recursive (folder) transfer. Lets the UI show the FULL list — not just the
    *  first — and retry exactly the files that didn't make it. */
   failures?: TransferFailureItem[]
+}
+
+/** Result of `sftp_get`/`sftp_put`. Mirrors TransferOutcome in ssh.rs. */
+export interface TransferOutcome {
+  bytes: number
+  notes: string[]
 }
 
 /** One failed file inside a recursive transfer, with both sides retained so a
@@ -179,6 +216,8 @@ export interface TransferFailureItem {
  *  src-tauri/src/ssh.rs — change the two together. */
 export interface TransferProgressEvent {
   sessionId: string
+  /** The row's id (see Transfer.id). */
+  transferId: string
   /** The transfer's ROOT source path — the queue row's `path`. Equals
    *  `filePath` for a single file; for a folder it is the folder, and
    *  `bytesTransferred` is cumulative across the tree (with `totalBytes` 0). */
@@ -190,6 +229,9 @@ export interface TransferProgressEvent {
   totalBytes: number
   direction: TransferDirection
   done: boolean
+  /** A warning to show while the transfer still runs (the in-place,
+   *  non-atomic fallback), sent before the destination is truncated. */
+  note?: string
 }
 
 /** Payload of the `sftp://failure` event. Mirrors TransferFailure in
@@ -197,10 +239,69 @@ export interface TransferProgressEvent {
  *  source path, matching the queue row's `path`. */
 export interface TransferFailureEvent {
   sessionId: string
+  /** The row's id (see Transfer.id). */
+  transferId: string
   root: string
   name: string
   local: string
   remote: string
   reason: string
   direction: TransferDirection
+}
+
+/* ------------------------------------------------------- remote editing */
+
+/** Mirrors EditStatus in src-tauri/src/utils/remote_edit.rs. */
+export type EditStatus = 'synced' | 'uploading' | 'conflict' | 'error'
+
+/** One remote file open in a local editor: the `edit_open` / `edit_list`
+ *  result and the `sftp://edit` event. Mirrors EditInfo in
+ *  src-tauri/src/utils/remote_edit.rs — change the two together. */
+export interface EditInfo {
+  editId: string
+  sessionId: string
+  remotePath: string
+  /** The private local copy the editor has open. */
+  localPath: string
+  name: string
+  status: EditStatus
+  message: string | null
+  /** The local copy has (or may have) changes the server does not. */
+  dirty: boolean
+  bytes: number
+  /** Unix seconds the server last matched the local copy. */
+  lastSync: number | null
+  /** Bumped on every conflict found (see lib/remoteEdit conflictPromptDue). */
+  conflictSeq: number
+  /** 'default': the OS default app; 'command': the editor command. */
+  opener: 'default' | 'command'
+}
+
+/** `sftp://edit-closed`. `keptAt`: unsynced changes were kept there. */
+export interface EditClosed {
+  editId: string
+  keptAt: string | null
+}
+
+/** A local copy kept because it had unsynced changes (`edit_leftovers`,
+ *  `sftp://edit-leftovers`). Mirrors Leftover in remote_edit.rs. */
+export interface EditLeftover {
+  id: string
+  remotePath: string
+  localPath: string
+  name: string
+}
+
+/** `edit_stop`'s result. `stopped` false: unsynced changes, ask the user. */
+export interface EditStopOutcome {
+  stopped: boolean
+  dirty: boolean
+  keptAt: string | null
+}
+
+/** `edit_editor_load` / `edit_editor_save`. */
+export interface EditorView {
+  command: string
+  /** The program it runs, as a full path; null for the default app. */
+  resolved: string | null
 }

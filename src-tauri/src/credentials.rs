@@ -19,6 +19,7 @@ pub enum CredError {
     #[error("no saved credential for {0}")]
     NotFound(String),
     #[error("stored secret for {0} is not valid text")]
+    #[cfg_attr(not(windows), allow(dead_code))]
     Malformed(String),
     #[cfg(windows)]
     #[error("credential manager error 0x{0:08X}")]
@@ -28,25 +29,88 @@ pub enum CredError {
     Backend(String),
 }
 
-/// Vault key for a host. Namespaced so Skiff's entries are obvious in each
+/// Vault key for a host. Namespaced so Hawser's entries are obvious in each
 /// platform's vault UI and cannot collide with another application's entries.
 pub fn target_name(host_id: &str) -> String {
-    format!("skiff:host:{host_id}")
+    format!("hawser:host:{host_id}")
 }
 
-/// True for vault ids that belong to another namespace and must never be used
-/// as a host credential id. The AI provider key is stored at `ai:<profile>`
-/// (see utils::ai::vault_profile), which shares `target_name`'s prefix — so a
-/// host whose id were `ai:default` would otherwise address that key. Matched
-/// case-insensitively because Windows Credential Manager target names are.
+/// Vault id prefixes owned by the app itself, never usable as a host
+/// credential id. Every item shares `target_name`'s prefix, so without this a
+/// host whose id were `ai:default` would address the AI provider key
+/// (utils::ai::vault_profile), and one named `hawser:audit-head` the audit-log
+/// anchor (utils::audit::SEAL_ID).
+const RESERVED_PREFIXES: [&str; 2] = ["ai:", "hawser:"];
+
+/// True for vault ids in a reserved namespace. Matched case-insensitively
+/// because Windows Credential Manager target names are, and with full Unicode
+/// folding rather than ASCII-only: upper- then lower-casing maps look-alikes
+/// such as `ſ` (long s) and `K` (Kelvin sign) onto `s` / `k`, so `hawſer:` cannot
+/// slip past if the vault folds them together.
 pub fn is_reserved_id(id: &str) -> bool {
-    id.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("ai:"))
+    let folded = id.to_uppercase().to_lowercase();
+    RESERVED_PREFIXES.iter().any(|p| folded.starts_with(p))
 }
 
-/// Whether a secret exists, without exposing it. Lets the UI show "password
+/// Longest vault id accepted. Generated ids are ~20 characters; this is room
+/// for any hand-made one, far below every backend's target-name limit.
+const MAX_ID: usize = 200;
+
+/// Refuse vault ids no backend can store faithfully, BEFORE any lookup,
+/// namespace check, or binding operation, so a vault item and its binding can
+/// never disagree about which id they belong to:
+/// - empty or over-long ids;
+/// - NUL and other control characters. The Windows backend passes ids as
+///   NUL-terminated UTF-16, so `a\0b` would address the vault item `a` while
+///   its binding is keyed by the whole string;
+/// - on Windows, non-ASCII ids. Credential Manager folds case with its own
+///   Unicode tables, which no Rust fold reproduces exactly; with ASCII ids the
+///   binding key's ASCII fold is exactly the vault's.
+pub fn validate_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("a vault id must not be empty".into());
+    }
+    if id.len() > MAX_ID {
+        return Err(format!("a vault id must be at most {MAX_ID} bytes"));
+    }
+    if id.chars().any(char::is_control) {
+        return Err("a vault id must not contain control characters".into());
+    }
+    if cfg!(windows) && !id.is_ascii() {
+        return Err(format!("'{id}' cannot be a vault id on Windows: use ASCII letters, digits and punctuation"));
+    }
+    Ok(())
+}
+
+/// Whether a secret exists, without decrypting it. Lets the UI show "password
 /// saved" while the plaintext stays in the vault.
+///
+/// An existence query, never a read: on macOS an attributes-only Keychain
+/// search (no `kSecReturnData`), so opening the host editor cannot raise a
+/// Keychain "allow access" prompt; on Linux a Secret Service search, which
+/// lists locked items without unlocking them; on Windows `CredReadW`, whose
+/// DPAPI decrypt never prompts (the blob is wiped in place before it is freed;
+/// see `imp::secret_exists` for why no metadata-only call is used there).
 pub fn has_secret(host_id: &str) -> bool {
-    matches!(read_secret(host_id), Ok(_))
+    matches!(imp::secret_exists(host_id), Ok(true))
+}
+
+/// Whether the vault folds the case of ids: Windows Credential Manager
+/// resolves target names case-insensitively (`H-1` and `h-1` are one entry);
+/// the macOS Keychain and the Secret Service do not. The frontend asks for
+/// this (`vault_id_rule`) so it compares ids exactly as the vault does.
+pub const fn vault_folds_case() -> bool {
+    cfg!(windows)
+}
+
+/// The key under which the vault identifies `id`: ASCII-folded on Windows
+/// (ids there are ASCII-only, see `validate_id`), the id itself elsewhere.
+pub fn vault_id_key(id: &str) -> String {
+    if vault_folds_case() {
+        id.to_ascii_lowercase()
+    } else {
+        id.to_string()
+    }
 }
 
 pub use imp::{delete_secret, read_secret, write_secret};
@@ -178,6 +242,39 @@ mod imp {
         Ok(())
     }
 
+    /// Whether a credential exists.
+    ///
+    /// Credential Manager has no metadata-only lookup. `CredEnumerateW` with
+    /// the exact target name as its filter was considered and rejected: it
+    /// returns the same `CREDENTIALW` records, decrypted blob included, so it
+    /// copies no less than `CredReadW` (and a filter is a wildcard pattern, so
+    /// an exact name needs escaping it does not offer). `CredReadW` is
+    /// acceptable because (1) it never prompts: the blob is DPAPI-decrypted
+    /// silently with the user's own logon key, which this process already
+    /// runs under, so nothing is revealed that the process could not read
+    /// anyway; and (2) the plaintext never leaves the API's buffer: it is
+    /// wiped in place before `CredFree`, and nothing is copied out of it.
+    pub fn secret_exists(host_id: &str) -> Result<bool, CredError> {
+        let target_w = wide(&target_name(host_id));
+        let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: as in read_secret.
+        let ok = unsafe { CredReadW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0, &mut ptr) };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return if code == ERROR_NOT_FOUND { Ok(false) } else { Err(CredError::Win32(code)) };
+        }
+        // SAFETY: ptr is a live CredReadW allocation, wiped then freed once.
+        unsafe {
+            let cred = &*ptr;
+            let len = cred.CredentialBlobSize as usize;
+            if !cred.CredentialBlob.is_null() && len > 0 {
+                std::slice::from_raw_parts_mut(cred.CredentialBlob, len).zeroize();
+            }
+            CredFree(ptr as *mut c_void);
+        }
+        Ok(true)
+    }
+
     /// Remove a stored password. Used when a host is deleted, so the vault does
     /// not accumulate orphaned secrets.
     pub fn delete_secret(host_id: &str) -> Result<(), CredError> {
@@ -201,7 +298,7 @@ mod imp {
 // ---------------------------------------------------------------------------
 // Unix (Linux Secret Service / macOS Keychain) via the `keyring` crate.
 //
-// A host is keyed by (service = "skiff", account = target_name(host_id)) so a
+// A host is keyed by (service = "hawser", account = target_name(host_id)) so a
 // read needs only the host id — the username the Windows path stores is not
 // part of the lookup key here. `get_password` returns a plain `String`; we wrap
 // it in `Zeroizing` immediately so it wipes on drop like the Windows path.
@@ -213,7 +310,7 @@ mod imp {
 
     use super::{target_name, CredError};
 
-    const SERVICE: &str = "skiff";
+    const SERVICE: &str = "hawser";
 
     fn entry(host_id: &str) -> Result<Entry, CredError> {
         Entry::new(SERVICE, &target_name(host_id)).map_err(|e| CredError::Backend(e.to_string()))
@@ -240,6 +337,47 @@ mod imp {
             Err(e) => Err(CredError::Backend(e.to_string())),
         }
     }
+
+    /// Existence without decryption: an attributes-only Keychain search for
+    /// the item keyring writes (generic password, service + account). No
+    /// `kSecReturnData`, so no "allow access" prompt.
+    #[cfg(target_os = "macos")]
+    pub fn secret_exists(host_id: &str) -> Result<bool, CredError> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+        let account = target_name(host_id);
+        let mut q = ItemSearchOptions::new();
+        q.class(ItemClass::generic_password())
+            .service(SERVICE)
+            .account(&account)
+            .load_attributes(true)
+            .load_data(false)
+            .limit(Limit::Max(1));
+        match q.search() {
+            Ok(found) => Ok(!found.is_empty()),
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(false),
+            Err(e) => Err(CredError::Backend(e.to_string())),
+        }
+    }
+
+    /// Existence without unlocking: a Secret Service search for the item
+    /// keyring writes. The search lists locked items too, and never unlocks
+    /// them (keyring's own `get_attributes` does, which can prompt). Plain
+    /// session: no secret crosses the bus.
+    #[cfg(not(target_os = "macos"))]
+    pub fn secret_exists(host_id: &str) -> Result<bool, CredError> {
+        use dbus_secret_service::{EncryptionType, SecretService};
+        let account = target_name(host_id);
+        let ss = SecretService::connect(EncryptionType::Plain).map_err(|e| CredError::Backend(e.to_string()))?;
+        // keyring's attributes for Entry::new(service, user): target "default".
+        let attrs = std::collections::HashMap::from([
+            ("service", SERVICE),
+            ("username", account.as_str()),
+            ("target", "default"),
+        ]);
+        let found = ss.search_items(attrs).map_err(|e| CredError::Backend(e.to_string()))?;
+        Ok(!(found.unlocked.is_empty() && found.locked.is_empty()))
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +393,30 @@ mod reserved_tests {
         assert!(!is_reserved_id("ai")); // too short to carry the prefix
         assert!(!is_reserved_id("air-1"));
         assert!(!is_reserved_id("h1:ai:"));
+    }
+
+    #[test]
+    fn vault_ids_with_nul_or_control_characters_are_refused() {
+        use super::validate_id;
+        assert!(validate_id("h-lq3x-01").is_ok());
+        assert!(validate_id("").is_err());
+        assert!(validate_id("h-1\0evil").is_err());
+        assert!(validate_id("h-1\nx").is_err());
+        assert!(validate_id("h-1\u{85}x").is_err()); // C1 control
+        assert!(validate_id(&"x".repeat(201)).is_err());
+        assert_eq!(validate_id("h-\u{e9}").is_ok(), !cfg!(windows));
+    }
+
+    #[test]
+    fn audit_seal_namespace_is_reserved_case_insensitively() {
+        assert!(is_reserved_id(crate::utils::audit::SEAL_ID));
+        assert!(is_reserved_id("HAWSER:audit-head"));
+        assert!(is_reserved_id("Hawser:anything"));
+        assert!(!is_reserved_id("hawser"));
+        assert!(!is_reserved_id("hawser-audit-head-seal"));
+        assert!(!is_reserved_id("my-hawser:x"));
+        assert!(is_reserved_id("haw\u{17f}er:audit-head")); // long s
+        assert!(is_reserved_id("Ai:x"));
     }
 }
 
@@ -274,7 +436,7 @@ mod tests {
     /// would test nothing at all.
     #[test]
     fn write_read_delete_roundtrip() {
-        let id = "__skiff_selftest__";
+        let id = "__hawser_selftest__";
         // Deliberately not ASCII: the blob is UTF-16LE, and a truncation bug in
         // the encode/decode pair only shows up above the BMP-free happy path.
         let secret = "p@ss w\u{f6}rd \u{4e2d}\u{6587} 123";
@@ -290,7 +452,7 @@ mod tests {
 
     #[test]
     fn missing_secret_is_not_found() {
-        match read_secret("__skiff_definitely_absent__") {
+        match read_secret("__hawser_definitely_absent__") {
             Err(CredError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }

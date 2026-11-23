@@ -1,4 +1,4 @@
-# Skiff
+# Hawser
 
 A fast, small SSH terminal and SFTP client for Windows, built for network and
 systems administrators. Tauri + React front end, Rust back end — a single
@@ -10,7 +10,7 @@ systems administrators. Tauri + React front end, Rust back end — a single
 > network appliances as first-class citizens, with the terminal front and
 > center and the extra tooling one keystroke away.
 
-Skiff is a PuTTY/Termius-class client first; the network toolbox, config
+Hawser is a PuTTY/Termius-class client first; the network toolbox, config
 history, and AI assistant are there when you need them and out of the way when
 you don't.
 
@@ -50,7 +50,7 @@ you don't.
   keyboard-interactive fallback is what makes **TACACS+-fronted network gear**
   work, where the device advertises only that method and asks a hidden
   "Password:".
-- **Generate a key in-app and install it in one click** — Skiff creates an
+- **Generate a key in-app and install it in one click** — Hawser creates an
   Ed25519 keypair and, with the password entered once, appends it to the
   server's `authorized_keys` itself (an `ssh-copy-id` built in). No copy/paste
   ritual.
@@ -82,11 +82,11 @@ you don't.
   distinguishes open / closed / filtered, and **DNS lookup** — run from your
   workstation, for exactly the moment SSH *can't* connect.
 - **Reachability sweep**: one click probes every saved host's SSH port and marks
-  the sidebar. On demand only — Skiff never background-scans your network.
+  the sidebar. On demand only — Hawser never background-scans your network.
 
 ### Config management
 - **Config snapshots** — set a capture command per host (`show running-config`,
-  `show config running`, `cat /etc/…`); Skiff runs it over a hidden channel,
+  `show config running`, `cat /etc/…`); Hawser runs it over a hidden channel,
   stores timestamped plain-text history, and **diffs any two snapshots**. The
   answer to "what changed on this box since Tuesday," in two clicks.
 
@@ -120,7 +120,7 @@ you don't.
 
 ## Security model
 
-Skiff handles credentials for infrastructure, so the boundaries are deliberate:
+Hawser handles credentials for infrastructure, so the boundaries are deliberate:
 
 - **Secrets live in Windows Credential Manager**, encrypted per-user by DPAPI —
   never in config files, never in plaintext on disk.
@@ -149,16 +149,16 @@ and how to report a vulnerability.
 Grab the artifacts for your platform from the [Releases](../../releases) page.
 
 **Windows**
-- **`Skiff_<version>_x64-setup.exe`** — installer. Per-user, no admin prompt,
+- **`Hawser_<version>_x64-setup.exe`** — installer. Per-user, no admin prompt,
   Start Menu entry and uninstaller, and it auto-installs the WebView2 runtime if
   the machine lacks it. Recommended.
-- **`skiff.exe`** — portable single file. Run from anywhere, delete to remove.
+- **`hawser.exe`** — portable single file. Run from anywhere, delete to remove.
   Assumes WebView2 is present (it ships with Windows 10/11).
 
 **Linux**
-- **`.AppImage`** — universal, no install: `chmod +x Skiff_*.AppImage && ./Skiff_*.AppImage`
+- **`.AppImage`** — universal, no install: `chmod +x Hawser_*.AppImage && ./Hawser_*.AppImage`
   on any recent distro.
-- **`.deb`** — Debian/Ubuntu: `sudo apt install ./skiff_<version>_amd64.deb`.
+- **`.deb`** — Debian/Ubuntu: `sudo apt install ./hawser_<version>_amd64.deb`.
 
   Secrets are stored in the freedesktop Secret Service (GNOME Keyring / KWallet),
   and the SSH agent is read from `$SSH_AUTH_SOCK`.
@@ -173,21 +173,21 @@ with the C++ workload.
 
 ```
 npm install
-npm run tauri build -- --no-bundle   # portable exe → src-tauri/target/release/skiff.exe
+npm run tauri build -- --no-bundle   # portable exe → src-tauri/target/release/hawser.exe
 npm run tauri build                  # installer   → …/release/bundle/nsis/
 npm run tauri dev                    # hot reload + devtools
 ```
 
-## Where Skiff keeps things
+## Where Hawser keeps things
 
 | Path | Contents |
 |---|---|
-| `%APPDATA%\skiff\hosts.json` | Host catalogue (no secrets) |
-| `%APPDATA%\skiff\known_hosts` | Trusted host keys (OpenSSH format) |
-| `%APPDATA%\skiff\sessions.json` | Tabs to restore on launch |
-| `%APPDATA%\skiff\configs\<host>\` | Config snapshots |
-| `%APPDATA%\skiff\logs\` | Session transcripts (**plaintext — treat as sensitive**) |
-| Windows Credential Manager | Passwords / key passphrases (`skiff:host:<id>`) |
+| `%APPDATA%\hawser\hosts.json` | Host catalogue (no secrets) |
+| `%APPDATA%\hawser\known_hosts` | Trusted host keys (OpenSSH format) |
+| `%APPDATA%\hawser\sessions.json` | Tabs to restore on launch |
+| `%APPDATA%\hawser\configs\<host>\` | Config snapshots |
+| `%APPDATA%\hawser\logs\` | Session transcripts (**plaintext — treat as sensitive**) |
+| Windows Credential Manager | Passwords / key passphrases (`hawser:host:<id>`) |
 
 ## Keyboard shortcuts
 

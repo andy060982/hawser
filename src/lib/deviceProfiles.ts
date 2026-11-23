@@ -32,7 +32,7 @@ export const DEVICE_PROFILES: DeviceProfile[] = [
   {
     id: 'linux',
     label: 'Linux (tmux)',
-    startupCommands: ['tmux new-session -A -D -s skiff-{pane}'],
+    startupCommands: ['tmux new-session -A -D -s hawser-{pane}'],
     configCommand: 'cat /etc/os-release',
   },
 ]

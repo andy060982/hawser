@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Bot, Check, Copy, CornerDownLeft, Loader2, Settings2, ShieldOff, Sparkles,
-  TextSearch, X,
+  Square, TextSearch, X,
 } from 'lucide-react'
 import type { Host, Session } from '../types'
 import type { HostColor } from '../lib/hostColors'
 import { type ColorPolicy, policyFor, useSettings } from '../lib/settings'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { getTerm } from '../lib/termRegistry'
+import { bracketedNow } from '../lib/termInput'
 import { scanForSecrets, type SecretHit } from '../lib/secretScan'
+import { COPY_INSTEAD, isDangerousCommand, planInsert } from '../lib/dangerous'
+import { useDialogs } from '../lib/dialogs'
+import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 import { ShieldAlert } from 'lucide-react'
 
 interface AiConfig {
@@ -32,16 +37,22 @@ interface AiEvent {
   error: string | null
 }
 
+/* The first preset is the starting point when nothing is saved. A plain HTTP
+   API is the default: the CLI is a local agent (run here with every tool
+   disabled, but still the larger surface), so it is opt-in. A config saved
+   with the CLI keeps working; only the unconfigured default changed. */
 const PRESETS: { label: string; cfg: AiConfig }[] = [
-  {
-    label: 'Claude Code CLI (uses your Claude subscription)',
-    cfg: { kind: 'claude-code', baseUrl: '', model: 'managed by Claude Code' },
-  },
   { label: 'Anthropic (Claude)', cfg: { kind: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'claude-sonnet-4-5' } },
   { label: 'OpenAI', cfg: { kind: 'openai', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' } },
   { label: 'Ollama (local)', cfg: { kind: 'openai', baseUrl: 'http://localhost:11434/v1', model: 'llama3.1' } },
   { label: 'LM Studio (local)', cfg: { kind: 'openai', baseUrl: 'http://localhost:1234/v1', model: 'local-model' } },
+  {
+    label: 'Claude Code CLI (uses your Claude subscription; tools disabled)',
+    cfg: { kind: 'claude-code', baseUrl: '', model: 'managed by Claude Code' },
+  },
 ]
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 /** Whether the assistant may see this host's terminal output. Red-accented
  *  hosts (production, by this app's own convention) default to NO — sending a
@@ -60,20 +71,28 @@ export function aiAllowedFor(
    AI assistant panel (Ctrl+Shift+A).
 
    Advisor only, by architecture rather than by policy:
-   - Suggestions render as chips; Insert TYPES the command into the terminal
-     with no newline. The human pressing Enter is the approval step.
-   - Context is the visible tail of THIS session's transcript (~4 KB), shown
-     as a labelled line so what leaves the machine is never a surprise.
-   - The provider sees one session, never other tabs.
+   - Suggestions render as chips; Insert pastes the command through the
+     terminal's own paste path with no newline. One line with no control
+     characters is typed as is; anything with a line break only as a
+     bracketed paste (re-checked at the moment of writing), else refused.
+     Destructive commands need a confirm. The human pressing Enter is the
+     approval step.
+   - Context is the tail of THIS session's transcript (~4 KB), looked up by
+     the session's own dialled endpoint identity rather than hostname, and
+     refused if that is no longer the endpoint this host's AI policy is for.
+   - The provider sees one endpoint, never other tabs.
 --------------------------------------------------------------------------- */
 export function AiPanel({
   session,
   host,
+  endpoint,
   effectiveColor,
   onClose,
 }: {
   session: Session | undefined
   host: Host | undefined
+  /** Endpoint identity of `host` (lib/endpoint); keys the transcript lookup. */
+  endpoint: string | undefined
   effectiveColor?: HostColor
   onClose: () => void
 }) {
@@ -81,6 +100,7 @@ export function AiPanel({
   const [showSettings, setShowSettings] = useState(false)
   const [keySaved, setKeySaved] = useState(false)
   const [keyDraft, setKeyDraft] = useState('')
+  const [settingsError, setSettingsError] = useState<string | null>(null)
   // One conversation per session id, so switching panes/sessions and coming
   // back restores that session's thread instead of wiping it — while still
   // never showing one session's history under another (no cross-host bleed).
@@ -116,25 +136,40 @@ export function AiPanel({
     systemContext: string
     hits: SecretHit[]
   } | null>(null)
+  /* The secret warning is a modal layer: app shortcuts (Ctrl+Shift+K and the
+     rest check anyModalOpen) stay off while it is up, and Escape cancels it
+     (only it, never a dialog under or over it). */
+  useModalLayer(!!pendingSend, () => setPendingSend(null), LAYER.aiWarning)
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
+  /** The run in flight, for the Stop button. Set as ai_chat is sent: the
+   *  backend remembers a cancel that overtakes its ai_chat, so a Stop sent
+   *  from then on always reaches the run. */
+  const runRef = useRef<string | null>(null)
+  /** Stop was pressed before ai_chat was sent (listener setup): don't send it. */
+  const stopPendingRef = useRef(false)
 
   const { settings } = useSettings()
   const allowed = aiAllowedFor(host, policyFor(settings, effectiveColor))
 
   /* Provider config: load once; missing config opens settings. */
   useEffect(() => {
-    void safeInvoke<AiConfig | null>('ai_config_load').then((c) => {
-      // kind, not baseUrl: the Claude Code CLI provider has no URL at all.
-      if (c && c.kind) setCfg(c)
-      else setShowSettings(true)
-    })
+    void safeInvoke<AiConfig | null>('ai_config_load')
+      .then((c) => {
+        // kind, not baseUrl: the Claude Code CLI provider has no URL at all.
+        if (c && c.kind) setCfg(c)
+        else setShowSettings(true)
+      })
+      .catch((e: unknown) => {
+        setSettingsError(`Could not load the saved provider settings: ${errText(e)}`)
+        setShowSettings(true)
+      })
   }, [])
 
   useEffect(() => {
-    void safeInvoke<boolean>('ai_key_status', { profile: 'default' }).then((v) =>
-      setKeySaved(Boolean(v)),
-    )
+    void safeInvoke<boolean>('ai_key_status', { profile: 'default' })
+      .then((v) => setKeySaved(Boolean(v)))
+      .catch(() => setKeySaved(false))
   }, [showSettings])
 
   useEffect(() => {
@@ -143,30 +178,55 @@ export function AiPanel({
 
   useEffect(() => () => unlistenRef.current?.(), [])
 
+  /* The key is saved (and bound) before the provider switch is persisted, and
+     the in-memory config changes only once both succeeded: a failed key save
+     no longer leaves the provider switched with its key unbound. The typed key
+     is cleared from state whatever happens, so a failure cannot leave it
+     sitting in React state for the life of the panel. */
   const saveSettings = async (next: AiConfig) => {
-    setCfg(next)
-    await safeInvoke('ai_config_save', { config: next })
-    if (keyDraft.trim()) {
-      // Pass the origin so the backend can bind the key to it (see save_key):
-      // the key may then only be sent to this kind/base_url, regardless of any
-      // later edit to ai.json.
-      await safeInvoke('ai_key_save', {
-        profile: 'default',
-        key: keyDraft.trim(),
-        kind: next.kind,
-        baseUrl: next.baseUrl,
-      })
+    setSettingsError(null)
+    const key = keyDraft.trim()
+    try {
+      if (key) {
+        // Pass the origin so the backend can bind the key to it (see save_key):
+        // the key may then only be sent to this kind/base_url, regardless of any
+        // later edit to ai.json.
+        await safeInvoke('ai_key_save', {
+          profile: 'default',
+          key,
+          kind: next.kind,
+          baseUrl: next.baseUrl,
+        })
+        setKeySaved(true)
+      }
+      await safeInvoke('ai_config_save', { config: next })
+      setCfg(next)
+      setShowSettings(false)
+    } catch (e) {
+      setSettingsError(`Not saved: ${errText(e)}`)
+    } finally {
       setKeyDraft('')
-      setKeySaved(true)
     }
-    setShowSettings(false)
   }
 
   /** Forget the saved key (and the origin it is bound to). The way out after
    *  moving to a provider that needs none, e.g. local Ollama. */
   const removeKey = async () => {
-    await safeInvoke('ai_key_delete', { profile: 'default' })
-    setKeySaved(false)
+    setSettingsError(null)
+    try {
+      await safeInvoke('ai_key_delete', { profile: 'default' })
+      setKeySaved(false)
+    } catch (e) {
+      setSettingsError(`The key was not removed: ${errText(e)}`)
+    }
+  }
+
+  /** Stop the request in flight. The backend kills the CLI or drops the HTTP
+   *  request and sends the run's final event, which unlocks the composer. */
+  const stop = () => {
+    const runId = runRef.current
+    if (runId) void safeInvoke('ai_cancel', { runId }).catch(() => {})
+    else stopPendingRef.current = true
   }
 
   /** Actually fire the request — reached either directly, or after the user
@@ -184,36 +244,47 @@ export function AiPanel({
       unlistenRef.current = null
       setThreadMsgs(target, [...thread, { role: 'assistant', content: '' }])
       setStreaming(true)
-      const runId = `ai-${Date.now()}`
-      unlistenRef.current = await safeListen<AiEvent>(`ai://${runId}`, (ev) => {
-        if (ev.error) {
-          setThreadMsgs(target, (m) => {
-            const copy = [...m]
-            copy[copy.length - 1] = {
-              role: 'assistant',
-              content: `⚠ ${ev.error}`,
-              error: true,
-            }
-            return copy
-          })
-        } else if (ev.delta) {
-          setThreadMsgs(target, (m) => {
-            const copy = [...m]
-            copy[copy.length - 1] = {
-              role: 'assistant',
-              content: copy[copy.length - 1].content + ev.delta,
-            }
-            return copy
-          })
-        }
-        if (ev.done) {
-          setStreaming(false)
-          unlistenRef.current?.()
-          unlistenRef.current = null
-        }
-      })
-
+      runRef.current = null
+      stopPendingRef.current = false
+      const runId = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      let started = false
+      /** The final event arrived (possibly before ai_chat even returned). */
+      const finish = () => {
+        setStreaming(false)
+        if (runRef.current === runId) runRef.current = null
+        unlistenRef.current?.()
+        unlistenRef.current = null
+      }
       try {
+        // Listener first, so no event of the run can be missed; registration
+        // failing is handled like any other failure below.
+        unlistenRef.current = await safeListen<AiEvent>(`ai://${runId}`, (ev) => {
+          if (ev.error) {
+            setThreadMsgs(target, (m) => {
+              const copy = [...m]
+              copy[copy.length - 1] = {
+                role: 'assistant',
+                content: `⚠ ${ev.error}`,
+                error: true,
+              }
+              return copy
+            })
+          } else if (ev.delta) {
+            setThreadMsgs(target, (m) => {
+              const copy = [...m]
+              copy[copy.length - 1] = {
+                role: 'assistant',
+                content: copy[copy.length - 1].content + ev.delta,
+              }
+              return copy
+            })
+          }
+          if (ev.done) finish()
+        })
+        if (stopPendingRef.current) throw new Error('Cancelled.')
+        // The run id is ours, so Stop can target it before ai_chat returns: a
+        // cancel that reaches the backend first ends the run as it starts.
+        runRef.current = runId
         await safeInvoke('ai_chat', {
           runId,
           cfg,
@@ -221,14 +292,16 @@ export function AiPanel({
           systemContext,
           messages: thread,
         })
+        started = true
       } catch (e) {
-        setStreaming(false)
-        unlistenRef.current?.()
-        unlistenRef.current = null
         setThreadMsgs(target, (m) => [
           ...m.slice(0, -1),
           { role: 'assistant', content: `⚠ ${e instanceof Error ? e.message : e}`, error: true },
         ])
+      } finally {
+        stopPendingRef.current = false
+        // Nothing was started, so no final event will come to unlock the composer.
+        if (!started) finish()
       }
     },
     [cfg, setThreadMsgs],
@@ -252,13 +325,31 @@ export function AiPanel({
       const thread = [...sendable, userMsg]
       setInput('')
 
-      // Context: the transcript tail for THIS host. Labelled in the thread
-      // header below so the user always knows what was shared.
-      const tail =
-        (await safeInvoke<string | null>('session_history', {
-          host: host.hostname,
-          maxBytes: 4000,
-        })) ?? ''
+      // Context: the transcript tail for THIS endpoint — never a hostname
+      // lookup, which could return another entry's output under this host's
+      // AI policy. Labelled in the thread header so the user always knows what
+      // was shared.
+      //
+      // The live session's own dialled identity keys the lookup; `endpoint`
+      // (what this host's policy above was evaluated for) must match it, so a
+      // tab still connected to a repointed host's old device is refused.
+      let tail = ''
+      if (endpoint) {
+        try {
+          tail =
+            (await safeInvoke<string | null>('session_history', {
+              sessionId: targetSid,
+              endpoint,
+              maxBytes: 4000,
+            })) ?? ''
+        } catch (e) {
+          setThreadMsgs(targetSid, [
+            ...thread,
+            { role: 'assistant', content: `⚠ Not sent: ${errText(e)}`, error: true },
+          ])
+          return
+        }
+      }
 
       const systemContext =
         `Host: ${host.name} (${host.hostname}:${host.port}, user ${host.username}).\n` +
@@ -278,7 +369,7 @@ export function AiPanel({
       }
       void dispatch(targetSid, thread, systemContext)
     },
-    [cfg, session, host, allowed, streaming, messages, dispatch],
+    [cfg, session, host, endpoint, allowed, streaming, messages, dispatch, setThreadMsgs],
   )
 
   const explainSelection = () => {
@@ -313,6 +404,7 @@ export function AiPanel({
       {showSettings ? (
         <SettingsForm
           cfg={cfg}
+          error={settingsError}
           keySaved={keySaved}
           keyDraft={keyDraft}
           setKeyDraft={setKeyDraft}
@@ -380,15 +472,27 @@ export function AiPanel({
                 placeholder="Ask about this session…"
                 className="min-w-0 flex-1 resize-none rounded border border-line bg-surface-0 px-2 py-1.5 text-[12.5px] text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
               />
-              <button
-                type="button"
-                disabled={streaming || !input.trim()}
-                onClick={() => void send(input)}
-                aria-label="Send"
-                className="grid w-9 shrink-0 place-items-center rounded border border-accent/60 bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40"
-              >
-                <CornerDownLeft size={14} />
-              </button>
+              {streaming ? (
+                <button
+                  type="button"
+                  onClick={stop}
+                  aria-label="Stop"
+                  title="Stop this request"
+                  className="grid w-9 shrink-0 place-items-center rounded border border-line text-ink-dim hover:bg-surface-3 hover:text-ink"
+                >
+                  <Square size={12} />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={!input.trim()}
+                  onClick={() => void send(input)}
+                  aria-label="Send"
+                  className="grid w-9 shrink-0 place-items-center rounded border border-accent/60 bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40"
+                >
+                  <CornerDownLeft size={14} />
+                </button>
+              )}
             </div>
           </div>
         </>
@@ -400,7 +504,11 @@ export function AiPanel({
             onMouseDown={() => setPendingSend(null)}
             aria-hidden
           />
-          <div className="relative w-full max-w-[20rem] overflow-hidden rounded-panel border border-warn/50 bg-surface-2 shadow-2xl">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            className="relative w-full max-w-[20rem] overflow-hidden rounded-panel border border-warn/50 bg-surface-2 shadow-2xl"
+          >
             <header className="flex items-center gap-2 border-b border-line px-3 py-2.5">
               <ShieldAlert size={15} className="shrink-0 text-warn" aria-hidden />
               <span className="text-[12.5px] font-medium text-ink">Possible secret in context</span>
@@ -434,6 +542,7 @@ export function AiPanel({
             <footer className="flex justify-end gap-2 border-t border-line bg-surface-1 px-3 py-2.5">
               <button
                 type="button"
+                autoFocus
                 onClick={() => setPendingSend(null)}
                 className="rounded border border-line px-3 py-1 text-[12px] text-ink-dim hover:bg-surface-3 hover:text-ink"
               >
@@ -494,6 +603,9 @@ function MessageView({ msg, sessionId }: { msg: Msg; sessionId: string }) {
 
 function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
   const [inserted, setInserted] = useState(false)
+  /** The last insert happened while broadcast was on (it went here only). */
+  const [insertedLocal, setInsertedLocal] = useState(false)
+  const { confirm, alert } = useDialogs()
   // Strip an optional language tag line ("bash\n...") and trailing whitespace.
   const lines = raw.replace(/^\s*\n/, '').split('\n')
   const first = lines[0]?.trim() ?? ''
@@ -503,16 +615,75 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
 
   if (!body) return null
 
-  const insert = () => {
-    // Typed into the terminal input, NO trailing newline: the user reviews it
-    // on their own prompt and presses Enter — or doesn't. That keystroke is
-    // the entire approval model; never "improve" this by appending \n.
-    const bytes = Array.from(new TextEncoder().encode(body))
-    void safeInvoke('ssh_write', { sessionId, data: bytes }).then(() => {
-      setInserted(true)
-      getTerm(sessionId)?.term.focus()
-      setTimeout(() => setInserted(false), 1600)
-    })
+  /* Pasted into the terminal input, NO trailing newline: the user reviews it
+     on their own prompt and presses Enter — or doesn't. That keystroke is the
+     entire approval model; never "improve" this by appending \n.
+
+     It goes through term.paste(), the same path as a user paste, and only in
+     a shape that cannot act on its own (lib/dangerous planInsert): one line
+     with no control characters, or a multi-line block only as a bracketed
+     paste. Without bracketed paste every line break is Enter, so multi-line
+     text is refused rather than confirmed. The bracketed-paste state is read
+     again synchronously right before writing, after every dialog: the remote
+     can switch it off while a confirm is open. The model's output is
+     steerable by whatever is on the remote screen, so the destructive-command
+     check applies here regardless of the paste-guard setting. */
+  const insert = async () => {
+    const refuse = (reason: string) =>
+      void alert(`This suggestion was not inserted: ${reason}. ${COPY_INSTEAD}`, { title: 'Suggestion refused' })
+    const first = getTerm(sessionId)
+    if (!first) {
+      await alert('This session’s terminal is not open, so nothing was inserted.', { title: 'Not inserted' })
+      return
+    }
+    const plan = planInsert(body, bracketedNow(first.term))
+    if (plan.kind === 'refuse') {
+      refuse(plan.reason)
+      return
+    }
+    // AI insert is never broadcast: it goes to this pane only.
+    const localNote =
+      first.broadcastTargets().length > 0
+        ? ' Broadcast is on, but a suggestion is inserted only into this pane, never into the others.'
+        : ''
+    if (
+      plan.lines > 1 &&
+      !(await confirm(
+        `This suggestion is ${plan.lines} lines. It will be pasted as one block; review all of it before pressing Enter.${localNote}`,
+        { title: 'Multi-line suggestion', confirmLabel: `Insert ${plan.lines} lines` },
+      ))
+    ) {
+      return
+    }
+    const reason = isDangerousCommand(body)
+    if (
+      reason &&
+      !(await confirm(`This suggestion looks destructive (${reason}). Insert it?${localNote}`, {
+        title: 'Destructive suggestion',
+        confirmLabel: 'Insert',
+        danger: true,
+      }))
+    ) {
+      return
+    }
+    // From here to paste(): no await, so nothing can change in between.
+    const target = getTerm(sessionId)
+    if (!target) {
+      void alert('This session’s terminal closed, so nothing was inserted.', { title: 'Not inserted' })
+      return
+    }
+    const final = planInsert(body, bracketedNow(target.term))
+    if (final.kind === 'refuse') {
+      refuse(final.reason)
+      return
+    }
+    // Never broadcast (pasteLocal): the siblings' bracketed-paste state is
+    // unknown, and the model's text is the least trusted input there is.
+    target.pasteLocal(final.text)
+    target.term.focus()
+    setInsertedLocal(target.broadcastTargets().length > 0)
+    setInserted(true)
+    setTimeout(() => setInserted(false), 1600)
   }
 
   return (
@@ -523,11 +694,15 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
       <span className="flex border-t border-line">
         <button
           type="button"
-          onClick={insert}
+          onClick={() => void insert()}
           className="flex flex-1 items-center justify-center gap-1 py-1 text-[11px] text-accent hover:bg-accent/10"
         >
           {inserted ? <Check size={11} aria-hidden /> : <CornerDownLeft size={11} aria-hidden />}
-          {inserted ? 'Typed — press Enter to run' : 'Insert into terminal'}
+          {inserted
+            ? insertedLocal
+              ? 'Typed in this pane only — press Enter to run'
+              : 'Typed — press Enter to run'
+            : 'Insert into terminal'}
         </button>
         <button
           type="button"
@@ -545,13 +720,15 @@ function CommandChip({ raw, sessionId }: { raw: string; sessionId: string }) {
 /* -------------------------------------------------------------- settings */
 
 function SettingsForm({
-  cfg, keySaved, keyDraft, setKeyDraft, onSave, onRemoveKey,
+  cfg, error, keySaved, keyDraft, setKeyDraft, onSave, onRemoveKey,
 }: {
   cfg: AiConfig | null
+  /** Why the last load/save/remove failed, shown above Save. */
+  error: string | null
   keySaved: boolean
   keyDraft: string
   setKeyDraft: (v: string) => void
-  onSave: (cfg: AiConfig) => void
+  onSave: (cfg: AiConfig) => Promise<void>
   onRemoveKey: () => Promise<void>
 }) {
   const [draft, setDraft] = useState<AiConfig>(
@@ -600,9 +777,12 @@ function SettingsForm({
       {draft.kind === 'claude-code' && (
         <p className="rounded border border-line bg-surface-0 px-2.5 py-2 text-[11px] leading-relaxed text-ink-faint">
           Runs the <code className="font-mono">claude</code> CLI installed on
-          this machine. Auth (API key or claude.ai subscription) is handled by
-          Claude Code itself — nothing to configure here. Responses arrive in
-          one piece rather than streaming.
+          this machine as a text-only model: all of its tools, MCP servers,
+          hooks and settings are switched off, in an empty working folder, and
+          a CLI too old to allow that is refused. Auth (API key or claude.ai
+          subscription) is handled by Claude Code itself. Responses arrive in
+          one piece rather than streaming. Organisation-managed Claude Code
+          policies are not covered; use the API presets on managed machines.
         </p>
       )}
 
@@ -641,7 +821,7 @@ function SettingsForm({
           className={inputCls}
         />
         <span className="mt-1 block text-[10.5px] text-ink-faint">
-          Stored in Windows Credential Manager, never in a file. Note: this is
+          Stored in the system credential vault, never in a file. Note: this is
           an API key (console.anthropic.com / platform.openai.com) — chat
           subscriptions (claude.ai, ChatGPT) have no third-party API. Local
           Ollama / LM Studio need no key and send nothing off this machine.
@@ -659,9 +839,15 @@ function SettingsForm({
         )}
       </label>
 
+      {error && (
+        <p role="alert" className="selectable rounded border border-alert/40 bg-alert/10 px-2.5 py-1.5 text-[11px] text-alert">
+          {error}
+        </p>
+      )}
+
       <button
         type="button"
-        onClick={() => onSave(draft)}
+        onClick={() => void onSave(draft)}
         className="w-full rounded border border-accent/60 bg-accent/15 py-1.5 text-[12.5px] font-medium text-accent hover:bg-accent/25"
       >
         Save

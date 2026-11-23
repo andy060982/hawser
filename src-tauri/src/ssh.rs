@@ -15,8 +15,8 @@ use russh::client::{self, Handle};
 use crate::utils::known_hosts::{self, HostKeyStatus};
 use crate::utils::session_log::SessionLog;
 use russh::{ChannelMsg, ChannelWriteHalf};
-use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::FileType;
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileType, StatusCode};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,12 +29,49 @@ use crate::credentials;
 /// not pin a connection task forever.
 const HOST_KEY_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Connect-stage deadlines. Each bounds machine time only: a stage's clock is
+/// paused while a host-key or password dialog waits for the human (see
+/// `HumanWait`), so a slow reader is never cut off by them.
+///
+/// TCP connect: the SYN/ACK round trip (per address tried by the resolver), or
+/// for a jump target the bastion's own connect to it (direct-tcpip open).
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The server's SSH identification line plus the whole key exchange. A port
+/// that accepts TCP but never speaks SSH (a TLS service, a tarpit) ends here.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Every authentication round trip together (password, keyboard-interactive
+/// rounds, each agent identity).
+const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Opening the session channel and the server's replies to the PTY and shell
+/// requests.
+const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long closing an exec channel, or disconnecting a throwaway connection,
+/// may take before it is abandoned.
+const EXEC_CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// After the shell's EOF, how long to wait for its exit status or channel close
+/// before treating the shell as gone. OpenSSH sends both at once.
+const SHELL_EOF_GRACE: Duration = Duration::from_secs(2);
+
 /// Minimum gap between progress events for one transfer. At 64 KB chunks an
 /// unthrottled emit would fire ~16k times per gigabyte; the IPC bridge and
 /// React would both spend more time on bookkeeping than on the transfer.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 const CHUNK: usize = 64 * 1024;
+
+/// A transfer step (one chunk read or written, one commit rename) that makes
+/// no progress for this long fails the file as stalled, so a black-holed link
+/// can never leave a row "active" forever. russh-sftp's own per-request
+/// timeout normally fires first; this also covers local I/O and the copy loop.
+const TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Opening the auxiliary raw SFTP channel (see `Registry::sftp`).
+const SFTP_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most entries one directory listing returns; the rest are reported as
+/// truncated. A broken or hostile server cannot grow client memory without
+/// limit by streaming READDIR batches forever.
+const MAX_LIST_ENTRIES: usize = 200_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
@@ -52,15 +89,44 @@ pub enum SshError {
     HostKeyTimeout { host: String },
     #[error(
         "host key for {host} CHANGED (known_hosts line {line}). This is either a rebuilt \
-         server or an interception attempt. Skiff will not connect until the old entry is \
+         server or an interception attempt. Hawser will not connect until the old entry is \
          removed by hand."
     )]
     ChangedHostKey { host: String, line: usize },
     #[error("{0}")]
     PartialTransfer(String),
+    /// A transfer stopped because its SFTP channel died or stopped answering.
+    /// The text says what was left where (a backup, a staged copy, the rest
+    /// of a folder). A variant of its own, not a `PartialTransfer`, so
+    /// `sftp_dead` still sees it: the folder walk stops and the cached
+    /// session is reopened.
+    #[error("{0}")]
+    ChannelLost(String),
+    /// A connect stage ran past its deadline (see the `*_TIMEOUT` constants).
+    #[error("{host}: {stage} timed out after {secs}s")]
+    Timeout { host: String, stage: &'static str, secs: u64 },
+    /// The server answered the shell request with a refusal.
+    #[error(
+        "{host} refused to start a shell (the account may be SFTP-only or have no login \
+         shell)"
+    )]
+    ShellRefused { host: String },
+    /// The session ended before the server answered the PTY and shell
+    /// requests. `output` is what it printed first (often the only reason
+    /// given: an expired account, a forced command).
+    #[error("{}", shell_ended_early_text(.host, .output))]
+    ShellEndedEarly { host: String, output: String },
+    #[error("{0}")]
+    Connect(String),
     /// The tab that started this connect was closed before it finished.
     #[error("connection {0} was cancelled")]
     Cancelled(String),
+    /// A transfer stopped by `transfer_cancel`.
+    #[error("transfer cancelled")]
+    TransferCancelled,
+    /// A transfer step made no progress for `TRANSFER_STALL_TIMEOUT`.
+    #[error("transfer stalled: no progress for {0}s")]
+    TransferStalled(u64),
     #[error(transparent)]
     KnownHosts(#[from] crate::utils::known_hosts::KnownHostsError),
     #[error(transparent)]
@@ -71,6 +137,13 @@ pub enum SshError {
     Sftp(#[from] russh_sftp::client::error::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// `SshError::ShellEndedEarly`'s text: the server's output, then the reason
+/// on a line of its own.
+fn shell_ended_early_text(host: &str, output: &str) -> String {
+    let sep = if output.is_empty() || output.ends_with('\n') { "" } else { "\r\n" };
+    format!("{output}{sep}{host} closed the session before the shell started")
 }
 
 /* ------------------------------------------------------------------ payloads */
@@ -94,12 +167,28 @@ pub struct FileEntry {
 pub struct DirListing {
     pub path: String,
     pub entries: Vec<FileEntry>,
+    /// The server listed more than `MAX_LIST_ENTRIES`; only that many are here.
+    pub truncated: bool,
+}
+
+/// What a finished `sftp_get`/`sftp_put` reports. Mirrors `TransferOutcome`
+/// in src/types.ts.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferOutcome {
+    pub bytes: u64,
+    /// Things the user should know although the transfer succeeded: a write
+    /// that went through a symlink, or a non-atomic in-place fallback.
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgress {
     pub session_id: String,
+    /// The frontend's id for this transfer: the queue row is matched on it,
+    /// so two transfers of the same source never update each other's row.
+    pub transfer_id: String,
     /// The transfer's ROOT source path — what the queue row is keyed on. Equal
     /// to `file_path` for a single file; for a folder, the folder, so per-file
     /// events land on the folder's row (bytes are then cumulative for the tree).
@@ -111,6 +200,11 @@ pub struct TransferProgress {
     pub total_bytes: u64,
     pub direction: &'static str,
     pub done: bool,
+    /// A warning the user must see while the transfer is still running: a
+    /// fallback to a non-atomic in-place write, sent BEFORE the destination
+    /// is truncated. It is also among the transfer's final notes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// One file a recursive transfer could not move, pushed on `sftp://failure` so
@@ -121,6 +215,8 @@ pub struct TransferProgress {
 #[serde(rename_all = "camelCase")]
 pub struct TransferFailure {
     pub session_id: String,
+    /// The transfer's id (see `TransferProgress::transfer_id`).
+    pub transfer_id: String,
     /// The transfer's ROOT source path (local for upload, remote for download) —
     /// the value the queue row is keyed on, so the UI attributes this correctly.
     pub root: String,
@@ -151,8 +247,16 @@ pub struct SessionStatusEvent {
 pub struct HostKeyRequest {
     pub request_id: String,
     pub host: String,
+    /// The peer address the socket actually connected to, for a direct
+    /// connection. Empty when the connection rides a jump host: the bastion
+    /// resolved and dialled the name, so no local address is meaningful (see
+    /// `via`).
     pub ip: String,
     pub port: u16,
+    /// Who is asking (catalogue name, user@host:port, bastion). Backend-derived
+    /// from the dial, except the display name.
+    #[serde(flatten)]
+    pub origin: PromptOrigin,
     pub key_type: String,
     /// OpenSSH-style SHA256 fingerprint — the exact string `ssh-keygen -lf`
     /// prints, so it can be compared against an out-of-band source verbatim.
@@ -182,6 +286,418 @@ pub struct JumpParams {
     pub username: String,
     pub auth: String,
     pub key_path: Option<String>,
+    /// Catalogue display name, for prompts only.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Which connection a prompt belongs to, shown in the host-key and auth
+/// dialogs apart from anything the server wrote. `target` and `via` come from
+/// the parameters actually dialled; only `name` is the frontend's label.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptOrigin {
+    /// Catalogue name of the host, when it has one.
+    pub host_name: Option<String>,
+    /// `user@host:port` of the machine asking.
+    pub target: String,
+    /// `user@host:port` (or name) of the bastion this connection rides, if any.
+    pub via: Option<String>,
+}
+
+impl PromptOrigin {
+    fn new(name: Option<&str>, username: &str, host: &str, port: u16, via: Option<String>) -> Self {
+        let name = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        PromptOrigin { host_name: name, target: endpoint_label(username, host, port), via }
+    }
+}
+
+/// `user@host:port`, bracketing an IPv6 literal.
+fn endpoint_label(username: &str, host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("{username}@[{host}]:{port}")
+    } else {
+        format!("{username}@{host}:{port}")
+    }
+}
+
+/* ---------------------------------------------------------------- deadlines */
+
+/// Time spent waiting on a human (host-key or auth dialog) during one connect
+/// attempt. Stage deadlines subtract it, so they bound only machine time.
+#[derive(Clone, Default)]
+pub(crate) struct HumanWait(Arc<std::sync::Mutex<HumanWaitState>>);
+
+#[derive(Default)]
+struct HumanWaitState {
+    open: u32,
+    since: Option<Instant>,
+    total: Duration,
+}
+
+/// Held while a dialog is open; dropping it resumes the stage clocks.
+pub(crate) struct HumanWaitGuard(HumanWait);
+
+impl HumanWait {
+    pub(crate) fn enter(&self) -> HumanWaitGuard {
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if s.open == 0 {
+            s.since = Some(Instant::now());
+        }
+        s.open += 1;
+        drop(s);
+        HumanWaitGuard(self.clone())
+    }
+
+    /// (total waited so far, including an open wait; whether one is open now)
+    fn waited(&self) -> (Duration, bool) {
+        let s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let open = s.since.map(|t| t.elapsed()).unwrap_or_default();
+        (s.total + open, s.open > 0)
+    }
+}
+
+impl Drop for HumanWaitGuard {
+    fn drop(&mut self) {
+        let mut s = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        s.open = s.open.saturating_sub(1);
+        if s.open == 0 {
+            if let Some(t) = s.since.take() {
+                s.total += t.elapsed();
+            }
+        }
+    }
+}
+
+/// Run `fut` under `limit` of machine time: the clock does not run while a
+/// human prompt is open (`wait`). Times out with a `Timeout` naming the stage.
+async fn within<F: std::future::Future>(
+    wait: &HumanWait,
+    limit: Duration,
+    host: &str,
+    stage: &'static str,
+    fut: F,
+) -> Result<F::Output, SshError> {
+    let start = Instant::now();
+    tokio::pin!(fut);
+    loop {
+        let (waited, open) = wait.waited();
+        let wake = if open {
+            // Re-check periodically; the deadline moves out while a human reads.
+            Instant::now() + Duration::from_millis(250)
+        } else {
+            start + limit + waited
+        };
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            _ = tokio::time::sleep_until(wake.into()) => {
+                let (waited, open) = wait.waited();
+                if !open && Instant::now() >= start + limit + waited {
+                    return Err(SshError::Timeout {
+                        host: host.to_string(),
+                        stage,
+                        secs: limit.as_secs(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------ kill switch */
+
+/// Ends one connect attempt's transports for real.
+///
+/// russh spawns its session task inside `connect_stream`, and that task owns
+/// the socket. Dropping the connect future (a deadline, a cancel) drops only
+/// the task's JoinHandle, which detaches it; and during key exchange the task
+/// does not poll the channel that would tell it its caller is gone, so it can
+/// sit on a stalled peer forever. Every stream handed to russh is therefore
+/// wrapped in `Killable`: firing the switch makes the stream's next poll fail,
+/// waking the parked task, which then unwinds and drops the socket. The host-key
+/// handler (which runs in that task and may be parked on a dialog) also stops
+/// waiting when it fires.
+#[derive(Clone, Default)]
+pub(crate) struct Kill(Arc<KillInner>);
+
+#[derive(Default)]
+struct KillInner {
+    fired: AtomicBool,
+    /// One pair of wakers PER stream. A ProxyJump attempt wraps two streams
+    /// (the bastion's TCP socket and the target's direct-tcpip channel) in the
+    /// same switch, each polled by its own russh task; a single shared waker
+    /// kept only the last registrant, so `fire` could wake the target while
+    /// the bastion's parked flush slept on.
+    streams: std::sync::Mutex<Vec<Arc<StreamWakers>>>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct StreamWakers {
+    read: futures_util::task::AtomicWaker,
+    write: futures_util::task::AtomicWaker,
+}
+
+impl Kill {
+    pub(crate) fn fire(&self) {
+        self.0.fired.store(true, Ordering::SeqCst);
+        let streams = match self.0.streams.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        for w in streams {
+            w.read.wake();
+            w.write.wake();
+        }
+        self.0.notify.notify_waiters();
+    }
+
+    /// A fresh waker pair for one stream, woken by every later `fire`.
+    fn register_stream(&self) -> Arc<StreamWakers> {
+        let w = Arc::new(StreamWakers::default());
+        match self.0.streams.lock() {
+            Ok(mut g) => g.push(Arc::clone(&w)),
+            Err(p) => p.into_inner().push(Arc::clone(&w)),
+        }
+        w
+    }
+
+    pub(crate) fn fired(&self) -> bool {
+        self.0.fired.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the switch has fired.
+    async fn wait(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a fire in between is not missed.
+            notified.as_mut().enable();
+            if self.fired() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Fires its `Kill` when dropped, unless disarmed. A connect attempt holds one
+/// from its first dial: any exit that does not hand the transport to a
+/// registered session (an error, a deadline, the future being dropped by a
+/// cancel) kills every stream the attempt created.
+pub(crate) struct KillGuard {
+    kill: Kill,
+    armed: bool,
+}
+
+impl KillGuard {
+    pub(crate) fn new() -> Self {
+        Self { kill: Kill::default(), armed: true }
+    }
+
+    pub(crate) fn kill(&self) -> Kill {
+        self.kill.clone()
+    }
+
+    /// The transports now belong to a registered session.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill.fire();
+        }
+    }
+}
+
+/// A stream whose I/O fails once its `Kill` fires (see `Kill`).
+pub(crate) struct Killable<S> {
+    inner: S,
+    kill: Kill,
+    wakers: Arc<StreamWakers>,
+}
+
+impl<S> Killable<S> {
+    pub(crate) fn new(inner: S, kill: Kill) -> Self {
+        let wakers = kill.register_stream();
+        Self { inner, kill, wakers }
+    }
+}
+
+fn killed_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "connection attempt abandoned")
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Killable<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.wakers.read.register(cx.waker());
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Err(killed_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Killable<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.wakers.write.register(cx.waker());
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Err(killed_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.wakers.write.register(cx.waker());
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Err(killed_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Killed: do not wait on a peer that stopped reading; dropping the
+        // stream closes it.
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Host-key algorithms to offer, pinned ones first (as OpenSSH orders them):
+/// a host pinned as ECDSA that later also offers Ed25519 keeps signing with the
+/// pinned key instead of being refused as CHANGED. Only algorithms russh
+/// implements are offered; an RSA pin covers all three RSA signature names.
+///
+/// The pinned block is in russh's own strength order (Ed25519, ECDSA,
+/// rsa-sha2-512/256, then SHA-1 `ssh-rsa`), not file order: with an RSA pin
+/// and an Ed25519 pin, a server offering both must get Ed25519, never SHA-1.
+/// SHA-1 `ssh-rsa` is therefore always the last pinned algorithm.
+fn preferred_host_key_order(pinned: &[russh::keys::Algorithm]) -> Vec<russh::keys::Algorithm> {
+    use russh::keys::Algorithm;
+    let defaults: &[Algorithm] = &russh::Preferred::DEFAULT.key;
+    let rsa_pinned = pinned.iter().any(|a| matches!(a, Algorithm::Rsa { .. }));
+    let is_pinned = |a: &Algorithm| match a {
+        Algorithm::Rsa { .. } => rsa_pinned,
+        other => pinned.contains(other),
+    };
+    let mut out: Vec<Algorithm> = defaults.iter().filter(|a| is_pinned(a)).cloned().collect();
+    for alg in defaults {
+        if !out.contains(alg) {
+            out.push(alg.clone());
+        }
+    }
+    out
+}
+
+/// keepalive interval and how many may go unanswered. russh ends the link when
+/// MORE than `KEEPALIVE_MAX` intervals pass without a reply, i.e. after
+/// `KEEPALIVE_INTERVAL * (KEEPALIVE_MAX + 1)`: 45s here.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_MAX: usize = 2;
+
+fn keepalive_timeout() -> Duration {
+    KEEPALIVE_INTERVAL * (KEEPALIVE_MAX as u32 + 1)
+}
+
+/// Client config for one hop: keepalives (what makes a dropped link
+/// detectable; see `KEEPALIVE_MAX`) and the host-key algorithm order for that
+/// host.
+fn hop_config(host: &str, port: u16) -> Arc<client::Config> {
+    let pinned = known_hosts::pinned_algorithms(host, port);
+    let mut preferred = russh::Preferred::default();
+    preferred.key = std::borrow::Cow::Owned(preferred_host_key_order(&pinned));
+    Arc::new(client::Config {
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
+        nodelay: true,
+        preferred,
+        ..client::Config::default()
+    })
+}
+
+/// Dial TCP under `TCP_CONNECT_TIMEOUT` and return the stream with the peer
+/// address it actually connected to (the resolver may try several).
+async fn dial_tcp(host: &str, port: u16) -> Result<(tokio::net::TcpStream, String), SshError> {
+    let stream = match tokio::time::timeout(
+        TCP_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(SshError::Connect(format!("could not connect to {host}:{port}: {e}")))
+        }
+        Err(_) => {
+            return Err(SshError::Timeout {
+                host: format!("{host}:{port}"),
+                stage: "TCP connect",
+                secs: TCP_CONNECT_TIMEOUT.as_secs(),
+            })
+        }
+    };
+    let _ = stream.set_nodelay(true);
+    let ip = stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| host.to_string());
+    Ok((stream, ip))
+}
+
+/// SSH identification + key exchange over `stream`, under `limit` of machine
+/// time (`HANDSHAKE_TIMEOUT` outside tests).
+///
+/// The stream goes to russh wrapped in `Killable`. On any failure here — the
+/// deadline included — the switch is fired, so russh's already-spawned
+/// session task unwinds and the socket closes instead of outliving the
+/// attempt (see `Kill`). The caller's `KillGuard` covers the future being
+/// dropped mid-way (a cancel).
+async fn handshake<H, S>(
+    config: Arc<client::Config>,
+    stream: S,
+    handler: H,
+    wait: &HumanWait,
+    host: &str,
+    limit: Duration,
+    kill: &Kill,
+) -> Result<Handle<H>, SshError>
+where
+    H: client::Handler<Error = SshError> + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let stream = Killable::new(stream, kill.clone());
+    let r = within(
+        wait,
+        limit,
+        host,
+        "SSH handshake (no SSH banner, or the key exchange stalled)",
+        client::connect_stream(config, stream, handler),
+    )
+    .await
+    .and_then(|r| r);
+    if r.is_err() {
+        kill.fire();
+    }
+    r
 }
 
 /* -------------------------------------------------------------- host keys */
@@ -193,9 +709,11 @@ pub struct JumpParams {
 /// is handed back by the `host_key_respond` command.
 #[derive(Default)]
 pub struct HostKeyPrompts {
-    /// request id -> (owning session id, answer channel). The session id lets a
-    /// closed tab drop its own prompts instead of leaving them on screen.
-    pending: DashMap<String, (String, oneshot::Sender<bool>)>,
+    /// request id -> (owning session id + connect generation, answer channel).
+    /// The session id lets a closed tab drop its own prompts instead of leaving
+    /// them on screen; the generation lets a newer connect for the same tab
+    /// drop only the prompts of the attempt it superseded.
+    pending: DashMap<String, (PromptOwner, oneshot::Sender<bool>)>,
 }
 
 impl HostKeyPrompts {
@@ -216,24 +734,32 @@ impl HostKeyPrompts {
     /// the UI can be told to close them. Dropping the sender rejects the key,
     /// which aborts that in-flight connect.
     pub fn cancel_session(&self, session_id: &str) -> Vec<String> {
-        cancel_for_session(&self.pending, session_id)
+        cancel_matching(&self.pending, |o| o.0 == session_id)
+    }
+
+    fn cancel_attempt(&self, session_id: &str, ticket: u64) -> Vec<String> {
+        cancel_matching(&self.pending, |o| o.0 == session_id && o.1 == ticket)
     }
 }
 
-/// Remove all pending prompts owned by `session_id` from a prompt map.
-fn cancel_for_session<T>(
-    pending: &DashMap<String, (String, oneshot::Sender<T>)>,
-    session_id: &str,
+/// (session id, connect generation) that raised a prompt.
+type PromptOwner = (String, u64);
+
+/// Remove all pending prompts whose owner matches from a prompt map,
+/// returning their request ids.
+fn cancel_matching<T>(
+    pending: &DashMap<String, (PromptOwner, oneshot::Sender<T>)>,
+    matches: impl Fn(&PromptOwner) -> bool,
 ) -> Vec<String> {
     let ids: Vec<String> = pending
         .iter()
-        .filter(|e| e.value().0 == session_id)
+        .filter(|e| matches(&e.value().0))
         .map(|e| e.key().clone())
         .collect();
-    for id in &ids {
-        pending.remove(id);
-    }
-    ids
+    // remove_if: an id is never reused, but stay exact anyway.
+    ids.into_iter()
+        .filter(|id| pending.remove_if(id, |_, v| matches(&v.0)).is_some())
+        .collect()
 }
 
 /// Register a prompt and show it, atomically with respect to
@@ -250,16 +776,14 @@ fn cancel_for_session<T>(
 /// Returns `None` (with nothing left registered) when cancelled or when the
 /// emit fails. `emit` must not touch `pending`.
 fn register_and_emit<T>(
-    pending: &DashMap<String, (String, oneshot::Sender<T>)>,
+    pending: &DashMap<String, (PromptOwner, oneshot::Sender<T>)>,
     request_id: &str,
-    session_id: &str,
+    owner: PromptOwner,
     cancelled: impl FnOnce() -> bool,
     emit: impl FnOnce() -> bool,
 ) -> Option<oneshot::Receiver<T>> {
     let (tx, rx) = oneshot::channel();
-    let guard = pending
-        .entry(request_id.to_string())
-        .insert((session_id.to_string(), tx));
+    let guard = pending.entry(request_id.to_string()).insert((owner, tx));
     let shown = !cancelled() && emit();
     drop(guard);
     if shown {
@@ -268,6 +792,23 @@ fn register_and_emit<T>(
         pending.remove(request_id);
         None
     }
+}
+
+/// `register_and_emit`, with the stage clocks paused FIRST: the deadline that
+/// races a prompt may run on another worker (a host-key check runs in russh's
+/// own task), and pausing only after the emit left a gap in which it could fire
+/// and close a dialog the user had just been shown. The guard comes back with
+/// the receiver and must be held until the answer arrives.
+fn raise_prompt<T>(
+    wait: &HumanWait,
+    pending: &DashMap<String, (PromptOwner, oneshot::Sender<T>)>,
+    request_id: &str,
+    owner: PromptOwner,
+    cancelled: impl FnOnce() -> bool,
+    emit: impl FnOnce() -> bool,
+) -> Option<(HumanWaitGuard, oneshot::Receiver<T>)> {
+    let human = wait.enter();
+    register_and_emit(pending, request_id, owner, cancelled, emit).map(|rx| (human, rx))
 }
 
 /// Payload of `ssh://prompt-closed`: a host-key or auth prompt that no longer
@@ -308,6 +849,12 @@ pub struct AuthPromptRequest {
     pub name: String,
     pub instruction: String,
     pub prompts: Vec<AuthPromptField>,
+    /// Which connection is asking, apart from the server-written text above.
+    #[serde(flatten)]
+    pub origin: PromptOrigin,
+    /// "password" for Hawser's own up-front password prompt (no server text),
+    /// "challenge" for a keyboard-interactive round written by the server.
+    pub kind: &'static str,
     /// When true, the dialog offers a "save to the OS vault" checkbox. Only set
     /// for the up-front "no saved password" prompt — never for a live server
     /// challenge (an OTP or token code is single-use and must not be stored).
@@ -318,7 +865,7 @@ pub struct AuthPromptRequest {
 /// plus whether they asked to save the password to the OS vault.
 #[derive(Debug, Default)]
 pub struct AuthAnswer {
-    pub answers: Vec<String>,
+    pub answers: Vec<zeroize::Zeroizing<String>>,
     pub save: bool,
 }
 
@@ -328,12 +875,17 @@ pub struct AuthAnswer {
 #[derive(Default)]
 pub struct AuthPrompts {
     /// request id -> (owning session id, answer channel); see HostKeyPrompts.
-    pending: DashMap<String, (String, oneshot::Sender<AuthAnswer>)>,
+    pending: DashMap<String, (PromptOwner, oneshot::Sender<AuthAnswer>)>,
 }
 
 impl AuthPrompts {
     /// Resolve a pending auth prompt with the user's typed answers and save choice.
-    pub fn respond(&self, request_id: &str, answers: Vec<String>, save: bool) -> bool {
+    pub fn respond(
+        &self,
+        request_id: &str,
+        answers: Vec<zeroize::Zeroizing<String>>,
+        save: bool,
+    ) -> bool {
         match self.pending.remove(request_id) {
             Some((_, (_, tx))) => tx.send(AuthAnswer { answers, save }).is_ok(),
             None => false,
@@ -343,7 +895,11 @@ impl AuthPrompts {
     /// Drop every prompt raised for `session_id` (see HostKeyPrompts). The
     /// waiting auth then fails as cancelled, so nothing is sent.
     pub fn cancel_session(&self, session_id: &str) -> Vec<String> {
-        cancel_for_session(&self.pending, session_id)
+        cancel_matching(&self.pending, |o| o.0 == session_id)
+    }
+
+    fn cancel_attempt(&self, session_id: &str, ticket: u64) -> Vec<String> {
+        cancel_matching(&self.pending, |o| o.0 == session_id && o.1 == ticket)
     }
 
     /// Drop the pending sender for a request. The waiting `request_auth_answers`
@@ -373,64 +929,197 @@ const AUTH_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 ///     record the answer in known_hosts on acceptance (trust on first use).
 struct ClientHandler {
     host: String,
-    /// Resolved peer address, shown alongside the hostname so the user can see
-    /// *which* machine answered — the distinction that matters when a name
-    /// resolves somewhere unexpected.
+    /// The peer address the TCP socket connected to, shown alongside the
+    /// hostname so the user can see *which* machine answered. Empty for a
+    /// target reached through a jump host (the bastion dialled it; see
+    /// `origin.via`).
     ip: String,
     port: u16,
+    /// Who is asking, for the dialog (name, user@host:port, bastion).
+    origin: PromptOrigin,
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
-    /// The tab this connection belongs to, so closing it can drop the prompt.
-    session_id: String,
+    /// The tab and connect generation this connection belongs to, so closing
+    /// the tab (or a newer connect for it) can drop the prompt.
+    owner: PromptOwner,
     /// Closes (sender dropped) when the tab is closed mid-connect. Host-key
     /// checks run in russh's own session task, which outlives the cancelled
     /// connect future, so the handler must look itself before prompting.
-    /// `None` for connections with no tab (copy_id).
-    cancel: Option<watch::Receiver<()>>,
+    cancel: watch::Receiver<()>,
+    /// Pauses the connect-stage deadlines while the dialog is open.
+    wait: HumanWait,
+    /// Why the transport ended, filled by `disconnected` for the output pump.
+    death: DeathNote,
+    /// The attempt's kill switch: a parked host-key check gives up when it
+    /// fires (see `Kill`).
+    kill: Kill,
+    /// What the key exchange actually negotiated, filled by `kex_done` (and
+    /// refreshed on every rekey), for the status bar.
+    algos: Algos,
+}
+
+/// Where `ClientHandler::disconnected` leaves the reason a transport died.
+type DeathNote = Arc<std::sync::Mutex<Option<String>>>;
+
+/// The algorithms a connection negotiated, as the server and this client
+/// agreed them in the key exchange (not a guess or a preference list).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Negotiated {
+    pub kex: String,
+    pub cipher: String,
+    pub host_key: String,
+}
+
+/// Shared slot a handler fills and the session reads.
+pub(crate) type Algos = Arc<std::sync::Mutex<Option<Negotiated>>>;
+
+/// Record a finished key exchange into `slot`. Called from every handler's
+/// `kex_done`, the first exchange and each rekey alike.
+pub(crate) fn record_negotiated(slot: &Algos, names: &russh::Names) {
+    let n = Negotiated {
+        kex: names.kex.as_ref().to_string(),
+        cipher: names.cipher.as_ref().to_string(),
+        host_key: names.key.as_str().to_string(),
+    };
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(n);
+    }
 }
 
 impl ClientHandler {
     fn cancelled(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|rx| rx.has_changed().is_err())
+        self.cancel.has_changed().is_err()
+    }
+}
+
+/// The key a host-key decision is made on. Hawser pins plain public keys; a
+/// certificate is judged by the key it embeds, exactly as that raw key would
+/// be (the CA signature earns no extra trust and no exemption).
+fn presented_key(presented: &russh::keys::PublicKeyOrCertificate) -> russh::keys::PublicKey {
+    match presented {
+        russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
+        russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
+            russh::keys::ssh_key::PublicKey::new(cert.public_key().clone(), "")
+        }
+    }
+}
+
+/// What to do with a presented host key, before any human is involved.
+#[derive(Debug)]
+enum KeyVerdict {
+    /// Pinned and matching: accept silently.
+    Accept,
+    /// Changed, revoked, or the store could not be read: refuse, never prompt.
+    Refuse(SshError),
+    /// First use: ask a human.
+    Ask,
+}
+
+/// The tri-state mapping that is the whole security property:
+///   Trusted -> accept silently
+///   Changed / Revoked -> refuse, never prompt
+///   Unknown -> ask a human
+///   store error -> refuse (fail closed, not a trust prompt)
+fn key_verdict(host: &str, port: u16, key: &russh::keys::PublicKey, store: &std::path::Path) -> KeyVerdict {
+    match known_hosts::classify(host, port, key, store) {
+        Ok(HostKeyStatus::Trusted) => KeyVerdict::Accept,
+        Ok(HostKeyStatus::Changed { line }) | Ok(HostKeyStatus::Revoked { line }) => {
+            KeyVerdict::Refuse(SshError::ChangedHostKey { host: host.to_string(), line })
+        }
+        Ok(HostKeyStatus::Unknown) => KeyVerdict::Ask,
+        Err(e) => KeyVerdict::Refuse(SshError::KnownHosts(e)),
+    }
+}
+
+/// How a host-key dialog ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptEnd {
+    Accepted,
+    Rejected,
+    /// The sender was dropped: the tab closed, or a newer connect swept it.
+    Dropped,
+    TimedOut,
+}
+
+async fn await_host_key_answer(rx: oneshot::Receiver<bool>, limit: Duration) -> PromptEnd {
+    match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(true)) => PromptEnd::Accepted,
+        Ok(Ok(false)) => PromptEnd::Rejected,
+        Ok(Err(_)) => PromptEnd::Dropped,
+        Err(_) => PromptEnd::TimedOut,
+    }
+}
+
+/// `settle_host_key` off the async runtime: trusting a key takes the
+/// known_hosts file lock (a bounded wait, see `known_hosts::trust_at`), which
+/// must never block a russh worker. Gives up with the attempt when `kill`
+/// fires; the blocking call itself then finishes within its lock bound.
+async fn settle_host_key_off_runtime(
+    end: PromptEnd,
+    host: &str,
+    port: u16,
+    key: &russh::keys::PublicKey,
+    store: &std::path::Path,
+    kill: &Kill,
+) -> Result<bool, SshError> {
+    if end != PromptEnd::Accepted {
+        return settle_host_key(&end, host, port, key, store);
+    }
+    let (h, k, s) = (host.to_string(), key.clone(), store.to_path_buf());
+    let task = tokio::task::spawn_blocking(move || settle_host_key(&end, &h, port, &k, &s));
+    tokio::select! {
+        r = task => r.map_err(|e| SshError::Connect(format!("recording the host key failed: {e}")))?,
+        _ = kill.wait() => Err(SshError::Cancelled(host.to_string())),
+    }
+}
+
+/// Turn a dialog's end into the handler's answer. Only an explicit accept
+/// trusts the key, and only after the store re-check in `trust_at` (under its
+/// lock) still sees the host as unknown or already pinned to this key.
+fn settle_host_key(
+    end: &PromptEnd,
+    host: &str,
+    port: u16,
+    key: &russh::keys::PublicKey,
+    store: &std::path::Path,
+) -> Result<bool, SshError> {
+    match end {
+        PromptEnd::Accepted => {
+            known_hosts::trust_at(host, port, key, store)?;
+            Ok(true)
+        }
+        PromptEnd::Rejected | PromptEnd::Dropped => {
+            Err(SshError::HostKeyRejected { host: host.to_string() })
+        }
+        PromptEnd::TimedOut => Err(SshError::HostKeyTimeout { host: host.to_string() }),
     }
 }
 
 impl client::Handler for ClientHandler {
     type Error = SshError;
 
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        names: &russh::Names,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        record_negotiated(&self.algos, names);
+        Ok(())
+    }
+
     async fn check_server_key(
         &mut self,
         presented: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // russh 0.63 hands us a key-or-certificate. Skiff pins the plain public
-        // key; for a certificate we pin the embedded key. Either way the trust
-        // decision below runs against a concrete PublicKey.
-        let server_public_key = match presented {
-            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.clone(),
-            russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
-                russh::keys::ssh_key::PublicKey::new(cert.public_key().clone(), "")
-            }
-        };
+        let server_public_key = presented_key(presented);
         let server_public_key = &server_public_key;
-        // Tri-state, and the mapping is the whole security property:
-        //   Trusted -> accept silently
-        //   Changed -> refuse, never prompt
-        //   Unknown -> ask a human
-        match known_hosts::check(&self.host, self.port, server_public_key) {
-            Ok(HostKeyStatus::Trusted) => return Ok(true),
-            Ok(HostKeyStatus::Changed { line }) | Ok(HostKeyStatus::Revoked { line }) => {
-                // Both refuse outright and never prompt: a different key for a
-                // known host, or one explicitly revoked, is exactly the case a
-                // trust dialog must never appear for.
-                return Err(SshError::ChangedHostKey {
-                    host: self.host.clone(),
-                    line,
-                })
-            }
-            Ok(HostKeyStatus::Unknown) => { /* fall through and ask */ }
-            // A read/parse failure of the store fails CLOSED (refuse), rather
-            // than routing to a first-use trust prompt.
-            Err(e) => return Err(SshError::KnownHosts(e)),
+        let store = known_hosts::ensure_store()?;
+        match key_verdict(&self.host, self.port, server_public_key, &store) {
+            KeyVerdict::Accept => return Ok(true),
+            KeyVerdict::Refuse(e) => return Err(e),
+            KeyVerdict::Ask => {}
         }
 
         let request_id = format!(
@@ -447,57 +1136,99 @@ impl client::Handler for ClientHandler {
             host: self.host.clone(),
             ip: self.ip.clone(),
             port: self.port,
+            origin: self.origin.clone(),
             key_type: server_public_key.algorithm().to_string(),
             fingerprint,
         };
         let mut was_cancelled = false;
-        let rx = register_and_emit(
+        let raised = raise_prompt(
+            &self.wait,
             &self.prompts.pending,
             &request_id,
-            &self.session_id,
+            self.owner.clone(),
             || {
-                was_cancelled = self.cancelled();
+                was_cancelled = self.cancelled() || self.kill.fired();
                 was_cancelled
             },
             || self.app.emit("ssh://host-key-prompt", request).is_ok(),
         );
-        let Some(rx) = rx else {
+        let Some((human, rx)) = raised else {
             return Err(if was_cancelled {
-                SshError::Cancelled(self.session_id.clone())
+                SshError::Cancelled(self.owner.0.clone())
             } else {
                 SshError::HostKeyRejected { host: self.host.clone() }
             });
         };
 
-        match tokio::time::timeout(HOST_KEY_PROMPT_TIMEOUT, rx).await {
-            Ok(Ok(true)) => {
-                // Trust on first use, recorded so the next connection is silent.
-                // Same store the check above reads — writing anywhere else would
-                // mean re-prompting forever.
-                known_hosts::trust(&self.host, self.port, server_public_key)?;
-                Ok(true)
+        let end = tokio::select! {
+            end = await_host_key_answer(rx, HOST_KEY_PROMPT_TIMEOUT) => end,
+            // The attempt was abandoned (cancel or deadline): drop the dialog
+            // and let russh's task unwind.
+            _ = self.kill.wait() => {
+                self.prompts.cancel(&request_id);
+                emit_prompt_closed(&self.app, &request_id);
+                return Err(SshError::Cancelled(self.owner.0.clone()));
             }
-            Ok(Ok(false)) => Err(SshError::HostKeyRejected {
-                host: self.host.clone(),
-            }),
-            // Sender dropped: the tab was closed (or the session swept). The
+        };
+        drop(human);
+        match end {
+            // Sender dropped: the tab was closed (or the attempt swept). The
             // sweep already emitted prompt-closed after our prompt; repeat it
             // so a close always follows the prompt even on a path that missed
             // it (the UI ignores a close for an id it no longer holds).
-            Ok(Err(_)) => {
-                emit_prompt_closed(&self.app, &request_id);
-                Err(SshError::HostKeyRejected {
-                    host: self.host.clone(),
-                })
-            }
-            Err(_) => {
+            PromptEnd::Dropped => emit_prompt_closed(&self.app, &request_id),
+            PromptEnd::TimedOut => {
                 self.prompts.cancel(&request_id);
                 emit_prompt_closed(&self.app, &request_id);
-                Err(SshError::HostKeyTimeout {
-                    host: self.host.clone(),
-                })
             }
+            PromptEnd::Accepted | PromptEnd::Rejected => {}
         }
+        // Trust on first use, recorded so the next connection is silent. Same
+        // store the check above read — writing anywhere else would mean
+        // re-prompting forever.
+        settle_host_key_off_runtime(end, &self.host, self.port, server_public_key, &store, &self.kill)
+            .await
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let (note, out) = match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                let msg = info.message.trim();
+                (
+                    if msg.is_empty() {
+                        "the server closed the connection".to_string()
+                    } else {
+                        format!("the server closed the connection: {msg}")
+                    },
+                    Ok(()),
+                )
+            }
+            client::DisconnectReason::Error(e) => (death_reason(&e), Err(e)),
+        };
+        if let Ok(mut slot) = self.death.lock() {
+            slot.get_or_insert(note);
+        }
+        out
+    }
+}
+
+/// User-facing wording for a transport that ended with an error.
+fn death_reason(e: &SshError) -> String {
+    match e {
+        SshError::Russh(russh::Error::KeepaliveTimeout) => format!(
+            "no reply to keepalives for {}s (the network path or VPN dropped)",
+            keepalive_timeout().as_secs()
+        ),
+        SshError::Russh(russh::Error::InactivityTimeout) => "closed after inactivity".into(),
+        SshError::Russh(russh::Error::IO(io)) => format!("connection lost: {io}"),
+        SshError::Io(io) => format!("connection lost: {io}"),
+        SshError::Russh(russh::Error::HUP) | SshError::Russh(russh::Error::Disconnect) => {
+            "the connection was closed".into()
+        }
+        other => format!("connection lost: {other}"),
     }
 }
 
@@ -509,27 +1240,57 @@ pub struct Session {
     /// the read half can be owned by a pump task while writes and window-change
     /// requests still work — `into_stream()` would consume the Channel and take
     /// `window_change` with it, leaving no way to resize.
-    shell: Mutex<Option<ChannelWriteHalf<client::Msg>>>,
-    sftp: Mutex<Option<Arc<SftpSession>>>,
-    /// The bastion connection, when this session rides a jump host. Held only
-    /// so it is not dropped: dropping the jump Handle closes the tunnel under
-    /// the target session's feet.
-    _jump: Option<Handle<ClientHandler>>,
-    /// Cleared by the output pump when the channel ends. Checked before every
-    /// write so input into a dead session fails loudly instead of vanishing
-    /// into a closed channel.
+    shell: Arc<Mutex<Option<ChannelWriteHalf<client::Msg>>>>,
+    sftp: Mutex<Option<Arc<SftpConn>>>,
+    /// The server refused the `sftp` subsystem on this connection. Remembered
+    /// so a pane refresh or cache reset does not open (and spend a session
+    /// slot on) a channel the server will refuse again.
+    sftp_refused: AtomicBool,
+    /// The bastion connection, when this session rides a jump host. Held so it
+    /// is not dropped (that closes the tunnel under the target session's feet),
+    /// and disconnected explicitly on teardown.
+    jump: Option<Handle<ClientHandler>>,
+    /// Cleared when the shell or transport ends. Checked before every write so
+    /// input into a dead session fails loudly instead of vanishing into a
+    /// closed channel, and by `forward_start` to refuse a dead transport.
     alive: AtomicBool,
+    /// Endpoint identity derived from what this connection actually dialled
+    /// (see `utils::artifacts::dial_identity`). Keys the transcript, and every
+    /// config, capture and AI-context lookup made for this session.
+    endpoint: String,
+    /// The connect that produced this session. Forwards record it so that the
+    /// end of this session tears down its own forwards and never a newer
+    /// connection's for the same tab.
+    generation: u64,
+    /// What the target's key exchange negotiated (see `Negotiated`).
+    algos: Algos,
+}
+
+impl Session {
+    /// Mark the session dead and send SSH_MSG_DISCONNECT on the target and then
+    /// the bastion. Best-effort: on a link that is already gone each send errors
+    /// harmlessly. This closes the transport and every channel on it, including
+    /// an in-flight SFTP transfer, whose next read or write then fails.
+    async fn close(&self, why: &str) {
+        self.alive.store(false, Ordering::SeqCst);
+        let _ = self.handle.disconnect(russh::Disconnect::ByApplication, why, "").await;
+        if let Some(jh) = self.jump.as_ref() {
+            let _ = jh.disconnect(russh::Disconnect::ByApplication, why, "").await;
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct Registry {
-    sessions: DashMap<String, Arc<Session>>,
+    /// Shared with the output pumps, which end their own generation's forwards
+    /// when the shell or transport ends.
+    sessions: Arc<DashMap<String, Arc<Session>>>,
     /// Output-pump task per session, so disconnect can stop it — otherwise the
     /// pump keeps an Arc<Session> (hence the SSH Handle) alive and blocks on
     /// `read_half.wait()` forever after the tab is "closed".
     pumps: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Active local/SOCKS forwards, keyed by forward id. See `Forward`.
-    forwards: DashMap<String, Forward>,
+    forwards: Arc<DashMap<String, Forward>>,
     /// Connects still in flight, session id -> generation. `remove` deletes the
     /// entry, which is how closing a tab mid-connect cancels it: the connect
     /// checks its generation at each step and before registering, and tears its
@@ -539,20 +1300,50 @@ pub struct Registry {
     /// drops it, which interrupts the connect at whatever await it is parked on
     /// (see `connect`) and tells the russh handlers to stop prompting.
     connecting: DashMap<String, (u64, watch::Sender<()>)>,
+    /// In-flight key installs (`copy_id`), op id -> cancel sender.
+    copy_ids: DashMap<String, (u64, watch::Sender<()>)>,
+    /// Cancels that arrived for an op id not registered yet (the editor's
+    /// cancel IPC overtook its install IPC), op id -> when. An install that
+    /// registers under such an id stops before it dials. Pruned after
+    /// `COPY_ID_CANCEL_TTL`.
+    copy_id_cancels: DashMap<String, Instant>,
+    /// Running transfers and early cancels, under ONE lock (see
+    /// `TransferTable`).
+    transfers: std::sync::Mutex<TransferTable>,
 }
 
+/// Running transfers and the cancels that arrived before their transfer
+/// registered. One lock for both: with two maps, a cancel could find no
+/// transfer, the transfer then register (finding no marker), and the cancel
+/// then leave its marker behind — a cancel that stopped nothing.
+#[derive(Default)]
+struct TransferTable {
+    /// Transfer id -> (registration seq, cancel sender).
+    running: std::collections::HashMap<String, (u64, watch::Sender<bool>)>,
+    /// Transfer id -> when the early cancel came, pruned after
+    /// `COPY_ID_CANCEL_TTL`.
+    early_cancels: std::collections::HashMap<String, Instant>,
+}
+
+/// How long an early `copy_id_cancel` is remembered (see `copy_id_cancels`).
+const COPY_ID_CANCEL_TTL: Duration = Duration::from_secs(120);
+
 /// Generation counter for `Registry::connecting`.
-static CONNECT_SEQ: AtomicU64 = AtomicU64::new(0);
+static CONNECT_SEQ: AtomicU64 = AtomicU64::new(1);
+static COPY_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+static TRANSFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Everything needed to tear a forward down *completely*.
 ///
 /// Aborting only the listener stops new connections but leaves already-
 /// established tunnels carrying traffic — a user who "stopped" a forward would
-/// still be leaking through the live ones. So each forward also owns the abort
+/// still be leaking through the live ones. So each forward also owns the
 /// handles of the per-connection tunnel tasks it has spawned; tearing the
-/// forward down aborts those too.
+/// forward down ends those too.
 struct Forward {
     info: ForwardInfo,
+    /// `Session::generation` of the transport this forward tunnels over.
+    generation: u64,
     listener: tokio::task::JoinHandle<()>,
     tunnels: TunnelHandles,
 }
@@ -574,7 +1365,7 @@ async fn accept_or_retry(
     match listener.accept().await {
         Ok(pair) => Some(pair),
         Err(e) => {
-            eprintln!("skiff: forward accept failed (retrying): {e}");
+            eprintln!("hawser: forward accept failed (retrying): {e}");
             tokio::time::sleep(Duration::from_millis(100)).await;
             None
         }
@@ -591,7 +1382,7 @@ fn track_tunnel(tunnels: &TunnelHandles, handle: tokio::task::JoinHandle<()>) {
 }
 
 /// Remove and return all currently-tracked tunnel handles, so the caller can
-/// abort (and optionally await) them without holding the lock across `.await`.
+/// abort and await them without holding the lock across `.await`.
 fn take_tunnels(tunnels: &TunnelHandles) -> Vec<tokio::task::JoinHandle<()>> {
     match tunnels.lock() {
         Ok(mut v) => std::mem::take(&mut *v),
@@ -599,7 +1390,278 @@ fn take_tunnels(tunnels: &TunnelHandles) -> Vec<tokio::task::JoinHandle<()>> {
     }
 }
 
+/// Tear one forward down, in the only order that leaves nothing behind: stop
+/// the listener and WAIT for it, so it can no longer accept and register a new
+/// tunnel; only then take, abort and await every tunnel it registered.
+async fn teardown_forward(fw: Forward) {
+    fw.listener.abort();
+    let _ = fw.listener.await;
+    let tunnels = take_tunnels(&fw.tunnels);
+    for h in &tunnels {
+        h.abort();
+    }
+    for h in tunnels {
+        let _ = h.await;
+    }
+}
+
+/// Tear down forwards already removed from the map, in a way the caller being
+/// aborted cannot interrupt.
+///
+/// Every listener is aborted first, synchronously (`abort()` never waits), so
+/// none can outlive this call even if it is cut off at its first await. The
+/// ordered joins then run in a detached task that owns every handle: dropping
+/// the awaiting caller (the pump aborted by a reconnect or tab close) leaves
+/// that task running to completion instead of detaching half-joined
+/// listeners and tunnels that no registry sweep can find any more.
+async fn teardown_forwards(fws: Vec<Forward>) {
+    if fws.is_empty() {
+        return;
+    }
+    for fw in &fws {
+        fw.listener.abort();
+    }
+    let joiner = tokio::spawn(async move {
+        for fw in fws {
+            teardown_forward(fw).await;
+        }
+    });
+    let _ = joiner.await;
+}
+
+/// Remove every forward that matches from the map, for teardown.
+fn take_forwards(
+    forwards: &DashMap<String, Forward>,
+    matches: impl Fn(&Forward) -> bool,
+) -> Vec<Forward> {
+    let ids: Vec<String> = forwards
+        .iter()
+        .filter(|e| matches(e.value()))
+        .map(|e| e.key().clone())
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| forwards.remove_if(&id, |_, f| matches(f)).map(|(_, f)| f))
+        .collect()
+}
+
+/// Everything a connect needs, as the frontend asked for it.
+pub struct ConnectSpec {
+    pub session_id: String,
+    /// Vault id of the credential (the host's own id, or the one it borrows).
+    pub host_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub cols: u32,
+    pub rows: u32,
+    pub startup_commands: Vec<String>,
+    pub auth: String,
+    pub key_path: Option<String>,
+    pub jump: Option<JumpParams>,
+    /// A quick-connect password, used once and wiped on drop.
+    pub one_shot_password: Option<zeroize::Zeroizing<String>>,
+    /// The frontend's computed endpoint identity. Only its catalogue ids are
+    /// used; destinations come from the dial (utils::artifacts::dial_identity).
+    pub endpoint: Option<String>,
+    /// Catalogue display name, for prompts only.
+    pub label: Option<String>,
+    /// A quick-connect host that is not in the catalogue: never offer to save
+    /// a typed password for it (nothing could ever delete that vault entry).
+    pub ephemeral: bool,
+}
+
+/// Prompt context shared by one hop's authentication.
+struct PromptCtx<'a> {
+    app: &'a AppHandle,
+    auth_prompts: &'a Arc<AuthPrompts>,
+    owner: PromptOwner,
+    origin: PromptOrigin,
+    wait: HumanWait,
+    /// Offer "save to the vault" on the up-front password prompt.
+    offer_save: bool,
+}
+
+/// One hop's authentication parameters.
+struct AuthSpec<'a> {
+    host_id: &'a str,
+    host: &'a str,
+    port: u16,
+    username: &'a str,
+    auth: &'a str,
+    key_path: Option<&'a str>,
+    /// The ONE secret snapshot `authorize_stored_password` read and authorized
+    /// for this destination (or the one-shot password). `authenticate` never
+    /// reads the vault again, so what was checked is exactly what is sent.
+    secret: Option<zeroize::Zeroizing<String>>,
+}
+
+/// Open the shell channel, ask for a PTY and a shell, and wait for the
+/// server's replies to both. russh's request calls only enqueue; the replies
+/// arrive on the channel as Success/Failure, in request order. Anything else
+/// that arrives first is returned for the pump to replay.
+///
+/// A refused PTY is reported (the shell may still work, as with OpenSSH's
+/// "PTY allocation request failed"); a refused shell is an error.
+///
+/// A session that ends before both replies (an expired account, a forced
+/// command that prints and exits) fails with what it printed, followed by the
+/// diagnostic: that output is usually the only explanation the user gets.
+///
+/// Startup input is NOT sent here: it goes out only once the output pump is
+/// reading (see `send_startup`).
+async fn open_shell<H: client::Handler>(
+    handle: &Handle<H>,
+    host: &str,
+    cols: u32,
+    rows: u32,
+) -> Result<(russh::ChannelReadHalf, ChannelWriteHalf<client::Msg>, Vec<ChannelMsg>, bool), SshError>
+{
+    let channel = handle.channel_open_session().await?;
+    let (mut read_half, write_half) = channel.split();
+    write_half
+        .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+        .await?;
+    write_half.request_shell(true).await?;
+    let mut early = Vec::new();
+    let mut replies: Vec<bool> = Vec::with_capacity(2);
+    while replies.len() < 2 {
+        match read_half.wait().await {
+            Some(ChannelMsg::Success) => replies.push(true),
+            Some(ChannelMsg::Failure) => replies.push(false),
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                return Err(SshError::ShellEndedEarly {
+                    host: host.to_string(),
+                    output: early_output(&early),
+                })
+            }
+            Some(other) => early.push(other),
+        }
+    }
+    if !replies[1] {
+        return Err(SshError::ShellRefused { host: host.to_string() });
+    }
+    Ok((read_half, write_half, early, replies[0]))
+}
+
+/// Cap on the early output carried in a `ShellEndedEarly` error.
+const EARLY_OUTPUT_CAP: usize = 16 * 1024;
+
+/// The terminal text of messages buffered before the shell started, decoded as
+/// the pump would (stdout and stderr), capped at `EARLY_OUTPUT_CAP` bytes.
+fn early_output(early: &[ChannelMsg]) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    for m in early {
+        if let ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } = m {
+            let room = EARLY_OUTPUT_CAP.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&data[..data.len().min(room)]);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The startup commands as the lines `send_startup` types, blanks dropped.
+fn startup_lines(commands: &[String]) -> Vec<String> {
+    commands
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{c}\n"))
+        .collect()
+}
+
+/// The shell writer, held exclusively. Taken by `connect` BEFORE the session
+/// is registered (so before any user keystroke can reach it) and handed to
+/// `send_startup`, so the first user input always lands after the startup
+/// lines, never ahead of a `tmux attach`.
+type ShellGuard = tokio::sync::OwnedMutexGuard<Option<ChannelWriteHalf<client::Msg>>>;
+
+/// Ctrl-U: discards the shell's current input line.
+const KILL_LINE: &[u8] = b"\x15";
+
+/// Send the startup commands as shell input. Called only once the output pump
+/// is reading: a shell that prints a lot at login (an MOTD, a tmux attach)
+/// fills russh's per-channel receive queue, and russh then blocks delivering
+/// that output — so it never processes the window adjustment that a write
+/// waiting for send credit needs. With nobody reading, connect hung forever.
+///
+/// Holds the shell writer (taken before registration, see `ShellGuard`) for
+/// the whole batch, and gives up after `limit` (the session stays up; only the
+/// remaining startup lines are skipped). A line cut off part-way is never left
+/// for the user's typing to extend: `report` is told first, then the writer is
+/// kept until a Ctrl-U has discarded the partial line (or the session ends).
+async fn send_startup(
+    mut guard: ShellGuard,
+    commands: &[String],
+    limit: Duration,
+    report: impl FnOnce(&SshError),
+) -> Result<(), SshError> {
+    let lines = startup_lines(commands);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let Some(w) = guard.as_mut() else { return Ok(()) };
+    let mut mid_line = false;
+    let send = async {
+        for line in &lines {
+            mid_line = true;
+            w.data(line.as_bytes()).await?;
+            mid_line = false;
+        }
+        Ok::<(), SshError>(())
+    };
+    let r = match tokio::time::timeout(limit, send).await {
+        Ok(r) => r,
+        Err(_) => Err(SshError::Connect(format!(
+            "the server took no input for {}s",
+            limit.as_secs()
+        ))),
+    };
+    if let Err(e) = &r {
+        report(e);
+        if mid_line {
+            // Unbounded on purpose: user input queued behind this lock would
+            // wait on the same send window anyway, and must not go out first.
+            let _ = w.data(KILL_LINE).await;
+        }
+    }
+    r
+}
+
+/// One live session, resolved from the registry once. Its endpoint identity
+/// and every operation run through it belong to the same connection, even if
+/// a reconnect replaces the tab's registry entry in between.
+pub struct SessionRef {
+    id: String,
+    session: Arc<Session>,
+}
+
+impl SessionRef {
+    /// The endpoint identity this connection dialled (see `Session::endpoint`).
+    pub fn endpoint(&self) -> &str {
+        &self.session.endpoint
+    }
+}
+
 impl Registry {
+    /// The algorithms a live session negotiated with its target (None until
+    /// the first key exchange has been recorded).
+    pub fn algorithms(&self, id: &str) -> Result<Option<Negotiated>, SshError> {
+        let s = self.get(id)?;
+        let g = s.algos.lock().map(|g| g.clone()).unwrap_or(None);
+        Ok(g)
+    }
+
+    /// The endpoint identity of a live session (see `Session::endpoint`).
+    pub fn endpoint_of(&self, id: &str) -> Result<String, SshError> {
+        Ok(self.get(id)?.endpoint.clone())
+    }
+
+    /// Resolve a live session once, for a caller that needs its identity and
+    /// an operation on the same connection (see `SessionRef`).
+    pub fn session(&self, id: &str) -> Result<SessionRef, SshError> {
+        Ok(SessionRef { id: id.to_string(), session: self.get(id)? })
+    }
+
     fn get(&self, id: &str) -> Result<Arc<Session>, SshError> {
         self.sessions
             .get(id)
@@ -607,70 +1669,41 @@ impl Registry {
             .ok_or_else(|| SshError::NoSession(id.to_string()))
     }
 
-    /// Tear a session down for real: stop the pump, send an SSH disconnect so
-    /// the transport actually closes (Handle's Drop does NOT close it), and
-    /// sweep the session's forwards. Without the explicit disconnect the
-    /// authenticated connection and remote shell keep running after the user
-    /// thinks they have closed the tab.
-    ///
-    /// Teardown is awaited to completion before returning: `abort()` only
-    /// *requests* cancellation, so a caller that returned as soon as abort was
-    /// issued could report "disconnected" while the pump was still mid-poll,
-    /// still holding its `Arc<Session>` (and thus the SSH `Handle`). Awaiting the
-    /// aborted `JoinHandle`s makes "disconnected" mean the tasks have actually
-    /// stopped and their session references are gone.
+    /// Close a tab's connection: cancel a connect still in flight for it, then
+    /// tear down whatever is registered (see `teardown_registered`).
     pub async fn remove(&self, id: &str) {
         // Cancel a connect that has not registered yet (see `connecting`).
         self.connecting.remove(id);
+        self.teardown_registered(id).await;
+    }
+
+    /// Tear a registered session down for real: stop the pump, send an SSH
+    /// disconnect to the target and the bastion so the transports actually
+    /// close (Handle's Drop does NOT close them), and sweep the session's
+    /// forwards. Leaves `connecting` alone, so a reconnect can hold its ticket
+    /// across this teardown (a tab closed meanwhile then cancels it).
+    ///
+    /// Teardown is awaited to completion before returning: `abort()` only
+    /// *requests* cancellation, so returning as soon as abort was issued could
+    /// report "disconnected" while the pump was still mid-poll, still holding
+    /// its `Arc<Session>`.
+    async fn teardown_registered(&self, id: &str) {
         let session = self.sessions.remove(id).map(|(_, s)| s);
 
         // Stop the output pump first, and WAIT for it to unwind, so it has
-        // dropped its Arc<Session> before we send the disconnect below — then
-        // the only remaining Handle reference is ours. An aborted JoinHandle
-        // resolves promptly (the pump blocks on a cancel-safe `read_half.wait()`)
-        // with a cancellation error, which we discard.
+        // dropped its Arc<Session> before we send the disconnect below.
         if let Some((_, pump)) = self.pumps.remove(id) {
             pump.abort();
             let _ = pump.await;
         }
 
         if let Some(session) = session {
-            session.alive.store(false, Ordering::Relaxed);
-            // Send SSH_MSG_DISCONNECT. Best-effort: if the link is already gone
-            // this errors harmlessly. This closes the transport and, with it,
-            // every channel — including any in-flight SFTP transfer, whose next
-            // read/write then fails and unwinds rather than continuing against a
-            // connection the user believes is closed.
-            let _ = session
-                .handle
-                .disconnect(russh::Disconnect::ByApplication, "closed by user", "")
-                .await;
+            session.close("closed by user").await;
         }
 
         // A forward's transport is this session; with it gone the listener
-        // would sit accepting connections it can never tunnel, forever. Sweep
-        // them here so closing a tab tears down its tunnels too, and await each
-        // aborted listener so teardown is complete before we return.
-        let doomed: Vec<String> = self
-            .forwards
-            .iter()
-            .filter(|e| e.value().info.session_id == id)
-            .map(|e| e.key().clone())
-            .collect();
-        for fid in doomed {
-            if let Some((_, fw)) = self.forwards.remove(&fid) {
-                // Abort AND await every live tunnel, then the listener, so
-                // "disconnected" means the per-connection tunnel tasks have
-                // actually unwound and dropped their channels — not merely that
-                // cancellation was requested.
-                for h in take_tunnels(&fw.tunnels) {
-                    h.abort();
-                    let _ = h.await;
-                }
-                fw.listener.abort();
-                let _ = fw.listener.await;
-            }
-        }
+        // would sit accepting connections it can never tunnel, forever.
+        teardown_forwards(take_forwards(&self.forwards, |f| f.info.session_id == id)).await;
     }
 
     /// Whether connect `ticket` for `id` is still wanted (no
@@ -681,138 +1714,154 @@ impl Registry {
 
     /// Open a connection, authenticate, and start an interactive shell.
     ///
-    /// The password is read from the Windows Credential Manager here, held in a
-    /// zeroizing buffer, and dropped as soon as authentication returns. It is
-    /// never a parameter, never logged, and never sent to the webview.
-    #[allow(clippy::too_many_arguments)]
+    /// A stored password is read from the OS vault once, authorized for this
+    /// destination, held in a zeroizing buffer, and dropped as soon as
+    /// authentication returns. It is never a parameter, never logged, and never
+    /// sent to the webview.
+    ///
+    /// Returns the endpoint identity the connection dialled (see
+    /// `Session::endpoint`), so the caller keys follow-up work by what was
+    /// actually dialled rather than by the catalogue as it stands afterwards.
     pub async fn connect(
         &self,
         app: AppHandle,
         prompts: Arc<HostKeyPrompts>,
         auth_prompts: Arc<AuthPrompts>,
-        session_id: &str,
-        host_id: &str,
-        host: &str,
-        port: u16,
-        username: &str,
-        cols: u32,
-        rows: u32,
-        startup_commands: &[String],
-        auth: &str,
-        key_path: Option<&str>,
-        jump: Option<JumpParams>,
-        one_shot_password: Option<&str>,
-    ) -> Result<(), SshError> {
-        // A reconnect reuses the session id. Tear the previous connection down
-        // first: replacing the map entry alone would leave its transport alive
-        // (forward listeners hold their own Arc<Session>) and its forwards still
-        // listed under this id.
-        if self.sessions.contains_key(session_id) || self.pumps.contains_key(session_id) {
-            self.remove(session_id).await;
-        }
+        spec: ConnectSpec,
+    ) -> Result<String, SshError> {
+        let session_id = spec.session_id.clone();
         let ticket = CONNECT_SEQ.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(());
-        self.connecting.insert(session_id.to_string(), (ticket, cancel_tx));
-        let mut closed = cancel_rx.clone();
-        let (sweep_hk, sweep_auth) = (Arc::clone(&prompts), Arc::clone(&auth_prompts));
-        let sweep_app = app.clone();
-        // Race the whole connect against cancellation. `still_wanted` checks
-        // between stages are not enough: a disconnect during the TCP/kex
-        // handshake or authentication must stop it there, before a password is
-        // sent or a new prompt raised. Dropping the future drops every Handle it
-        // owns, which ends those transports.
-        let result = tokio::select! {
-            biased;
-            _ = closed.changed() => Err(SshError::Cancelled(session_id.to_string())),
-            r = self.connect_inner(
-                app, prompts, auth_prompts, session_id, host_id, host, port, username, cols,
-                rows, startup_commands, auth, key_path, jump, one_shot_password, ticket,
-                cancel_rx,
-            ) => r,
+        // Take the ticket FIRST, before tearing down the previous connection:
+        // a tab closed during that teardown then removes our ticket and this
+        // connect stops before it dials, instead of prompting for a closed tab.
+        let superseded = self.connecting.insert(session_id.clone(), (ticket, cancel_tx));
+        let sweep = |owner_ticket: u64| {
+            let closed = prompts
+                .cancel_attempt(&session_id, owner_ticket)
+                .into_iter()
+                .chain(auth_prompts.cancel_attempt(&session_id, owner_ticket));
+            for request_id in closed {
+                emit_prompt_closed(&app, &request_id);
+            }
+        };
+        // Dropping the superseded attempt's sender cancels it; its prompts (a
+        // host-key check parks in russh's own task, which outlives that
+        // attempt) are dropped here so they do not linger beside ours.
+        if let Some((old_ticket, _old_tx)) = superseded {
+            sweep(old_ticket);
+        }
+
+        // A reconnect reuses the session id. Tear the previous connection down:
+        // replacing the map entry alone would leave its transport alive
+        // (forward listeners hold their own Arc<Session>) and its forwards
+        // still listed under this id. Not raced against cancellation: a
+        // teardown cut off half-way would drop a session without disconnecting.
+        if self.sessions.contains_key(&session_id) || self.pumps.contains_key(&session_id) {
+            self.teardown_registered(&session_id).await;
+        }
+
+        let result = if !self.still_wanted(&session_id, ticket) {
+            Err(SshError::Cancelled(session_id.clone()))
+        } else {
+            let mut closed = cancel_rx.clone();
+            // Race the whole connect against cancellation. `still_wanted`
+            // checks between stages are not enough: a disconnect during the
+            // TCP/kex handshake or authentication must stop it there, before a
+            // password is sent or a new prompt raised. Dropping the future
+            // drops every Handle it owns, which ends those transports.
+            tokio::select! {
+                biased;
+                _ = closed.changed() => Err(SshError::Cancelled(session_id.clone())),
+                r = self.connect_inner(
+                    app.clone(), Arc::clone(&prompts), Arc::clone(&auth_prompts), spec, ticket,
+                    cancel_rx,
+                ) => r,
+            }
         };
         // Clear our in-flight marker, but only if it is still ours.
-        self.connecting.remove_if(session_id, |_, g| g.0 == ticket);
-        // Cancelled mid-connect: a prompt registered in the poll that raced the
-        // caller's sweep (or a cancel by a newer connect, which sweeps nothing)
-        // would be orphaned — its timeout cleanup lived in the dropped future.
-        // Sweep here too, unless a newer connect now owns this id and its
-        // prompts.
-        if matches!(result, Err(SshError::Cancelled(_)))
-            && !self.connecting.contains_key(session_id)
-        {
-            let closed = sweep_hk
-                .cancel_session(session_id)
-                .into_iter()
-                .chain(sweep_auth.cancel_session(session_id));
-            for request_id in closed {
-                emit_prompt_closed(&sweep_app, &request_id);
-            }
+        self.connecting.remove_if(&session_id, |_, g| g.0 == ticket);
+        // A failed or cancelled attempt leaves no prompt behind: one registered
+        // in the poll that raced a sweep would otherwise be orphaned (its
+        // timeout cleanup lived in the dropped future). Swept by generation,
+        // so a newer connect's prompts for this tab are left alone.
+        if result.is_err() {
+            sweep(ticket);
         }
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn connect_inner(
         &self,
         app: AppHandle,
         prompts: Arc<HostKeyPrompts>,
         auth_prompts: Arc<AuthPrompts>,
-        session_id: &str,
-        host_id: &str,
-        host: &str,
-        port: u16,
-        username: &str,
-        cols: u32,
-        rows: u32,
-        startup_commands: &[String],
-        auth: &str,
-        key_path: Option<&str>,
-        jump: Option<JumpParams>,
-        one_shot_password: Option<&str>,
+        spec: ConnectSpec,
         ticket: u64,
         cancel: watch::Receiver<()>,
-    ) -> Result<(), SshError> {
+    ) -> Result<String, SshError> {
+        let ConnectSpec {
+            session_id,
+            host_id,
+            host,
+            port,
+            username,
+            cols,
+            rows,
+            startup_commands,
+            auth,
+            key_path,
+            jump,
+            one_shot_password,
+            endpoint,
+            label,
+            ephemeral,
+        } = spec;
+        let (session_id, host, username) = (session_id.as_str(), host.as_str(), username.as_str());
+
         // Before dialing anything, refuse to send a saved password to a
         // destination the catalogue never bound it to (both the target and any
         // jump host). This fails fast, before we even connect to the requested
         // host, so a compromised frontend cannot use the connection itself as an
-        // exfiltration channel for another host's stored secret.
-        authorize_stored_password(auth, host_id, host, port, username, one_shot_password)?;
-        if let Some(j) = jump.as_ref() {
-            authorize_stored_password(&j.auth, &j.host_id, &j.host, j.port, &j.username, None)?;
-        }
-
-        // Resolve first so the prompt can show which machine actually answered.
-        // Best-effort: a failure here is not fatal, the connect below will
-        // produce a better error than we could.
-        let ip = tokio::net::lookup_host((host, port))
-            .await
-            .ok()
-            .and_then(|mut addrs| addrs.next())
-            .map(|a| a.ip().to_string())
-            .unwrap_or_else(|| host.to_string());
-
-        // Keepalives are what make a dropped link *detectable*. Without them a
-        // VPN drop or an idle firewall timeout leaves the socket open forever:
-        // the read half never returns, so nothing ever reports a disconnect and
-        // the UI keeps showing a live session. Three missed 15s keepalives tears
-        // the connection down after ~45s.
-        let config = Arc::new(client::Config {
-            keepalive_interval: Some(Duration::from_secs(15)),
-            keepalive_max: 3,
-            nodelay: true,
-            ..client::Config::default()
-        });
-        let self_prompts = Arc::clone(&prompts);
-        let handler = ClientHandler {
-            host: host.to_string(),
-            ip,
-            port,
-            app: app.clone(),
-            prompts,
-            session_id: session_id.to_string(),
-            cancel: Some(cancel.clone()),
+        // exfiltration channel for another host's stored secret. The snapshot
+        // it authorized is what authentication later uses.
+        let target_secret = match one_shot_password {
+            Some(p) => {
+                authorize_stored_password(&auth, &host_id, host, port, username, true).await?;
+                Some(p)
+            }
+            None => authorize_stored_password(&auth, &host_id, host, port, username, false).await?,
         };
+        let jump_secret = match jump.as_ref() {
+            Some(j) => authorize_stored_password(&j.auth, &j.host_id, &j.host, j.port, &j.username, false).await?,
+            None => None,
+        };
+
+        // Endpoint identity from the parameters actually dialled below, not
+        // from the claim: the claim only says which catalogue entries these are.
+        let endpoint = crate::utils::artifacts::dial_identity(
+            endpoint.as_deref(),
+            (username, host, port),
+            jump.as_ref().map(|j| (j.username.as_str(), j.host.as_str(), j.port)),
+        );
+
+        let owner: PromptOwner = (session_id.to_string(), ticket);
+        let wait = HumanWait::default();
+        let death: DeathNote = Arc::default();
+        let algos: Algos = Arc::default();
+        // Fires on every exit that does not register a session, including this
+        // future being dropped by a cancel: no russh task or socket from this
+        // attempt survives it (see `Kill`).
+        let mut guard = KillGuard::new();
+        let kill = guard.kill();
+        let via = jump.as_ref().map(|j| {
+            let ep = endpoint_label(&j.username, &j.host, j.port);
+            match j.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                Some(n) => format!("{n} ({ep})"),
+                None => ep,
+            }
+        });
+        let target_origin = PromptOrigin::new(label.as_deref(), username, host, port, via);
 
         // With a jump host: dial the bastion, authenticate there, then open a
         // direct-tcpip channel to the real target and run the SSH handshake
@@ -820,34 +1869,47 @@ impl Registry {
         // bastion's own host key is checked and prompted like any other.
         let (mut handle, jump_handle) = match jump {
             Some(j) => {
-                let jump_config = Arc::new(client::Config {
-                    keepalive_interval: Some(Duration::from_secs(15)),
-                    keepalive_max: 3,
-                    nodelay: true,
-                    ..client::Config::default()
-                });
-                let jump_ip = tokio::net::lookup_host((j.host.as_str(), j.port))
-                    .await
-                    .ok()
-                    .and_then(|mut a| a.next())
-                    .map(|a| a.ip().to_string())
-                    .unwrap_or_else(|| j.host.clone());
+                let (tcp, jump_ip) = dial_tcp(&j.host, j.port).await?;
+                let jump_origin =
+                    PromptOrigin::new(j.name.as_deref(), &j.username, &j.host, j.port, None);
                 let jump_handler = ClientHandler {
                     host: j.host.clone(),
                     ip: jump_ip,
                     port: j.port,
+                    origin: jump_origin.clone(),
                     app: app.clone(),
-                    prompts: Arc::clone(&self_prompts),
-                    session_id: session_id.to_string(),
-                    cancel: Some(cancel.clone()),
+                    prompts: Arc::clone(&prompts),
+                    owner: owner.clone(),
+                    cancel: cancel.clone(),
+                    wait: wait.clone(),
+                    death: Arc::default(),
+                    kill: kill.clone(),
+                    algos: Arc::default(),
                 };
-                let mut jh =
-                    client::connect(jump_config, (j.host.as_str(), j.port), jump_handler).await?;
-                authenticate(
-                    &mut jh, &j.host_id, &j.host, j.port, &j.username, &j.auth,
-                    j.key_path.as_deref(), None, &app, &auth_prompts, session_id,
+                let jlabel = format!("{}:{}", j.host, j.port);
+                let mut jh = handshake(
+                    hop_config(&j.host, j.port), tcp, jump_handler, &wait, &jlabel, HANDSHAKE_TIMEOUT, &kill,
                 )
                 .await?;
+                let jctx = PromptCtx {
+                    app: &app,
+                    auth_prompts: &auth_prompts,
+                    owner: owner.clone(),
+                    origin: jump_origin,
+                    wait: wait.clone(),
+                    offer_save: true,
+                };
+                let jspec = AuthSpec {
+                    host_id: &j.host_id,
+                    host: &j.host,
+                    port: j.port,
+                    username: &j.username,
+                    auth: &j.auth,
+                    key_path: j.key_path.as_deref(),
+                    secret: jump_secret,
+                };
+                within(&wait, AUTH_TIMEOUT, &jlabel, "authentication", authenticate(&mut jh, jspec, &jctx))
+                    .await??;
                 if !self.still_wanted(session_id, ticket) {
                     let _ = jh
                         .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
@@ -855,33 +1917,98 @@ impl Registry {
                     return Err(SshError::Cancelled(session_id.to_string()));
                 }
 
-                let tunnel = jh
-                    .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
-                    .await?;
-                let h =
-                    client::connect_stream(config, tunnel.into_stream(), handler).await?;
+                // The bastion resolves and dials the target itself, so there
+                // is no local address to show; the prompt says "via" instead.
+                let tunnel = within(
+                    &wait,
+                    TCP_CONNECT_TIMEOUT,
+                    &format!("{host}:{port}"),
+                    "the bastion's connection to the target",
+                    jh.channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0),
+                )
+                .await??;
+                let handler = ClientHandler {
+                    host: host.to_string(),
+                    ip: String::new(),
+                    port,
+                    origin: target_origin.clone(),
+                    app: app.clone(),
+                    prompts,
+                    owner: owner.clone(),
+                    cancel: cancel.clone(),
+                    wait: wait.clone(),
+                    death: Arc::clone(&death),
+                    kill: kill.clone(),
+                    algos: Arc::clone(&algos),
+                };
+                let h = handshake(
+                    hop_config(host, port),
+                    tunnel.into_stream(),
+                    handler,
+                    &wait,
+                    &format!("{host}:{port}"),
+                    HANDSHAKE_TIMEOUT,
+                    &kill,
+                )
+                .await?;
                 (h, Some(jh))
             }
-            None => (
-                client::connect(config, (host, port), handler).await?,
-                None,
-            ),
+            None => {
+                let (tcp, ip) = dial_tcp(host, port).await?;
+                let handler = ClientHandler {
+                    host: host.to_string(),
+                    ip,
+                    port,
+                    origin: target_origin.clone(),
+                    app: app.clone(),
+                    prompts,
+                    owner: owner.clone(),
+                    cancel: cancel.clone(),
+                    wait: wait.clone(),
+                    death: Arc::clone(&death),
+                    kill: kill.clone(),
+                    algos: Arc::clone(&algos),
+                };
+                let h = handshake(
+                    hop_config(host, port), tcp, handler, &wait, &format!("{host}:{port}"),
+                    HANDSHAKE_TIMEOUT, &kill,
+                )
+                .await?;
+                (h, None)
+            }
         };
 
-        authenticate(
-            &mut handle, host_id, host, port, username, auth, key_path, one_shot_password,
-            &app, &auth_prompts, session_id,
+        let ctx = PromptCtx {
+            app: &app,
+            auth_prompts: &auth_prompts,
+            owner,
+            origin: target_origin,
+            wait: wait.clone(),
+            offer_save: !ephemeral,
+        };
+        let aspec = AuthSpec {
+            host_id: &host_id,
+            host,
+            port,
+            username,
+            auth: &auth,
+            key_path: key_path.as_deref(),
+            secret: target_secret,
+        };
+        let hlabel = format!("{host}:{port}");
+        within(&wait, AUTH_TIMEOUT, &hlabel, "authentication", authenticate(&mut handle, aspec, &ctx))
+            .await??;
+
+        // Interactive shell on its own channel. "Connected" only once the
+        // server has accepted the shell request.
+        let (read_half, write_half, early, pty_ok) = within(
+            &wait,
+            CHANNEL_SETUP_TIMEOUT,
+            &hlabel,
+            "shell setup",
+            open_shell(&handle, host, cols, rows),
         )
-        .await?;
-
-        // Interactive shell on its own channel.
-        let channel = handle.channel_open_session().await?;
-        let (mut read_half, write_half) = channel.split();
-
-        write_half
-            .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
-            .await?;
-        write_half.request_shell(true).await?;
+        .await??;
 
         // The tab may have been closed during any of the awaits above (a slow
         // handshake, a host-key or password dialog). Stop before the startup
@@ -898,120 +2025,55 @@ impl Registry {
             return Err(SshError::Cancelled(session_id.to_string()));
         }
 
-        // Optional first line of input. Written as input rather than via
-        // request_exec so it degrades gracefully: if the command does not exist
-        // the user sees "command not found" and still has a working shell,
-        // whereas a failed exec would close the channel and look like a broken
-        // connection.
-        // Order matters and is the user's: a `tmux new-session` first means every
-        // later line runs *inside* tmux, which is usually what is wanted.
-        for cmd in startup_commands.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
-            let line = format!("{cmd}
-");
-            write_half.data(line.as_bytes()).await?;
-        }
-
-        // Output pump. Emits on the per-session topic TerminalPane subscribes
-        // to. stderr (ExtendedData) is interleaved into the same stream, which
-        // is what a real terminal does — separating it would reorder output.
-        let pump_app = app.clone();
-        let topic = format!("ssh://{session_id}");
-
-        // Transcript. Opened here rather than inside the task so a failure is
-        // visible immediately, and degraded to None rather than propagated:
-        // losing a log must never take down a working connection.
-        let mut log = SessionLog::create(host, username).ok();
-        if let Some(l) = log.as_ref() {
-            let _ = pump_app.emit(
-                &topic,
-                format!(
-                    "\x1b[38;5;244mlogging to {}\x1b[0m\r\n",
-                    l.path().display()
-                ),
-            );
-        }
-
-        // The pump holds its own Arc so it can clear the liveness flag when the
-        // channel ends. Registration in the maps happens below, atomically with
-        // the cancellation check.
         let session = Arc::new(Session {
             handle,
-            shell: Mutex::new(Some(write_half)),
+            shell: Arc::new(Mutex::new(Some(write_half))),
             sftp: Mutex::new(None),
-            _jump: jump_handle,
+            sftp_refused: AtomicBool::new(false),
+            jump: jump_handle,
             alive: AtomicBool::new(true),
+            endpoint,
+            generation: ticket,
+            algos,
         });
 
-        let pump_session = Arc::clone(&session);
-        let sid = session_id.to_string();
+        // Output pump. Spawned now so its JoinHandle can be registered
+        // atomically below, but it emits nothing until it is handed its
+        // transcript, which happens only after a successful registration: a
+        // cancelled or superseded attempt creates no transcript file and
+        // writes nothing into a tab a newer connect owns.
+        //
+        // The startup commands go with it: the pump sends them once it is
+        // reading (see `send_startup`). Written as input rather than via
+        // request_exec so they degrade gracefully: a missing command shows
+        // "command not found" in a working shell, where a failed exec would
+        // close the channel and look like a broken connection. Order is the
+        // user's: a `tmux new-session` first means every later line runs
+        // inside tmux, which is usually what is wanted.
+        //
+        // The writer is taken for the startup batch HERE, before registration
+        // exposes the session to `write`: nothing else can hold it yet (the
+        // session is not registered), and from the moment it is, a keystroke
+        // or paste queues behind the startup lines instead of racing them.
+        let (go_tx, go_rx) = oneshot::channel::<Option<SessionLog>>();
+        let startup_guard = if startup_lines(&startup_commands).is_empty() {
+            None
+        } else {
+            Some(Arc::clone(&session.shell).lock_owned().await)
+        };
+        let pump = tokio::spawn(run_pump(
+            app.clone(),
+            session_id.to_string(),
+            Arc::clone(&session),
+            read_half,
+            early,
+            go_rx,
+            death,
+            Arc::clone(&self.forwards),
+            startup_commands,
+            startup_guard,
+        ));
 
-        let pump = tokio::spawn(async move {
-            // Distinguishes a clean logout from a link that died under us. The
-            // difference matters to the user: one is expected, the other means
-            // "your VPN dropped" or "the firewall timed you out".
-            let mut reason = "connection closed by remote";
-            // Incomplete UTF-8 tails carried to the next chunk, one per stream:
-            // a packet boundary can split a multi-byte character, and decoding
-            // each chunk alone would print two U+FFFD for one real character.
-            let mut pending_out: Vec<u8> = Vec::new();
-            let mut pending_err: Vec<u8> = Vec::new();
-
-            while let Some(msg) = read_half.wait().await {
-                match msg {
-                    ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                        // Logged before display, so anything that reaches the
-                        // screen is already durable if the app dies next.
-                        if let Some(l) = log.as_mut() {
-                            l.append(data);
-                        }
-
-                        let pending = if matches!(msg, ChannelMsg::Data { .. }) {
-                            &mut pending_out
-                        } else {
-                            &mut pending_err
-                        };
-                        let text = decode_utf8_stream(pending, data);
-                        if !text.is_empty() {
-                            let _ = pump_app.emit(&topic, text);
-                        }
-                    }
-                    ChannelMsg::Eof | ChannelMsg::Close => {
-                        reason = "session closed";
-                        break;
-                    }
-                    ChannelMsg::ExitStatus { exit_status } => {
-                        reason = if exit_status == 0 {
-                            "shell exited"
-                        } else {
-                            "shell exited with an error"
-                        };
-                    }
-                    _ => {}
-                }
-            }
-
-            // Reaching here with no Eof/Close means `wait()` returned None: the
-            // transport itself went away — keepalive failure, reset, or a
-            // dropped route. That is the case the UI most needs told about.
-            pump_session.alive.store(false, Ordering::Relaxed);
-
-            if let Some(l) = log.as_mut() {
-                l.footer(reason);
-            }
-
-            let _ = pump_app.emit(
-                &topic,
-                format!("\r\n\x1b[38;2;242;178;92m\u{25cf} disconnected\x1b[0m {reason}\r\n"),
-            );
-            let _ = pump_app.emit(
-                "ssh://status",
-                SessionStatusEvent {
-                    session_id: sid,
-                    status: "disconnected",
-                    detail: reason.to_string(),
-                },
-            );
-        });
         // Register only while our ticket is still current, holding the
         // `connecting` entry (a shard lock, no await) so a concurrent
         // `remove()` — which deletes that entry first — either runs before us
@@ -1019,6 +2081,14 @@ impl Registry {
         // tears down what we registered). Never `remove()` by id here: a newer
         // connect may own this id now, and that would cancel or tear down ITS
         // session instead of ours.
+        //
+        // The transcript is created and announced under that same entry lock:
+        // a close or superseding connect right after registration has to take
+        // the lock to remove or replace the entry, so it cannot slip in between
+        // registering and the file being created (which would leave the new
+        // owner's tab showing this attempt's "logging to"). Creating the file
+        // is one small local open; the emits only queue events.
+        let topic = format!("ssh://{session_id}");
         let mut pump = Some(pump);
         let registered = match self.connecting.get(session_id) {
             Some(g) if g.0 == ticket => {
@@ -1027,34 +2097,56 @@ impl Registry {
                 if let Some(p) = pump.take() {
                     self.pumps.insert(session_id.to_string(), p);
                 }
-                true
+                // Transcript. Degraded to None rather than propagated: losing
+                // a log must never take down a working connection.
+                let log = SessionLog::create_for(Some(&session.endpoint), host, username).ok();
+                if let Some(l) = log.as_ref() {
+                    let _ = app.emit(
+                        &topic,
+                        format!("\x1b[38;5;244mlogging to {}\x1b[0m\r\n", l.path().display()),
+                    );
+                }
+                if !pty_ok {
+                    let _ = app.emit(
+                        &topic,
+                        "\x1b[38;2;242;178;92mthe server refused a terminal (PTY); line editing and \
+                         full-screen programs may not work\x1b[0m\r\n"
+                            .to_string(),
+                    );
+                }
+                drop(g);
+                Some(log)
             }
-            _ => false,
+            _ => None,
         };
-        if !registered {
+        let Some(log) = registered else {
             // Superseded or cancelled: tear down only this attempt's own
             // resources. Detached, because the cancel that brought us here also
             // makes `connect`'s select drop this future at its next await — an
-            // inline teardown would be cut off half-way.
+            // inline teardown would be cut off half-way. The pump never got its
+            // go signal, so it has emitted nothing.
+            //
+            // The kill guard goes with it and fires once the disconnect has
+            // had a moment to reach the server, so the transport ends either
+            // way. Bounded: a window-blocked transport may never take the
+            // disconnect at all.
             if let Some(p) = pump.take() {
                 p.abort();
             }
-            session.alive.store(false, Ordering::Relaxed);
+            session.alive.store(false, Ordering::SeqCst);
             tokio::spawn(async move {
-                let _ = session
-                    .handle
-                    .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
-                    .await;
-                if let Some(jh) = session._jump.as_ref() {
-                    let _ = jh
-                        .disconnect(russh::Disconnect::ByApplication, "cancelled", "")
-                        .await;
-                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), session.close("cancelled")).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                drop(guard);
             });
             return Err(SshError::Cancelled(session_id.to_string()));
-        }
+        };
+        // Registered: the session owns its transports now, and its own
+        // teardown (`Session::close`) ends them.
+        guard.disarm();
+        let _ = go_tx.send(log);
 
-        Ok(())
+        Ok(session.endpoint.clone())
     }
 
     /* ------------------------------------------------------------ phase 1 */
@@ -1104,7 +2196,13 @@ impl Registry {
     /// The SFTP subsystem rides the existing SSH connection rather than opening
     /// a second one, and starts lazily: a session that only uses the terminal
     /// never pays for it. Cached because channel setup costs a round trip.
-    async fn sftp(&self, session_id: &str) -> Result<Arc<SftpSession>, SshError> {
+    ///
+    /// Two subsystem channels: russh-sftp's high-level session (streaming file
+    /// I/O) and a raw one for what the high-level API cannot do — a listing
+    /// read batch by batch (so it can be capped) and `posix-rename@openssh.com`
+    /// (an atomic replace). A server that refuses the second channel still
+    /// gets every operation, without those two refinements.
+    async fn sftp(&self, session_id: &str) -> Result<Arc<SftpConn>, SshError> {
         let session = self.get(session_id)?;
         if !session.alive.load(Ordering::Relaxed) {
             return Err(SshError::Disconnected(session_id.to_string()));
@@ -1114,101 +2212,70 @@ impl Registry {
             return Ok(Arc::clone(existing));
         }
 
-        let channel = session.handle.channel_open_session().await?;
-        channel.request_subsystem(true, "sftp").await?;
-        let sftp = Arc::new(SftpSession::new(channel.into_stream()).await?);
-        *guard = Some(Arc::clone(&sftp));
-        Ok(sftp)
+        let conn = Arc::new(open_sftp_conn(&session.handle, &session.sftp_refused).await?);
+        *guard = Some(Arc::clone(&conn));
+        Ok(conn)
     }
 
     /// Forget the cached SFTP session if `r` failed because its channel is gone
-    /// (the sftp-server process exited or was killed while the SSH transport
-    /// stayed up). Without this every later file operation reuses the dead
-    /// session and fails until the whole tab is reconnected; with it the next
-    /// call reopens the subsystem.
-    async fn check_sftp<T>(&self, session_id: &str, r: Result<T, SshError>) -> Result<T, SshError> {
-        use russh_sftp::client::error::Error as SftpErr;
-        if let Err(SshError::Sftp(SftpErr::UnexpectedBehavior(_) | SftpErr::IO(_))) = &r {
+    /// or stopped answering (the sftp-server process exited, was killed or
+    /// hangs while the SSH transport stayed up). Without this every later file
+    /// operation reuses the dead session and fails until the whole tab is
+    /// reconnected; with it the next call reopens the subsystem. `used` is the
+    /// connection that produced `r`: only that one is ever forgotten (see
+    /// `forget_sftp`).
+    async fn check_sftp<T>(
+        &self,
+        session_id: &str,
+        used: &Arc<SftpConn>,
+        r: Result<T, SshError>,
+    ) -> Result<T, SshError> {
+        if let Err(e) = &r {
             if let Ok(session) = self.get(session_id) {
-                *session.sftp.lock().await = None;
+                forget_sftp(&session.sftp, used, e).await;
             }
         }
         r
     }
 
     pub async fn list_dir(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
-        let first = self.list_dir_once(session_id, path).await;
-        if matches!(first, Err(SshError::Sftp(_))) {
-            // A dead cached channel is dropped by check_sftp; one retry then
-            // runs on a fresh subsystem, so the pane recovers by itself.
-            let cleared = match self.get(session_id) {
-                Ok(s) => s.sftp.lock().await.is_none(),
-                Err(_) => false,
-            };
-            if cleared {
-                return self.list_dir_once(session_id, path).await;
+        let sftp = self.sftp(session_id).await?;
+        let first = list_dir_with(&sftp, path).await;
+        let first = self.check_sftp(session_id, &sftp, first).await;
+        if matches!(&first, Err(e) if sftp_dead(e)) {
+            // The dead channel was dropped by check_sftp; one retry then runs
+            // on a fresh subsystem (or a replacement another call already
+            // opened), so the pane recovers by itself.
+            let again = self.sftp(session_id).await?;
+            if !Arc::ptr_eq(&again, &sftp) {
+                let r = list_dir_with(&again, path).await;
+                return self.check_sftp(session_id, &again, r).await;
             }
         }
         first
     }
 
-    async fn list_dir_once(&self, session_id: &str, path: &str) -> Result<DirListing, SshError> {
-        let sftp = self.sftp(session_id).await?;
-        let r = self.list_dir_with(&sftp, path).await;
-        self.check_sftp(session_id, r).await
-    }
-
-    async fn list_dir_with(&self, sftp: &SftpSession, path: &str) -> Result<DirListing, SshError> {
-        // Resolve first so the pane shows the real location: the server may
-        // return something different for ".", "~", or a symlinked directory.
-        let canonical = sftp
-            .canonicalize(path)
-            .await
-            .unwrap_or_else(|_| path.to_string());
-
-        let mut entries = vec![FileEntry {
-            name: "..".into(),
-            kind: "directory",
-            size: 0,
-            modified: None,
-            mode: String::new(),
-        }];
-
-        for entry in sftp.read_dir(&canonical).await? {
-            let meta = entry.metadata();
-            let kind = match entry.file_type() {
-                FileType::Dir => "directory",
-                FileType::Symlink => "symlink",
-                _ => "file",
-            };
-            entries.push(FileEntry {
-                name: entry.file_name(),
-                kind,
-                size: meta.size.unwrap_or(0),
-                modified: meta.mtime,
-                mode: mode_string(meta.permissions, kind),
-            });
-        }
-
-        Ok(DirListing {
-            path: canonical,
-            entries,
-        })
-    }
-
-    /// Whether a remote path exists — the overwrite guard asks before a
-    /// transfer clobbers something already there.
+    /// Whether anything is at a remote path — the overwrite guard asks before
+    /// a transfer clobbers something already there. LSTAT, so a symlink (even
+    /// a dangling one) counts as present. Only a definite "no such file" is
+    /// `false`; any other failure (a dead channel, a timeout, permission
+    /// denied) is an error, never a silent "not there".
     pub async fn sftp_exists(&self, session_id: &str, path: &str) -> Result<bool, SshError> {
         let sftp = self.sftp(session_id).await?;
-        Ok(sftp.metadata(path).await.is_ok())
+        let r = match sftp.hi.symlink_metadata(path).await {
+            Ok(_) => Ok(true),
+            Err(e) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => Ok(false),
+            Err(e) => Err(SshError::from(e)),
+        };
+        self.check_sftp(session_id, &sftp, r).await
     }
 
     /// Rename a remote file or directory. SFTP rename is not a copy — it is
     /// the server's own rename, atomic where the filesystem allows.
     pub async fn sftp_rename(&self, session_id: &str, from: &str, to: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
-        let r = sftp.rename(from, to).await.map_err(SshError::from);
-        self.check_sftp(session_id, r).await
+        let r = sftp.hi.rename(from, to).await.map_err(SshError::from);
+        self.check_sftp(session_id, &sftp, r).await
     }
 
     /// Delete a remote file, or an EMPTY remote directory.
@@ -1220,276 +2287,128 @@ impl Registry {
     pub async fn sftp_delete(&self, session_id: &str, path: &str, is_dir: bool) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
         let r = if is_dir {
-            sftp.remove_dir(path).await
+            sftp.hi.remove_dir(path).await
         } else {
-            sftp.remove_file(path).await
+            sftp.hi.remove_file(path).await
         };
-        self.check_sftp(session_id, r.map_err(SshError::from)).await
+        self.check_sftp(session_id, &sftp, r.map_err(SshError::from)).await
     }
 
     /// Create a remote directory.
     pub async fn sftp_mkdir(&self, session_id: &str, path: &str) -> Result<(), SshError> {
         let sftp = self.sftp(session_id).await?;
-        let r = sftp.create_dir(path).await.map_err(SshError::from);
-        self.check_sftp(session_id, r).await
+        let r = sftp.hi.create_dir(path).await.map_err(SshError::from);
+        self.check_sftp(session_id, &sftp, r).await
     }
 
     /* ------------------------------------------------------------ phase 2 */
+
+    /// Register a transfer under the frontend's id so `transfer_cancel` can
+    /// reach it. A cancel that overtook this call (the user cancelled a row
+    /// whose command had not started yet) stops it before any byte moves.
+    fn transfer_begin(&self, transfer_id: &str) -> Result<(u64, watch::Receiver<bool>), SshError> {
+        let seq = TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = watch::channel(false);
+        let mut t = self.transfers.lock().unwrap_or_else(|p| p.into_inner());
+        if t.running.contains_key(transfer_id) {
+            return Err(SshError::PartialTransfer(format!(
+                "transfer id {transfer_id} is already running"
+            )));
+        }
+        if t.early_cancels.remove(transfer_id).is_some() {
+            return Err(SshError::TransferCancelled);
+        }
+        t.running.insert(transfer_id.to_string(), (seq, tx));
+        Ok((seq, rx))
+    }
+
+    fn transfer_end(&self, transfer_id: &str, seq: u64) {
+        let mut t = self.transfers.lock().unwrap_or_else(|p| p.into_inner());
+        if t.running.get(transfer_id).is_some_and(|v| v.0 == seq) {
+            t.running.remove(transfer_id);
+        }
+    }
+
+    /// Cancel a running transfer (`sftp_get`/`sftp_put` with the same id). Its
+    /// copy loop stops at the next chunk and removes its staging files on both
+    /// sides while the connection is still up. An id with no transfer
+    /// registered yet is remembered, so that transfer stops as it starts. A
+    /// transfer already committing its file is not interrupted (see
+    /// `commit_upload`): it finishes and reports what really happened.
+    pub fn transfer_cancel(&self, transfer_id: &str) {
+        let now = Instant::now();
+        let mut t = self.transfers.lock().unwrap_or_else(|p| p.into_inner());
+        t.early_cancels
+            .retain(|_, at| now.duration_since(*at) < COPY_ID_CANCEL_TTL);
+        match t.running.get(transfer_id) {
+            Some(e) => {
+                let _ = e.1.send(true);
+            }
+            None => {
+                t.early_cancels.insert(transfer_id.to_string(), now);
+            }
+        }
+    }
 
     /// Download, streamed and reporting byte-accurate progress.
     ///
     /// Streaming rather than read-to-end is not only about memory: it is what
     /// makes progress reportable at all. Chunks are 64 KB; events are throttled
-    /// to one per PROGRESS_INTERVAL with a guaranteed final event so the UI
-    /// always lands on 100%.
+    /// to one per PROGRESS_INTERVAL across the whole transfer, with a
+    /// guaranteed final event so the UI always lands on 100%.
+    ///
+    /// `overwrite` is enforced when each file is committed, not only when the
+    /// user was asked: a file that appeared at the destination meanwhile is
+    /// never replaced under `Overwrite::Never`.
     pub async fn download(
         &self,
         app: &AppHandle,
         session_id: &str,
+        transfer_id: &str,
         remote: &str,
         local: &str,
-    ) -> Result<u64, SshError> {
-        let sftp = self.sftp(session_id).await?;
-
-        // A directory recurses; a file copies directly. Walking the tree
-        // iteratively (a worklist, not async recursion) keeps this a plain
-        // function with no Box::pin ceremony.
-        let is_dir = sftp
-            .metadata(remote)
+        overwrite: Overwrite,
+    ) -> Result<TransferOutcome, SshError> {
+        let (seq, cancel) = self.transfer_begin(transfer_id)?;
+        let sftp = match self.sftp(session_id).await {
+            Ok(sftp) => sftp,
+            Err(e) => {
+                self.transfer_end(transfer_id, seq);
+                return Err(e);
+            }
+        };
+        let mut p = Progress::new(app, session_id, transfer_id, remote, "download", cancel);
+        let r = download_tree(&sftp, &mut p, remote, local, overwrite)
             .await
-            .map(|m| m.file_type().is_dir())
-            .unwrap_or(false);
-
-        // Single file: the frontend built `local` from the server's name, so
-        // verify its final component has not been used to escape the target.
-        let last = std::path::Path::new(local)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !safe_local_component(&last) {
-            return Err(SshError::PartialTransfer(format!(
-                "refusing to write unsafe filename: {last}"
-            )));
-        }
-        if !is_dir {
-            return copy_remote_file(&sftp, app, session_id, remote, local, ProgressCtx::single(remote))
-                .await;
-        }
-
-        // Everything from `local` downward is built from server-chosen names and
-        // is therefore untrusted; the folder that CONTAINS `local` is the one the
-        // user actually picked and is the trust boundary. Any pre-existing symlink
-        // or junction below it must not be followed. (`local` always has a parent
-        // here: `safe_local_component` above rejected an empty final component.)
-        let root = std::path::Path::new(local)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-
-        let mut total = 0u64;
-        let mut failed: Vec<String> = Vec::new();
-        // Bound the walk so a malicious or misconfigured server advertising a
-        // pathologically deep/wide tree cannot grow the worklist without limit.
-        const MAX_DIRS: usize = 50_000;
-        let mut visited = 0usize;
-        let mut dirs = vec![(remote.to_string(), local.to_string())];
-        while let Some((rdir, ldir)) = dirs.pop() {
-            visited += 1;
-            // The root failing is a real error; a subdirectory failing is one
-            // more item in the tally, like an unreadable file (see below).
-            let is_root = visited == 1;
-            if visited > MAX_DIRS {
-                let reason = format!(
-                    "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
-                );
-                // Empty paths: not retryable — a retry would re-run the whole tree.
-                emit_transfer_failure(app, session_id, remote, "(tree)", "", "", reason.clone(), "download");
-                failed.push(reason);
-                break;
-            }
-            // Refuse to descend into (or create under) a linked ancestor before
-            // create_dir_all can follow it outside the destination.
-            if let Err(e) = reject_link_in_subtree(&root, std::path::Path::new(&ldir)) {
-                failed.push(format!("{ldir}: {e}"));
-                continue;
-            }
-            let dir_name = rdir.rsplit('/').next().unwrap_or(&rdir).to_string();
-            let listing = match tokio::fs::create_dir_all(&ldir).await {
-                Err(e) if is_root => return Err(e.into()),
-                Err(e) => Err(SshError::from(e)),
-                Ok(()) => sftp.read_dir(&rdir).await.map_err(SshError::from),
-            };
-            let listing = match listing {
-                Ok(l) => l,
-                Err(e) if is_root => return Err(e),
-                Err(e) => {
-                    emit_transfer_failure(app, session_id, remote, &dir_name, &ldir, &rdir, format!("{e}"), "download");
-                    failed.push(format!("{rdir}: {e}"));
-                    continue;
-                }
-            };
-            for entry in listing {
-                let name = entry.file_name();
-                let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
-                // The server chose this name; refuse anything that is not a
-                // plain component before it becomes a local path.
-                if !safe_local_component(&name) {
-                    let reason = format!("{name} (unsafe name, skipped)");
-                    emit_transfer_failure(app, session_id, remote, &name, "", &rpath, reason.clone(), "download");
-                    failed.push(reason);
-                    continue;
-                }
-                let lpath = std::path::Path::new(&ldir)
-                    .join(&name)
-                    .to_string_lossy()
-                    .to_string();
-                let ft = entry.file_type();
-                if ft.is_dir() {
-                    dirs.push((rpath, lpath));
-                } else if ft.is_symlink() {
-                    // A symlink in a tree walk is skipped, not followed: SFTP
-                    // open() on a dir-symlink fails, and following file links
-                    // can duplicate or even loop. Recorded so the user learns
-                    // it was left behind rather than silently missing it.
-                    // Emitted with an empty local path so it is NOT retryable:
-                    // a retry would copy it as a plain file, following the link
-                    // the walk deliberately refused to follow.
-                    let reason = format!("{rpath} (symlink, skipped)");
-                    emit_transfer_failure(app, session_id, remote, &name, "", &rpath, "symlink, skipped".into(), "download");
-                    failed.push(reason);
-                } else {
-                    // One unreadable file must not abort the other 499: keep
-                    // walking, collect what failed, report the tally at the end.
-                    let ctx = ProgressCtx { root: remote, base: total, tree: true };
-                    match copy_remote_file(&sftp, app, session_id, &rpath, &lpath, ctx).await {
-                        Ok(n) => total += n,
-                        Err(e) => {
-                            emit_transfer_failure(app, session_id, remote, &name, &lpath, &rpath, format!("{e}"), "download");
-                            failed.push(format!("{rpath}: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-        if failed.is_empty() {
-            Ok(total)
-        } else {
-            Err(SshError::PartialTransfer(format!(
-                "copied {} bytes; {} item(s) not transferred — first: {}",
-                total,
-                failed.len(),
-                failed[0]
-            )))
-        }
+            .map(|bytes| TransferOutcome { bytes, notes: p.take_notes() });
+        self.transfer_end(transfer_id, seq);
+        self.check_sftp(session_id, &sftp, r).await
     }
 
-    /// Upload, same streaming and reporting contract, directory-aware.
+    /// Upload, same streaming, reporting and overwrite contract, directory-aware.
     pub async fn upload(
         &self,
         app: &AppHandle,
         session_id: &str,
+        transfer_id: &str,
         local: &str,
         remote: &str,
-    ) -> Result<u64, SshError> {
-        let sftp = self.sftp(session_id).await?;
-
-        let is_dir = tokio::fs::metadata(local)
+        overwrite: Overwrite,
+    ) -> Result<TransferOutcome, SshError> {
+        let (seq, cancel) = self.transfer_begin(transfer_id)?;
+        let sftp = match self.sftp(session_id).await {
+            Ok(sftp) => sftp,
+            Err(e) => {
+                self.transfer_end(transfer_id, seq);
+                return Err(e);
+            }
+        };
+        let mut p = Progress::new(app, session_id, transfer_id, local, "upload", cancel);
+        let r = upload_tree(&sftp, &mut p, local, remote, overwrite)
             .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-
-        if !is_dir {
-            return copy_local_file(&sftp, app, session_id, local, remote, ProgressCtx::single(local))
-                .await;
-        }
-
-        let mut total = 0u64;
-        let mut failed: Vec<String> = Vec::new();
-        const MAX_DIRS: usize = 50_000;
-        let mut visited = 0usize;
-        let mut dirs = vec![(local.to_string(), remote.to_string())];
-        while let Some((ldir, rdir)) = dirs.pop() {
-            visited += 1;
-            let is_root = visited == 1;
-            if visited > MAX_DIRS {
-                let reason = format!(
-                    "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
-                );
-                // Empty paths: not retryable — a retry would re-run the whole tree.
-                emit_transfer_failure(app, session_id, local, "(tree)", "", "", reason.clone(), "upload");
-                failed.push(reason);
-                break;
-            }
-            // create_dir on an existing directory is an error over SFTP; ignore
-            // it so re-uploading into a partially-present tree just works.
-            let _ = sftp.create_dir(&rdir).await;
-            // An unreadable SUBdirectory (another user's 0700 dir, a macOS
-            // TCC-protected folder) is one more failed item, not the end of the
-            // whole tree; only the root failing is fatal.
-            let dir_name = std::path::Path::new(&ldir)
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| ldir.clone());
-            let mut rd = match tokio::fs::read_dir(&ldir).await {
-                Ok(rd) => rd,
-                Err(e) if is_root => return Err(e.into()),
-                Err(e) => {
-                    emit_transfer_failure(app, session_id, local, &dir_name, &ldir, &rdir, format!("{e}"), "upload");
-                    failed.push(format!("{ldir}: {e}"));
-                    continue;
-                }
-            };
-            loop {
-                let entry = match rd.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => break,
-                    Err(e) => {
-                        failed.push(format!("{ldir}: {e}"));
-                        break;
-                    }
-                };
-                let name = entry.file_name().to_string_lossy().to_string();
-                let lpath = entry.path().to_string_lossy().to_string();
-                let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(e) => {
-                        emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, format!("{e}"), "upload");
-                        failed.push(format!("{lpath}: {e}"));
-                        continue;
-                    }
-                };
-                if ft.is_dir() {
-                    dirs.push((lpath, rpath));
-                } else if ft.is_symlink() {
-                    // Empty local path: NOT retryable. A retry would open the
-                    // path as a plain file and upload whatever the link points
-                    // at (e.g. ~/.ssh/id_ed25519) — the very thing the walk
-                    // refused to do.
-                    emit_transfer_failure(app, session_id, local, &name, "", &rpath, "symlink, skipped".into(), "upload");
-                    failed.push(format!("{lpath} (symlink, skipped)"));
-                } else {
-                    let ctx = ProgressCtx { root: local, base: total, tree: true };
-                    match copy_local_file(&sftp, app, session_id, &lpath, &rpath, ctx).await {
-                        Ok(n) => total += n,
-                        Err(e) => {
-                            emit_transfer_failure(app, session_id, local, &name, &lpath, &rpath, format!("{e}"), "upload");
-                            failed.push(format!("{lpath}: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-        if failed.is_empty() {
-            Ok(total)
-        } else {
-            Err(SshError::PartialTransfer(format!(
-                "copied {} bytes; {} item(s) not transferred — first: {}",
-                total,
-                failed.len(),
-                failed[0]
-            )))
-        }
+            .map(|bytes| TransferOutcome { bytes, notes: p.take_notes() });
+        self.transfer_end(transfer_id, seq);
+        self.check_sftp(session_id, &sftp, r).await
     }
 }
 
@@ -1561,34 +2480,55 @@ impl Registry {
             }
         });
 
-        self.insert_forward(Forward {
+        self.insert_forward(&session, Forward {
             info: info.clone(),
+            generation: session.generation,
             listener: task,
             tunnels,
-        });
+        })
+        .await?;
         Ok(info)
     }
 
-    /// Register a forward. Ids are `<kind>-<session>-<port>`, so re-creating a
-    /// forward on a port whose old listener died yields the same id; tear the
-    /// old entry down rather than let `insert` silently detach its tunnels.
-    fn insert_forward(&self, fw: Forward) {
-        if let Some(old) = self.forwards.insert(fw.info.id.clone(), fw) {
-            for h in take_tunnels(&old.tunnels) {
-                h.abort();
-            }
-            old.listener.abort();
+    /// Register a forward, then make sure its session is still the live one.
+    ///
+    /// The bind above awaits, and the tab can close (or the shell end) meanwhile:
+    /// that teardown swept this session's forwards before ours existed, so a
+    /// forward inserted now would hold its port and stay listed forever. The
+    /// teardowns clear the session (map entry or `alive`) BEFORE sweeping, so
+    /// re-checking after the insert is enough: either we see it gone and roll
+    /// back, or the sweep runs after our insert and takes this forward too.
+    ///
+    /// Ids are `<kind>-<session>-<port>`, so re-creating a forward on a port
+    /// whose old listener died yields the same id; tear the old entry down
+    /// rather than let `insert` silently detach its tunnels.
+    async fn insert_forward(&self, session: &Arc<Session>, fw: Forward) -> Result<(), SshError> {
+        let id = fw.info.id.clone();
+        let sid = fw.info.session_id.clone();
+        if let Some(old) = self.forwards.insert(id.clone(), fw) {
+            teardown_forwards(vec![old]).await;
         }
+        let live = self
+            .sessions
+            .get(&sid)
+            .is_some_and(|s| Arc::ptr_eq(s.value(), session))
+            && session.alive.load(Ordering::SeqCst);
+        if !live {
+            if let Some((_, ours)) =
+                self.forwards.remove_if(&id, |_, f| f.generation == session.generation)
+            {
+                teardown_forwards(vec![ours]).await;
+            }
+            return Err(SshError::Disconnected(sid));
+        }
+        Ok(())
     }
 
-    /// Stop one forward: abort its live tunnels AND its listener, so no traffic
-    /// keeps flowing after the user stops it — not just the listener.
-    pub fn forward_stop(&self, forward_id: &str) {
+    /// Stop one forward: its listener first, then every live tunnel, so no
+    /// traffic keeps flowing after the user stops it (see `teardown_forward`).
+    pub async fn forward_stop(&self, forward_id: &str) {
         if let Some((_, fw)) = self.forwards.remove(forward_id) {
-            for h in take_tunnels(&fw.tunnels) {
-                h.abort();
-            }
-            fw.listener.abort();
+            teardown_forwards(vec![fw]).await;
         }
     }
 
@@ -1637,11 +2577,13 @@ impl Registry {
             }
         });
 
-        self.insert_forward(Forward {
+        self.insert_forward(&session, Forward {
             info: info.clone(),
+            generation: session.generation,
             listener: task,
             tunnels,
-        });
+        })
+        .await?;
         Ok(info)
     }
 
@@ -1652,9 +2594,87 @@ impl Registry {
             .filter(|f| session_id.is_none_or(|sid| f.session_id == sid))
             .collect()
     }
+
+    /// Install a public key (ssh-copy-id) over a throwaway connection, under
+    /// the same stage deadlines as a connect, and cancellable by `op_id` with
+    /// `copy_id_cancel` (the editor closed, or the user gave up). A cancelled
+    /// install leaves no prompt behind.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_id_run(
+        &self,
+        app: AppHandle,
+        prompts: Arc<HostKeyPrompts>,
+        auth_prompts: Arc<AuthPrompts>,
+        op_id: Option<&str>,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: zeroize::Zeroizing<String>,
+        public_key: &str,
+    ) -> Result<(), SshError> {
+        let seq = COPY_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        let session_id = format!("install-key-{seq}");
+        let op = op_id.map(str::to_string).unwrap_or_else(|| session_id.clone());
+        let (tx, rx) = watch::channel(());
+        // A second install under the same op id supersedes (cancels) the first.
+        // Registered, and checked against an early cancel, under the entry's
+        // lock and before anything dials, so a cancel either lands in
+        // `copy_id_cancels` first (seen here) or finds this entry.
+        if !self.copy_id_register(&op, seq, tx) {
+            return Err(SshError::Cancelled(op));
+        }
+        let mut closed = rx.clone();
+        let result = tokio::select! {
+            biased;
+            _ = closed.changed() => Err(SshError::Cancelled(op.clone())),
+            r = copy_id(
+                app.clone(), Arc::clone(&prompts), Arc::clone(&auth_prompts), &session_id, rx,
+                host, port, username, password, public_key,
+            ) => r,
+        };
+        self.copy_ids.remove_if(&op, |_, v| v.0 == seq);
+        if result.is_err() {
+            let swept = prompts
+                .cancel_session(&session_id)
+                .into_iter()
+                .chain(auth_prompts.cancel_session(&session_id));
+            for request_id in swept {
+                emit_prompt_closed(&app, &request_id);
+            }
+        }
+        result
+    }
+
+    /// Register install `seq` under `op`, unless a cancel for `op` already
+    /// arrived (then false, and nothing is registered).
+    fn copy_id_register(&self, op: &str, seq: u64, tx: watch::Sender<()>) -> bool {
+        let entry = self.copy_ids.entry(op.to_string());
+        if self.copy_id_cancels.remove(op).is_some() {
+            return false;
+        }
+        entry.insert((seq, tx));
+        true
+    }
+
+    /// Cancel a `copy_id_run`. An id with no install registered yet is
+    /// remembered, so the install it belongs to stops as soon as it starts.
+    pub fn copy_id_cancel(&self, op_id: &str) {
+        let now = Instant::now();
+        self.copy_id_cancels
+            .retain(|_, at| now.duration_since(*at) < COPY_ID_CANCEL_TTL);
+        // Under the entry lock, the mirror of `copy_id_run`'s registration.
+        match self.copy_ids.entry(op_id.to_string()) {
+            dashmap::Entry::Occupied(e) => {
+                e.remove();
+            }
+            dashmap::Entry::Vacant(_) => {
+                self.copy_id_cancels.insert(op_id.to_string(), now);
+            }
+        }
+    }
 }
 
-impl Registry {
+impl SessionRef {
     /// Run one command on a fresh exec channel and capture its output.
     ///
     /// Exec, not the interactive shell: capturing through the user's live
@@ -1664,81 +2684,147 @@ impl Registry {
     /// interactive shells and refuse exec — those fail here with the server's
     /// own error, which the UI surfaces as "this device may not support
     /// command capture".
-    pub async fn exec_capture(
-        &self,
-        session_id: &str,
-        command: &str,
-        timeout_secs: u64,
-    ) -> Result<String, SshError> {
-        let session = self.get(session_id)?;
+    ///
+    /// On a `SessionRef` rather than the registry, so the output always comes
+    /// from the connection whose identity the caller files it under.
+    pub async fn exec_capture(&self, command: &str, timeout_secs: u64) -> Result<ExecOutput, SshError> {
+        let session = &self.session;
         if !session.alive.load(Ordering::Relaxed) {
-            return Err(SshError::Disconnected(session_id.to_string()));
+            return Err(SshError::Disconnected(self.id.clone()));
         }
 
         let mut channel = session.handle.channel_open_session().await?;
         channel.exec(true, command).await?;
         let run = run_exec(&mut channel, 16 * 1024 * 1024, Duration::from_secs(timeout_secs)).await;
-
-        // Don't pass off a partial or failed capture as a valid snapshot:
-        //  - timed out   -> we have no idea if the config finished printing
-        //  - truncated   -> hit the size cap mid-dump
-        //  - unconfirmed -> the channel/transport ended before the server
-        //    confirmed the run (EOF, then a status or close)
-        //  - killed / exit != 0 -> the command itself reported failure (a
-        //    missing status after EOF + close is tolerated: much network gear
-        //    never sends one over exec)
-        if run.timed_out {
-            return Err(SshError::PartialTransfer(if run.eof {
-                format!(
-                    "device ended its output but never confirmed completion within \
-                     {timeout_secs}s; output discarded"
-                )
-            } else {
-                format!("capture timed out after {timeout_secs}s; output discarded")
-            }));
+        if !run.close_sent {
+            // The close did not get out within its grace (a full outbound
+            // queue). This is the user's live session, so the channel must not
+            // simply be dropped: russh would then never send its close, and the
+            // command (`tail -f`, a pager waiting for input) would keep running
+            // and hold a channel slot until the whole session ends. The close
+            // stays queued here and goes out as soon as the transport drains;
+            // it fails (and the task ends) when the session ends.
+            tokio::spawn(async move {
+                let _ = channel.close().await;
+            });
         }
-        if run.truncated {
-            return Err(SshError::PartialTransfer(
-                "capture exceeded 16 MiB; output discarded".into(),
-            ));
-        }
-        if !run.confirmed {
-            return Err(SshError::PartialTransfer(
-                "connection ended before the capture completed; output discarded".into(),
-            ));
-        }
-        if let Some(sig) = run.signal {
-            return Err(SshError::PartialTransfer(format!(
-                "capture command was killed by signal {sig}"
-            )));
-        }
-        if let Some(code) = run.exit_status {
-            if code != 0 {
-                return Err(SshError::PartialTransfer(format!(
-                    "capture command exited with status {code}"
-                )));
-            }
-        }
-        let out = run.out;
-
-        let (clean, _) = crate::utils::session_log::strip_ansi(&out);
-        Ok(String::from_utf8_lossy(&clean).to_string())
+        exec_verdict(run, timeout_secs)
     }
 }
 
+/// What a capture printed, the two streams kept apart: stderr (a login-shell
+/// `setlocale` warning, MOTD noise) must never become part of a saved config.
+#[derive(Debug, Default)]
+pub struct ExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ExecOutput {
+    /// Both streams for a human-read capture file, stderr labelled.
+    pub fn labelled(&self) -> String {
+        if self.stderr.trim().is_empty() {
+            return self.stdout.clone();
+        }
+        let sep = if self.stdout.is_empty() || self.stdout.ends_with('\n') { "" } else { "\n" };
+        format!("{}{sep}--- stderr ---\n{}", self.stdout, self.stderr)
+    }
+}
+
+/// A short stderr excerpt for an error message, or "".
+fn stderr_hint(err: &[u8]) -> String {
+    let (clean, _) = crate::utils::session_log::strip_ansi(err);
+    let text = String::from_utf8_lossy(&clean);
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let short: String = text.chars().take(300).collect();
+    format!(": {short}")
+}
+
+/// Judge a finished exec run (see `exec_capture`).
+///
+/// Don't pass off a partial or failed capture as a valid snapshot:
+///  - refused     -> the server answered the exec request with a failure
+///  - timed out   -> we have no idea if the config finished printing
+///  - truncated   -> hit the size cap mid-dump
+///  - unconfirmed -> the channel/transport ended before the server confirmed
+///    the run (EOF, then a status or close)
+///  - killed / exit != 0 -> the command itself reported failure (a missing
+///    status after EOF + close is tolerated: much network gear never sends one
+///    over exec)
+fn exec_verdict(run: ExecRun, timeout_secs: u64) -> Result<ExecOutput, SshError> {
+    if run.refused {
+        return Err(SshError::PartialTransfer(
+            "the device refused to run the command over an exec channel (it may only \
+             support interactive shells)"
+                .into(),
+        ));
+    }
+    if run.timed_out {
+        return Err(SshError::PartialTransfer(if run.eof {
+            format!(
+                "device ended its output but never confirmed completion within \
+                 {timeout_secs}s; output discarded"
+            )
+        } else {
+            format!("capture timed out after {timeout_secs}s; output discarded")
+        }));
+    }
+    if run.truncated {
+        return Err(SshError::PartialTransfer(
+            "capture exceeded 16 MiB; output discarded".into(),
+        ));
+    }
+    if !run.confirmed {
+        return Err(SshError::PartialTransfer(
+            "connection ended before the capture completed; output discarded".into(),
+        ));
+    }
+    if let Some(sig) = run.signal {
+        return Err(SshError::PartialTransfer(format!(
+            "capture command was killed by signal {sig}{}",
+            stderr_hint(&run.err)
+        )));
+    }
+    if let Some(code) = run.exit_status {
+        if code != 0 {
+            return Err(SshError::PartialTransfer(format!(
+                "capture command exited with status {code}{}",
+                stderr_hint(&run.err)
+            )));
+        }
+    }
+    let (out, _) = crate::utils::session_log::strip_ansi(&run.out);
+    let (err, _) = crate::utils::session_log::strip_ansi(&run.err);
+    Ok(ExecOutput {
+        stdout: String::from_utf8_lossy(&out).to_string(),
+        stderr: String::from_utf8_lossy(&err).to_string(),
+    })
+}
+
 /// How an exec channel's run ended, as far as the server confirmed it.
+#[derive(Default)]
 struct ExecRun {
+    /// stdout.
     out: Vec<u8>,
+    /// stderr (extended data), kept apart from stdout.
+    err: Vec<u8>,
     exit_status: Option<u32>,
     /// Name of the signal that killed the command (`exit-signal`).
     signal: Option<String>,
     eof: bool,
     truncated: bool,
     timed_out: bool,
+    /// The server answered the exec request with CHANNEL_FAILURE.
+    refused: bool,
     /// The server confirmed the run finished: EOF, then an exit status/signal
     /// or a channel close (in either order). A transport that drops, or a
     /// close with no EOF first, is NOT confirmation.
     confirmed: bool,
+    /// Our CHANNEL_CLOSE went out within `EXEC_CLOSE_GRACE`.
+    close_sent: bool,
 }
 
 /// Collect an exec channel's output under `deadline`, then close the channel.
@@ -1748,38 +2834,33 @@ struct ExecRun {
 /// second of {EOF, status/signal} arrives, or on close after EOF. No short
 /// post-EOF grace: that passed off a command that closed its output and then
 /// failed as success. A device that EOFs but never confirms now times out.
+///
+/// The exec request must have been sent with want_reply: a CHANNEL_FAILURE
+/// reply (the device refuses exec but leaves the channel open) ends the run at
+/// once as `refused` instead of waiting out the deadline.
 async fn run_exec(
     channel: &mut russh::Channel<client::Msg>,
     cap: usize,
     deadline: Duration,
 ) -> ExecRun {
-    let mut run = ExecRun {
-        out: Vec::new(),
-        exit_status: None,
-        signal: None,
-        eof: false,
-        truncated: false,
-        timed_out: false,
-        confirmed: false,
-    };
-    // These commands read no stdin. Send our EOF (like `ssh host cmd
-    // </dev/null`) so stacks that wait for the peer's EOF before closing do.
-    let _ = channel.eof().await;
+    let mut run = ExecRun::default();
     let collect = async {
+        // These commands read no stdin. Send our EOF (like `ssh host cmd
+        // </dev/null`) so stacks that wait for the peer's EOF before closing
+        // do. Inside the deadline: on a stalled transport even queueing it
+        // can wait.
+        let _ = channel.eof().await;
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                    run.out.extend_from_slice(data);
-                    // A runaway command (`tail -f`) must not eat RAM until the
-                    // deadline.
-                    if run.out.len() > cap {
-                        run.truncated = true;
-                        return;
-                    }
-                }
+                ChannelMsg::Data { ref data } => run.out.extend_from_slice(data),
+                ChannelMsg::ExtendedData { ref data, .. } => run.err.extend_from_slice(data),
                 ChannelMsg::ExitStatus { exit_status } => run.exit_status = Some(exit_status),
                 ChannelMsg::ExitSignal { signal_name, .. } => {
                     run.signal = Some(format!("{signal_name:?}"))
+                }
+                ChannelMsg::Failure if !run.eof && run.out.is_empty() => {
+                    run.refused = true;
+                    return;
                 }
                 ChannelMsg::Eof => run.eof = true,
                 ChannelMsg::Close => {
@@ -1787,6 +2868,12 @@ async fn run_exec(
                     return;
                 }
                 _ => {}
+            }
+            // A runaway command (`tail -f`) must not eat RAM until the
+            // deadline.
+            if run.out.len() + run.err.len() > cap {
+                run.truncated = true;
+                return;
             }
             if run.eof && (run.exit_status.is_some() || run.signal.is_some()) {
                 run.confirmed = true;
@@ -1797,32 +2884,45 @@ async fn run_exec(
     };
     run.timed_out = tokio::time::timeout(deadline, collect).await.is_err();
     // A plain russh Channel sends no CHANNEL_CLOSE on drop; without this a
-    // timed-out exec would leak a channel on the user's live session.
-    let _ = channel.close().await;
+    // timed-out exec would leak a channel on the user's live session. Bounded
+    // like the rest: a stalled transport must not hold the caller past it
+    // (`exec_capture` then keeps the close queued; see there).
+    run.close_sent = matches!(
+        tokio::time::timeout(EXEC_CLOSE_GRACE, channel.close()).await,
+        Ok(Ok(()))
+    );
     run
 }
 
-/// Authenticate an open handle by the host's configured method.
-///
-/// Refuse to send a *stored password* to a destination the saved catalogue
-/// never bound it to.
+/// Read the vault slot for `host_id` and authorize what it holds for this
+/// destination. Returns the ONE snapshot that `authenticate` will use, so the
+/// secret that was checked is exactly the secret that is sent: re-reading at
+/// send time let a password saved during the handshake (after a NotFound
+/// here) go to an unchecked destination.
 ///
 /// Only stored password auth transmits the vault secret to the server. Key auth
 /// uses the vault entry as a local key passphrase (it decrypts the key here and
 /// is never sent), and agent auth / a one-shot password carry no stored secret —
-/// so those are exempt. When a stored password exists for `host_id`, the
-/// destination must match a connection the user actually saved for that
-/// credential (its own record, or one that borrows it via `credentialId`);
-/// otherwise a compromised frontend could pair the id with an attacker's host
-/// and read the secret off the wire.
-fn authorize_stored_password(
+/// so those are exempt from the binding check. When a stored password exists
+/// for `host_id`, the destination must match a connection the user actually
+/// saved for that credential (its own record, or one that borrows it via
+/// `credentialId`); otherwise a compromised frontend could pair the id with an
+/// attacker's host and read the secret off the wire.
+///
+/// The vault read and the binding check happen together, under the lock every
+/// credential save and delete holds (utils::hosts::read_authorized), so the
+/// secret returned is always checked against ITS OWN binding — never a
+/// replacement secret against the previous binding mid-save. The read runs on
+/// the blocking pool: it is a keychain call that can show a prompt.
+async fn authorize_stored_password(
     auth: &str,
     host_id: &str,
     host: &str,
     port: u16,
     username: &str,
-    one_shot_password: Option<&str>,
-) -> Result<(), SshError> {
+    one_shot: bool,
+) -> Result<Option<zeroize::Zeroizing<String>>, SshError> {
+    use crate::utils::hosts::{Dest, StoredSecret};
     // Ids in a reserved vault namespace (the AI provider key lives at `ai:…`)
     // are never host credentials: refuse them for every auth method, so no
     // host id can address — and send, or use as a passphrase — that secret.
@@ -1831,80 +2931,136 @@ fn authorize_stored_password(
             "refusing to use '{host_id}' as a host credential: it is a reserved vault id"
         )));
     }
-    if one_shot_password.is_some() || matches!(auth, "key" | "agent") {
-        return Ok(());
+    if let Err(e) = credentials::validate_id(host_id) {
+        return Err(SshError::AuthFailed(format!("refusing to use '{host_id}' as a host credential: {e}")));
     }
-    // No saved secret for this id → nothing to leak; a bare password attempt
-    // simply fails later if the server demands one. Only a definite NotFound
-    // counts as "no secret": any other vault error (a locked keyring, a
-    // dismissed unlock prompt) fails CLOSED, since the later read in
-    // `authenticate` could succeed and send the secret unchecked.
-    match credentials::read_secret(host_id) {
-        Err(credentials::CredError::NotFound(_)) => return Ok(()),
-        Err(e) => return Err(e.into()),
-        Ok(_) => {}
+    if one_shot || auth == "agent" {
+        return Ok(None);
     }
-    if crate::utils::hosts::binding_is_authorized(host_id, host, port, username) {
-        Ok(())
-    } else {
-        Err(SshError::AuthFailed(format!(
+    // A key passphrase is used locally and never transmitted: no binding.
+    let check_binding = auth != "key";
+    let dest = Dest { host: host.to_string(), port, username: username.to_string() };
+    let id = host_id.to_string();
+    let read = tokio::task::spawn_blocking(move || {
+        crate::utils::hosts::read_authorized(&id, &dest, check_binding)
+    })
+    .await
+    .map_err(|e| SshError::Connect(format!("vault read task failed: {e}")))?;
+    // No saved secret for this id → nothing to leak (a password is then asked
+    // for). Only a definite NotFound counts as "no secret": any other vault
+    // error (a locked keyring, a dismissed unlock prompt) fails CLOSED and is
+    // reported as the vault problem it is.
+    match read.map_err(|e| vault_error(host_id, e))? {
+        StoredSecret::None => Ok(None),
+        StoredSecret::Authorized(secret) => Ok(Some(secret)),
+        StoredSecret::Unbound => Err(SshError::AuthFailed(format!(
             "refusing to send the saved credential '{host_id}' to {host}:{port} as {username}: \
              it is not an authorized saved destination for that credential"
-        )))
+        ))),
+        // Covers a save that failed half-way, a destination digest that does
+        // not match the binding list, and a vault item that cannot be read.
+        StoredSecret::Poisoned => Err(SshError::AuthFailed(format!(
+            "the saved credential '{host_id}' is not used: Hawser could not confirm where this \
+             saved password may be sent. Save the password again."
+        ))),
+    }
+}
+
+/// A vault read that failed for a reason other than "nothing saved".
+fn vault_error(host_id: &str, e: credentials::CredError) -> SshError {
+    SshError::Connect(format!(
+        "could not read the saved credential for '{host_id}' from the OS vault (it may be \
+         locked, or the unlock prompt was dismissed): {e}"
+    ))
+}
+
+/// The RSA signature hash to use, asked of the server only when an RSA key is
+/// actually offered: russh waits up to 1s for EXT_INFO, which much network gear
+/// never sends, and every non-RSA login used to pay that.
+///
+/// Returns (hash, retry with SHA-1 on failure). With no EXT_INFO the server's
+/// support is unknown, so rsa-sha2-256 is tried first (modern OpenSSH refuses
+/// SHA-1) and ssh-rsa second (old stacks only know SHA-1), as russh's docs
+/// suggest. A server that sent EXT_INFO without rsa-sha2 gets SHA-1 directly.
+#[derive(Default)]
+struct RsaHash(Option<(Option<russh::keys::HashAlg>, bool)>);
+
+impl RsaHash {
+    async fn get(
+        &mut self,
+        handle: &Handle<ClientHandler>,
+    ) -> Result<(Option<russh::keys::HashAlg>, bool), SshError> {
+        if let Some(v) = self.0 {
+            return Ok(v);
+        }
+        let v = match handle.best_supported_rsa_hash().await? {
+            Some(h) => (h, false),
+            None => (Some(russh::keys::HashAlg::Sha256), true),
+        };
+        self.0 = Some(v);
+        Ok(v)
     }
 }
 
 /// Shared between the target connection and a jump-host connection so the
 /// bastion supports the same three methods as any other host.
-#[allow(clippy::too_many_arguments)]
 async fn authenticate(
     handle: &mut Handle<ClientHandler>,
-    host_id: &str,
-    host: &str,
-    port: u16,
-    username: &str,
-    auth: &str,
-    key_path: Option<&str>,
-    one_shot_password: Option<&str>,
-    app: &AppHandle,
-    auth_prompts: &Arc<AuthPrompts>,
-    session_id: &str,
+    spec: AuthSpec<'_>,
+    ctx: &PromptCtx<'_>,
 ) -> Result<(), SshError> {
+    let AuthSpec { host_id, host, port, username, auth, key_path, secret } = spec;
     let authed = match auth {
-        // Private key file. The Credential Manager entry for this host, if
-        // present, is used as the key's passphrase — one vault slot per host,
-        // meaning either "password" or "key passphrase" depending on the auth
-        // method, never both.
+        // Private key file. The vault entry for this host, if present, is the
+        // key's passphrase — one vault slot per host, meaning either
+        // "password" or "key passphrase" depending on the auth method.
         "key" => {
             let path = key_path.ok_or_else(|| {
                 SshError::AuthFailed(format!("{username}: no key file configured"))
             })?;
-            let passphrase = credentials::read_secret(host_id).ok();
-            let key = russh::keys::load_secret_key(path, passphrase.as_ref().map(|p| p.as_str()))
+            // `~/.ssh/id_ed25519` is how a key path is written on Unix.
+            let file = crate::utils::platform::expand_home(path, crate::utils::platform::home_dir().as_deref());
+            let key = russh::keys::load_secret_key(&file, secret.as_ref().map(|p| p.as_str()))
                 .map_err(|e| SshError::AuthFailed(format!("could not load key {path}: {e}")))?;
-            // RSA needs the strongest hash the server advertises; rsa-sha1 is
-            // refused by modern OpenSSH. Non-RSA ignores it.
-            let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
-            let key = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
-            handle.authenticate_publickey(username, key).await?
-        }
-
-        // Running SSH agent: the OpenSSH agent service pipe, then Pageant.
-        // Keys never leave the agent; it only signs.
-        "agent" => {
-            let hash_alg = handle.best_supported_rsa_hash().await?.flatten();
-            match agent_auth(handle, username, hash_alg).await? {
-                Some(result) => result,
-                None => {
-                    return Err(SshError::AuthFailed(format!(
-                        "{username}: no SSH agent reachable (tried the OpenSSH agent                          pipe and Pageant), or the agent holds no accepted keys"
-                    )))
+            drop(secret);
+            let key = Arc::new(key);
+            if key.algorithm().is_rsa() {
+                // RSA needs the strongest hash the server advertises.
+                let (hash, retry_sha1) = RsaHash::default().get(handle).await?;
+                let first = handle
+                    .authenticate_publickey(
+                        username,
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::clone(&key), hash),
+                    )
+                    .await?;
+                if retry_sha1 && !matches!(first, russh::client::AuthResult::Success) {
+                    handle
+                        .authenticate_publickey(
+                            username,
+                            russh::keys::PrivateKeyWithHashAlg::new(key, None),
+                        )
+                        .await?
+                } else {
+                    first
                 }
+            } else {
+                handle
+                    .authenticate_publickey(
+                        username,
+                        russh::keys::PrivateKeyWithHashAlg::new(key, None),
+                    )
+                    .await?
             }
         }
 
-        // Password (default). A one-shot password (quick connect, never saved)
-        // takes precedence over the vault; it lives only for this call.
+        // Running SSH agent(s). Keys never leave the agent; it only signs.
+        "agent" => match agent_auth(handle, username).await? {
+            Some(result) => result,
+            None => return Err(SshError::AuthFailed(format!("{username}: {NO_AGENT}"))),
+        },
+
+        // Password (default): the one-shot password or the authorized vault
+        // snapshot, else asked for.
         //
         // On failure, keyboard-interactive is tried with the same secret.
         // That fallback is what makes TACACS+-fronted network gear work:
@@ -1912,47 +3068,34 @@ async fn authenticate(
         // single hidden "Password:" question. Users should not need to know
         // which of the two dances their firewall does.
         _ => {
-            // Hold the working copy in Zeroizing so it is wiped on EVERY exit
-            // path: the old code copied the secret into a plain String and only
-            // wiped it after both awaits succeeded, so a failed `?` between them
-            // (or a cancellation) left the plaintext in the heap. read_secret
-            // already returns Zeroizing; a one-shot password is wrapped to match.
-            // The previous `unsafe { as_mut_vec().fill(0) }` is gone — fill(0) is
-            // not a guaranteed zeroization primitive, and Zeroizing::drop is.
+            // Held in Zeroizing so it is wiped on EVERY exit path, including a
+            // failed `?` or a cancellation.
             // A password the user typed AND asked to save, held until we know it
             // actually authenticated — never persist a wrong guess.
             let mut save_typed: Option<zeroize::Zeroizing<String>> = None;
-            let pw: zeroize::Zeroizing<String> = match one_shot_password {
-                Some(p) => zeroize::Zeroizing::new(p.to_string()),
-                None => match credentials::read_secret(host_id) {
-                    Ok(secret) => secret,
-                    // No saved password and none supplied for this connect: ask
-                    // the user for it interactively rather than failing outright
-                    // with "no saved credential". The prompt is hidden (masked),
-                    // and the typed password comes INWARD via auth_prompt_respond
-                    // — no stored secret is ever emitted outward, so the
-                    // "secrets never cross IPC outward" invariant holds.
-                    Err(credentials::CredError::NotFound(_)) => {
-                        let answer = request_auth_answers(
-                            app,
-                            auth_prompts,
-                            session_id,
-                            "Password required",
-                            &format!("Enter the password for {username}"),
-                            vec![AuthPromptField { prompt: "Password:".into(), echo: false }],
-                            true,
-                        )
-                        .await?;
-                        let typed = zeroize::Zeroizing::new(
-                            answer.answers.into_iter().next().unwrap_or_default(),
-                        );
-                        if answer.save {
-                            save_typed = Some(typed.clone());
-                        }
-                        typed
+            let pw: zeroize::Zeroizing<String> = match secret {
+                Some(s) => s,
+                // No saved password and none supplied for this connect: ask
+                // for it. The prompt is hidden (masked), and the typed password
+                // comes INWARD via auth_prompt_respond — no stored secret is
+                // ever emitted outward.
+                None => {
+                    let offer_save = ctx.offer_save && !host_id.is_empty();
+                    let answer = request_auth_answers(
+                        ctx,
+                        "password",
+                        "",
+                        "",
+                        vec![AuthPromptField { prompt: "Password:".into(), echo: false }],
+                        offer_save,
+                    )
+                    .await?;
+                    let typed = answer.answers.into_iter().next().unwrap_or_default();
+                    if answer.save && offer_save {
+                        save_typed = Some(typed.clone());
                     }
-                    Err(e) => return Err(e.into()),
-                },
+                    typed
+                }
             };
             let first = handle.authenticate_password(username, pw.as_str()).await?;
             let result = if matches!(first, russh::client::AuthResult::Success) {
@@ -1971,9 +3114,7 @@ async fn authenticate(
                     username,
                     pw.as_str(),
                     password_accepted,
-                    app,
-                    auth_prompts,
-                    session_id,
+                    ctx,
                 )
                 .await?
             };
@@ -1982,30 +3123,25 @@ async fn authenticate(
             // otherwise-good session, so it is logged, not propagated.
             if matches!(result, russh::client::AuthResult::Success) {
                 if let Some(secret) = &save_typed {
-                    if let Err(e) = credentials::write_secret(host_id, username, secret.as_str()) {
-                        eprintln!("skiff: could not save password for {host_id}: {e}");
-                    } else if let Err(e) =
-                        crate::utils::hosts::snapshot_binding(host_id, host, port, username)
-                    {
-                        // The binding authorizes this exact destination for the
-                        // credential (same pairing the host-editor save records).
-                        // If it fails to persist, a saved secret with no binding is
-                        // refused by the anti-exfiltration guard on the very next
-                        // connect — fail-closed but confusing. Roll the secret back
-                        // so the user is simply prompted again next time instead of
-                        // hitting an inexplicable "not an authorized destination".
-                        eprintln!(
-                            "skiff: could not bind saved credential {host_id}: {e}; \
-                             rolling back the saved password"
-                        );
-                        let _ = credentials::delete_secret(host_id);
-                        crate::utils::hosts::remove_binding(host_id);
+                    // Secret and binding as one unit (utils::hosts::save_credential):
+                    // the vault item is a `hawser-vault:2` envelope holding
+                    // {user, secret, dest_digest}, where dest_digest pins the
+                    // destination list kept in credential_bindings.json, so a
+                    // secret is only ever sent where that list allows. On the
+                    // blocking pool: keychain calls can show a prompt.
+                    let (id, user, secret) = (host_id.to_string(), username.to_string(), secret.clone());
+                    let owner = crate::utils::hosts::Dest { host: host.to_string(), port, username: username.to_string() };
+                    let saved = tokio::task::spawn_blocking(move || {
+                        crate::utils::hosts::save_credential(&id, &user, secret.as_str(), &owner, None)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                    if let Err(e) = saved {
+                        eprintln!("hawser: could not save password for {host_id}: {e}");
                     }
                 }
             }
             result
-            // `pw` (Zeroizing) drops here — or at any `?` above — wiping its
-            // buffer on every exit path; no manual fill, no plain-String copy.
         }
     };
 
@@ -2014,6 +3150,13 @@ async fn authenticate(
     }
     Ok(())
 }
+
+#[cfg(windows)]
+const NO_AGENT: &str = "no SSH agent reachable (tried the Windows OpenSSH agent service and \
+                        Pageant), or no key it holds was accepted";
+#[cfg(not(windows))]
+const NO_AGENT: &str = "no SSH agent reachable through $SSH_AUTH_SOCK, or no key it holds \
+                        was accepted";
 
 /// True if a keyboard-interactive prompt's text asks for the account password
 /// (as opposed to an OTP / verification code, which PAM also sends hidden).
@@ -2107,9 +3250,7 @@ async fn keyboard_interactive_with_password(
     username: &str,
     password: &str,
     password_accepted: bool,
-    app: &AppHandle,
-    auth_prompts: &Arc<AuthPrompts>,
-    session_id: &str,
+    ctx: &PromptCtx<'_>,
 ) -> Result<russh::client::AuthResult, SshError> {
     use russh::client::KeyboardInteractiveAuthResponse as Kb;
 
@@ -2141,7 +3282,7 @@ async fn keyboard_interactive_with_password(
                 // `..._respond` takes the answers `Vec<String>` by value into its
                 // internal message queue, so that one transient plaintext copy
                 // lives inside russh for the round-trip and cannot be zeroized
-                // here — no additional copy is retained on Skiff's side.
+                // here — no additional copy is retained on Hawser's side.
                 let shape: Vec<(String, bool)> =
                     prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect();
                 let slots = password_slots(&shape, round == 0, password_used, password_accepted);
@@ -2157,12 +3298,10 @@ async fn keyboard_interactive_with_password(
                 let mut typed = if ask.is_empty() {
                     Vec::new().into_iter()
                 } else {
-                    request_auth_answers(
-                        app, auth_prompts, session_id, &name, &instructions, ask, false,
-                    )
-                    .await?
-                    .answers
-                    .into_iter()
+                    request_auth_answers(ctx, "challenge", &name, &instructions, ask, false)
+                        .await?
+                        .answers
+                        .into_iter()
                 };
                 // Merge back in prompt order: password slots get the password,
                 // the rest take the user's answers in the order they were shown.
@@ -2172,7 +3311,7 @@ async fn keyboard_interactive_with_password(
                         if *auto {
                             password.to_string()
                         } else {
-                            typed.next().unwrap_or_default()
+                            typed.next().map(|t| t.to_string()).unwrap_or_default()
                         }
                     })
                     .collect();
@@ -2192,14 +3331,14 @@ async fn keyboard_interactive_with_password(
 /// answer are sent out; the returned vector is one typed answer per prompt
 /// shown, in order.
 async fn request_auth_answers(
-    app: &AppHandle,
-    auth_prompts: &Arc<AuthPrompts>,
-    session_id: &str,
+    ctx: &PromptCtx<'_>,
+    kind: &'static str,
     name: &str,
     instruction: &str,
     fields: Vec<AuthPromptField>,
     offer_save: bool,
 ) -> Result<AuthAnswer, SshError> {
+    let (app, auth_prompts, session_id) = (ctx.app, ctx.auth_prompts, ctx.owner.0.as_str());
     let request_id = format!(
         "auth-{}-{}",
         session_id,
@@ -2211,16 +3350,21 @@ async fn request_auth_answers(
         name: name.to_string(),
         instruction: instruction.to_string(),
         prompts: fields,
+        origin: ctx.origin.clone(),
+        kind,
         offer_save,
     };
     // No cancellation check here: this runs inside the connect future, which
     // the cancel select drops at its next await. A sweep that ran just before
     // this registration is followed by connect()'s own post-cancel sweep, which
     // then closes the prompt — after it was emitted (see register_and_emit).
-    let Some(rx) = register_and_emit(
+    // The stage deadlines stop before the prompt is shown and do not run
+    // while the human types.
+    let Some((_human, rx)) = raise_prompt(
+        &ctx.wait,
         &auth_prompts.pending,
         &request_id,
-        session_id,
+        ctx.owner.clone(),
         || false,
         || app.emit("ssh://auth-prompt", request).is_ok(),
     ) else {
@@ -2260,82 +3404,174 @@ async fn request_auth_answers(
 /// config and are out of scope here — the UI offers the copyable command for
 /// those.
 #[allow(clippy::too_many_arguments)]
-pub async fn copy_id(
+/// Validate a public key for `copy_id` and return its single trimmed line.
+///
+/// It must parse as one OpenSSH public key line (so an empty paste, a private
+/// key or arbitrary text is refused), and it must be safe inside the
+/// single-quoted remote script: no quote, no line break, no control
+/// character, and no leading '-' (which `grep` would take as an option).
+fn validate_public_key(public_key: &str) -> Result<String, String> {
+    let key = public_key.trim();
+    if key.is_empty() {
+        return Err("no public key given".into());
+    }
+    if key.contains('\n') || key.contains('\r') {
+        return Err("the public key must be a single line".into());
+    }
+    if key.starts_with('-') {
+        return Err("the public key cannot start with '-'".into());
+    }
+    if key.contains('\'') || key.chars().any(|c| c.is_control()) {
+        return Err("public key contains illegal characters".into());
+    }
+    russh::keys::ssh_key::PublicKey::from_openssh(key)
+        .map_err(|e| format!("not an OpenSSH public key line ({e})"))?;
+    Ok(key.to_string())
+}
+
+/// Quote `s` as one POSIX-shell single-quoted word.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The exec command for a key install: `exec sh -s`, which every login shell
+/// (sh, bash, zsh, fish, csh, tcsh) runs the same way because it contains
+/// nothing any of them interprets. The script and the key go to that `sh` on
+/// stdin (`copy_id_script`), so the login shell never sees the key: csh and
+/// tcsh history-expand a `!` even inside single quotes, and a key comment may
+/// hold `!`, `$` or backticks.
+const COPY_ID_COMMAND: &str = "exec sh -s";
+
+/// The POSIX sh script `COPY_ID_COMMAND` reads on stdin, for a key already
+/// passed through `validate_public_key` (one line, no `'`), which makes it a
+/// safe single-quoted sh word.
+///
+/// One brace group, so sh has parsed all of it before anything runs (nothing
+/// in it reads stdin, and nothing could read a later line as input). `-e`
+/// keeps grep from reading the key as an option.
+///
+/// grep -qxF: only append if the exact line is not already present, so running
+/// this twice does not duplicate the key. The chain is conjunctive:
+/// HAWSER_KEY_OK is printed only if every step — including the append —
+/// actually succeeded. A file whose last line has no trailing newline gets one
+/// first (as ssh-copy-id does); otherwise the key is glued onto that line, grep
+/// never sees it as its own line, and "success" is reported for a key sshd
+/// cannot parse.
+fn copy_id_script(key: &str) -> String {
+    let k = sh_single_quote(key);
+    format!(
+        "{{\n\
+         mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys \\\n\
+         && {{ [ ! -s ~/.ssh/authorized_keys ] || [ -z \"$(tail -c 1 ~/.ssh/authorized_keys)\" ] \\\n\
+               || printf '\\n' >> ~/.ssh/authorized_keys; }} \\\n\
+         && {{ grep -qxF -e {k} ~/.ssh/authorized_keys || printf '%s\\n' {k} >> ~/.ssh/authorized_keys; }} \\\n\
+         && chmod 600 ~/.ssh/authorized_keys && echo HAWSER_KEY_OK\n\
+         }}\n"
+    )
+}
+
+async fn copy_id(
     app: AppHandle,
     prompts: Arc<HostKeyPrompts>,
     auth_prompts: Arc<AuthPrompts>,
+    session_id: &str,
+    cancel: watch::Receiver<()>,
     host: &str,
     port: u16,
     username: &str,
-    password: &str,
+    password: zeroize::Zeroizing<String>,
     public_key: &str,
 ) -> Result<(), SshError> {
-    let key = public_key.trim();
-    // The key is wrapped in single quotes in the remote command; a quote in it
-    // would break out. Generated keys never contain one, but guard anyway.
-    if key.contains('\'') || key.contains('\n') {
-        return Err(SshError::AuthFailed(
-            "public key contains illegal characters".into(),
-        ));
-    }
+    // Checked before anything dials: an empty, multi-line or non-key text
+    // would otherwise be appended to authorized_keys and reported "installed".
+    let key = validate_public_key(public_key).map_err(SshError::AuthFailed)?;
+    let key = key.as_str();
 
-    let ip = tokio::net::lookup_host((host, port))
-        .await
-        .ok()
-        .and_then(|mut a| a.next())
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|| host.to_string());
-
-    let config = Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(15)),
-        nodelay: true,
-        ..client::Config::default()
-    });
+    // Same stage deadlines as a normal connect; the host-key check and any
+    // keyboard-interactive challenge pause them while the user reads.
+    let wait = HumanWait::default();
+    let owner: PromptOwner = (session_id.to_string(), 0);
+    let origin = PromptOrigin::new(None, username, host, port, None);
+    // As for a connect: whatever ends this install (an error, a deadline, a
+    // cancel dropping this future, or success) ends its transport too.
+    let guard = KillGuard::new();
+    let kill = guard.kill();
+    let (tcp, ip) = dial_tcp(host, port).await?;
     let handler = ClientHandler {
         host: host.to_string(),
         ip,
         port,
+        origin: origin.clone(),
         app: app.clone(),
         prompts,
-        session_id: "install-key".to_string(),
-        cancel: None,
+        owner: owner.clone(),
+        cancel,
+        wait: wait.clone(),
+        death: Arc::default(),
+        kill: kill.clone(),
+        algos: Arc::default(),
     };
-    let mut handle = client::connect(config, (host, port), handler).await?;
+    let hlabel = format!("{host}:{port}");
+    let mut handle =
+        handshake(hop_config(host, port), tcp, handler, &wait, &hlabel, HANDSHAKE_TIMEOUT, &kill).await?;
 
     // Password (with keyboard-interactive fallback), one-shot. host_id "" is
     // never consulted because the one-shot password is supplied.
-    authenticate(
-        &mut handle, "", host, port, username, "password", None, Some(password),
-        &app, &auth_prompts, "install-key",
+    let ctx = PromptCtx {
+        app: &app,
+        auth_prompts: &auth_prompts,
+        owner,
+        origin,
+        wait: wait.clone(),
+        offer_save: false,
+    };
+    let spec = AuthSpec {
+        host_id: "",
+        host,
+        port,
+        username,
+        auth: "password",
+        key_path: None,
+        secret: Some(password),
+    };
+    within(&wait, AUTH_TIMEOUT, &hlabel, "authentication", authenticate(&mut handle, spec, &ctx))
+        .await??;
+
+    // See copy_id_script.
+    let script = copy_id_script(key);
+
+    let mut channel = within(
+        &wait,
+        CHANNEL_SETUP_TIMEOUT,
+        &hlabel,
+        "opening a session channel",
+        handle.channel_open_session(),
     )
-    .await?;
-
-    // grep -qxF: only append if the exact line is not already present, so
-    // running this twice does not duplicate the key. The append is BRACE-GROUPED
-    // so the whole chain is conjunctive: SKIFF_KEY_OK is printed only if every
-    // step — including the append — actually succeeded. (The earlier version
-    // used `;` before chmod/echo, which printed the success marker even when the
-    // append failed, e.g. a full or read-only home directory.)
-    //
-    // A file whose last line has no trailing newline gets one first (as
-    // OpenSSH's ssh-copy-id does); otherwise the key is glued onto that line,
-    // grep never sees it as its own line, and "success" is reported for a key
-    // sshd cannot parse.
-    let cmd = format!(
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys \
-         && {{ [ ! -s ~/.ssh/authorized_keys ] || [ -z \"$(tail -c 1 ~/.ssh/authorized_keys)\" ] \
-               || printf '\\n' >> ~/.ssh/authorized_keys; }} \
-         && {{ grep -qxF '{key}' ~/.ssh/authorized_keys || printf '%s\n' '{key}' >> ~/.ssh/authorized_keys; }} \
-         && chmod 600 ~/.ssh/authorized_keys && echo SKIFF_KEY_OK"
-    );
-
-    let mut channel = handle.channel_open_session().await?;
-    channel.exec(true, cmd).await?;
+    .await??;
+    within(
+        &wait,
+        CHANNEL_SETUP_TIMEOUT,
+        &hlabel,
+        "starting the install command",
+        channel.exec(true, COPY_ID_COMMAND),
+    )
+    .await??;
+    // The script on stdin; run_exec then sends EOF, which ends it.
+    within(
+        &wait,
+        CHANNEL_SETUP_TIMEOUT,
+        &hlabel,
+        "sending the install script",
+        channel.data(script.as_bytes()),
+    )
+    .await??;
     // A timeout is a failure, not a silent success: don't judge the run by
     // whatever partial output happened to arrive before the clock ran out.
     let run = run_exec(&mut channel, 1024 * 1024, Duration::from_secs(20)).await;
     let completed = !run.timed_out && !run.truncated && run.confirmed && run.signal.is_none();
-    let (out, exit_status) = (run.out, run.exit_status);
+    let exit_status = run.exit_status;
+    let mut out = run.out;
+    out.extend_from_slice(&run.err);
 
     // Three signals must agree before we claim the key is installed:
     //   - the command actually finished within the timeout,
@@ -2346,8 +3582,17 @@ pub async fn copy_id(
     //     if every step (including the append) succeeded.
     // Deciding on the marker alone let a non-zero exit or a truncated/timed-out
     // run be reported as success.
-    let marker = String::from_utf8_lossy(&out).contains("SKIFF_KEY_OK");
+    let marker = String::from_utf8_lossy(&out).contains("HAWSER_KEY_OK");
     let exit_ok = exit_status.map_or(true, |code| code == 0);
+    // A throwaway connection: close it properly rather than just dropping it.
+    // Bounded (a transport that stopped taking messages would hold this
+    // forever); the kill guard then ends the transport regardless.
+    let _ = tokio::time::timeout(
+        EXEC_CLOSE_GRACE,
+        handle.disconnect(russh::Disconnect::ByApplication, "key installed", ""),
+    )
+    .await;
+    drop(guard);
     if completed && exit_ok && marker {
         Ok(())
     } else {
@@ -2358,37 +3603,42 @@ pub async fn copy_id(
     }
 }
 
-/// Try every identity a running SSH agent offers.
+/// Try every identity each reachable SSH agent offers.
 ///
 /// Returns `Ok(None)` when no agent is reachable or no key was accepted —
 /// distinct from an SSH-level error, so the caller can produce a message that
 /// says what to actually do (start the agent, add a key) rather than a generic
-/// failure. Tries the Windows OpenSSH agent service first because it is the
-/// one Windows ships; Pageant second for the PuTTY crowd.
+/// failure. An error from one agent does not stop the next being tried.
+/// Windows tries the OpenSSH agent service first (the one Windows ships), then
+/// Pageant for the PuTTY crowd; elsewhere the one agent is $SSH_AUTH_SOCK.
 async fn agent_auth(
     handle: &mut Handle<ClientHandler>,
     username: &str,
-    hash_alg: Option<russh::keys::HashAlg>,
 ) -> Result<Option<russh::client::AuthResult>, SshError> {
     use russh::keys::agent::client::AgentClient;
 
-    // Windows ships the OpenSSH agent on a fixed pipe; Pageant serves the PuTTY
-    // crowd. On Unix the one agent socket is named by $SSH_AUTH_SOCK.
+    let mut rsa = RsaHash::default();
+    let mut tried = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
     #[cfg(windows)]
     {
         if let Ok(mut agent) =
             AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await
         {
-            if let Some(r) = try_agent_identities(&mut agent, handle, username, hash_alg, "agent").await? {
-                return Ok(Some(r));
+            match try_agent_identities(&mut agent, handle, username, &mut rsa, &mut tried).await {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("OpenSSH agent: {}", auth_detail(e))),
             }
         }
-
-        // Pageant (PuTTY). russh 0.63 makes connect_pageant fallible; a missing
-        // Pageant is just "no agent", so skip on Err and fall through.
+        // russh makes connect_pageant fallible; a missing Pageant is just "no
+        // agent".
         if let Ok(mut pageant) = AgentClient::connect_pageant().await {
-            if let Some(r) = try_agent_identities(&mut pageant, handle, username, hash_alg, "pageant").await? {
-                return Ok(Some(r));
+            match try_agent_identities(&mut pageant, handle, username, &mut rsa, &mut tried).await {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("Pageant: {}", auth_detail(e))),
             }
         }
     }
@@ -2397,66 +3647,91 @@ async fn agent_auth(
     {
         // $SSH_AUTH_SOCK — set by ssh-agent, gnome-keyring, 1Password, etc.
         if let Ok(mut agent) = AgentClient::connect_env().await {
-            if let Some(r) = try_agent_identities(&mut agent, handle, username, hash_alg, "agent").await? {
-                return Ok(Some(r));
+            match try_agent_identities(&mut agent, handle, username, &mut rsa, &mut tried).await {
+                Ok(Some(r)) => return Ok(Some(r)),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("agent: {}", auth_detail(e))),
             }
         }
     }
 
-    Ok(None)
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(SshError::AuthFailed(format!("{username}: {}", errors.join("; "))))
+    }
 }
 
 /// Offer each identity a connected agent holds to the server, signing with the
 /// agent. Returns `Ok(Some(..))` on the first accepted key, `Ok(None)` if the
-/// agent is unreachable or holds no accepted key. `label` names the agent in
-/// the error message so "agent signing failed" vs "pageant signing failed"
-/// still tells the user which one balked.
+/// agent holds no accepted key, and an error if it cannot list its keys. `tried` counts attempts
+/// across agents, for the MaxAuthTries hint.
 async fn try_agent_identities(
     agent: &mut russh::keys::agent::client::AgentClient<
         impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     >,
     handle: &mut Handle<ClientHandler>,
     username: &str,
-    hash_alg: Option<russh::keys::HashAlg>,
-    label: &str,
+    rsa: &mut RsaHash,
+    tried: &mut usize,
 ) -> Result<Option<russh::client::AuthResult>, SshError> {
-    let Ok(identities) = agent.request_identities().await else {
-        return Ok(None);
-    };
+    // A reachable agent that cannot list its keys is reported as that, not
+    // folded into "no agent, or no key accepted".
+    let identities = agent.request_identities().await.map_err(|e| {
+        SshError::AuthFailed(format!("could not list the agent's keys: {e}"))
+    })?;
     for identity in identities {
-        // russh 0.63 yields AgentIdentity (key or certificate); publickey auth
-        // wants the underlying PublicKey.
+        // AgentIdentity is a key or a certificate; publickey auth wants the
+        // underlying PublicKey.
         let key = identity.public_key().into_owned();
-        let result = handle
-            .authenticate_publickey_with(username, key, hash_alg, agent)
-            .await
-            .map_err(|e| SshError::AuthFailed(format!("{label} signing failed: {e}")))?;
-        if matches!(result, russh::client::AuthResult::Success) {
-            return Ok(Some(result));
+        let (hashes, is_rsa): (Vec<Option<russh::keys::HashAlg>>, bool) =
+            if key.algorithm().is_rsa() {
+                let (h, retry_sha1) = rsa.get(handle).await?;
+                (if retry_sha1 { vec![h, None] } else { vec![h] }, true)
+            } else {
+                (vec![None], false)
+            };
+        for hash in hashes {
+            *tried += 1;
+            let result = handle
+                .authenticate_publickey_with(username, key.clone(), hash, agent)
+                .await
+                .map_err(|e| agent_error(e, *tried))?;
+            if matches!(result, russh::client::AuthResult::Success) {
+                return Ok(Some(result));
+            }
+            if !is_rsa {
+                break;
+            }
         }
     }
     Ok(None)
 }
 
-/// Reject a remote-supplied name that could escape the local target directory.
-///
-/// A malicious or compromised server controls the filenames it lists, and on
-/// download those names become LOCAL path components. A name like
-/// `..\Windows\evil` — or an absolute path, which `Path::join` uses to
-/// REPLACE the base entirely — would write outside the folder the user chose.
-/// This is the scp/zip-slip class; the defense is to accept only plain file
-/// names as path components.
-fn safe_local_component(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        // Drive letters / alternate data streams are a Windows hazard only; on
-        // macOS/Linux ':' is an ordinary filename character (timestamped logs).
-        && !(cfg!(windows) && name.contains(':'))
-        && !name.contains('\0')
-        && !is_windows_reserved(name)
+/// The detail of an auth error, without `AuthFailed`'s "authentication failed
+/// for" prefix (the caller adds its own context once).
+fn auth_detail(e: SshError) -> String {
+    match e {
+        SshError::AuthFailed(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// Wording for an agent-auth error. A server that drops the connection mid-way
+/// has almost always hit its MaxAuthTries limit with a well-stocked agent.
+fn agent_error(e: russh::AgentAuthError, tried: usize) -> SshError {
+    let text = e.to_string();
+    // `Send`: the session task is gone, i.e. the server hung up.
+    let dropped = matches!(&e, russh::AgentAuthError::Send(_));
+    if dropped {
+        SshError::AuthFailed(format!(
+            "the server closed the connection after {tried} key attempts (it probably limits \
+             attempts, MaxAuthTries). Remove keys from the agent, or use a key file for this \
+             host"
+        ))
+    } else {
+        SshError::AuthFailed(format!("agent signing failed: {text}"))
+    }
 }
 
 /// True if `meta` describes a symlink or (on Windows) any reparse point such as
@@ -2534,41 +3809,1717 @@ fn is_windows_reserved(name: &str) -> bool {
     RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
 }
 
-/// Push one per-file failure to the UI so a recursive transfer can report the
-/// full list and offer a retry. Best-effort — a dropped event only costs detail.
-#[allow(clippy::too_many_arguments)]
-fn emit_transfer_failure(
-    app: &AppHandle,
-    session_id: &str,
-    root: &str,
-    name: &str,
+/* ------------------------------------------------------------ sftp plumbing */
+
+/// A session's SFTP channel (see `open_sftp_conn`).
+pub struct SftpConn {
+    /// The high-level session: file handles, metadata, renames.
+    hi: SftpSession,
+    /// A raw session over the SAME channel, for listings read batch by batch
+    /// (so they can be capped) and `posix-rename@openssh.com`.
+    raw: RawSftpSession,
+    /// The server advertised `posix-rename@openssh.com` version 1.
+    posix_rename: bool,
+    /// The server advertised `hardlink@openssh.com` version 1: link(2), which
+    /// refuses an existing target atomically. The `Never` commit (see
+    /// `commit_upload`).
+    hardlink: bool,
+    /// The tasks carrying both sessions over the channel. Stopped, and the
+    /// channel CLOSED, when this connection is dropped or evicted.
+    mux: SftpMux,
+}
+
+impl SftpConn {
+    /// Stop the channel now, even while other holders still have this
+    /// connection (they then fail fast): an evicted connection must give its
+    /// session slot back at once, not when its last straggler gives up.
+    fn shutdown(&self) {
+        self.mux.shutdown();
+    }
+}
+
+/// Forget `failed` from a session's SFTP cache if `e` says its channel is
+/// dead — but only if it is still the cached connection. A straggler failing
+/// on an old channel (one already replaced after an earlier failure) must not
+/// evict the healthy replacement: on a server allowing one SFTP channel, that
+/// would make the next open fail while live operations still hold the
+/// replacement. Returns whether it was forgotten; a forgotten connection is
+/// shut down (see `SftpConn::shutdown`).
+async fn forget_sftp(
+    slot: &Mutex<Option<Arc<SftpConn>>>,
+    failed: &Arc<SftpConn>,
+    e: &SshError,
+) -> bool {
+    if !sftp_dead(e) {
+        return false;
+    }
+    let mut cached = slot.lock().await;
+    if !cached.as_ref().is_some_and(|c| Arc::ptr_eq(c, failed)) {
+        return false;
+    }
+    *cached = None;
+    drop(cached);
+    failed.shutdown();
+    true
+}
+
+/// Open the `sftp` subsystem on a fresh session channel and wait for the
+/// server's answer. A refusal (or no answer) CLOSES the channel — dropping it
+/// would leave it open on the server, holding one of its session slots — and
+/// a refusal is remembered in `refused`, so the connection does not ask again.
+async fn open_sftp_channel<H: client::Handler>(
+    handle: &Handle<H>,
+    refused: &AtomicBool,
+) -> Result<(russh::ChannelReadHalf, ChannelWriteHalf<client::Msg>, Vec<u8>), SshError> {
+    if refused.load(Ordering::SeqCst) {
+        return Err(SshError::Connect("the server refused the SFTP subsystem on this connection".into()));
+    }
+    let mut channel = tokio::time::timeout(SFTP_SETUP_TIMEOUT, handle.channel_open_session())
+        .await
+        .map_err(|_| SshError::Connect("opening the SFTP channel timed out".into()))??;
+    let mut early = Vec::new();
+    let answer = tokio::time::timeout(SFTP_SETUP_TIMEOUT, async {
+        channel.request_subsystem(true, "sftp").await?;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(true),
+                Some(ChannelMsg::Failure) => return Ok(false),
+                // Some servers start talking before the reply is processed.
+                Some(ChannelMsg::Data { data }) => early.extend_from_slice(&data),
+                Some(ChannelMsg::Close | ChannelMsg::Eof) | None => {
+                    return Err(SshError::Connect("the SFTP channel closed before it started".into()))
+                }
+                Some(_) => {}
+            }
+        }
+    })
+    .await;
+    match answer {
+        Ok(Ok(true)) => {
+            let (r, w) = channel.split();
+            Ok((r, w, early))
+        }
+        other => {
+            // Enqueued from its own task, with no deadline: a full command
+            // queue must delay the CLOSE, never discard it.
+            tokio::spawn(async move {
+                let _ = channel.close().await;
+            });
+            Err(match other {
+                Ok(Ok(_)) => {
+                    refused.store(true, Ordering::SeqCst);
+                    SshError::Connect("the server refused the SFTP subsystem".into())
+                }
+                Ok(Err(e)) => e,
+                Err(_) => SshError::Connect(format!(
+                    "the server did not answer the SFTP subsystem request within {}s",
+                    SFTP_SETUP_TIMEOUT.as_secs()
+                )),
+            })
+        }
+    }
+}
+
+/// Open a session's SFTP channel: ONE subsystem channel shared by the
+/// high-level session and a raw one (see `spawn_sftp_mux`), so a server that
+/// allows one SFTP channel per connection still gets capped listings and
+/// posix-rename, and no second channel ever holds a session slot.
+async fn open_sftp_conn<H: client::Handler>(
+    handle: &Handle<H>,
+    refused: &AtomicBool,
+) -> Result<SftpConn, SshError> {
+    let (r, w, early) = open_sftp_channel(handle, refused).await?;
+    // Dropped on any failure below, which stops the mux and closes the channel.
+    let (hi_io, raw_io, mux) = spawn_sftp_mux(r, w, early);
+    let setup = async {
+        let hi = SftpSession::new(hi_io).await?;
+        let raw = RawSftpSession::new(raw_io);
+        let version = raw.init().await?;
+        Ok::<_, SshError>((hi, raw, version))
+    };
+    let (hi, raw, version) = tokio::time::timeout(SFTP_SETUP_TIMEOUT, setup)
+        .await
+        .map_err(|_| SshError::Connect("the SFTP server did not answer its INIT".into()))??;
+    let has = |name: &str| version.extensions.get(name).is_some_and(|v| v == "1");
+    let (posix_rename, hardlink) = (has(POSIX_RENAME), has(HARDLINK));
+    Ok(SftpConn { hi, raw, posix_rename, hardlink, mux })
+}
+
+/// Largest SFTP packet the mux relays (the protocol's own limits are far
+/// lower; anything bigger is a broken stream).
+const MUX_MAX_PACKET: usize = 4 << 20;
+const SSH_FXP_INIT: u8 = 1;
+const SSH_FXP_VERSION: u8 = 2;
+
+/// The one stop switch of a mux: every task watches it, and the first to stop
+/// (or the owner) CLOSES the channel.
+struct MuxStop {
+    stop: watch::Sender<bool>,
+    write: Arc<ChannelWriteHalf<client::Msg>>,
+    closed: AtomicBool,
+}
+
+impl MuxStop {
+    /// Stop every task and CLOSE the channel, once. The CLOSE is enqueued from
+    /// a detached task with no deadline: behind a full SSH command queue (a
+    /// stalled peer) it waits its turn instead of being dropped after a grace
+    /// period, which would leave the channel holding a session slot.
+    fn shutdown(&self) {
+        self.stop.send_replace(true);
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let write = Arc::clone(&self.write);
+                rt.spawn(async move {
+                    let _ = write.close().await;
+                });
+            }
+        }
+    }
+}
+
+/// Resolves once the mux is told to stop.
+async fn mux_stopped(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|stop| *stop).await;
+}
+
+/// The running mux: its stop switch and its tasks. Dropping it (with the
+/// `SftpConn` that owns it) stops everything.
+struct SftpMux {
+    stop: Arc<MuxStop>,
+    tasks: Vec<tokio::task::AbortHandle>,
+    /// How many of its tasks are still running.
+    #[cfg_attr(not(test), allow(dead_code))]
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SftpMux {
+    /// Stop the channel: signal every task, CLOSE the channel, and abort the
+    /// tasks outright, so even one parked inside an SSH send (a zero window,
+    /// a full queue) is gone at once.
+    fn shutdown(&self) {
+        self.stop.shutdown();
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SftpMux {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// One session's end of the mux: a duplex stream that, together with the
+/// other session's end, holds `MuxEnds`. When BOTH ends are dropped (both
+/// sessions gone) the mux is told to stop — even while its writer is parked
+/// inside an SSH send and its readers inside a full queue, where neither
+/// could see the sessions leave.
+struct MuxEnd {
+    io: tokio::io::DuplexStream,
+    _ends: Arc<MuxEnds>,
+}
+
+/// Shared by both `MuxEnd`s; dropped with the last of them.
+struct MuxEnds(Arc<MuxStop>);
+
+impl Drop for MuxEnds {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+impl tokio::io::AsyncRead for MuxEnd {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for MuxEnd {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// Spawn one mux task, counted in `live` until it ends or is aborted.
+fn mux_task(
+    live: &Arc<std::sync::atomic::AtomicUsize>,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::AbortHandle {
+    struct Live(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Live {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    live.fetch_add(1, Ordering::SeqCst);
+    let live = Live(Arc::clone(live));
+    tokio::spawn(async move {
+        let _live = live;
+        fut.await;
+    })
+    .abort_handle()
+}
+
+/// Two SFTP client sessions over one subsystem channel.
+///
+/// Each session talks to its own in-memory stream. Every request it sends
+/// gets a fresh request id on the wire, remembered with the session and the
+/// id it used; each reply is routed back with its original id. Only the first
+/// session's INIT goes to the server; the second is answered with a copy of
+/// the server's VERSION. A reply for a request its session gave up on is
+/// delivered and ignored by that session, as a late reply on a private
+/// channel would be.
+///
+/// Every task races its work against one stop switch (`MuxStop`). The first
+/// task to end (the server ended the stream, a send failed) throws it; so do
+/// both endpoint readers having exited, and both sessions' ends being dropped
+/// (`MuxEnd`); and the returned `SftpMux` throws it and aborts every task
+/// when dropped. So the channel is CLOSED (not just dropped, which sends
+/// nothing) even while the writer is parked on a peer that stopped reading
+/// (its send races the stop switch), and both sessions then see end-of-stream
+/// and fail fast (see `sftp_dead`).
+fn spawn_sftp_mux(
+    mut read: russh::ChannelReadHalf,
+    write: ChannelWriteHalf<client::Msg>,
+    early: Vec<u8>,
+) -> (MuxEnd, MuxEnd, SftpMux) {
+    use tokio::io::AsyncWriteExt as _;
+    struct Routes {
+        next: u32,
+        pending: std::collections::HashMap<u32, (usize, u32)>,
+        version: Option<Vec<u8>>,
+        raw_waiting: bool,
+    }
+    let routes = Arc::new(std::sync::Mutex::new(Routes {
+        next: 1,
+        pending: std::collections::HashMap::new(),
+        version: None,
+        raw_waiting: false,
+    }));
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let ctl = Arc::new(MuxStop { stop: stop_tx, write: Arc::new(write), closed: AtomicBool::new(false) });
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    let (hi_app, hi_mux) = tokio::io::duplex(1 << 20);
+    let (raw_app, raw_mux) = tokio::io::duplex(1 << 20);
+    let (hi_r, hi_w) = tokio::io::split(hi_mux);
+    let (raw_r, raw_w) = tokio::io::split(raw_mux);
+    // Frames from either session, in the order they were completed.
+    let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(64);
+    // The second session's INIT, answered by the downstream task.
+    let (init_tx, mut init_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    async fn frame<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Option<Vec<u8>> {
+        let mut len = [0u8; 4];
+        r.read_exact(&mut len).await.ok()?;
+        let n = u32::from_be_bytes(len) as usize;
+        if n == 0 || n > MUX_MAX_PACKET {
+            return None;
+        }
+        let mut f = vec![0u8; 4 + n];
+        f[..4].copy_from_slice(&len);
+        r.read_exact(&mut f[4..]).await.ok()?;
+        Some(f)
+    }
+    // Endpoint readers still running: the last one out stops the mux, so a
+    // writer parked in a send does not outlive everyone it writes for.
+    let readers = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    for (ep, mut r) in [(0usize, Box::new(hi_r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>), (1, Box::new(raw_r))] {
+        let tx = up_tx.clone();
+        let mut stop = stop_rx.clone();
+        let (readers, ctl) = (Arc::clone(&readers), Arc::clone(&ctl));
+        tasks.push(mux_task(&live, async move {
+            struct Out(Arc<std::sync::atomic::AtomicUsize>, Arc<MuxStop>);
+            impl Drop for Out {
+                fn drop(&mut self) {
+                    if self.0.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        self.1.shutdown();
+                    }
+                }
+            }
+            let _out = Out(readers, ctl);
+            loop {
+                let f = tokio::select! {
+                    biased;
+                    _ = mux_stopped(&mut stop) => break,
+                    f = frame(&mut r) => f,
+                };
+                let Some(f) = f else { break };
+                tokio::select! {
+                    biased;
+                    _ = mux_stopped(&mut stop) => break,
+                    sent = tx.send((ep, f)) => if sent.is_err() { break },
+                }
+            }
+        }));
+    }
+    drop(up_tx);
+
+    // Upstream: one writer, so two sessions' packets never interleave. Every
+    // send races the stop switch: a send parked on the SSH window must not
+    // keep the channel alive after everyone left.
+    let up_routes = Arc::clone(&routes);
+    let up_ctl = Arc::clone(&ctl);
+    let mut up_stop = stop_rx.clone();
+    tasks.push(mux_task(&live, async move {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = mux_stopped(&mut up_stop) => None,
+                next = up_rx.recv() => next,
+            };
+            // None: both sessions gone (or told to stop).
+            let Some((ep, mut f)) = next else { break };
+            if f[4] == SSH_FXP_INIT {
+                if ep != 0 {
+                    let _ = init_tx.try_send(());
+                    continue;
+                }
+            } else {
+                if f.len() < 9 {
+                    continue;
+                }
+                let orig = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
+                let wire = {
+                    let mut r = up_routes.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut id = r.next;
+                    while r.pending.contains_key(&id) {
+                        id = id.wrapping_add(1);
+                    }
+                    r.next = id.wrapping_add(1);
+                    r.pending.insert(id, (ep, orig));
+                    id
+                };
+                f[5..9].copy_from_slice(&wire.to_be_bytes());
+            }
+            let sent = tokio::select! {
+                biased;
+                _ = mux_stopped(&mut up_stop) => break,
+                sent = up_ctl.write.data(&f[..]) => sent,
+            };
+            if sent.is_err() {
+                break;
+            }
+        }
+        up_ctl.shutdown();
+    }));
+
+    // Downstream: route each reply to its session.
+    let down_ctl = Arc::clone(&ctl);
+    let mut down_stop = stop_rx;
+    tasks.push(mux_task(&live, async move {
+        let mut outs = [hi_w, raw_w];
+        let mut buf = early;
+        // Deliver one frame to a session; false if the mux is stopping. A
+        // session that is gone just misses it.
+        async fn deliver(
+            stop: &mut watch::Receiver<bool>,
+            out: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            f: &[u8],
+        ) -> bool {
+            tokio::select! {
+                biased;
+                _ = mux_stopped(stop) => false,
+                _ = out.write_all(f) => true,
+            }
+        }
+        'run: loop {
+            // Every complete frame in the buffer.
+            loop {
+                if buf.len() < 4 {
+                    break;
+                }
+                let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if n == 0 || n > MUX_MAX_PACKET {
+                    break 'run;
+                }
+                if buf.len() < 4 + n {
+                    break;
+                }
+                let mut f: Vec<u8> = buf.drain(..4 + n).collect();
+                if f[4] == SSH_FXP_VERSION {
+                    let raw_waiting = {
+                        let mut r = routes.lock().unwrap_or_else(|p| p.into_inner());
+                        r.version = Some(f.clone());
+                        std::mem::take(&mut r.raw_waiting)
+                    };
+                    if raw_waiting && !deliver(&mut down_stop, &mut outs[1], &f).await {
+                        break 'run;
+                    }
+                    if !deliver(&mut down_stop, &mut outs[0], &f).await {
+                        break 'run;
+                    }
+                    continue;
+                }
+                if f.len() < 9 {
+                    continue;
+                }
+                let wire = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
+                let route = routes.lock().unwrap_or_else(|p| p.into_inner()).pending.remove(&wire);
+                if let Some((ep, orig)) = route {
+                    f[5..9].copy_from_slice(&orig.to_be_bytes());
+                    if !deliver(&mut down_stop, &mut outs[ep], &f).await {
+                        break 'run;
+                    }
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = mux_stopped(&mut down_stop) => break 'run,
+                msg = read.wait() => match msg {
+                    Some(ChannelMsg::Data { data }) => buf.extend_from_slice(&data),
+                    Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break 'run,
+                    Some(_) => {}
+                },
+                Some(()) = init_rx.recv() => {
+                    let version = {
+                        let mut r = routes.lock().unwrap_or_else(|p| p.into_inner());
+                        let v = r.version.clone();
+                        if v.is_none() {
+                            r.raw_waiting = true;
+                        }
+                        v
+                    };
+                    if let Some(v) = version {
+                        if !deliver(&mut down_stop, &mut outs[1], &v).await {
+                            break 'run;
+                        }
+                    }
+                }
+            }
+        }
+        // Both sessions see EOF (bounded: a session that stopped reading must
+        // not hold this up), and the channel is closed from our side too.
+        for o in outs.iter_mut() {
+            let _ = tokio::time::timeout(EXEC_CLOSE_GRACE, o.shutdown()).await;
+        }
+        drop(outs);
+        down_ctl.shutdown();
+    }));
+    let ends = Arc::new(MuxEnds(Arc::clone(&ctl)));
+    let hi = MuxEnd { io: hi_app, _ends: Arc::clone(&ends) };
+    let raw = MuxEnd { io: raw_app, _ends: ends };
+    (hi, raw, SftpMux { stop: ctl, tasks, live })
+}
+
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
+const HARDLINK: &str = "hardlink@openssh.com";
+
+/// The SFTP status code inside `e`, if it is a status reply.
+fn sftp_status(e: &russh_sftp::client::error::Error) -> Option<StatusCode> {
+    match e {
+        russh_sftp::client::error::Error::Status(st) => Some(st.status_code),
+        _ => None,
+    }
+}
+
+/// Whether `e` means the SFTP channel itself is gone or not answering (rather
+/// than one operation failing), so the cached session must be reopened and a
+/// tree walk must stop instead of timing out on every remaining file.
+fn sftp_dead(e: &SshError) -> bool {
+    use russh_sftp::client::error::Error as SftpErr;
+    fn dead(e: &SftpErr) -> bool {
+        matches!(e, SftpErr::UnexpectedBehavior(_) | SftpErr::IO(_) | SftpErr::Timeout)
+    }
+    match e {
+        SshError::Sftp(s) => dead(s),
+        SshError::TransferStalled(_) | SshError::ChannelLost(_) => true,
+        // Errors from an SFTP `File` (AsyncRead/AsyncWrite) arrive as io::Error
+        // carrying the SFTP error inside.
+        SshError::Io(io) => {
+            io.kind() == std::io::ErrorKind::TimedOut
+                || io
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<SftpErr>())
+                    .is_some_and(dead)
+        }
+        _ => false,
+    }
+}
+
+/// Read one remote directory, at most `cap` entries ("." and ".." left out).
+/// Returns the entries and whether the listing was cut off.
+async fn read_dir_capped(
+    sftp: &SftpConn,
+    path: &str,
+    cap: usize,
+) -> Result<(Vec<(String, russh_sftp::protocol::FileAttributes)>, bool), SshError> {
+    let raw = &sftp.raw;
+    let handle = raw.opendir(path).await?.handle;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    let result = loop {
+        match raw.readdir(handle.as_str()).await {
+            Ok(name) => {
+                for f in name.files {
+                    if f.filename == "." || f.filename == ".." {
+                        continue;
+                    }
+                    if out.len() >= cap {
+                        truncated = true;
+                        break;
+                    }
+                    out.push((f.filename, f.attrs));
+                }
+                if truncated {
+                    break Ok(());
+                }
+            }
+            Err(e) if sftp_status(&e) == Some(StatusCode::Eof) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = raw.close(handle).await;
+    result?;
+    Ok((out, truncated))
+}
+
+async fn list_dir_with(sftp: &SftpConn, path: &str) -> Result<DirListing, SshError> {
+    // Resolve first so the pane shows the real location: the server may
+    // return something different for ".", "~", or a symlinked directory.
+    let canonical = sftp
+        .hi
+        .canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_string());
+
+    let mut entries = vec![FileEntry {
+        name: "..".into(),
+        kind: "directory",
+        size: 0,
+        modified: None,
+        mode: String::new(),
+    }];
+
+    let (listed, truncated) = read_dir_capped(sftp, &canonical, MAX_LIST_ENTRIES).await?;
+    for (name, meta) in listed {
+        let kind = match meta.file_type() {
+            FileType::Dir => "directory",
+            FileType::Symlink => "symlink",
+            _ => "file",
+        };
+        entries.push(FileEntry {
+            name,
+            kind,
+            size: meta.size.unwrap_or(0),
+            modified: meta.mtime,
+            mode: mode_string(meta.permissions, kind),
+        });
+    }
+
+    Ok(DirListing { path: canonical, entries, truncated })
+}
+
+/// `posix-rename@openssh.com`: rename that atomically REPLACES an existing
+/// target (POSIX rename(2) semantics), unlike SFTPv3 RENAME.
+async fn posix_rename(raw: &RawSftpSession, from: &str, to: &str) -> Result<(), SshError> {
+    two_path_extension(raw, POSIX_RENAME, from, to).await
+}
+
+/// `hardlink@openssh.com`: link(2) — a second name `to` for `from`, refused
+/// (atomically, by the server's kernel) if anything is already at `to`.
+async fn remote_hard_link(raw: &RawSftpSession, from: &str, to: &str) -> Result<(), SshError> {
+    two_path_extension(raw, HARDLINK, from, to).await
+}
+
+/// An OpenSSH extension request whose body is two paths, answered by STATUS.
+async fn two_path_extension(raw: &RawSftpSession, name: &str, from: &str, to: &str) -> Result<(), SshError> {
+    fn put(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+    let mut data = Vec::with_capacity(8 + from.len() + to.len());
+    put(&mut data, from);
+    put(&mut data, to);
+    match raw.extended(name, data).await? {
+        russh_sftp::protocol::Packet::Status(st) if st.status_code == StatusCode::Ok => Ok(()),
+        russh_sftp::protocol::Packet::Status(st) => {
+            Err(SshError::Sftp(russh_sftp::client::error::Error::Status(st)))
+        }
+        _ => Err(SshError::Sftp(russh_sftp::client::error::Error::UnexpectedPacket)),
+    }
+}
+
+/* ---------------------------------------------------------- transfer policy */
+
+/// What a transfer may do to a file already at its destination. Chosen by the
+/// frontend's overwrite prompt, carried through IPC (retries included), and
+/// enforced when each file is COMMITTED: a destination that appears after the
+/// prompt is never clobbered under `Never`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overwrite {
+    /// Refuse to replace anything (the default, and the choice for a
+    /// destination that did not exist when the user was asked).
+    Never,
+    /// Replace an existing file.
+    Replace,
+    /// The user was asked about this existing destination and agreed.
+    Confirmed,
+}
+
+impl Overwrite {
+    /// Parse the IPC value; a missing value is `Never`.
+    pub fn parse(v: Option<&str>) -> Result<Self, String> {
+        match v.unwrap_or("never") {
+            "never" => Ok(Self::Never),
+            "replace" => Ok(Self::Replace),
+            "confirmed" => Ok(Self::Confirmed),
+            other => Err(format!("unknown overwrite policy: {other}")),
+        }
+    }
+
+    fn allows_replace(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
+fn already_exists(path: &str) -> SshError {
+    SshError::PartialTransfer(format!("{path} already exists; not overwriting it"))
+}
+
+/// Run one transfer step under the transfer's cancel switch and the stall
+/// deadline.
+async fn step<T, E: Into<SshError>>(
+    cancel: &watch::Receiver<bool>,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, SshError> {
+    let mut rx = cancel.clone();
+    if *rx.borrow() {
+        return Err(SshError::TransferCancelled);
+    }
+    let cancelled = async move {
+        loop {
+            if rx.changed().await.is_err() {
+                // Sender gone: nobody can cancel any more.
+                std::future::pending::<()>().await;
+            }
+            if *rx.borrow() {
+                return;
+            }
+        }
+    };
+    let stall = stall_timeout();
+    tokio::select! {
+        biased;
+        _ = cancelled => Err(SshError::TransferCancelled),
+        r = tokio::time::timeout(stall, fut) => match r {
+            Ok(r) => r.map_err(Into::into),
+            Err(_) => Err(SshError::TransferStalled(stall.as_secs())),
+        },
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// A test's shorter stall deadline (see `stall_timeout`).
+    static TEST_STALL: Duration;
+}
+
+/// How long one transfer step may make no progress: `TRANSFER_STALL_TIMEOUT`,
+/// or a test's own (the SFTP harness drops and delays replies).
+fn stall_timeout() -> Duration {
+    #[cfg(test)]
+    if let Ok(d) = TEST_STALL.try_with(|d| *d) {
+        return d;
+    }
+    TRANSFER_STALL_TIMEOUT
+}
+
+/// A cancel switch that never fires: for the steps of a commit, which must
+/// run to the end once started (see `commit_upload`).
+fn uncancellable() -> watch::Receiver<bool> {
+    watch::channel(false).1
+}
+
+/// Run `fut` as its own task and wait for it, so it runs to completion even
+/// if the caller stops waiting: a commit that has moved the original aside
+/// must get to put something back.
+async fn shielded<T: Send + 'static>(
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, SshError> {
+    #[cfg(test)]
+    let fut = TEST_STALL.scope(stall_timeout(), fut);
+    tokio::spawn(fut)
+        .await
+        .map_err(|e| SshError::PartialTransfer(format!("the commit task failed: {e}")))
+}
+
+/// Remove a remote staging or probe file, best effort and bounded, never
+/// cancelled: called on the way out of a failed or cancelled transfer.
+async fn remove_remote_quietly(sftp: &SftpConn, path: &str) {
+    let _ = step(&uncancellable(), sftp.hi.remove_file(path)).await;
+}
+
+/// Whether anything is at `path` on the server (LSTAT: a link counts). Only a
+/// definite "no such file" is `false`.
+async fn remote_present(sftp: &SftpConn, path: &str) -> Result<bool, SshError> {
+    match step(&uncancellable(), sftp.hi.symlink_metadata(path)).await {
+        Ok(_) => Ok(true),
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/* ------------------------------------------------------------- progress */
+
+/// Throttled progress for one whole transfer (a file, or every file of a
+/// tree). One clock for the whole transfer: a 100k-file tree must not send
+/// two IPC events per file.
+struct Progress<'a> {
+    /// None only in tests that drive a transfer without a Tauri app.
+    app: Option<&'a AppHandle>,
+    payload: TransferProgress,
+    last: Option<Instant>,
+    /// Bytes of files already completed in this transfer.
+    base: u64,
+    /// The current file's size (single-file transfers only).
+    file_total: u64,
+    /// Part of a folder transfer: the row's total is unknown, so never report
+    /// one file's size (or completion) as the tree's.
+    tree: bool,
+    cancel: watch::Receiver<bool>,
+    notes: Vec<String>,
+    notes_dropped: usize,
+    /// Remote editing only: the most bytes a download may write. Enforced
+    /// per chunk while streaming, so a file that grows (or a server that
+    /// understates its size) cannot fill the disk past it.
+    byte_limit: Option<u64>,
+    /// Remote editing only: the SHA-256 the upload's destination must still
+    /// have, checked by reading it back immediately before the commit (and
+    /// before any in-place write). See `edit_commit_guard`.
+    commit_guard: Option<String>,
+    /// Set when `commit_guard` refused the commit: the destination changed.
+    guard_tripped: bool,
+    /// Tests: run right before the commit guard reads the destination (a
+    /// concurrent writer). Always None outside the SFTP harness.
+    before_guard: Option<EditHook>,
+    /// Tests: every event, as it would have been emitted.
+    #[cfg(test)]
+    sent: Option<Arc<std::sync::Mutex<Vec<TransferProgress>>>>,
+}
+
+const MAX_NOTES: usize = 20;
+
+impl<'a> Progress<'a> {
+    fn new(
+        app: &'a AppHandle,
+        session_id: &str,
+        transfer_id: &str,
+        root: &str,
+        direction: &'static str,
+        cancel: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            app: Some(app),
+            payload: TransferProgress {
+                session_id: session_id.to_string(),
+                transfer_id: transfer_id.to_string(),
+                root: root.to_string(),
+                file_path: root.to_string(),
+                bytes_transferred: 0,
+                total_bytes: 0,
+                direction,
+                done: false,
+                note: None,
+            },
+            last: None,
+            base: 0,
+            file_total: 0,
+            tree: false,
+            cancel,
+            notes: Vec::new(),
+            notes_dropped: 0,
+            byte_limit: None,
+            commit_guard: None,
+            guard_tripped: false,
+            before_guard: None,
+            #[cfg(test)]
+            sent: None,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    /// A transfer with nobody to report to: the SFTP harness tests, and the
+    /// remote-edit sync (`edit_fetch_with` / `edit_push_with`), which reports
+    /// through its own `sftp://edit` events rather than a transfer row.
+    fn detached(cancel: watch::Receiver<bool>) -> Progress<'static> {
+        Progress {
+            app: None,
+            payload: TransferProgress {
+                session_id: String::new(),
+                transfer_id: String::new(),
+                root: String::new(),
+                file_path: String::new(),
+                bytes_transferred: 0,
+                total_bytes: 0,
+                direction: "upload",
+                done: false,
+                note: None,
+            },
+            last: None,
+            base: 0,
+            file_total: 0,
+            tree: false,
+            cancel,
+            notes: Vec::new(),
+            notes_dropped: 0,
+            byte_limit: None,
+            commit_guard: None,
+            guard_tripped: false,
+            before_guard: None,
+            #[cfg(test)]
+            sent: None,
+        }
+    }
+
+    /// What a detached transfer would have emitted, from now on.
+    #[cfg(test)]
+    fn record(&mut self) -> Arc<std::sync::Mutex<Vec<TransferProgress>>> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.sent = Some(Arc::clone(&log));
+        log
+    }
+
+    fn emit(&mut self) {
+        self.last = Some(Instant::now());
+        #[cfg(test)]
+        if let Some(log) = &self.sent {
+            log.lock().unwrap().push(self.payload.clone());
+        }
+        if let Some(app) = self.app {
+            let _ = app.emit("sftp://progress", self.payload.clone());
+        }
+    }
+
+    /// A warning: shown NOW (an unthrottled event carrying it), and kept
+    /// among the final notes.
+    fn warn(&mut self, text: String) {
+        self.payload.note = Some(text.clone());
+        self.emit();
+        self.payload.note = None;
+        self.note(text);
+    }
+
+    /// A file starts. A single file emits at once, so the row gets its
+    /// denominator; a tree file does not (see the struct comment).
+    fn start_file(&mut self, file_path: &str, total: u64) {
+        self.payload.file_path = file_path.to_string();
+        self.file_total = total;
+        self.payload.total_bytes = if self.tree { 0 } else { total };
+        self.payload.bytes_transferred = self.base;
+        if !self.tree {
+            self.emit();
+        }
+    }
+
+    fn tick(&mut self, file_bytes: u64) {
+        if self.last.is_some_and(|t| t.elapsed() < PROGRESS_INTERVAL) {
+            return;
+        }
+        self.payload.bytes_transferred = self.base + file_bytes;
+        self.emit();
+    }
+
+    /// A file completed. A single file always emits its final event, so the
+    /// UI never stalls at 97%; a tree file only counts toward the total.
+    fn finish_file(&mut self, file_bytes: u64) {
+        self.base += file_bytes;
+        if self.tree {
+            self.tick(0);
+            return;
+        }
+        self.payload.bytes_transferred = self.base;
+        if self.payload.total_bytes == 0 {
+            self.payload.total_bytes = file_bytes;
+        }
+        self.payload.done = true;
+        self.emit();
+    }
+
+    /// The tree finished: one unthrottled event with the final count.
+    fn finish_tree(&mut self) {
+        self.payload.bytes_transferred = self.base;
+        self.emit();
+    }
+
+    fn note(&mut self, text: String) {
+        if self.notes.len() < MAX_NOTES {
+            self.notes.push(text);
+        } else {
+            self.notes_dropped += 1;
+        }
+    }
+
+    fn take_notes(&mut self) -> Vec<String> {
+        let mut notes = std::mem::take(&mut self.notes);
+        if self.notes_dropped > 0 {
+            notes.push(format!("…and {} more like these", self.notes_dropped));
+        }
+        notes
+    }
+
+    fn failure(&self, name: &str, local: &str, remote: &str, reason: String) {
+        let Some(app) = self.app else { return };
+        let _ = app.emit(
+            "sftp://failure",
+            TransferFailure {
+                session_id: self.payload.session_id.clone(),
+                transfer_id: self.payload.transfer_id.clone(),
+                root: self.payload.root.clone(),
+                name: name.to_string(),
+                local: local.to_string(),
+                remote: remote.to_string(),
+                reason,
+                direction: self.payload.direction,
+            },
+        );
+    }
+}
+
+/* ------------------------------------------------------------ tree walks */
+
+/// A tree's tally. `dead`: the walk stopped because the SFTP channel stopped
+/// answering, which `sftp_dead` must still see so the cached session is
+/// dropped (a `PartialTransfer` would hide it, and the next transfer would
+/// reuse the stalled channel).
+fn partial_summary(total: u64, failed: &[String], dead: bool) -> SshError {
+    let text = format!(
+        "copied {} bytes; {} item(s) not transferred — first: {}",
+        total,
+        failed.len(),
+        failed[0]
+    );
+    if dead {
+        SshError::ChannelLost(text)
+    } else {
+        SshError::PartialTransfer(text)
+    }
+}
+
+async fn download_tree(
+    sftp: &Arc<SftpConn>,
+    p: &mut Progress<'_>,
+    remote: &str,
+    local: &str,
+    overwrite: Overwrite,
+) -> Result<u64, SshError> {
+    // A directory recurses; a file copies directly. Walking the tree
+    // iteratively (a worklist, not async recursion) keeps this a plain
+    // function with no Box::pin ceremony.
+    let is_dir = step(&p.cancel, sftp.hi.metadata(remote))
+        .await
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+
+    // Single file: the frontend built `local` from the server's name, so
+    // verify its final component has not been used to escape the target.
+    let last = std::path::Path::new(local)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !safe_local_component(&last) {
+        return Err(SshError::PartialTransfer(format!(
+            "refusing to write unsafe filename: {last}"
+        )));
+    }
+    if !is_dir {
+        p.tree = false;
+        return copy_remote_file(sftp, p, remote, local, overwrite).await;
+    }
+    p.tree = true;
+
+    // Everything from `local` downward is built from server-chosen names and
+    // is therefore untrusted; the folder that CONTAINS `local` is the one the
+    // user actually picked and is the trust boundary. Any pre-existing symlink
+    // or junction below it must not be followed. (`local` always has a parent
+    // here: `safe_local_component` above rejected an empty final component.)
+    let root = std::path::Path::new(local)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut dead = false;
+    // Bound the walk so a malicious or misconfigured server advertising a
+    // pathologically deep/wide tree cannot grow the worklist without limit.
+    const MAX_DIRS: usize = 50_000;
+    let mut visited = 0usize;
+    let mut dirs = vec![(remote.to_string(), local.to_string())];
+    'walk: while let Some((rdir, ldir)) = dirs.pop() {
+        if p.cancelled() {
+            return Err(SshError::TransferCancelled);
+        }
+        visited += 1;
+        // The root failing is a real error; a subdirectory failing is one
+        // more item in the tally, like an unreadable file (see below).
+        let is_root = visited == 1;
+        if visited > MAX_DIRS {
+            let reason = format!(
+                "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
+            );
+            // Empty paths: not retryable — a retry would re-run the whole tree.
+            p.failure("(tree)", "", "", reason.clone());
+            failed.push(reason);
+            break;
+        }
+        // Refuse to descend into (or create under) a linked ancestor before
+        // create_dir_all can follow it outside the destination.
+        if let Err(e) = reject_link_in_subtree(&root, std::path::Path::new(&ldir)) {
+            failed.push(format!("{ldir}: {e}"));
+            continue;
+        }
+        let dir_name = rdir.rsplit('/').next().unwrap_or(&rdir).to_string();
+        let listing = match tokio::fs::create_dir_all(&ldir).await {
+            Err(e) if is_root => return Err(e.into()),
+            Err(e) => Err(SshError::from(e)),
+            Ok(()) => step(&p.cancel, read_dir_capped(sftp, &rdir, MAX_LIST_ENTRIES)).await,
+        };
+        let (listing, truncated) = match listing {
+            Ok(l) => l,
+            Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+            Err(e) if is_root || sftp_dead(&e) => return Err(e),
+            Err(e) => {
+                p.failure(&dir_name, &ldir, &rdir, format!("{e}"));
+                failed.push(format!("{rdir}: {e}"));
+                continue;
+            }
+        };
+        if truncated {
+            let reason = format!("listing cut off at {MAX_LIST_ENTRIES} entries; the rest was skipped");
+            p.failure(&dir_name, "", &rdir, reason.clone());
+            failed.push(format!("{rdir}: {reason}"));
+        }
+        for (name, meta) in listing {
+            let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
+            // The server chose this name; refuse anything that is not a
+            // plain component before it becomes a local path.
+            if !safe_local_component(&name) {
+                let reason = format!("{name} (unsafe name, skipped)");
+                p.failure(&name, "", &rpath, reason.clone());
+                failed.push(reason);
+                continue;
+            }
+            let lpath = std::path::Path::new(&ldir)
+                .join(&name)
+                .to_string_lossy()
+                .to_string();
+            let ft = meta.file_type();
+            if ft.is_dir() {
+                dirs.push((rpath, lpath));
+            } else if ft.is_symlink() {
+                // A symlink in a tree walk is skipped, not followed: SFTP
+                // open() on a dir-symlink fails, and following file links
+                // can duplicate or even loop. Recorded so the user learns
+                // it was left behind rather than silently missing it.
+                // Emitted with an empty local path so it is NOT retryable:
+                // a retry would copy it as a plain file, following the link
+                // the walk deliberately refused to follow.
+                p.failure(&name, "", &rpath, "symlink, skipped".into());
+                failed.push(format!("{rpath} (symlink, skipped)"));
+            } else {
+                // One unreadable file must not abort the other 499: keep
+                // walking, collect what failed, report the tally at the end.
+                match copy_remote_file(sftp, p, &rpath, &lpath, overwrite).await {
+                    Ok(_) => {}
+                    Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+                    Err(e) => {
+                        p.failure(&name, &lpath, &rpath, format!("{e}"));
+                        failed.push(format!("{rpath}: {e}"));
+                        if sftp_dead(&e) {
+                            // Every remaining file would wait out the same
+                            // timeout on a channel that is gone.
+                            failed.push("the SFTP session stopped responding; the rest was skipped".into());
+                            dead = true;
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    p.finish_tree();
+    if failed.is_empty() {
+        Ok(p.base)
+    } else {
+        Err(partial_summary(p.base, &failed, dead))
+    }
+}
+
+async fn upload_tree(
+    sftp: &Arc<SftpConn>,
+    p: &mut Progress<'_>,
     local: &str,
     remote: &str,
-    reason: String,
-    direction: &'static str,
-) {
-    let _ = app.emit(
-        "sftp://failure",
-        TransferFailure {
-            session_id: session_id.to_string(),
-            root: root.to_string(),
-            name: name.to_string(),
-            local: local.to_string(),
-            remote: remote.to_string(),
-            reason,
-            direction,
-        },
-    );
+    overwrite: Overwrite,
+) -> Result<u64, SshError> {
+    let is_dir = tokio::fs::metadata(local)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+
+    if !is_dir {
+        p.tree = false;
+        return copy_local_file(sftp, p, local, remote, overwrite).await;
+    }
+    p.tree = true;
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut dead = false;
+    const MAX_DIRS: usize = 50_000;
+    let mut visited = 0usize;
+    let mut dirs = vec![(local.to_string(), remote.to_string())];
+    'walk: while let Some((ldir, rdir)) = dirs.pop() {
+        if p.cancelled() {
+            return Err(SshError::TransferCancelled);
+        }
+        visited += 1;
+        let is_root = visited == 1;
+        if visited > MAX_DIRS {
+            let reason = format!(
+                "directory limit ({MAX_DIRS}) reached — tree too large; remainder skipped"
+            );
+            // Empty paths: not retryable — a retry would re-run the whole tree.
+            p.failure("(tree)", "", "", reason.clone());
+            failed.push(reason);
+            break;
+        }
+        // create_dir on an existing directory is an error over SFTP; ignore
+        // it so re-uploading into a partially-present tree just works.
+        match step(&p.cancel, sftp.hi.create_dir(rdir.clone())).await {
+            Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+            Err(e) if sftp_dead(&e) => return Err(e),
+            _ => {}
+        }
+        // An unreadable SUBdirectory (another user's 0700 dir, a macOS
+        // TCC-protected folder) is one more failed item, not the end of the
+        // whole tree; only the root failing is fatal.
+        let dir_name = std::path::Path::new(&ldir)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| ldir.clone());
+        let mut rd = match tokio::fs::read_dir(&ldir).await {
+            Ok(rd) => rd,
+            Err(e) if is_root => return Err(e.into()),
+            Err(e) => {
+                p.failure(&dir_name, &ldir, &rdir, format!("{e}"));
+                failed.push(format!("{ldir}: {e}"));
+                continue;
+            }
+        };
+        loop {
+            let entry = match rd.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => {
+                    failed.push(format!("{ldir}: {e}"));
+                    break;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lpath = entry.path().to_string_lossy().to_string();
+            let rpath = format!("{}/{}", rdir.trim_end_matches('/'), name);
+            let ft = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(e) => {
+                    p.failure(&name, &lpath, &rpath, format!("{e}"));
+                    failed.push(format!("{lpath}: {e}"));
+                    continue;
+                }
+            };
+            if ft.is_dir() {
+                dirs.push((lpath, rpath));
+            } else if ft.is_symlink() {
+                // Empty local path: NOT retryable. A retry would open the
+                // path as a plain file and upload whatever the link points
+                // at (e.g. ~/.ssh/id_ed25519) — the very thing the walk
+                // refused to do.
+                p.failure(&name, "", &rpath, "symlink, skipped".into());
+                failed.push(format!("{lpath} (symlink, skipped)"));
+            } else {
+                match copy_local_file(sftp, p, &lpath, &rpath, overwrite).await {
+                    Ok(_) => {}
+                    Err(SshError::TransferCancelled) => return Err(SshError::TransferCancelled),
+                    Err(e) => {
+                        p.failure(&name, &lpath, &rpath, format!("{e}"));
+                        failed.push(format!("{lpath}: {e}"));
+                        if sftp_dead(&e) {
+                            failed.push("the SFTP session stopped responding; the rest was skipped".into());
+                            dead = true;
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    p.finish_tree();
+    if failed.is_empty() {
+        Ok(p.base)
+    } else {
+        Err(partial_summary(p.base, &failed, dead))
+    }
 }
+
+/* ------------------------------------------------------------ local names */
+
+/// Reject a remote-supplied name that could escape the local target directory.
+///
+/// A malicious or compromised server controls the filenames it lists, and on
+/// download those names become LOCAL path components. A name like
+/// `..\Windows\evil` — or an absolute path, which `Path::join` uses to
+/// REPLACE the base entirely — would write outside the folder the user chose.
+/// This is the scp/zip-slip class; the defense is to accept only plain file
+/// names as path components.
+///
+/// The Windows-only hazards are checked on Windows only: on macOS and Linux
+/// `aux.c`, `con.h` or `report.` are ordinary, legal names.
+pub(crate) fn safe_local_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !(cfg!(windows) && !windows_name_ok(name))
+}
+
+/// The Windows rules: no ':' (drive letters, alternate data streams), no
+/// reserved device name, and no trailing '.' or ' ' — Win32 strips those, so
+/// `report` and `report.` in one server tree would silently write one file.
+fn windows_name_ok(name: &str) -> bool {
+    !name.contains(':')
+        && !is_windows_reserved(name)
+        && !name.ends_with('.')
+        && !name.ends_with(' ')
+}
+
+/// The longest file name (in bytes) the staging names below may produce.
+const NAME_MAX: usize = 255;
+
+/// A hidden staging name beside `name`: `.<name>.<tag><suffix>`, with `name`
+/// shortened (at a character boundary) so the whole stays within `NAME_MAX`
+/// bytes — a 250-byte file name must still transfer.
+fn staging_name(name: &str, tag: &str, suffix: &str) -> String {
+    let room = NAME_MAX.saturating_sub(2 + tag.len() + suffix.len());
+    let mut end = name.len().min(room);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(".{}.{tag}{suffix}", &name[..end])
+}
+
+const PART_SUFFIX: &str = ".hawserpart";
+const BAK_SUFFIX: &str = ".hawserbak";
+
+/// The remote sibling `dir/<staging name>` for `remote`.
+fn remote_staging(remote: &str, suffix: &str) -> String {
+    let (dir, name) = match remote.rfind('/') {
+        Some(i) => (&remote[..=i], &remote[i + 1..]),
+        None => ("", remote),
+    };
+    format!("{dir}{}", staging_name(name, &crate::utils::artifacts::random_hex(6), suffix))
+}
+
+/// Create a fresh local staging file beside `dest`: exclusive (an existing
+/// file or a planted symlink at that name fails the create instead of being
+/// followed), with a random name, and owner-only (0600) on Unix while it
+/// streams. Created in the folder that will hold `dest`, so the commit is a
+/// same-directory rename.
+async fn create_local_staging(
+    dest: &std::path::Path,
+) -> Result<(std::path::PathBuf, tokio::fs::File), SshError> {
+    let dir = match dest.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut last_err = None;
+    for _ in 0..8 {
+        let tmp = dir.join(staging_name(&name, &crate::utils::artifacts::random_hex(6), PART_SUFFIX));
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        match opts.open(&tmp).await {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last_err.map(SshError::from).unwrap_or_else(|| {
+        SshError::PartialTransfer("could not create a staging file".into())
+    }))
+}
+
+/* ------------------------------------------------------- download commit */
+
+/// What `CommitFs::kind` sees at a path (without following a link).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalKind {
+    File,
+    Dir,
+    /// A symlink, junction, device…: never moved aside or replaced.
+    Other,
+}
+
+/// The file operations `commit_download` uses, so tests can fail any one.
+trait CommitFs {
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>;
+    fn rename_noreplace(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>;
+    fn hard_link(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>;
+    fn remove(&self, p: &std::path::Path) -> std::io::Result<()>;
+    fn kind(&self, p: &std::path::Path) -> Option<LocalKind>;
+    /// Swap two names atomically (see `exchange_paths`).
+    fn exchange(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()>;
+    /// What entry `p` names (device and inode, without following a link), to
+    /// tell whether a name still holds the entry it did. None where unknown.
+    fn ident(&self, p: &std::path::Path) -> Option<(u64, u64)>;
+}
+
+/// Whether an `exchange_paths` failure only means "no atomic exchange here"
+/// (the platform, kernel or filesystem lacks it), so the portable move-aside
+/// may run instead. Anything else (permissions, a vanished name, I/O) is an
+/// error of its own and must not be papered over.
+fn exchange_unsupported(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(c) if c == libc::EINVAL || c == libc::ENOTSUP || c == libc::EOPNOTSUPP || c == libc::ENOSYS
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Swap what two paths name, in one atomic step: Linux `renameat2`
+/// `RENAME_EXCHANGE`, macOS `renamex_np` `RENAME_SWAP`. Neither name is ever
+/// missing, nothing is replaced, and a failure changes nothing. `Unsupported`
+/// elsewhere (Windows); a kernel or filesystem without it reports its own
+/// error (ENOSYS, EINVAL, ENOTSUP), also with nothing changed.
+fn exchange_paths(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+        let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+        // Linux: through syscall(), not the glibc wrapper (renameat2 joined
+        // glibc only in 2.28; see `utils::artifacts::rename_noreplace`).
+        #[cfg(target_os = "linux")]
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                a.as_ptr(),
+                libc::AT_FDCWD,
+                b.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (a, b);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no atomic exchange on this platform"))
+    }
+}
+
+struct RealFs;
+
+impl CommitFs for RealFs {
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+    fn rename_noreplace(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        crate::utils::artifacts::rename_noreplace(from, to)
+    }
+    fn hard_link(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::hard_link(from, to)
+    }
+    fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+        std::fs::remove_file(p)
+    }
+    fn exchange(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+        exchange_paths(a, b)
+    }
+    fn ident(&self, p: &std::path::Path) -> Option<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::symlink_metadata(p).ok()?;
+            Some((m.dev(), m.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            // Only asked after an exchange, which Windows does not have.
+            let _ = p;
+            None
+        }
+    }
+    fn kind(&self, p: &std::path::Path) -> Option<LocalKind> {
+        let m = std::fs::symlink_metadata(p).ok()?;
+        Some(if is_link_or_reparse(&m) {
+            LocalKind::Other
+        } else if m.is_dir() {
+            LocalKind::Dir
+        } else if m.is_file() {
+            LocalKind::File
+        } else {
+            LocalKind::Other
+        })
+    }
+}
+
+/// Put `from` at `to` only if nothing is there, atomically: a no-replace
+/// rename, or where the filesystem has none (an old kernel, some network
+/// shares) a hard link — which cannot replace either — and then dropping the
+/// old name. `AlreadyExists` if something is at `to`; `Unsupported` if this
+/// filesystem offers neither. Never a check followed by a replacing rename.
+fn place_noreplace(fs: &dyn CommitFs, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    let e1 = match fs.rename_noreplace(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(e),
+        Err(e) => e,
+    };
+    match fs.hard_link(from, to) {
+        Ok(()) => {
+            // The content is at `to`; a leftover second name is harmless.
+            let _ = fs.remove(from);
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(e),
+        Err(e2) => Err(std::io::Error::new(ErrorKind::Unsupported, format!("{e1}; {e2}"))),
+    }
+}
+
+/// Move a finished download from its staging file `tmp` to `dest`. On
+/// success, an optional note for the user (a backup that could not be
+/// removed).
+///
+/// Never destroys both copies: on every failure either the original is still
+/// at `dest` or the error says where it went, and the downloaded copy stays at
+/// `tmp` (named in the error) unless the policy refused it.
+///
+/// - `replace == false`: placed with `place_noreplace`. A file at `dest` (even
+///   one created after the user was asked) is never clobbered; the staged
+///   copy is then removed. A filesystem with no atomic no-replace fails the
+///   download instead (choose Replace there).
+/// - `replace == true`: an atomic rename over `dest`. If the platform refuses
+///   (Windows: something holds the file open), and the original is still a
+///   regular file: where the platform can, the two are EXCHANGED atomically
+///   (Linux, macOS), so the original never leaves a name; then what came out
+///   is checked to be that regular file — if something else had taken its
+///   place in between, it is exchanged straight back. Elsewhere the original
+///   is moved aside to `bak` (no-replace), checked the same way and put back
+///   (no-replace) if it was not the file, the new copy put in place (never
+///   over something that appeared meanwhile), and the backup dropped; if
+///   putting the new copy in place fails, the original is moved back, never
+///   over anything either. Whatever cannot be put back is named with its
+///   path. An exchange that fails for any reason other than "not supported
+///   here" (`exchange_unsupported`) fails the download, naming both paths; it
+///   never falls back to a move.
+///
+/// RESIDUAL (needs another local process racing Hawser in the destination
+/// folder): every check here is followed by a separate step, so a process
+/// that swaps `dest` in exactly that gap can still have its entry moved (it
+/// is never deleted: it ends up at `tmp` or `bak`, and the error says which
+/// path holds what as far as Hawser can tell). The exchange's swap-back
+/// checks that `dest` still names the download's inode first, which narrows
+/// this to the instant between that check and the second exchange.
+fn commit_download(
+    fs: &dyn CommitFs,
+    tmp: &std::path::Path,
+    dest: &std::path::Path,
+    bak: &std::path::Path,
+    replace: bool,
+) -> Result<Option<String>, String> {
+    use std::io::ErrorKind;
+    let (t, d, b) = (tmp.display(), dest.display(), bak.display());
+    if !replace {
+        return match place_noreplace(fs, tmp, dest) {
+            Ok(()) => Ok(None),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                let _ = fs.remove(tmp);
+                Err(format!("{d} already exists; not overwriting it"))
+            }
+            Err(e) => Err(format!(
+                "this folder's filesystem cannot add a file without possibly overwriting one ({e}), \
+                 so Hawser can't guarantee {d} is not overwritten; choose Replace to download \
+                 anyway. The downloaded copy was kept at {t}"
+            )),
+        };
+    }
+    let e1 = match fs.rename(tmp, dest) {
+        Ok(()) => return Ok(None),
+        Err(e) => e,
+    };
+    // Checked again right before the move-aside: only a regular file is ever
+    // moved aside (a folder or link that appeared during the copy is not).
+    match fs.kind(dest) {
+        None => {
+            return Err(format!(
+                "could not move the download into place ({e1}); the downloaded copy was kept at {t}"
+            ))
+        }
+        Some(LocalKind::File) => {}
+        Some(_) => {
+            return Err(format!(
+                "{d} is no longer a regular file; not replacing it ({e1}). The downloaded copy \
+                 was kept at {t}"
+            ))
+        }
+    }
+    // One atomic step where the platform has it: the new copy at `dest`, the
+    // original at `tmp`. A failure changed nothing; only "no exchange here"
+    // falls through to the move-aside below, any other error is reported.
+    let ours = fs.ident(tmp);
+    match fs.exchange(tmp, dest) {
+        Ok(()) => {
+            if fs.kind(tmp) == Some(LocalKind::File) {
+                return match fs.remove(tmp) {
+                    Ok(()) => Ok(None),
+                    Err(e) => Ok(Some(format!(
+                        "{d} was replaced, but its previous version could not be removed ({e}) and \
+                         was left at {t}"
+                    ))),
+                };
+            }
+            // A folder or link took the file's place between the check and the
+            // exchange, and is now at `tmp`. Swap it straight back — but only
+            // if `dest` still holds the download: if something else replaced
+            // it meanwhile, a second exchange would move THAT to `tmp` instead.
+            // (RESIDUAL, see this function's doc: another local process can
+            // still swap `dest` between this check and the exchange.)
+            if ours.is_none() || fs.ident(dest) != ours {
+                return Err(format!(
+                    "{d} changed twice while it was being replaced: what was there (not a regular \
+                     file) is now at {t}, and {d} holds something another program put there. The \
+                     downloaded copy is no longer at either path"
+                ));
+            }
+            return match fs.exchange(tmp, dest) {
+                Ok(()) => Err(format!(
+                    "{d} changed while it was being replaced; it was left as it was and the \
+                     downloaded copy kept at {t}"
+                )),
+                Err(e) => Err(format!(
+                    "{d} changed while it was being replaced and could not be put back ({e}): \
+                     what was there is now at {t}, and the downloaded copy at {d}"
+                )),
+            };
+        }
+        Err(e) if exchange_unsupported(&e) => {}
+        Err(e) => {
+            return Err(format!(
+                "could not replace {d} ({e1}; exchanging it with the download failed: {e}); the \
+                 original is untouched and the downloaded copy was kept at {t}"
+            ))
+        }
+    }
+    if let Err(e2) = fs.rename_noreplace(dest, bak).or_else(|e| {
+        if e.kind() == ErrorKind::AlreadyExists {
+            Err(e)
+        } else {
+            fs.rename(dest, bak)
+        }
+    }) {
+        return Err(format!(
+            "could not replace {d} ({e1}; moving it aside failed: {e2}); the original is \
+             untouched and the downloaded copy was kept at {t}"
+        ));
+    }
+    // Something swapped in between the check and the move: put it back.
+    if fs.kind(bak) != Some(LocalKind::File) {
+        return match place_noreplace(fs, bak, dest) {
+            Ok(()) => Err(format!(
+                "{d} changed while it was being replaced; it was left as it was and the \
+                 downloaded copy kept at {t}"
+            )),
+            Err(e) => Err(format!(
+                "{d} changed while it was being replaced and could not be put back ({e}): it \
+                 is at {b}, and the downloaded copy at {t}"
+            )),
+        };
+    }
+    let installed = match place_noreplace(fs, tmp, dest) {
+        Err(e) if e.kind() == ErrorKind::Unsupported => fs.rename(tmp, dest),
+        r => r,
+    };
+    match installed {
+        Ok(()) => match fs.remove(bak) {
+            Ok(()) => Ok(None),
+            Err(e) => Ok(Some(format!(
+                "{d} was replaced, but its previous version could not be removed ({e}) and was \
+                 left at {b}"
+            ))),
+        },
+        Err(e3) => match place_noreplace(fs, bak, dest) {
+            Ok(()) => Err(format!(
+                "could not replace {d} ({e3}); the original was restored and the downloaded \
+                 copy was kept at {t}"
+            )),
+            Err(e4) => Err(format!(
+                "could not replace {d} ({e3}) or restore it without overwriting anything ({e4}): \
+                 the original is at {b} and the downloaded copy at {t}"
+            )),
+        },
+    }
+}
+
+/* ---------------------------------------------------------- file copies */
 
 /// Copy one remote file to a local path, streaming with progress.
 async fn copy_remote_file(
-    sftp: &SftpSession,
-    app: &AppHandle,
-    session_id: &str,
+    sftp: &Arc<SftpConn>,
+    p: &mut Progress<'_>,
     remote: &str,
     local: &str,
-    ctx: ProgressCtx<'_>,
+    overwrite: Overwrite,
 ) -> Result<u64, SshError> {
     // Never write THROUGH an existing symlink at the destination: a
     // server-controlled tree must not use a pre-placed link to redirect a
@@ -2580,67 +5531,117 @@ async fn copy_remote_file(
                 "refusing to overwrite a symlink: {local}"
             )));
         }
+        if meta.is_dir() {
+            return Err(SshError::PartialTransfer(format!(
+                "{local} is a folder here; refusing to replace it with a file"
+            )));
+        }
+        if !overwrite.allows_replace() {
+            return Err(already_exists(local));
+        }
     }
 
-    let total = sftp.metadata(remote).await.ok().and_then(|m| m.size).unwrap_or(0);
-    let mut src = sftp.open(remote).await?;
+    let rmeta = step(&p.cancel, sftp.hi.metadata(remote)).await.ok();
+    let total = rmeta.as_ref().and_then(|m| m.size).unwrap_or(0);
+    let mut src = step(&p.cancel, sftp.hi.open(remote)).await?;
 
-    // Stream to a unique temp file beside the destination, then atomically
-    // rename over it. A failed/cancelled/interrupted transfer therefore never
-    // destroys the existing file or leaves a truncated partial in its place.
-    let tmp = temp_sibling(local);
+    // Stream to a fresh staging file beside the destination, then commit it
+    // with a rename. A failed, cancelled or interrupted transfer therefore
+    // never destroys the existing file or leaves a truncated partial in its
+    // place.
+    let dest = std::path::PathBuf::from(local);
+    let staged = create_local_staging(&dest).await;
+    let (tmp, mut dst) = match staged {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = src.close().await;
+            return Err(e);
+        }
+    };
+    p.start_file(remote, total);
     let copy_result: Result<u64, SshError> = async {
-        let mut dst = tokio::fs::File::create(&tmp).await?;
-        let mut reporter = Reporter::new(app, session_id, remote, total, "download", ctx);
         let mut buf = vec![0u8; CHUNK];
         let mut done = 0u64;
         loop {
-            let n = src.read(&mut buf).await?;
+            let n = step(&p.cancel, src.read(&mut buf)).await?;
             if n == 0 {
                 break;
             }
-            dst.write_all(&buf[..n]).await?;
+            // Before the chunk is written: never more than the limit on disk.
+            if let Some(max) = p.byte_limit {
+                if done + n as u64 > max {
+                    return Err(SshError::PartialTransfer(format!(
+                        "{remote} is over {} MB (it grew while downloading, or the server \
+                         reported a smaller size); the download was stopped and the partial \
+                         copy deleted",
+                        max / (1024 * 1024)
+                    )));
+                }
+            }
+            step(&p.cancel, dst.write_all(&buf[..n])).await?;
             done += n as u64;
-            reporter.tick(done);
+            p.tick(done);
         }
-        dst.flush().await?;
-        reporter.finish(done);
+        step(&p.cancel, dst.flush()).await?;
         Ok(done)
     }
     .await;
+    drop(dst);
 
     // Close the remote read handle explicitly. Dropping the SFTP `File` does NOT
     // send SSH_FXP_CLOSE, so a recursive download of a large tree would leak one
-    // server-side handle per file and eventually exhaust the server's limit —
-    // the download-side twin of the upload handle leak. Best-effort: a close
-    // failure must not fail an otherwise-complete transfer.
-    let _ = src.close().await;
+    // server-side handle per file and eventually exhaust the server's limit.
+    // Best-effort and bounded: a close failure must not fail an otherwise-
+    // complete transfer.
+    let _ = tokio::time::timeout(stall_timeout(), src.close()).await;
 
-    match copy_result {
-        Ok(done) => {
-            // The temp was created with default permissions; an overwritten file
-            // keeps the mode it had (a 0600 secret must not come back 0644).
-            if let Some(meta) = existing.as_ref().filter(|m| m.is_file()) {
-                let _ = tokio::fs::set_permissions(&tmp, meta.permissions()).await;
-            }
-            // Atomic replace. std::fs::rename replaces an existing file on both
-            // Unix and Windows; if the platform refuses (e.g. dest locked),
-            // fall back to remove-then-rename rather than lose the new content.
-            if tokio::fs::rename(&tmp, local).await.is_err() {
-                let _ = tokio::fs::remove_file(local).await;
-                if let Err(e) = tokio::fs::rename(&tmp, local).await {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(e.into());
-                }
-            }
-            Ok(done)
-        }
+    let done = match copy_result {
+        Ok(done) => done,
         Err(e) => {
-            // Leave the original untouched; drop the partial temp.
+            // Leave the original untouched; drop the partial staging file.
             let _ = tokio::fs::remove_file(&tmp).await;
-            Err(e)
+            return Err(e);
         }
+    };
+
+    // The staging file is 0600 while it streams. It ends with the mode of
+    // the file it replaces (a 0600 secret stays 0600), or for a new file the
+    // remote file's permission bits (setuid/setgid/sticky dropped), as `scp
+    // -p` would. Unix only: Windows has no POSIX mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = existing
+            .as_ref()
+            .filter(|m| m.is_file())
+            .map(|m| m.permissions().mode() & 0o7777)
+            .or_else(|| rmeta.as_ref().and_then(|m| m.permissions).map(|m| m & 0o777))
+            .unwrap_or(0o644);
+        let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await;
     }
+
+    // Last point a cancel applies (a cancel that came during the close or the
+    // chmod above): the commit below is not interrupted.
+    if p.cancelled() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(SshError::TransferCancelled);
+    }
+
+    let bak = dest.with_file_name(staging_name(
+        &dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        &crate::utils::artifacts::random_hex(6),
+        BAK_SUFFIX,
+    ));
+    let replace = overwrite.allows_replace();
+    let (t2, d2) = (tmp.clone(), dest.clone());
+    let committed = tokio::task::spawn_blocking(move || commit_download(&RealFs, &t2, &d2, &bak, replace))
+        .await
+        .map_err(|e| SshError::PartialTransfer(format!("download commit failed: {e}")))?;
+    if let Some(note) = committed.map_err(SshError::PartialTransfer)? {
+        p.note(note);
+    }
+    p.finish_file(done);
+    Ok(done)
 }
 
 /// The local file's permission bits, for a new remote file. Unix only — the
@@ -2658,280 +5659,1194 @@ fn local_mode(meta: Option<&std::fs::Metadata>) -> Option<u32> {
     }
 }
 
-/// A unique sibling path for atomic writes: `<name>.<n>.skiffpart`. The counter
-/// makes concurrent transfers to the same directory collision-free.
-fn temp_sibling(path: &str) -> String {
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{path}.{n}.skiffpart")
+/// What is at an upload's destination before it starts.
+enum RemoteDest {
+    Missing,
+    /// STAT was refused (write-only drop boxes): it may or may not exist.
+    Unknown,
+    File(russh_sftp::protocol::FileAttributes),
+}
+
+/// How a staged upload's commit ended.
+enum UploadCommit {
+    /// In place, with an optional note (a backup left behind).
+    Done(Option<String>),
+    /// In place, but the server would not delete the staging name, which is
+    /// still a hard link to the uploaded file. The text names it and says it
+    /// must be deleted by hand; it is shown as a warning, not a quiet note.
+    DoneWithSecondName(String),
+    /// The server would not rename the staged copy into place, and the
+    /// original (if any) is still at the destination: write in place instead.
+    /// The complete staged copy is still at its staging name.
+    InPlace,
+}
+
+/// Stream the local file into an already-open remote handle.
+async fn stream_up(
+    p: &mut Progress<'_>,
+    src: &mut tokio::fs::File,
+    dst: &mut russh_sftp::client::fs::File,
+) -> Result<u64, SshError> {
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    loop {
+        let n = step(&p.cancel, src.read(&mut buf)).await?;
+        if n == 0 {
+            break;
+        }
+        step(&p.cancel, dst.write_all(&buf[..n])).await?;
+        done += n as u64;
+        p.tick(done);
+    }
+    Ok(done)
 }
 
 /// Copy one local file to a remote path, streaming with progress.
+///
+/// The normal path writes a hidden staging file beside the destination and
+/// renames it into place (`posix-rename@openssh.com` when the server has it:
+/// an atomic replace with no moment where the file is missing). Two fallbacks
+/// write the destination IN PLACE, non-atomically, with a note to the user:
+/// the folder is not writable (only the file is), or the server will not
+/// rename. In place keeps the file's owner, ACLs and hard links; the price is
+/// that an interrupted transfer leaves it truncated.
 async fn copy_local_file(
-    sftp: &SftpSession,
-    app: &AppHandle,
-    session_id: &str,
+    sftp: &Arc<SftpConn>,
+    p: &mut Progress<'_>,
     local: &str,
     remote: &str,
-    ctx: ProgressCtx<'_>,
+    overwrite: Overwrite,
 ) -> Result<u64, SshError> {
+    use russh_sftp::protocol::{FileAttributes, OpenFlags};
     let local_meta = tokio::fs::metadata(local).await.ok();
     let total = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let mut src = tokio::fs::File::open(local).await?;
 
-    // The temp-and-rename below replaces the remote inode, so its mode must be
-    // carried over explicitly: an overwritten file keeps its own permissions (a
-    // 0600 secret must not become 0644, a deploy script must keep +x); a new
-    // file takes the local file's mode where the platform has one. Refuse up
-    // front to replace a remote DIRECTORY with a file.
-    // Only a definite "no such file" means the destination is new. Permission
-    // denied (write-only dropboxes: SFTPGo upload-only users, ProFTPD
-    // <Limit READ>) leaves it UNKNOWN: still upload, but never replace an
-    // existing file whose mode we could not read — see `no_clobber` below. Any
-    // other STAT failure aborts.
-    use russh_sftp::protocol::StatusCode;
-    let mut no_clobber = false;
-    let remote_meta = match sftp.metadata(remote).await {
-        Ok(m) => Some(m),
-        Err(russh_sftp::client::error::Error::Status(st))
-            if st.status_code == StatusCode::NoSuchFile =>
-        {
-            None
-        }
-        Err(russh_sftp::client::error::Error::Status(st))
-            if st.status_code == StatusCode::PermissionDenied =>
-        {
-            no_clobber = true;
-            None
-        }
-        Err(e) => {
-            return Err(SshError::PartialTransfer(format!(
-                "could not check whether {remote} already exists ({e}); not overwriting it"
-            )))
+    // What is there now. LSTAT, so a symlink is seen as one: renaming over a
+    // link would replace the LINK with a plain file and never update what it
+    // points at. Only a definite "no such file" means new; a refused STAT
+    // (write-only drop boxes: SFTPGo upload-only users, ProFTPD <Limit READ>,
+    // appliances answering a generic failure) leaves it UNKNOWN: still upload,
+    // but never replace. Any other failure aborts.
+    let lstat = step(&p.cancel, sftp.hi.symlink_metadata(remote)).await;
+    let classify = |r: Result<FileAttributes, SshError>, path: &str| -> Result<RemoteDest, SshError> {
+        match r {
+            Ok(m) if m.file_type().is_dir() => Err(SshError::PartialTransfer(format!(
+                "{path} is a directory on the server; refusing to replace it with a file"
+            ))),
+            Ok(m) => Ok(RemoteDest::File(m)),
+            Err(SshError::Sftp(e)) => match sftp_status(&e) {
+                Some(StatusCode::NoSuchFile) => Ok(RemoteDest::Missing),
+                Some(StatusCode::PermissionDenied | StatusCode::Failure | StatusCode::OpUnsupported) => {
+                    Ok(RemoteDest::Unknown)
+                }
+                _ => Err(SshError::PartialTransfer(format!(
+                    "could not check whether {path} already exists ({e}); not overwriting it"
+                ))),
+            },
+            Err(e) => Err(e),
         }
     };
-    if remote_meta.as_ref().is_some_and(|m| m.file_type().is_dir()) {
-        return Err(SshError::PartialTransfer(format!(
-            "{remote} is a directory on the server; refusing to replace it with a file"
-        )));
-    }
-    let mode = remote_meta
-        .as_ref()
-        .and_then(|m| m.permissions)
-        .map(|p| p & 0o7777)
-        .or_else(|| local_mode(local_meta.as_ref()))
-        // Destination unknown: take the server's default rather than impose
-        // the local mode on what may be an existing file.
-        .filter(|_| !no_clobber);
-    // Overwriting a file whose mode we know: it MUST survive the replace. A new
-    // file's mode is only a best effort (the server's umask may trim it).
-    let preserve_required = remote_meta.as_ref().and_then(|m| m.permissions).is_some();
-
-    // Stream to a unique temp file beside the destination, then rename over it,
-    // exactly as the download does. `sftp.create` truncates, so writing straight
-    // to `remote` would destroy the existing file the moment the transfer began:
-    // a connection drop, disk-full, or cancel would then leave a truncated
-    // remote file with the original gone.
-    let tmp = temp_sibling(remote);
-    let copy_result: Result<u64, SshError> = async {
-        // Created WITH the mode, so a secret is never briefly world-readable in
-        // the temp; set again after the write because the server's umask may
-        // have trimmed it at create time.
-        let attrs = russh_sftp::protocol::FileAttributes {
-            permissions: mode,
-            ..Default::default()
-        };
-        let mut dst = sftp
-            .open_with_flags_and_attributes(
-                tmp.clone(),
-                russh_sftp::protocol::OpenFlags::CREATE
-                    | russh_sftp::protocol::OpenFlags::TRUNCATE
-                    | russh_sftp::protocol::OpenFlags::WRITE,
-                attrs,
-            )
-            .await?;
-        let mut reporter = Reporter::new(app, session_id, local, total, "upload", ctx);
-        let mut buf = vec![0u8; CHUNK];
-        let mut done = 0u64;
-        loop {
-            let n = src.read(&mut buf).await?;
-            if n == 0 {
-                break;
+    let (target, dest) = match lstat {
+        Ok(m) if m.file_type().is_symlink() => {
+            // Write THROUGH the link, as `cp` does — but only with the user's
+            // say-so: the frontend asked about this name (a link, even a
+            // dangling one, counts as existing).
+            if !overwrite.allows_replace() {
+                return Err(already_exists(remote));
             }
-            dst.write_all(&buf[..n]).await?;
-            done += n as u64;
-            reporter.tick(done);
+            let real = step(&p.cancel, sftp.hi.canonicalize(remote)).await.map_err(|e| {
+                SshError::PartialTransfer(format!(
+                    "{remote} is a symlink whose target could not be resolved ({e}); not \
+                     replacing it"
+                ))
+            })?;
+            let dest = classify(step(&p.cancel, sftp.hi.metadata(real.clone())).await, &real)?;
+            if matches!(dest, RemoteDest::Missing) {
+                return Err(SshError::PartialTransfer(format!(
+                    "{remote} is a symlink to {real}, which does not exist; not replacing it"
+                )));
+            }
+            p.note(format!("{remote} is a symlink: wrote through it to {real}"));
+            (real, dest)
         }
+        other => (remote.to_string(), classify(other, remote)?),
+    };
+    if matches!(dest, RemoteDest::File(_)) && !overwrite.allows_replace() {
+        return Err(already_exists(&target));
+    }
+    let replace = matches!(dest, RemoteDest::File(_)) && overwrite.allows_replace();
+
+    // The rename replaces the remote inode, so its mode must be carried over
+    // explicitly: an overwritten file keeps its own permissions (a 0600 secret
+    // must not become 0644, a deploy script must keep +x); a new file takes the
+    // local file's mode where the platform has one; an unknown destination
+    // takes the server's default.
+    let (mode, preserve_required) = match &dest {
+        RemoteDest::File(m) => (m.permissions.map(|p| p & 0o7777), m.permissions.is_some()),
+        RemoteDest::Missing => (local_mode(local_meta.as_ref()), false),
+        RemoteDest::Unknown => (None, false),
+    };
+
+    let mut src = tokio::fs::File::open(local).await?;
+    p.start_file(local, total);
+
+    // Stage. EXCLUDE: never open something already at the staging name.
+    let tmp = remote_staging(&target, PART_SUFFIX);
+    let attrs = FileAttributes { permissions: mode, ..Default::default() };
+    let opened = step(
+        &p.cancel,
+        sftp.hi.open_with_flags_and_attributes(
+            tmp.clone(),
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            attrs,
+        ),
+    )
+    .await;
+    let mut dst = match opened {
+        Ok(f) => f,
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::PermissionDenied) => {
+            // The folder is not writable, only (perhaps) the file.
+            let why = "the folder is not writable";
+            let checked = check_in_place_target(sftp, &p.cancel, &target, replace).await?;
+            edit_commit_guard(sftp, p, None, &target).await?;
+            p.warn(in_place_warning(&target, why));
+            let done = write_in_place(sftp, p, &mut src, &target, checked, mode)
+                .await
+                .map_err(|e| in_place_failed(&target, why, e, None))?;
+            p.finish_file(done);
+            return Ok(done);
+        }
+        Err(e) => {
+            // No status reply (a cancel, a stall): the server may have created
+            // the staging file before the answer was given up on.
+            if !matches!(&e, SshError::Sftp(russh_sftp::client::error::Error::Status(_))) {
+                remove_remote_quietly(sftp, &tmp).await;
+            }
+            return Err(e);
+        }
+    };
+
+    let staged: Result<u64, SshError> = async {
+        let done = stream_up(p, &mut src, &mut dst).await?;
         if let Some(m) = mode {
-            let set = dst
-                .set_metadata(russh_sftp::protocol::FileAttributes {
-                    permissions: Some(m),
-                    ..Default::default()
-                })
-                .await;
+            let set = step(
+                &p.cancel,
+                dst.set_metadata(FileAttributes { permissions: Some(m), ..Default::default() }),
+            )
+            .await;
             // FSETSTAT may be denied or unsupported. Retry by path (SETSTAT; the
-            // temp is our own unique sibling), then accept it if the permission
-            // bits match. Otherwise, for an overwrite, fail BEFORE the rename so
-            // the original (and its permissions) stays. Special bits are not
+            // staging file is our own), then accept it if the permission bits
+            // match. Otherwise, for an overwrite, fail BEFORE the rename so the
+            // original (and its permissions) stays. Special bits are not
             // compared: servers/kernels routinely strip setuid/setgid.
             if set.is_err() && preserve_required {
-                let _ = sftp
-                    .set_metadata(
+                let _ = step(
+                    &p.cancel,
+                    sftp.hi.set_metadata(
                         tmp.clone(),
-                        russh_sftp::protocol::FileAttributes {
-                            permissions: Some(m),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let actual = sftp
-                    .metadata(tmp.clone())
+                        FileAttributes { permissions: Some(m), ..Default::default() },
+                    ),
+                )
+                .await;
+                let actual = step(&p.cancel, sftp.hi.metadata(tmp.clone()))
                     .await
                     .ok()
                     .and_then(|md| md.permissions)
                     .map(|p| p & 0o777);
                 if actual != Some(m & 0o777) {
-                    // Close explicitly so it completes before the temp is
-                    // removed (some servers cannot delete an open file).
-                    let _ = dst.shutdown().await;
                     return Err(SshError::PartialTransfer(format!(
-                        "could not preserve the permissions ({m:o}) of {remote}; left it unchanged"
+                        "could not preserve the permissions ({m:o}) of {target}; left it unchanged"
                     )));
                 }
             }
         }
         // shutdown (not just flush) closes the remote handle, which must happen
         // before the rename and also avoids leaking the SFTP handle.
-        dst.shutdown().await?;
-        reporter.finish(done);
+        step(&p.cancel, dst.shutdown()).await?;
+        // The last point a cancel applies: the commit below runs to its end.
+        if p.cancelled() {
+            return Err(SshError::TransferCancelled);
+        }
         Ok(done)
     }
     .await;
 
-    match copy_result {
-        Ok(done) => {
-            // Atomic replace. SSH_FXP_RENAME does not universally replace an
-            // existing target, so if the direct rename fails, move the existing
-            // file ASIDE to a backup (never delete it) before putting the new
-            // one in place — so a second failure or a dropped connection cannot
-            // destroy the original with nothing to recover.
-            if let Err(e) = sftp.rename(tmp.clone(), remote.to_string()).await {
-                // Existence/mode unknown: SFTPv3 RENAME does not overwrite, so a
-                // failure likely means a file is there. Leave it alone.
-                if no_clobber {
-                    let _ = sftp.remove_file(tmp).await;
-                    return Err(SshError::PartialTransfer(format!(
-                        "{remote} may already exist and its permissions could not be read; \
-                         not overwriting it ({e})"
-                    )));
-                }
-                let bak = format!("{tmp}.bak");
-                let _ = sftp.remove_file(bak.clone()).await; // clear any stale backup
-                let moved = sftp.rename(remote.to_string(), bak.clone()).await.is_ok();
-                match sftp.rename(tmp.clone(), remote.to_string()).await {
-                    Ok(()) => {
-                        if moved {
-                            let _ = sftp.remove_file(bak).await;
-                        }
-                    }
-                    Err(e) => {
-                        // Restore the original rather than leave nothing behind.
-                        if moved {
-                            let _ = sftp.rename(bak, remote.to_string()).await;
-                        }
-                        let _ = sftp.remove_file(tmp).await;
-                        return Err(e.into());
-                    }
-                }
+    let done = match staged {
+        Ok(done) => done,
+        Err(e) => {
+            // Close explicitly so it completes before the staging file is
+            // removed (some servers cannot delete an open file). Leave the
+            // original untouched; drop the partial staging file. Bounded, and
+            // run even after a cancel: the connection is still up.
+            let _ = tokio::time::timeout(stall_timeout(), dst.shutdown()).await;
+            remove_remote_quietly(sftp, &tmp).await;
+            return Err(e);
+        }
+    };
+
+    // Remote editing: the destination must still hold the bytes the edit
+    // was based on (see `edit_commit_guard`); otherwise nothing is replaced.
+    edit_commit_guard(sftp, p, Some(&tmp), &target).await?;
+
+    // Replacing: what is at the destination now must still be what the user
+    // agreed to replace (see `recheck_target`); a check that fails refuses.
+    if replace {
+        recheck_target(sftp, &tmp, &target, true).await?;
+    }
+
+    // The commit runs as its own task: neither a cancel nor the caller going
+    // away can stop it halfway (with the original moved aside).
+    let commit = {
+        let (sftp, tmp, target) = (Arc::clone(sftp), tmp.clone(), target.clone());
+        shielded(async move { commit_upload(&sftp, &tmp, &target, replace).await }).await?
+    };
+    match commit? {
+        UploadCommit::Done(note) => {
+            if let Some(note) = note {
+                p.note(note);
             }
+            p.finish_file(done);
             Ok(done)
         }
-        Err(e) => {
-            // Leave the original untouched; drop the partial temp.
-            let _ = sftp.remove_file(tmp).await;
-            Err(e)
+        UploadCommit::DoneWithSecondName(warning) => {
+            p.warn(warning);
+            p.finish_file(done);
+            Ok(done)
         }
-    }
-}
-
-/* ------------------------------------------------------------- progress */
-
-/// Throttled progress emitter. Kept as a small struct so both transfer
-/// directions share one policy instead of duplicating the timing logic.
-struct Reporter<'a> {
-    app: &'a AppHandle,
-    payload: TransferProgress,
-    last: Instant,
-    /// Bytes already moved by earlier files of the same tree.
-    base: u64,
-    /// Part of a folder transfer: the row's total is unknown, so never report
-    /// one file's size (or completion) as the tree's.
-    tree: bool,
-}
-
-/// Where a single file copy sits in its transfer, for progress reporting.
-#[derive(Clone, Copy)]
-struct ProgressCtx<'a> {
-    root: &'a str,
-    base: u64,
-    tree: bool,
-}
-
-impl<'a> ProgressCtx<'a> {
-    fn single(path: &'a str) -> Self {
-        Self { root: path, base: 0, tree: false }
-    }
-}
-
-impl<'a> Reporter<'a> {
-    fn new(
-        app: &'a AppHandle,
-        session_id: &str,
-        file_path: &str,
-        total_bytes: u64,
-        direction: &'static str,
-        ctx: ProgressCtx<'_>,
-    ) -> Self {
-        let payload = TransferProgress {
-            session_id: session_id.to_string(),
-            root: ctx.root.to_string(),
-            file_path: file_path.to_string(),
-            bytes_transferred: ctx.base,
-            total_bytes: if ctx.tree { 0 } else { total_bytes },
-            direction,
-            done: false,
-        };
-        // Emit once immediately so the row appears with a denominator rather
-        // than sitting blank until the first interval elapses.
-        let _ = app.emit("sftp://progress", payload.clone());
-        Self {
-            app,
-            payload,
-            last: Instant::now(),
-            base: ctx.base,
-            tree: ctx.tree,
-        }
-    }
-
-    fn tick(&mut self, bytes: u64) {
-        if self.last.elapsed() < PROGRESS_INTERVAL {
-            return;
-        }
-        self.last = Instant::now();
-        self.payload.bytes_transferred = self.base + bytes;
-        let _ = self.app.emit("sftp://progress", self.payload.clone());
-    }
-
-    /// Always emitted, regardless of throttling, so the UI never stalls at 97%.
-    fn finish(&mut self, bytes: u64) {
-        self.payload.bytes_transferred = self.base + bytes;
-        if !self.tree {
-            if self.payload.total_bytes == 0 {
-                self.payload.total_bytes = bytes;
+        UploadCommit::InPlace => {
+            // The complete upload stays at `tmp` until the in-place write has
+            // fully succeeded.
+            let why = "the server would not rename the uploaded copy into place";
+            let checked = match check_in_place_target(sftp, &p.cancel, &target, replace).await {
+                Ok(c) => c,
+                // A cancel stays a cancel (a folder transfer then ends as
+                // cancelled, not with a failed file). Nothing was written to
+                // `target`; the staged copy (no other name links to it here)
+                // is dropped as on any other cancel.
+                Err(SshError::TransferCancelled) => {
+                    remove_remote_quietly(sftp, &tmp).await;
+                    return Err(SshError::TransferCancelled);
+                }
+                Err(e) => {
+                    return Err(transfer_error(
+                        sftp_dead(&e),
+                        format!("{e}; the complete upload is kept on the server at {tmp}"),
+                    ))
+                }
+            };
+            edit_commit_guard(sftp, p, Some(&tmp), &target).await?;
+            p.warn(in_place_warning(&target, why));
+            use tokio::io::AsyncSeekExt;
+            step(&p.cancel, src.seek(std::io::SeekFrom::Start(0)))
+                .await
+                .map_err(|e| in_place_failed(&target, why, e, Some(&tmp)))?;
+            p.start_file(local, total);
+            let done = write_in_place(sftp, p, &mut src, &target, checked, mode)
+                .await
+                .map_err(|e| in_place_failed(&target, why, e, Some(&tmp)))?;
+            if step(&uncancellable(), sftp.hi.remove_file(tmp.clone())).await.is_err() {
+                p.note(format!("{target}: the uploaded copy staged at {tmp} could not be removed"));
             }
-            self.payload.done = true;
+            p.finish_file(done);
+            Ok(done)
         }
-        let _ = self.app.emit("sftp://progress", self.payload.clone());
+    }
+}
+
+/// The note given BEFORE an in-place write starts.
+fn in_place_warning(target: &str, why: &str) -> String {
+    format!(
+        "{target}: {why}, so the file is written in place (not atomic: an interrupted \
+         transfer leaves it incomplete)"
+    )
+}
+
+/// An in-place write that failed: say the file may be incomplete, and where
+/// the complete upload is if one was staged.
+fn in_place_failed(target: &str, why: &str, e: SshError, staged: Option<&str>) -> SshError {
+    let kept = staged
+        .map(|t| format!("; the complete upload is kept on the server at {t}"))
+        .unwrap_or_default();
+    transfer_error(
+        sftp_dead(&e),
+        format!("{target} was being written in place ({why}) and may be incomplete: {e}{kept}"),
+    )
+}
+
+/// A path-rich transfer error. `ChannelLost` when the channel failed (`dead`),
+/// so `sftp_dead` still sees it; a `PartialTransfer` otherwise.
+fn transfer_error(dead: bool, text: String) -> SshError {
+    if dead {
+        SshError::ChannelLost(text)
+    } else {
+        SshError::PartialTransfer(text)
+    }
+}
+
+/// "a directory", "a symlink"… for a remote entry that is not a regular file.
+fn remote_kind(m: &russh_sftp::protocol::FileAttributes) -> &'static str {
+    let t = m.file_type();
+    if t.is_dir() {
+        "a directory"
+    } else if t.is_symlink() {
+        "a symlink"
+    } else if t.is_file() {
+        "a regular file"
+    } else {
+        "something other than a regular file"
+    }
+}
+
+/// Before replacing `target`: it must still be a regular file (LSTAT, so a
+/// link is seen as one). A link or folder that took its place is neither
+/// replaced nor followed, and a check that FAILS refuses too. `missing_ok`:
+/// a destination that disappeared may be created. The staged copy `tmp` is
+/// removed on refusal, or kept and named if the channel failed.
+async fn recheck_target(sftp: &SftpConn, tmp: &str, target: &str, missing_ok: bool) -> Result<(), SshError> {
+    let why = match step(&uncancellable(), sftp.hi.symlink_metadata(target)).await {
+        Ok(m) if m.file_type().is_file() => return Ok(()),
+        Ok(m) => format!("{target} became {} during the upload; not replacing it", remote_kind(&m)),
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => {
+            if missing_ok {
+                return Ok(());
+            }
+            format!("{target} disappeared during the upload; not replacing it")
+        }
+        Err(e) if sftp_dead(&e) => {
+            return Err(SshError::ChannelLost(format!(
+                "could not check {target} again before replacing it ({e}); it was not replaced, \
+                 and the new copy is at {tmp}"
+            )))
+        }
+        Err(e) => format!("could not check {target} again before replacing it ({e}); not replacing it"),
+    };
+    remove_remote_quietly(sftp, tmp).await;
+    Err(SshError::PartialTransfer(why))
+}
+
+/// After an install rename whose reply never came (`e`): it happened if the
+/// staged copy is gone. Anything else is no proof that it did NOT happen — the
+/// server may still be working on it — so the staged copy is kept and named.
+///
+/// RESIDUAL (non-compliant server, or another process on it): "staging gone"
+/// is taken as "installed". OpenSSH renames by link() then unlink(), so the
+/// staging name goes last, after the target exists; a server that does it
+/// the other way round, or a process deleting the staging file, would make
+/// this report success wrongly.
+async fn after_lost_install(
+    sftp: &SftpConn,
+    tmp: &str,
+    target: &str,
+    e: SshError,
+) -> Result<UploadCommit, SshError> {
+    match remote_present(sftp, tmp).await {
+        Ok(false) => Ok(UploadCommit::Done(None)),
+        _ => Err(SshError::ChannelLost(format!(
+            "the connection failed while putting the upload in place ({e}), and the server may \
+             still complete it: {target} holds either its old or its new version, and if not \
+             the new one, the new copy is at {tmp}"
+        ))),
+    }
+}
+
+/// Whether two LSTAT results look like the same file: regular files with the
+/// same size, modification time, owner and mode. SFTPv3 reports no inode
+/// number, so this is the best "is this the upload?" test the protocol
+/// allows. A different file matching in all of these is not ruled out, so it
+/// only ever words an error; nothing is deleted on its say-so.
+fn same_remote_file(a: &russh_sftp::protocol::FileAttributes, b: &russh_sftp::protocol::FileAttributes) -> bool {
+    a.file_type().is_file()
+        && b.file_type().is_file()
+        && a.size.is_some()
+        && a.size == b.size
+        && a.mtime.is_some()
+        && a.mtime == b.mtime
+        && a.uid == b.uid
+        && a.gid == b.gid
+        && a.permissions == b.permissions
+}
+
+/// The error for a `hardlink@openssh.com` commit whose reply never came
+/// (`e`). Made or not, the link only ADDS a name, so the staged upload is at
+/// `tmp` either way: nothing is concluded and nothing deleted. The error says
+/// what an LSTAT of both names shows, and names both.
+async fn after_lost_link(sftp: &SftpConn, tmp: &str, target: &str, e: SshError) -> SshError {
+    let never = uncancellable();
+    let seen = match step(&never, sftp.hi.symlink_metadata(target)).await {
+        Ok(t) => match step(&never, sftp.hi.symlink_metadata(tmp)).await {
+            Ok(s) if same_remote_file(&t, &s) => format!(
+                "{target} now matches the upload kept at {tmp} (size, time, owner and mode), so \
+                 the link most likely went through and {tmp} is a second name for it"
+            ),
+            _ => format!(
+                "something is at {target}, but it could not be confirmed to be the upload, which \
+                 is kept at {tmp}"
+            ),
+        },
+        Err(SshError::Sftp(s)) if sftp_status(&s) == Some(StatusCode::NoSuchFile) => format!(
+            "{target} does not exist yet (the server may still create it as a second name for \
+             the upload); the upload is kept at {tmp}"
+        ),
+        Err(e2) => format!("{target} could not be checked ({e2}); the upload is kept at {tmp}"),
+    };
+    SshError::ChannelLost(format!("the connection failed while linking the upload into place ({e}): {seen}"))
+}
+
+/// Drop the backup of a replaced file; a note if it could not be.
+async fn remove_backup(sftp: &SftpConn, bak: &str, target: &str) -> Option<String> {
+    match step(&uncancellable(), sftp.hi.remove_file(bak)).await {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "{target} was replaced, but its previous version could not be removed ({e}) and was \
+             left at {bak}"
+        )),
+    }
+}
+
+/// Drop `name`, a hard link (second name) to a file that must stay at its
+/// other name. REMOVE first; if the server refuses it for that name, RENAME
+/// it to a fresh unique throwaway name beside `beside` (with `suffix`) and
+/// REMOVE that. `Err` says which name is left (a description naming every
+/// path it may be at) and why; the caller must never treat that file as
+/// ours to truncate, since another name shares it.
+async fn drop_second_name(
+    sftp: &SftpConn,
+    name: &str,
+    beside: &str,
+    suffix: &str,
+) -> Result<(), (String, SshError)> {
+    let never = uncancellable();
+    let refused = match step(&never, sftp.hi.remove_file(name)).await {
+        Ok(()) => return Ok(()),
+        Err(e) if sftp_dead(&e) => return Err((name.to_string(), e)),
+        Err(e) => e,
+    };
+    let throwaway = remote_staging(beside, suffix);
+    match step(&never, sftp.hi.rename(name, throwaway.clone())).await {
+        Ok(()) => {}
+        Err(e) if sftp_dead(&e) => {
+            return Err((format!("{name} (or {throwaway}, if the server completes the rename)"), e))
+        }
+        Err(_) => return Err((name.to_string(), refused)),
+    }
+    match step(&never, sftp.hi.remove_file(throwaway.clone())).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err((throwaway, e)),
+    }
+}
+
+/// How `place_remote_noreplace` ended.
+enum Placed {
+    /// Hard-linked: `to` is a second name for `from`, which still exists.
+    Linked,
+    /// Renamed: `from` is gone, its file is at `to`.
+    Renamed,
+    /// Refused, with something at `to` (left alone; `from` untouched).
+    Exists,
+    /// RENAME refused with `to` free: the server will not rename here.
+    Refused(SshError),
+    /// A step's reply never came (`sftp_dead`). After a lost LINK reply,
+    /// `from` is still there whether or not the link was made.
+    LinkLost(SshError),
+    RenameLost(SshError),
+    /// Refused, and the LSTAT of `to` that should tell why failed.
+    Unchecked { refused: SshError, check: SshError },
+}
+
+/// Put `from` at `to` only if nothing is there. Where the server offers
+/// `hardlink@openssh.com`: link(2), whose "target exists" refusal is atomic
+/// in the server's kernel — no check-then-act, so no race at all. Else
+/// SFTPv3 RENAME, which by the spec (draft-ietf-secsh-filexfer-02, 6.5) must
+/// fail if `to` exists; OpenSSH implements it with link() + unlink().
+///
+/// A link refused with `to` free (a filesystem without hard links: FAT, many
+/// FUSE and SMB mounts) falls back to RENAME.
+///
+/// RESIDUAL (non-compliant server): without a working hard link, this relies
+/// on the server's RENAME following the spec. A server whose RENAME replaces
+/// — and OpenSSH itself on a filesystem without links, where it stat()s and
+/// then rename()s — can overwrite a file that appears at `to` at that moment.
+async fn place_remote_noreplace(sftp: &SftpConn, from: &str, to: &str) -> Placed {
+    let never = uncancellable();
+    if sftp.hardlink {
+        match step(&never, remote_hard_link(&sftp.raw, from, to)).await {
+            Ok(()) => return Placed::Linked,
+            Err(e) if sftp_dead(&e) => return Placed::LinkLost(e),
+            Err(refused) => match remote_present(sftp, to).await {
+                Ok(true) => return Placed::Exists,
+                Ok(false) => {}
+                Err(check) => return Placed::Unchecked { refused, check },
+            },
+        }
+    }
+    match step(&never, sftp.hi.rename(from, to)).await {
+        Ok(()) => Placed::Renamed,
+        Err(e) if sftp_dead(&e) => Placed::RenameLost(e),
+        Err(refused) => match remote_present(sftp, to).await {
+            Ok(true) => Placed::Exists,
+            Ok(false) => Placed::Refused(refused),
+            Err(check) => Placed::Unchecked { refused, check },
+        },
+    }
+}
+
+/// `Never`: put the staged upload `tmp` at `target`, never over anything —
+/// including a file that appeared after every earlier check (see
+/// `place_remote_noreplace`). There is no up-front probe of the server's
+/// RENAME: the commit itself is the no-clobber guarantee.
+///
+/// A step whose reply is lost (a stall, a dead channel) ends in
+/// `ChannelLost` naming both paths, so a folder transfer stops and the
+/// connection is dropped; it is never reported as an ordinary refusal.
+async fn commit_never(sftp: &SftpConn, tmp: &str, target: &str) -> Result<UploadCommit, SshError> {
+    match place_remote_noreplace(sftp, tmp, target).await {
+        // The upload is at `target`; `tmp` is a second name for it and must
+        // go (a server may deny REMOVE, e.g. OpenSSH `-P remove`, while
+        // allowing the link). Never silently left behind.
+        Placed::Linked => match drop_second_name(sftp, tmp, target, PART_SUFFIX).await {
+            Ok(()) => Ok(UploadCommit::Done(None)),
+            Err((left, e)) if sftp_dead(&e) => Err(SshError::ChannelLost(format!(
+                "{target} was uploaded, but the connection failed while removing its staging \
+                 name ({e}): {left} may still be a second name for the same file (a hard link, \
+                 not a copy); if it is there, delete it manually"
+            ))),
+            Err((left, e)) => Ok(UploadCommit::DoneWithSecondName(format!(
+                "{target} was uploaded, but the server would not delete its staging name ({e}): \
+                 {left} is a SECOND NAME FOR THE SAME FILE (a hard link, not a copy: a change \
+                 through either name changes both). It must be deleted manually"
+            ))),
+        },
+        Placed::Renamed => Ok(UploadCommit::Done(None)),
+        Placed::Exists => {
+            remove_remote_quietly(sftp, tmp).await;
+            Err(already_exists(target))
+        }
+        // Written in place with an exclusive create: still no clobber.
+        Placed::Refused(_) => Ok(UploadCommit::InPlace),
+        Placed::LinkLost(e) => Err(after_lost_link(sftp, tmp, target, e).await),
+        Placed::RenameLost(e) => after_lost_install(sftp, tmp, target, e).await,
+        Placed::Unchecked { refused, check } if sftp_dead(&check) => Err(SshError::ChannelLost(format!(
+            "the server would not put the upload in place ({refused}), and checking {target} then \
+             failed ({check}); {target} was not overwritten, and the upload is kept at {tmp}"
+        ))),
+        Placed::Unchecked { refused, check } => {
+            remove_remote_quietly(sftp, tmp).await;
+            Err(SshError::PartialTransfer(format!(
+                "the server would not put the upload in place ({refused}), and {target} could not \
+                 be checked ({check}); not overwriting it"
+            )))
+        }
+    }
+}
+
+/// How `put_back` ended.
+enum PutBack {
+    /// The original is at `target` again, and the backup name is gone.
+    Restored,
+    /// The original is at `target` again (hard-linked back), but the backup
+    /// name could not be dropped: both are names for the SAME file. The error
+    /// names both and says so. Nothing may write `target` in place now: that
+    /// would change the backup too.
+    Twinned(SshError),
+    /// Not put back.
+    Failed(SshError),
+}
+
+/// Move the original back from `bak` to `target` after a failed replace,
+/// never over whatever appeared at `target` meanwhile (see
+/// `place_remote_noreplace`, and its residual). Hard-linked back, the backup
+/// name is then dropped (see `drop_second_name`); if it cannot be, that is
+/// `Twinned`, never a silent success.
+async fn put_back(sftp: &SftpConn, bak: &str, target: &str) -> PutBack {
+    match place_remote_noreplace(sftp, bak, target).await {
+        Placed::Linked => match drop_second_name(sftp, bak, target, BAK_SUFFIX).await {
+            Ok(()) => PutBack::Restored,
+            Err((left, e)) => PutBack::Twinned(transfer_error(
+                sftp_dead(&e),
+                format!(
+                    "the original was linked back to {target}, but its backup name could not be \
+                     removed ({e}): {left} and {target} are the SAME FILE (two names for one \
+                     file, not two copies), so {target} was not written in place; delete {left} \
+                     manually"
+                ),
+            )),
+        },
+        Placed::Renamed => PutBack::Restored,
+        Placed::Exists => PutBack::Failed(SshError::PartialTransfer(format!(
+            "something else is at {target} now, so it was not moved back over it"
+        ))),
+        Placed::Refused(e) | Placed::LinkLost(e) | Placed::RenameLost(e) => PutBack::Failed(e),
+        Placed::Unchecked { check, .. } => PutBack::Failed(check),
+    }
+}
+
+/// Put a staged upload at `target`. See `copy_local_file`, which runs this as
+/// a shielded task: none of its steps can be cancelled.
+///
+/// - `replace == false`: `commit_never`.
+/// - `replace == true`: `posix-rename@openssh.com` (atomic replace) where
+///   offered; else a RENAME (which replaces on some servers); else the
+///   original — re-checked to be a regular file — is moved ASIDE (never
+///   deleted), checked again under its backup name, the new copy put in
+///   place and the backup dropped. Every error after the move-aside names the
+///   backup. The original is moved back only without replacing anything
+///   (`put_back`); otherwise both copies are kept and named.
+///
+/// A step whose reply is lost (the channel stalled or died) is followed by a
+/// look at the server, and only a POSITIVE sign that it happened is trusted:
+/// a "not there yet" may just mean the server has not got to it. Every other
+/// case keeps the staged copy and names every path involved. The staging file
+/// is removed on failure unless the error names it; on `InPlace` it is kept.
+///
+/// RESIDUAL (non-compliant server, replace only): after a lost move-aside
+/// reply, a backup that is present is taken as "the move happened". A server
+/// that renames by link() then unlink() exposes the backup while the
+/// original name still exists and the request is still pending; the install
+/// RENAME that follows is then refused (the target exists) and reported with
+/// both paths, so nothing is lost, but the error may say the original is at
+/// the backup when it is (also) still at `target`.
+async fn commit_upload(sftp: &SftpConn, tmp: &str, target: &str, replace: bool) -> Result<UploadCommit, SshError> {
+    let never = uncancellable();
+    if !replace {
+        return commit_never(sftp, tmp, target).await;
+    }
+    if sftp.posix_rename {
+        match step(&never, posix_rename(&sftp.raw, tmp, target)).await {
+            Ok(()) => return Ok(UploadCommit::Done(None)),
+            Err(e) if sftp_dead(&e) => return after_lost_install(sftp, tmp, target, e).await,
+            // Refused (a policy, a filesystem quirk): try the portable way.
+            Err(_) => {}
+        }
+    }
+    // Some servers' RENAME does replace.
+    match step(&never, sftp.hi.rename(tmp, target)).await {
+        Ok(()) => return Ok(UploadCommit::Done(None)),
+        Err(e) if sftp_dead(&e) => return after_lost_install(sftp, tmp, target, e).await,
+        Err(_) => {}
+    }
+    // Only a regular file is ever moved aside: checked again right before the
+    // move (a link or folder may have taken its place during the attempts
+    // above).
+    recheck_target(sftp, tmp, target, false).await?;
+    // Move the original ASIDE (never delete it) before putting the new one in
+    // place, so a second failure or a dropped connection cannot destroy it
+    // with nothing to recover.
+    let bak = remote_staging(target, BAK_SUFFIX);
+    match step(&never, sftp.hi.rename(target, bak.clone())).await {
+        Ok(()) => {}
+        Err(e) if sftp_dead(&e) => match remote_present(sftp, &bak).await {
+            // The reply was lost, but the move happened: carry on.
+            Ok(true) => {}
+            // Not proof that it did not happen: the server may still be
+            // processing that rename. Keep everything, name everything.
+            _ => {
+                return Err(SshError::ChannelLost(format!(
+                    "the connection failed while moving {target} aside ({e}), and the server may \
+                     still complete that move: if {target} is missing, the original is at {bak}. \
+                     The new copy is kept at {tmp}"
+                )))
+            }
+        },
+        // Cannot even move the original: the server does not rename here.
+        Err(_) => return Ok(UploadCommit::InPlace),
+    }
+    // The original is at `bak`: every error from here names it. What was
+    // moved must be the regular file that was checked; something swapped in
+    // between the check and the move is put back.
+    match step(&never, sftp.hi.symlink_metadata(bak.clone())).await {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(m) => {
+            let why = format!(
+                "{target} changed while it was being replaced (what was moved aside is {})",
+                remote_kind(&m)
+            );
+            return Err(match put_back(sftp, &bak, target).await {
+                PutBack::Restored => {
+                    remove_remote_quietly(sftp, tmp).await;
+                    SshError::PartialTransfer(format!("{why}; it was put back as it was and not replaced"))
+                }
+                PutBack::Twinned(e2) => transfer_error(
+                    sftp_dead(&e2),
+                    format!("{why}, so it was not replaced. {e2}. The new copy is kept at {tmp}"),
+                ),
+                PutBack::Failed(e2) => transfer_error(
+                    sftp_dead(&e2),
+                    format!("{why}, and could not be put back ({e2}): it is at {bak}, and the new copy at {tmp}"),
+                ),
+            });
+        }
+        Err(e) => {
+            return Err(transfer_error(
+                sftp_dead(&e),
+                format!(
+                    "could not check what was moved aside from {target} ({e}): the original is \
+                     at {bak}, and the new copy at {tmp}"
+                ),
+            ))
+        }
+    }
+    let e = match step(&never, sftp.hi.rename(tmp, target)).await {
+        Ok(()) => return Ok(UploadCommit::Done(remove_backup(sftp, &bak, target).await)),
+        Err(e) => e,
+    };
+    if sftp_dead(&e) {
+        return match remote_present(sftp, tmp).await {
+            // The reply was lost, but the new copy went in.
+            Ok(false) => Ok(UploadCommit::Done(remove_backup(sftp, &bak, target).await)),
+            _ => Err(SshError::ChannelLost(format!(
+                "the connection failed while putting the upload in place ({e}): the original is \
+                 at {bak}, and the new copy at {tmp} (or at {target}, if the server still \
+                 completes that rename)"
+            ))),
+        };
+    }
+    match put_back(sftp, &bak, target).await {
+        PutBack::Restored => Ok(UploadCommit::InPlace),
+        // Never on to the in-place fallback: its truncating OPEN would hit
+        // the inode the backup name shares.
+        PutBack::Twinned(e2) => Err(transfer_error(
+            sftp_dead(&e2),
+            format!("could not put the upload in place ({e}). {e2}. The new copy is kept at {tmp}"),
+        )),
+        PutBack::Failed(e2) => Err(transfer_error(
+            sftp_dead(&e2),
+            format!(
+                "could not put the upload in place ({e}) or move the original back ({e2}): the \
+                 original is at {bak}, and the new copy at {tmp}"
+            ),
+        )),
+    }
+}
+
+/// Proof that `check_in_place_target` passed: `write_in_place` cannot be
+/// called without one.
+struct InPlaceChecked {
+    replace: bool,
+}
+
+/// Before an in-place write. Replacing (the OPEN will TRUNCATE): `target`
+/// must be a regular file by a SUCCESSFUL LSTAT — a link is never followed, a
+/// folder never touched, and an LSTAT that fails (denied, unsupported, no
+/// answer) refuses. Not replacing, the OPEN is an exclusive create, which
+/// needs no check.
+///
+/// RESIDUAL (another process on the server): SFTPv3 OPEN has no O_NOFOLLOW,
+/// so a symlink swapped in between this LSTAT and the OPEN is followed.
+async fn check_in_place_target(
+    sftp: &SftpConn,
+    cancel: &watch::Receiver<bool>,
+    target: &str,
+    replace: bool,
+) -> Result<InPlaceChecked, SshError> {
+    if !replace {
+        return Ok(InPlaceChecked { replace });
+    }
+    match step(cancel, sftp.hi.symlink_metadata(target)).await {
+        Ok(m) if m.file_type().is_file() => Ok(InPlaceChecked { replace }),
+        Ok(m) => Err(SshError::PartialTransfer(format!(
+            "{target} is now {}; not writing into it",
+            remote_kind(&m)
+        ))),
+        Err(SshError::TransferCancelled) => Err(SshError::TransferCancelled),
+        Err(e) => Err(transfer_error(
+            sftp_dead(&e),
+            format!("could not check {target} before writing it in place ({e}); it was not touched"),
+        )),
+    }
+}
+
+/// The non-atomic fallback: write `target` itself. Replacing, an existing
+/// regular file is truncated (checked first, see `check_in_place_target`);
+/// otherwise the create is exclusive, so an existing file is never touched,
+/// and a failed write removes the file it created.
+async fn write_in_place(
+    sftp: &SftpConn,
+    p: &mut Progress<'_>,
+    src: &mut tokio::fs::File,
+    target: &str,
+    checked: InPlaceChecked,
+    mode: Option<u32>,
+) -> Result<u64, SshError> {
+    use russh_sftp::protocol::{FileAttributes, OpenFlags};
+    let replace = checked.replace;
+    let (flags, attrs) = if replace {
+        // An existing file keeps its own mode, owner and ACLs.
+        (OpenFlags::WRITE | OpenFlags::TRUNCATE, FileAttributes::default())
+    } else {
+        (
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            FileAttributes { permissions: mode, ..Default::default() },
+        )
+    };
+    let mut dst = match step(&p.cancel, sftp.hi.open_with_flags_and_attributes(target, flags, attrs)).await {
+        Ok(f) => f,
+        Err(SshError::Sftp(e))
+            if !replace && sftp_status(&e) == Some(StatusCode::Failure) =>
+        {
+            // OpenSSH reports EEXIST on an exclusive create as a generic
+            // failure; say what it most likely means.
+            return Err(SshError::PartialTransfer(format!(
+                "could not create {target} ({e}); it may already exist, so it was not overwritten"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let r = stream_up(p, src, &mut dst).await;
+    let closed = step(&uncancellable(), dst.shutdown()).await;
+    let r = r.and_then(|done| closed.map(|_| done));
+    if r.is_err() && !replace {
+        // Ours (the create was exclusive) and incomplete.
+        remove_remote_quietly(sftp, target).await;
+    }
+    r
+}
+
+/* --------------------------------------------------------- remote editing */
+
+// The SFTP half of "edit a remote file in a local editor" (the local half —
+// temp folders, the watcher, opening the editor — is utils::remote_edit).
+// Everything here goes through the same hardened paths as a transfer:
+// `copy_remote_file` stages and commits the download, `copy_local_file` the
+// upload (staged, posix-rename where offered, mode kept), under `Replace`.
+
+use crate::utils::remote_edit::{RemoteBaseline, RemoteStamp, MAX_EDIT_BYTES};
+
+/// What the remote file looked like when it was (re)checked.
+fn stamp_of(m: &russh_sftp::protocol::FileAttributes) -> RemoteStamp {
+    RemoteStamp { size: m.size.unwrap_or(0), mtime: m.mtime }
+}
+
+/// What a remote file opened for editing looks like on the server.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EditProbe {
+    pub stamp: RemoteStamp,
+    /// Permission bits as the server reports them (type bits included).
+    pub mode: Option<u32>,
+}
+
+/// A remote file downloaded for editing.
+#[derive(Debug, Clone)]
+pub(crate) struct EditFetched {
+    pub probe: EditProbe,
+    /// The remote file as downloaded: its stamp and the SHA-256 of the bytes
+    /// now on disk here. Every later save is checked against this.
+    pub baseline: RemoteBaseline,
+    pub bytes: u64,
+}
+
+/// How a save was pushed to the server.
+#[derive(Debug)]
+pub(crate) enum EditPushed {
+    /// Uploaded, and read back: the remote file holds exactly the bytes sent.
+    /// `baseline` is the new one.
+    Uploaded { baseline: RemoteBaseline, bytes: u64, notes: Vec<String> },
+    /// The remote file is not what the edit was based on. `now` is None when
+    /// it is gone.
+    ///
+    /// `during_upload: false`: someone else changed or removed it before the
+    /// commit, and NOTHING was uploaded. `true`: the upload was committed, but
+    /// reading it back found other bytes — someone wrote at the same time, so
+    /// the server may hold their version, not this one. Either way the
+    /// baseline is NOT moved on.
+    Conflict { now: Option<RemoteStamp>, during_upload: bool },
+}
+
+/// STAT (following a link, as an editor of `/etc/foo` -> `foo.real` would
+/// expect). `None` only for a definite "no such file".
+async fn edit_stat(sftp: &SftpConn, remote: &str) -> Result<Option<russh_sftp::protocol::FileAttributes>, SshError> {
+    match step(&uncancellable(), sftp.hi.metadata(remote)).await {
+        Ok(m) => Ok(Some(m)),
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read a remote file and return the SHA-256 of its content. `Ok(None)` when
+/// it is definitely gone, or holds more than `MAX_EDIT_BYTES` (it cannot be
+/// the bytes an edit was based on, so it counts as changed).
+async fn remote_content_hash(sftp: &SftpConn, remote: &str) -> Result<Option<String>, SshError> {
+    use sha2::{Digest, Sha256};
+    let never = uncancellable();
+    let mut f = match step(&never, sftp.hi.open(remote)).await {
+        Ok(f) => f,
+        Err(SshError::Sftp(e)) if sftp_status(&e) == Some(StatusCode::NoSuchFile) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let read: Result<Option<String>, SshError> = async {
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; CHUNK];
+        let mut done = 0u64;
+        loop {
+            let n = step(&never, f.read(&mut buf)).await?;
+            if n == 0 {
+                break;
+            }
+            done += n as u64;
+            if done > MAX_EDIT_BYTES {
+                return Ok(None);
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect()))
+    }
+    .await;
+    let _ = tokio::time::timeout(stall_timeout(), f.close()).await;
+    read
+}
+
+/// Remote editing's commit-time check (`Progress::commit_guard`): read the
+/// destination back and require the SHA-256 the edit was based on. Called by
+/// `copy_local_file` immediately before the commit, and before any in-place
+/// write; a no-op for every other transfer.
+///
+/// On a mismatch (or the file gone) nothing is committed: the staged copy
+/// `tmp` is removed and `p.guard_tripped` set, so the caller reports a
+/// conflict rather than an error. A failed read refuses too.
+///
+/// RESIDUAL: SFTP has no conditional write, so a write by someone else in the
+/// window between this read and the rename (one or two round trips) is not
+/// seen here. `edit_push_with` reads the result back afterwards, so such a
+/// race is reported as a conflict and never adopted as the new baseline —
+/// but their bytes may by then have been replaced by ours (or ours by theirs).
+async fn edit_commit_guard(sftp: &SftpConn, p: &mut Progress<'_>, tmp: Option<&str>, target: &str) -> Result<(), SshError> {
+    let Some(expect) = p.commit_guard.clone() else { return Ok(()) };
+    if let Some(hook) = p.before_guard.clone() {
+        hook();
+    }
+    let found = remote_content_hash(sftp, target).await;
+    let why = match found {
+        Ok(Some(h)) if h == expect => return Ok(()),
+        Ok(_) => {
+            p.guard_tripped = true;
+            format!("{target} was changed on the server while the save was being uploaded; not replacing it")
+        }
+        Err(e) => format!("could not read {target} back to check it before replacing it ({e}); not replacing it"),
+    };
+    if let Some(tmp) = tmp {
+        remove_remote_quietly(sftp, tmp).await;
+    }
+    Err(SshError::PartialTransfer(why))
+}
+
+/// The remote file, checked as editable: it exists, is a regular file (after
+/// following a link) and is no bigger than `MAX_EDIT_BYTES`.
+pub(crate) async fn edit_probe_with(sftp: &SftpConn, remote: &str) -> Result<EditProbe, SshError> {
+    let m = edit_stat(sftp, remote)
+        .await?
+        .ok_or_else(|| SshError::PartialTransfer(format!("{remote} no longer exists on the server")))?;
+    if !m.file_type().is_file() {
+        return Err(SshError::PartialTransfer(format!(
+            "{remote} is {}; only regular files can be edited",
+            remote_kind(&m)
+        )));
+    }
+    let size = m.size.unwrap_or(0);
+    if size > MAX_EDIT_BYTES {
+        return Err(SshError::PartialTransfer(format!(
+            "{remote} is {} MB; files over {} MB are not opened for editing — download it instead",
+            size.div_ceil(1024 * 1024),
+            MAX_EDIT_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(EditProbe { stamp: stamp_of(&m), mode: m.permissions })
+}
+
+/// SHA-256 of a local file of at most `MAX_EDIT_BYTES`, off the runtime.
+async fn local_edit_hash(local: &str) -> Result<String, SshError> {
+    let path = std::path::PathBuf::from(local);
+    tokio::task::spawn_blocking(move || {
+        let m = std::fs::symlink_metadata(&path)?;
+        if !m.is_file() || m.len() > MAX_EDIT_BYTES {
+            return Err(std::io::Error::other(format!(
+                "{} is not a plain file of at most {} MB",
+                path.display(),
+                MAX_EDIT_BYTES / (1024 * 1024)
+            )));
+        }
+        crate::utils::remote_edit::hash_file(&path)
+    })
+    .await
+    .map_err(|e| SshError::PartialTransfer(e.to_string()))?
+    .map_err(|e| SshError::PartialTransfer(format!("could not read the local copy: {e}")))
+}
+
+/// Download `remote` to `local` (a path that must not exist yet) and return
+/// the baseline: the remote size and mtime as they were downloaded, and the
+/// SHA-256 of the bytes written. A file that changed WHILE it was being read
+/// is refused (the copy is removed), and so is one that grows past
+/// `MAX_EDIT_BYTES` — the cap is enforced per chunk while streaming, so a
+/// lying or growing file never puts more than that on disk.
+pub(crate) async fn edit_fetch_with(sftp: &Arc<SftpConn>, remote: &str, local: &str) -> Result<EditFetched, SshError> {
+    let before = edit_probe_with(sftp, remote).await?;
+    let mut p = Progress::detached(uncancellable());
+    p.byte_limit = Some(MAX_EDIT_BYTES);
+    let bytes = copy_remote_file(sftp, &mut p, remote, local, Overwrite::Never).await?;
+    let after = edit_stat(sftp, remote).await;
+    let steady = matches!(&after, Ok(Some(m)) if !before.stamp.differs(&stamp_of(m)) && bytes == before.stamp.size);
+    if !steady {
+        let _ = tokio::fs::remove_file(local).await;
+        return Err(match after {
+            Err(e) => e,
+            _ => SshError::PartialTransfer(format!(
+                "{remote} changed on the server while it was downloading; try again"
+            )),
+        });
+    }
+    let hash = match local_edit_hash(local).await {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(local).await;
+            return Err(e);
+        }
+    };
+    Ok(EditFetched { probe: before, baseline: RemoteBaseline { stamp: before.stamp, hash }, bytes })
+}
+
+/// Push a saved local copy (a private snapshot) back over `remote`.
+///
+/// With `expect` (a normal save), the save is checked against the baseline
+/// twice: a cheap STAT before staging (size or mtime differ: `Conflict`, and
+/// nothing is sent), then — the check that matters — the remote content is
+/// read back and hashed IMMEDIATELY BEFORE the commit (`edit_commit_guard`),
+/// so a same-size change within the same second, or a write made while the
+/// upload was being staged, is still a `Conflict` with nothing replaced.
+/// Without `expect` (the user chose "Overwrite remote"), it is replaced
+/// regardless.
+///
+/// After the commit the remote file is read back again: only if it holds
+/// exactly the bytes sent does its stamp and hash become the new baseline;
+/// anything else means someone wrote concurrently, and is a `Conflict`
+/// (`during_upload`), never adopted.
+///
+/// RESIDUAL: SFTP has no conditional write. Between the commit-time read and
+/// the rename (one or two round trips) another writer can still land, and
+/// one of the two versions is lost. The read-back afterwards turns that into
+/// a reported conflict, but cannot undo it.
+pub(crate) async fn edit_push_with(
+    sftp: &Arc<SftpConn>,
+    local: &str,
+    remote: &str,
+    expect: Option<&RemoteBaseline>,
+) -> Result<EditPushed, SshError> {
+    edit_push_hooked(sftp, local, remote, expect, None, None).await
+}
+
+/// A test hook (a concurrent writer) for `edit_push_hooked`.
+pub(crate) type EditHook = Arc<dyn Fn() + Send + Sync>;
+
+/// `edit_push_with`, with test hooks: `before_guard` runs right before the
+/// commit-time read, `after_commit` between the commit and the read-back.
+/// Production passes None for both.
+pub(crate) async fn edit_push_hooked(
+    sftp: &Arc<SftpConn>,
+    local: &str,
+    remote: &str,
+    expect: Option<&RemoteBaseline>,
+    before_guard: Option<EditHook>,
+    after_commit: Option<EditHook>,
+) -> Result<EditPushed, SshError> {
+    let sent = local_edit_hash(local).await?;
+    if let Some(base) = expect {
+        match edit_stat(sftp, remote).await? {
+            None => return Ok(EditPushed::Conflict { now: None, during_upload: false }),
+            Some(m) if !m.file_type().is_file() => {
+                return Err(SshError::PartialTransfer(format!(
+                    "{remote} is now {}; not uploading over it",
+                    remote_kind(&m)
+                )))
+            }
+            Some(m) if base.stamp.differs(&stamp_of(&m)) => {
+                return Ok(EditPushed::Conflict { now: Some(stamp_of(&m)), during_upload: false })
+            }
+            Some(_) => {}
+        }
+    }
+    let mut p = Progress::detached(uncancellable());
+    p.commit_guard = expect.map(|b| b.hash.clone());
+    p.before_guard = before_guard;
+    let bytes = match copy_local_file(sftp, &mut p, local, remote, Overwrite::Replace).await {
+        Ok(b) => b,
+        Err(_) if p.guard_tripped => {
+            let now = edit_stat(sftp, remote).await.ok().flatten().map(|m| stamp_of(&m));
+            return Ok(EditPushed::Conflict { now, during_upload: false });
+        }
+        Err(e) => return Err(e),
+    };
+    let notes = p.take_notes();
+    if let Some(hook) = after_commit {
+        hook();
+    }
+    // Read it back: STAT, content, STAT. The new baseline is adopted only when
+    // the content is what was sent and the file did not change while read.
+    let first = edit_stat(sftp, remote).await?;
+    let content = remote_content_hash(sftp, remote).await?;
+    let last = edit_stat(sftp, remote).await?;
+    match (first, content, last) {
+        (Some(a), Some(h), Some(b)) if h == sent && !stamp_of(&a).differs(&stamp_of(&b)) => Ok(EditPushed::Uploaded {
+            baseline: RemoteBaseline { stamp: stamp_of(&b), hash: h },
+            bytes,
+            notes,
+        }),
+        (_, _, last) => Ok(EditPushed::Conflict { now: last.map(|m| stamp_of(&m)), during_upload: true }),
+    }
+}
+
+/// "Save a copy as name.conflict": upload the local copy to a NEW name next to
+/// `remote` — `<remote>.conflict`, or `.conflict.2` … when taken — never
+/// replacing anything (`Overwrite::Never`, enforced at commit). Returns the
+/// remote path used and the bytes written.
+pub(crate) async fn edit_save_copy_with(sftp: &Arc<SftpConn>, local: &str, remote: &str) -> Result<(String, u64), SshError> {
+    for n in 1..=20u32 {
+        let target = if n == 1 { format!("{remote}.conflict") } else { format!("{remote}.conflict.{n}") };
+        if remote_present(sftp, &target).await? {
+            continue;
+        }
+        let mut p = Progress::detached(uncancellable());
+        match copy_local_file(sftp, &mut p, local, &target, Overwrite::Never).await {
+            Ok(bytes) => return Ok((target, bytes)),
+            // Taken in the meantime: the next name.
+            Err(SshError::PartialTransfer(t)) if t.contains("already exists") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SshError::PartialTransfer(format!(
+        "{remote}.conflict through .conflict.20 all exist; tidy them up first"
+    )))
+}
+
+impl Registry {
+    /// `edit_probe_with` on a session's SFTP channel.
+    pub(crate) async fn edit_probe(&self, session_id: &str, remote: &str) -> Result<EditProbe, SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_probe_with(&sftp, remote).await;
+        self.check_sftp(session_id, &sftp, r).await
+    }
+
+    /// `edit_fetch_with` on a session's SFTP channel.
+    pub(crate) async fn edit_fetch(&self, session_id: &str, remote: &str, local: &str) -> Result<EditFetched, SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_fetch_with(&sftp, remote, local).await;
+        self.check_sftp(session_id, &sftp, r).await
+    }
+
+    /// `edit_push_with` on a session's SFTP channel.
+    pub(crate) async fn edit_push(
+        &self,
+        session_id: &str,
+        local: &str,
+        remote: &str,
+        expect: Option<&RemoteBaseline>,
+    ) -> Result<EditPushed, SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_push_with(&sftp, local, remote, expect).await;
+        self.check_sftp(session_id, &sftp, r).await
+    }
+
+    /// `edit_save_copy_with` on a session's SFTP channel.
+    pub(crate) async fn edit_save_copy(&self, session_id: &str, local: &str, remote: &str) -> Result<(String, u64), SshError> {
+        let sftp = self.sftp(session_id).await?;
+        let r = edit_save_copy_with(&sftp, local, remote).await;
+        self.check_sftp(session_id, &sftp, r).await
     }
 }
 
@@ -3009,10 +6924,190 @@ async fn socks5_serve(
     Ok(())
 }
 
+/// The shell's output pump: emits on the per-session topic TerminalPane
+/// subscribes to, appends to the transcript, and — when the shell or the
+/// transport ends — reports why and ends this session generation (its forwards
+/// and its transport), so nothing keeps tunnelling over a session the tab shows
+/// as disconnected. stderr (ExtendedData) is interleaved into the same stream,
+/// which is what a real terminal does — separating it would reorder output.
+///
+/// Waits for `go` before emitting anything: see `connect_inner`.
+#[allow(clippy::too_many_arguments)]
+async fn run_pump(
+    app: AppHandle,
+    sid: String,
+    session: Arc<Session>,
+    mut read_half: russh::ChannelReadHalf,
+    early: Vec<ChannelMsg>,
+    go: oneshot::Receiver<Option<SessionLog>>,
+    death: DeathNote,
+    forwards: Arc<DashMap<String, Forward>>,
+    startup: Vec<String>,
+    startup_guard: Option<ShellGuard>,
+) {
+    let Ok(mut log) = go.await else { return };
+    let topic = format!("ssh://{sid}");
+    // Startup input goes out concurrently with this loop, never before it:
+    // see `send_startup`. Aborted with the pump (the guard's drop), so it
+    // never outlives the session's reader.
+    let _startup = startup_guard.map(|guard| {
+        let session = Arc::clone(&session);
+        let (app, topic) = (app.clone(), topic.clone());
+        AbortOnDrop(tokio::spawn(async move {
+            let report = |e: &SshError| {
+                if session.alive.load(Ordering::SeqCst) {
+                    let _ = app.emit(
+                        &topic,
+                        format!("\x1b[38;2;242;178;92mstartup commands not sent: {e}\x1b[0m\r\n"),
+                    );
+                }
+            };
+            let _ = send_startup(guard, &startup, CHANNEL_SETUP_TIMEOUT, report).await;
+        }))
+    });
+    // Incomplete UTF-8 tails carried to the next chunk, one per stream: a
+    // packet boundary can split a multi-byte character, and decoding each chunk
+    // alone would print two U+FFFD for one real character.
+    let mut pending_out: Vec<u8> = Vec::new();
+    let mut pending_err: Vec<u8> = Vec::new();
+    let mut early = early.into_iter();
+    let mut eof = false;
+    let mut exit: Option<String> = None;
+    let mut transport_gone = false;
+
+    loop {
+        let msg = match early.next() {
+            Some(m) => m,
+            None => {
+                // After EOF, OpenSSH sends the exit status and the close at
+                // once; a stack that sends neither must not leave the tab
+                // looking connected to a shell that is gone.
+                let next = if eof {
+                    match tokio::time::timeout(SHELL_EOF_GRACE, read_half.wait()).await {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    }
+                } else {
+                    read_half.wait().await
+                };
+                match next {
+                    Some(m) => m,
+                    None => {
+                        // The transport itself went away — keepalive failure,
+                        // reset, a dropped route — unless the shell had ended.
+                        transport_gone = !eof && exit.is_none();
+                        break;
+                    }
+                }
+            }
+        };
+        match msg {
+            ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                // Logged before display, so anything that reaches the screen is
+                // already durable if the app dies next.
+                if let Some(l) = log.as_mut() {
+                    l.append(data);
+                }
+                let pending = if matches!(msg, ChannelMsg::Data { .. }) {
+                    &mut pending_out
+                } else {
+                    &mut pending_err
+                };
+                let text = decode_utf8_stream(pending, data);
+                if !text.is_empty() {
+                    let _ = app.emit(&topic, text);
+                }
+            }
+            // EOF alone is not the end: the exit status usually follows it.
+            ChannelMsg::Eof => {
+                eof = true;
+                if exit.is_some() {
+                    break;
+                }
+            }
+            ChannelMsg::Close => break,
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit = Some(if exit_status == 0 {
+                    "shell exited".to_string()
+                } else {
+                    format!("shell exited with status {exit_status}")
+                });
+                if eof {
+                    break;
+                }
+            }
+            ChannelMsg::ExitSignal { signal_name, .. } => {
+                exit = Some(format!("shell was killed by signal {signal_name:?}"));
+                if eof {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    session.alive.store(false, Ordering::SeqCst);
+
+    // Distinguishes a clean logout from a link that died under us: one is
+    // expected, the other means "your VPN dropped" or "the firewall timed you
+    // out". The cause of a dead transport is recorded by the handler's
+    // `disconnected`, which runs in russh's task; give it a moment to land.
+    let reason = if transport_gone {
+        let mut note = None;
+        for _ in 0..10 {
+            note = death.lock().ok().and_then(|mut d| d.take());
+            if note.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        note.unwrap_or_else(|| "connection lost".to_string())
+    } else {
+        exit.unwrap_or_else(|| "session closed".to_string())
+    };
+
+    if let Some(l) = log.as_mut() {
+        l.footer(&reason);
+    }
+    let _ = app.emit(
+        &topic,
+        format!("\r\n\x1b[38;2;242;178;92m\u{25cf} disconnected\x1b[0m {reason}\r\n"),
+    );
+    let _ = app.emit(
+        "ssh://status",
+        SessionStatusEvent {
+            session_id: sid.clone(),
+            status: "disconnected",
+            detail: reason,
+        },
+    );
+
+    // The shell is gone, so the session is over (as with `ssh`): end THIS
+    // generation's forwards — never a newer connection's for the same tab —
+    // and its transport. The registry entry stays (dead) until the tab is
+    // closed or reconnected, so later calls fail as "disconnected".
+    let generation = session.generation;
+    teardown_forwards(take_forwards(&forwards, |f| {
+        f.info.session_id == sid && f.generation == generation
+    }))
+    .await;
+    session.close("session ended").await;
+}
+
+
+/// Aborts its task when dropped (a JoinHandle's drop only detaches it).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Streaming UTF-8 decode: append `data` to `pending`, return every complete
 /// character, and keep an incomplete trailing sequence (at most 3 bytes) in
 /// `pending` for the next chunk. Only genuinely invalid bytes become U+FFFD.
-fn decode_utf8_stream(pending: &mut Vec<u8>, data: &[u8]) -> String {
+pub(crate) fn decode_utf8_stream(pending: &mut Vec<u8>, data: &[u8]) -> String {
     pending.extend_from_slice(data);
     let mut out = String::new();
     loop {
@@ -3080,7 +7175,7 @@ fn mode_string(permissions: Option<u32>, kind: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{reject_link_in_subtree, safe_local_component};
+    use super::*;
 
     #[test]
     fn rejects_traversal_and_absolute_names() {
@@ -3174,42 +7269,47 @@ mod tests {
     // cancellation seen at registration leaves nothing registered.
     #[test]
     fn prompt_registration_is_atomic_with_cancel_sweep() {
-        use super::{cancel_for_session, register_and_emit};
+        use super::{cancel_matching, register_and_emit, PromptOwner};
         use dashmap::{try_result::TryResult, DashMap};
         use tokio::sync::oneshot;
 
-        let pending: DashMap<String, (String, oneshot::Sender<bool>)> = DashMap::new();
+        let pending: DashMap<String, (PromptOwner, oneshot::Sender<bool>)> = DashMap::new();
+        let owner = |t: u64| -> PromptOwner { ("s1".to_string(), t) };
         let mut locked_during_emit = false;
-        let rx = register_and_emit(&pending, "hk-1", "s1", || false, || {
+        let rx = register_and_emit(&pending, "hk-1", owner(1), || false, || {
             locked_during_emit = matches!(pending.try_get_mut("hk-1"), TryResult::Locked);
             true
         });
         assert!(locked_during_emit, "sweep could interleave between check and emit");
         assert!(rx.is_some());
         // A sweep after the emit removes it (and the caller emits prompt-closed).
-        assert_eq!(cancel_for_session(&pending, "s1"), vec!["hk-1".to_string()]);
+        // A superseded attempt's sweep (generation 2) leaves generation 1 alone.
+        assert!(cancel_matching(&pending, |o| o.0 == "s1" && o.1 == 2).is_empty());
+        assert_eq!(cancel_matching(&pending, |o| o.0 == "s1"), vec!["hk-1".to_string()]);
 
         // Cancelled at registration: never emitted, nothing left behind.
         let mut emitted = false;
-        let rx = register_and_emit(&pending, "hk-2", "s1", || true, || {
+        let rx = register_and_emit(&pending, "hk-2", owner(1), || true, || {
             emitted = true;
             true
         });
         assert!(rx.is_none() && !emitted && pending.is_empty());
 
         // Emit failure also leaves nothing registered.
-        assert!(register_and_emit(&pending, "hk-3", "s1", || false, || false).is_none());
+        assert!(register_and_emit(&pending, "hk-3", owner(1), || false, || false).is_none());
         assert!(pending.is_empty());
     }
 
     #[test]
     fn rejects_windows_reserved_names() {
-        assert!(!safe_local_component("CON"));
-        assert!(!safe_local_component("nul")); // case-insensitive
-        assert!(!safe_local_component("NUL.txt")); // extension ignored
-        assert!(!safe_local_component("COM1"));
-        assert!(!safe_local_component("LPT9"));
-        // Names that merely start with a reserved stem are fine.
+        assert!(is_windows_reserved("CON"));
+        assert!(is_windows_reserved("nul")); // case-insensitive
+        assert!(is_windows_reserved("NUL.txt")); // extension ignored
+        assert!(is_windows_reserved("COM1"));
+        assert!(is_windows_reserved("LPT9"));
+        // Refused as download names on Windows only (see the test below).
+        assert_eq!(safe_local_component("CON"), !cfg!(windows));
+        // Names that merely start with a reserved stem are fine everywhere.
         assert!(safe_local_component("console.log"));
         assert!(safe_local_component("com10"));
         assert!(safe_local_component("nullable.rs"));
@@ -3223,7 +7323,7 @@ mod tests {
     #[test]
     fn rejects_symlinked_ancestor_in_subtree() {
         use std::fs;
-        let base = std::env::temp_dir().join(format!("skiff-symtest-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hawser-symtest-{}", std::process::id()));
         let root = base.join("root");
         let outside = base.join("outside");
         fs::create_dir_all(&root).unwrap();
@@ -3244,4 +7344,1368 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    /* ---------------------------------------------- host-key policy (W2) */
+
+    const ED_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1EeRn1nUZ6oQiaSmrlPONbjg1FxJtr35MXzTndFYIe";
+    const ED_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHveLo5tgiTjyNgc98zwmigaaw1vJ/1IN9KDWqa0Z43a";
+    const ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBI/gPg4KkOG52SzCdcnggcQk7DG6z1OLSfSAi2LTGk4OFnDnYrkNsxVIWtt/KArpW70Gac7c1im2IEx4u8Bs0MI=";
+    /// The raw host key a CA signed into `HOST_CERT` (ssh-keygen -s ca -h).
+    const CERT_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN9i5YuRG3Q+ur8Jb5GHlc8PHma3/lZIDJ8w28uSpVEx";
+    const HOST_CERT: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIB+h46eQH0FJHc7hx2tNtaxZ1fDOJGco3BuHG1HzpT/HAAAAIN9i5YuRG3Q+ur8Jb5GHlc8PHma3/lZIDJ8w28uSpVExAAAAAAAAAAAAAAACAAAAC2hhd3Nlci10ZXN0AAAAEAAAAAxjZXJ0LmV4YW1wbGUAAAAAAAAAAP//////////AAAAAAAAAAAAAAAAAAAAMwAAAAtzc2gtZWQyNTUxOQAAACA8sSKaRahTgUwI22aO8wihmUdkNFGaozzeUvs1SAGyjgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXQZ2JLfK29r9OIjDZKy3ubiIfFzB4005BDVGGpMoKFgo1PrvBFHsynEvqzl4NeGZ1hBNNelCdUanRtM5aPjIAA==";
+
+    fn key(s: &str) -> russh::keys::PublicKey {
+        russh::keys::PublicKey::from_openssh(s).unwrap()
+    }
+
+    fn raw(s: &str) -> russh::keys::PublicKeyOrCertificate {
+        russh::keys::PublicKeyOrCertificate::PublicKey { key: key(s), hash_alg: None }
+    }
+
+    fn cert() -> russh::keys::PublicKeyOrCertificate {
+        russh::keys::PublicKeyOrCertificate::Certificate(
+            russh::keys::Certificate::from_openssh(HOST_CERT).unwrap(),
+        )
+    }
+
+    /// A known_hosts file holding `body`, in a directory unique to the test.
+    struct Store(std::path::PathBuf);
+    impl Store {
+        fn new(tag: &str, body: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("hawser-ssh-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("known_hosts"), body).unwrap();
+            Store(dir)
+        }
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("known_hosts")
+        }
+        fn verdict(&self, host: &str, presented: &russh::keys::PublicKeyOrCertificate) -> KeyVerdict {
+            key_verdict(host, 22, &presented_key(presented), &self.path())
+        }
+        fn text(&self) -> String {
+            std::fs::read_to_string(self.path()).unwrap()
+        }
+    }
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn trusted_key_connects_silently() {
+        let store = Store::new("trusted", &format!("fw01 {ED_A}\n"));
+        assert!(matches!(store.verdict("fw01", &raw(ED_A)), KeyVerdict::Accept));
+        // Host names are case-insensitive.
+        assert!(matches!(store.verdict("FW01", &raw(ED_A)), KeyVerdict::Accept));
+    }
+
+    #[test]
+    fn changed_or_revoked_key_is_refused_without_a_prompt() {
+        // Same algorithm, different key.
+        let store = Store::new("changed", &format!("fw01 {ED_B}\n"));
+        assert!(matches!(
+            store.verdict("fw01", &raw(ED_A)),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { line: 1, .. })
+        ));
+        // Different algorithm for a pinned host is CHANGED too, not first use.
+        let store = Store::new("changed-alg", &format!("# pinned\nfw01 {ECDSA}\n"));
+        assert!(matches!(
+            store.verdict("fw01", &raw(ED_A)),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { line: 2, .. })
+        ));
+        // Revoked beats a matching trust line.
+        let store = Store::new("revoked", &format!("fw01 {ED_A}\n@revoked * {ED_A}\n"));
+        assert!(matches!(
+            store.verdict("fw01", &raw(ED_A)),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { line: 2, .. })
+        ));
+        // An unreadable store fails closed rather than prompting.
+        let missing = key_verdict(
+            "fw01",
+            22,
+            &key(ED_A),
+            std::path::Path::new("/nonexistent/hawser/known_hosts"),
+        );
+        assert!(matches!(missing, KeyVerdict::Refuse(SshError::KnownHosts(_))));
+    }
+
+    #[tokio::test]
+    async fn unknown_key_rejected_timed_out_or_cancelled_is_refused() {
+        let store = Store::new("unknown", "");
+        let k = key(ED_A);
+        assert!(matches!(store.verdict("new01", &raw(ED_A)), KeyVerdict::Ask));
+
+        // Rejected by the user.
+        let (tx, rx) = oneshot::channel();
+        tx.send(false).unwrap();
+        let end = await_host_key_answer(rx, Duration::from_secs(5)).await;
+        assert_eq!(end, PromptEnd::Rejected);
+        assert!(matches!(
+            settle_host_key(&end, "new01", 22, &k, &store.path()),
+            Err(SshError::HostKeyRejected { .. })
+        ));
+
+        // Cancelled: the tab closed, so the sender was dropped.
+        let (tx, rx) = oneshot::channel::<bool>();
+        drop(tx);
+        let end = await_host_key_answer(rx, Duration::from_secs(5)).await;
+        assert_eq!(end, PromptEnd::Dropped);
+        assert!(matches!(
+            settle_host_key(&end, "new01", 22, &k, &store.path()),
+            Err(SshError::HostKeyRejected { .. })
+        ));
+
+        // Nobody answered in time.
+        let (_tx, rx) = oneshot::channel::<bool>();
+        let end = await_host_key_answer(rx, Duration::from_millis(20)).await;
+        assert_eq!(end, PromptEnd::TimedOut);
+        assert!(matches!(
+            settle_host_key(&end, "new01", 22, &k, &store.path()),
+            Err(SshError::HostKeyTimeout { .. })
+        ));
+
+        // None of those recorded anything: the host is still unknown.
+        assert_eq!(store.text(), "");
+        assert!(matches!(store.verdict("new01", &raw(ED_A)), KeyVerdict::Ask));
+
+        // Only an explicit accept pins it, after which it connects silently.
+        let (tx, rx) = oneshot::channel();
+        tx.send(true).unwrap();
+        let end = await_host_key_answer(rx, Duration::from_secs(5)).await;
+        assert!(settle_host_key(&end, "new01", 22, &k, &store.path()).unwrap());
+        assert!(matches!(store.verdict("new01", &raw(ED_A)), KeyVerdict::Accept));
+    }
+
+    #[test]
+    fn certificate_follows_the_raw_key_policy() {
+        let c = cert();
+        // Its embedded key is what is judged.
+        assert_eq!(presented_key(&c).key_data(), key(CERT_HOST_KEY).key_data());
+
+        let pinned = Store::new("cert-pinned", &format!("cert.example {CERT_HOST_KEY}\n"));
+        assert!(matches!(pinned.verdict("cert.example", &c), KeyVerdict::Accept));
+
+        let changed = Store::new("cert-changed", &format!("cert.example {ED_A}\n"));
+        assert!(matches!(
+            changed.verdict("cert.example", &c),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { .. })
+        ));
+
+        let revoked = Store::new(
+            "cert-revoked",
+            &format!("cert.example {CERT_HOST_KEY}\n@revoked * {CERT_HOST_KEY}\n"),
+        );
+        assert!(matches!(
+            revoked.verdict("cert.example", &c),
+            KeyVerdict::Refuse(SshError::ChangedHostKey { .. })
+        ));
+
+        // The CA signature earns no trust: unknown is still a prompt.
+        let unknown = Store::new("cert-unknown", "");
+        assert!(matches!(unknown.verdict("cert.example", &c), KeyVerdict::Ask));
+    }
+
+    // Two tabs approving DIFFERENT unknown keys for one host at once, through
+    // the handler's own settle path: exactly one is pinned, the other refused.
+    #[test]
+    fn concurrent_trusts_of_different_keys_leave_one_pinned_key() {
+        for round in 0..10 {
+            let store = Store::new(&format!("race-{round}"), "");
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let spawn = |k: &'static str| {
+                let (b, p) = (Arc::clone(&barrier), store.path());
+                std::thread::spawn(move || {
+                    b.wait();
+                    settle_host_key(&PromptEnd::Accepted, "race01", 22, &key(k), &p).is_ok()
+                })
+            };
+            let (a, b) = (spawn(ED_A), spawn(ED_B));
+            let oks = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(oks.iter().filter(|o| **o).count(), 1);
+            let lines = store.text().lines().filter(|l| l.starts_with("race01 ")).count();
+            assert_eq!(lines, 1, "exactly one key pinned");
+        }
+    }
+
+    #[test]
+    fn pinned_host_key_algorithms_are_offered_first() {
+        use russh::keys::{Algorithm, EcdsaCurve, HashAlg};
+        let defaults: Vec<Algorithm> = russh::Preferred::DEFAULT.key.to_vec();
+
+        // Nothing pinned: russh's own order.
+        assert_eq!(preferred_host_key_order(&[]), defaults);
+
+        // ECDSA pinned: offered before Ed25519, every default still offered once.
+        let p256 = Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 };
+        let order = preferred_host_key_order(&[p256.clone()]);
+        assert_eq!(order[0], p256);
+        assert_eq!(order[1], Algorithm::Ed25519);
+        assert_eq!(order.len(), defaults.len());
+
+        // An RSA pin covers all three RSA signature names, strongest first.
+        let order = preferred_host_key_order(&[Algorithm::Rsa { hash: None }]);
+        assert_eq!(
+            &order[..3],
+            &[
+                Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+                Algorithm::Rsa { hash: Some(HashAlg::Sha256) },
+                Algorithm::Rsa { hash: None },
+            ]
+        );
+
+        // Something russh does not implement is never advertised.
+        let order = preferred_host_key_order(&[Algorithm::Dsa, Algorithm::Ed25519]);
+        assert!(!order.contains(&Algorithm::Dsa));
+        assert_eq!(order[0], Algorithm::Ed25519);
+
+        // From the store: the pinned ECDSA key comes first.
+        let store = Store::new("algs", &format!("fw01 {ECDSA}\n"));
+        let pinned = known_hosts::pinned_algorithms_at("fw01", 22, &store.path());
+        assert_eq!(preferred_host_key_order(&pinned)[0], p256);
+
+        // RSA pinned on the first line, Ed25519 later: a server offering
+        // Ed25519 and SHA-1 ssh-rsa must get Ed25519. SHA-1 is the last pinned
+        // algorithm, after every pinned non-SHA-1 one, and still ahead of the
+        // unpinned ones (it may be the only thing an old pinned host signs).
+        let order = preferred_host_key_order(&[Algorithm::Rsa { hash: None }, Algorithm::Ed25519]);
+        assert_eq!(
+            &order[..4],
+            &[
+                Algorithm::Ed25519,
+                Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+                Algorithm::Rsa { hash: Some(HashAlg::Sha256) },
+                Algorithm::Rsa { hash: None },
+            ]
+        );
+        assert_eq!(order[4], p256, "unpinned algorithms follow the pinned block");
+        assert_eq!(order.len(), defaults.len());
+        for pinned in [
+            vec![Algorithm::Rsa { hash: None }, p256.clone()],
+            vec![Algorithm::Rsa { hash: Some(HashAlg::Sha256) }, Algorithm::Ed25519, p256.clone()],
+        ] {
+            let order = preferred_host_key_order(&pinned);
+            let sha1 = order.iter().position(|a| *a == Algorithm::Rsa { hash: None }).unwrap();
+            for a in pinned.iter().filter(|a| **a != Algorithm::Rsa { hash: None }) {
+                assert!(order.iter().position(|o| o == a).unwrap() < sha1, "SHA-1 ahead of {a:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_deadline_excludes_time_waiting_on_a_human() {
+        // Machine time alone runs out.
+        let wait = HumanWait::default();
+        let r = within(&wait, Duration::from_millis(50), "h", "stage", tokio::time::sleep(Duration::from_millis(400))).await;
+        assert!(matches!(r, Err(SshError::Timeout { stage: "stage", .. })));
+
+        // The same work with a dialog open for most of it finishes in time.
+        let wait = HumanWait::default();
+        let guard = wait.enter();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(guard);
+        });
+        let r = within(&wait, Duration::from_millis(150), "h", "stage", tokio::time::sleep(Duration::from_millis(350))).await;
+        assert!(r.is_ok(), "prompt time counted against the deadline");
+        release.await.unwrap();
+    }
+
+    #[test]
+    fn prompt_origin_names_the_dialled_endpoint() {
+        let o = PromptOrigin::new(Some(" fw-prod "), "admin", "10.0.0.1", 22, Some("bastion".into()));
+        assert_eq!(o.host_name.as_deref(), Some("fw-prod"));
+        assert_eq!(o.target, "admin@10.0.0.1:22");
+        assert_eq!(o.via.as_deref(), Some("bastion"));
+        assert_eq!(PromptOrigin::new(Some(""), "u", "::1", 2222, None).target, "u@[::1]:2222");
+    }
+
+    #[test]
+    fn keepalive_wording_states_the_real_timeout() {
+        // russh ends the link after MORE than KEEPALIVE_MAX silent intervals.
+        assert_eq!(keepalive_timeout(), Duration::from_secs(45));
+        let text = death_reason(&SshError::Russh(russh::Error::KeepaliveTimeout));
+        assert!(text.contains("45s"), "{text}");
+    }
+
+    // The deadline that races a host-key prompt runs on another worker, so the
+    // stage clock must already be paused when the prompt is emitted.
+    #[test]
+    fn prompt_pauses_the_stage_clock_before_it_is_shown() {
+        let wait = HumanWait::default();
+        let pending: DashMap<String, (PromptOwner, oneshot::Sender<bool>)> = DashMap::new();
+        let owner = || -> PromptOwner { ("s1".to_string(), 1) };
+        let mut paused_at_emit = false;
+        let raised = raise_prompt(&wait, &pending, "hk-1", owner(), || false, || {
+            paused_at_emit = wait.waited().1;
+            true
+        });
+        assert!(paused_at_emit, "prompt emitted while the deadline was still running");
+        let (human, _rx) = raised.expect("shown");
+        assert!(wait.waited().1);
+        drop(human);
+        assert!(!wait.waited().1);
+        // A prompt that is never shown leaves the clock running.
+        assert!(raise_prompt(&wait, &pending, "hk-2", owner(), || true, || true).is_none());
+        assert!(!wait.waited().1);
+    }
+
+    #[test]
+    fn copy_id_cancel_that_overtakes_the_install_is_honoured() {
+        let r = Registry::default();
+        // The editor's cancel IPC is handled before the install registers.
+        r.copy_id_cancel("op-1");
+        let (tx, _rx) = watch::channel(());
+        assert!(!r.copy_id_register("op-1", 1, tx), "install ran after its cancel");
+        assert!(r.copy_ids.is_empty());
+        // The early cancel is consumed; a fresh install under the id runs.
+        let (tx, _rx) = watch::channel(());
+        assert!(r.copy_id_register("op-1", 2, tx));
+        // A cancel for a registered install removes it and leaves no tombstone.
+        r.copy_id_cancel("op-1");
+        assert!(r.copy_ids.is_empty() && r.copy_id_cancels.is_empty());
+    }
+
+    /* ------------------------------------------- transport lifetime (W2b) */
+
+    /// A client handler that trusts any key (the tests below are about the
+    /// transport's lifetime, not host-key policy).
+    struct AnyKey;
+
+    impl client::Handler for AnyKey {
+        type Error = SshError;
+
+        async fn check_server_key(
+            &mut self,
+            _: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// A listener that accepts one connection, sends an SSH banner, then never
+    /// answers the key exchange. Resolves the receiver when its side of the
+    /// socket sees the connection close (EOF or reset).
+    async fn kex_tarpit() -> (std::net::SocketAddr, oneshot::Receiver<Instant>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"SSH-2.0-tarpit\r\n").await.unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(Instant::now());
+        });
+        (addr, closed_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handshake_deadline_closes_a_stalled_transport() {
+        let (addr, closed) = kex_tarpit().await;
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let guard = KillGuard::new();
+        let start = Instant::now();
+        let r = handshake(
+            Arc::new(client::Config::default()),
+            sock,
+            AnyKey,
+            &HumanWait::default(),
+            "tarpit",
+            Duration::from_millis(300),
+            &guard.kill(),
+        )
+        .await;
+        assert!(matches!(r, Err(SshError::Timeout { .. })), "{:?}", r.err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // russh's session task owned the socket; the peer seeing it close
+        // means that task is gone too.
+        let at = tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("the stalled transport survived the deadline")
+            .unwrap();
+        assert!(at.duration_since(start) < Duration::from_secs(3));
+    }
+
+    // Control for the test above: the same deadline WITHOUT the kill switch
+    // leaves russh's task holding the socket open (the bug being fixed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_transport_outlives_a_plain_deadline() {
+        let (addr, closed) = kex_tarpit().await;
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r = within(
+            &HumanWait::default(),
+            Duration::from_millis(300),
+            "tarpit",
+            "handshake",
+            client::connect_stream(Arc::new(client::Config::default()), sock, AnyKey),
+        )
+        .await;
+        assert!(matches!(r, Err(SshError::Timeout { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), closed).await.is_err(),
+            "expected the unkilled transport to stay open"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_handshake_closes_its_transport() {
+        let (addr, closed) = kex_tarpit().await;
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let guard = KillGuard::new();
+        let kill = guard.kill();
+        let wait = HumanWait::default();
+        // A cancel drops the connect future mid-handshake...
+        tokio::select! {
+            _ = handshake(
+                Arc::new(client::Config::default()), sock, AnyKey, &wait,
+                "tarpit", Duration::from_secs(30), &kill,
+            ) => panic!("the tarpit completed a handshake"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        // ...and with it the attempt's guard.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("the cancelled transport survived")
+            .unwrap();
+    }
+
+    const TEST_SERVER_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACAfv5/eq75dWNkgZ+e28E5l7vex5x2Nk7HR13o0FD26OwAAAJhJGmXPSRpl
+zwAAAAtzc2gtZWQyNTUxOQAAACAfv5/eq75dWNkgZ+e28E5l7vex5x2Nk7HR13o0FD26Ow
+AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
+97HnHY2TsdHXejQUPbo7AAAAEmhhd3Nlci10ZXN0LXNlcnZlcgECAw==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    #[derive(Clone, Copy)]
+    enum ShellMode {
+        /// Accept the PTY, then print a reason and end the session without
+        /// answering the shell request (an expired account, a forced command).
+        ExitDuringSetup,
+        /// Start the shell, then print far more than the client buffers.
+        Flood,
+    }
+
+    struct TestServer {
+        mode: ShellMode,
+    }
+
+    impl russh::server::Handler for TestServer {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _: &str, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            // Drained, so the server side never blocks delivering our input.
+            tokio::spawn(async move {
+                let mut channel = channel;
+                while channel.wait().await.is_some() {}
+            });
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: &[(russh::Pty, u32)],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            match self.mode {
+                ShellMode::ExitDuringSetup => {
+                    session.data(channel, &b"This account has expired.\r\n"[..])?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                }
+                ShellMode::Flood => {
+                    session.channel_success(channel)?;
+                    let h = session.handle();
+                    tokio::spawn(async move {
+                        let chunk = vec![b'x'; 16 * 1024];
+                        for _ in 0..1024 {
+                            if h.data(channel, chunk.clone()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// An authenticated client session to an in-process russh server whose
+    /// receive window is `server_window` bytes.
+    async fn test_session(mode: ShellMode, server_window: u32) -> Handle<AnyKey> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let config = Arc::new(russh::server::Config {
+                keys: vec![russh::keys::PrivateKey::from_openssh(TEST_SERVER_KEY).unwrap()],
+                window_size: server_window,
+                auth_rejection_time: Duration::from_millis(1),
+                auth_rejection_time_initial: Some(Duration::ZERO),
+                ..Default::default()
+            });
+            let server = TestServer { mode };
+            if let Ok(running) = russh::server::run_stream(config, sock, server).await {
+                let _ = running.await;
+            }
+        });
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut h = handshake(
+            Arc::new(client::Config::default()),
+            sock,
+            AnyKey,
+            &HumanWait::default(),
+            "test",
+            Duration::from_secs(10),
+            &Kill::default(),
+        )
+        .await
+        .unwrap();
+        let auth = h.authenticate_password("u", "p").await.unwrap();
+        assert!(matches!(auth, russh::client::AuthResult::Success));
+        h
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_that_ends_during_setup_reports_its_output() {
+        let h = test_session(ShellMode::ExitDuringSetup, 2 * 1024 * 1024).await;
+        let e = open_shell(&h, "acct.example", 80, 24).await.unwrap_err();
+        assert!(matches!(e, SshError::ShellEndedEarly { .. }), "{e:?}");
+        let text = e.to_string();
+        assert!(text.starts_with("This account has expired.\r\n"), "{text:?}");
+        assert!(text.ends_with("acct.example closed the session before the shell started"));
+    }
+
+    #[test]
+    fn early_output_is_capped() {
+        let big = ChannelMsg::Data { data: vec![b'a'; EARLY_OUTPUT_CAP].into() };
+        let err = ChannelMsg::ExtendedData { data: b"more"[..].into(), ext: 1 };
+        assert_eq!(early_output(&[big, err]).len(), EARLY_OUTPUT_CAP);
+        assert_eq!(
+            shell_ended_early_text("h", "bye"),
+            "bye\r\nh closed the session before the shell started"
+        );
+        assert_eq!(shell_ended_early_text("h", ""), "h closed the session before the shell started");
+    }
+
+    /// Startup input larger than the server's window, against a shell that
+    /// floods output. With the output read concurrently (as the pump does) it
+    /// all goes out; with nobody reading, russh blocks delivering output and
+    /// never takes the window adjustment the write waits for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_input_goes_out_while_the_output_is_read() {
+        let commands: Vec<String> = (0..32).map(|i| format!("echo {i} {}", "y".repeat(8 * 1024))).collect();
+
+        let h = test_session(ShellMode::Flood, 4096).await;
+        let (mut read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
+        let shell = Arc::new(Mutex::new(Some(write)));
+        let reader = tokio::spawn(async move {
+            let mut n = 0usize;
+            while let Some(m) = read.wait().await {
+                if let ChannelMsg::Data { data } = m {
+                    n += data.len();
+                }
+            }
+            n
+        });
+        let guard = Arc::clone(&shell).lock_owned().await;
+        send_startup(guard, &commands, Duration::from_secs(10), |_| {})
+            .await
+            .expect("startup input stalled although output was being read");
+        reader.abort();
+
+        // Control: the same, with the output left unread, deadlocks.
+        let h = test_session(ShellMode::Flood, 4096).await;
+        let (_read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
+        let shell = Arc::new(Mutex::new(Some(write)));
+        let guard = Arc::clone(&shell).lock_owned().await;
+        // A Ctrl-U that cannot go out either: bound the whole call.
+        let r = tokio::time::timeout(
+            Duration::from_secs(4),
+            send_startup(guard, &commands, Duration::from_secs(2), |_| {}),
+        )
+        .await;
+        assert!(
+            !matches!(r, Ok(Ok(()))),
+            "expected the unread session to block the startup input"
+        );
+    }
+
+    /// The writer is taken before the session is exposed (here: before the
+    /// "user" task starts), so a keystroke cannot overtake the startup lines;
+    /// and a line cut off by the deadline keeps the writer until a Ctrl-U has
+    /// gone out after it, so the user's typing never extends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_holds_the_writer_and_never_leaves_a_partial_line() {
+        let h = test_session(ShellMode::Flood, 4096).await;
+        let (mut read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
+        let shell = Arc::new(Mutex::new(Some(write)));
+        let guard = Arc::clone(&shell).lock_owned().await;
+        // Nobody reads the flood yet: one long line stalls part-way.
+        let commands = vec![format!("echo {}", "z".repeat(256 * 1024))];
+        let reported = Arc::new(AtomicBool::new(false));
+        let rep = Arc::clone(&reported);
+        let startup = tokio::spawn(async move {
+            send_startup(guard, &commands, Duration::from_millis(500), move |_| {
+                rep.store(true, Ordering::SeqCst)
+            })
+            .await
+        });
+        // "User input" queued right after registration must wait.
+        let user_shell = Arc::clone(&shell);
+        let user = tokio::spawn(async move {
+            let g = user_shell.lock().await;
+            drop(g);
+            Instant::now()
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(reported.load(Ordering::SeqCst), "the timeout was not reported");
+        assert!(!user.is_finished(), "user input got the writer mid-line");
+        // Output drains: the window opens, the Ctrl-U goes out, the writer frees.
+        let reader = tokio::spawn(async move { while read.wait().await.is_some() {} });
+        let r = tokio::time::timeout(Duration::from_secs(10), startup).await.unwrap().unwrap();
+        assert!(r.is_err());
+        tokio::time::timeout(Duration::from_secs(5), user).await.unwrap().unwrap();
+        reader.abort();
+    }
+
+    /// Two streams on one switch (a ProxyJump attempt: bastion socket and the
+    /// target's channel), each with a write parked on a full pipe in its own
+    /// task: firing must wake BOTH.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_switch_wakes_every_parked_stream() {
+        let kill = Kill::default();
+        let mut tasks = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (a, b) = tokio::io::duplex(16);
+            peers.push(b); // never read: writes park once 16 bytes are queued
+            let mut s = Killable::new(a, kill.clone());
+            tasks.push(tokio::spawn(async move {
+                let r = s.write_all(&[0u8; 4096]).await;
+                let f = s.flush().await;
+                (r, f)
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(tasks.iter().all(|t| !t.is_finished()), "writes should be parked");
+        kill.fire();
+        for t in tasks {
+            let (r, _) = tokio::time::timeout(Duration::from_secs(2), t)
+                .await
+                .expect("a parked stream was not woken by the kill switch")
+                .unwrap();
+            assert!(r.is_err());
+        }
+        drop(peers);
+    }
+
+    #[test]
+    fn exec_refusal_and_stderr_are_reported_apart() {
+        let refused = ExecRun { refused: true, ..Default::default() };
+        let e = exec_verdict(refused, 60).unwrap_err().to_string();
+        assert!(e.contains("refused"), "{e}");
+
+        let ok = ExecRun {
+            out: b"hostname r1\n".to_vec(),
+            err: b"setlocale: LC_ALL: cannot change locale\n".to_vec(),
+            eof: true,
+            confirmed: true,
+            exit_status: Some(0),
+            ..Default::default()
+        };
+        let out = exec_verdict(ok, 60).unwrap();
+        assert_eq!(out.stdout, "hostname r1\n");
+        assert!(!out.stdout.contains("setlocale"));
+        assert!(out.labelled().contains("--- stderr ---\nsetlocale"));
+
+        let failed = ExecRun {
+            err: b"% Invalid input\n".to_vec(),
+            eof: true,
+            confirmed: true,
+            exit_status: Some(1),
+            ..Default::default()
+        };
+        let e = exec_verdict(failed, 60).unwrap_err().to_string();
+        assert!(e.contains("status 1") && e.contains("Invalid input"), "{e}");
+    }
+
+    const TEST_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB+/n96rvl1Y2SBn57bwTmXu97HnHY2TsdHXejQUPbo7 hawser test";
+
+    #[test]
+    fn public_key_is_validated_before_install() {
+        assert_eq!(validate_public_key(&format!("  {TEST_PUB}\n")).unwrap(), TEST_PUB);
+        assert!(validate_public_key("").is_err());
+        assert!(validate_public_key("   ").is_err());
+        assert!(validate_public_key(&format!("{TEST_PUB}\n{TEST_PUB}")).is_err());
+        assert!(validate_public_key(&format!("-{TEST_PUB}")).is_err());
+        assert!(validate_public_key(&format!("{TEST_PUB} it's")).is_err());
+        assert!(validate_public_key("-----BEGIN OPENSSH PRIVATE KEY-----").is_err());
+        assert!(validate_public_key("hello world").is_err());
+    }
+
+    /// The install, run for real the way sshd runs it: the login shell gets
+    /// `-c 'exec sh -s'` and the script arrives on stdin. Under sh, csh and
+    /// tcsh, with a key comment holding `!`, `$` and backticks (csh/tcsh
+    /// history-expand `!` even inside single quotes): it installs the exact
+    /// line once, is idempotent, and fixes a missing final newline.
+    #[cfg(unix)]
+    #[test]
+    fn copy_id_installs_through_posix_and_csh_login_shells() {
+        use std::io::Write;
+        let key = format!("{} !! $HOME `echo pwned` !$ $(id)", TEST_PUB);
+        assert_eq!(validate_public_key(&key).unwrap(), key);
+        let script = copy_id_script(&key);
+        assert!(COPY_ID_COMMAND.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-'));
+        let mut ran = 0;
+        for shell in ["/bin/sh", "/bin/csh", "/bin/tcsh"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            ran += 1;
+            let home = std::env::temp_dir().join(format!(
+                "hawser-copyid-{}-{}",
+                std::process::id(),
+                crate::utils::artifacts::random_hex(4)
+            ));
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            std::fs::write(home.join(".ssh/authorized_keys"), "ssh-rsa AAAA old").unwrap();
+            for _ in 0..2 {
+                let mut child = std::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(COPY_ID_COMMAND)
+                    .env("HOME", &home)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+                let out = child.wait_with_output().unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    text.contains("HAWSER_KEY_OK") && out.status.success(),
+                    "{shell}: {text} {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(!text.contains("pwned"), "{shell}: {text}");
+            }
+            let ak = std::fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+            assert_eq!(ak, format!("ssh-rsa AAAA old\n{key}\n"), "{shell}");
+            let _ = std::fs::remove_dir_all(&home);
+        }
+        assert!(ran > 0, "no shell to test with");
+    }
+
+    #[test]
+    fn staging_names_fit_name_max_and_are_hidden() {
+        let long = "a".repeat(255);
+        let n = staging_name(&long, "0123456789ab", PART_SUFFIX);
+        assert!(n.len() <= NAME_MAX, "{}", n.len());
+        assert!(n.starts_with('.') && n.ends_with(PART_SUFFIX));
+        // A multi-byte name is cut at a character boundary.
+        let wide = "é".repeat(200);
+        let n = staging_name(&wide, "0123456789ab", BAK_SUFFIX);
+        assert!(n.len() <= NAME_MAX);
+        assert!(std::str::from_utf8(n.as_bytes()).is_ok());
+        assert_eq!(staging_name("f.txt", "t", PART_SUFFIX), ".f.txt.t.hawserpart");
+        assert_eq!(remote_staging("/etc/f", PART_SUFFIX).len(), "/etc/.f.".len() + 12 + PART_SUFFIX.len());
+    }
+
+    #[test]
+    fn windows_only_name_rules_stay_on_windows() {
+        // Legal on macOS/Linux, refused on Windows.
+        for name in ["aux.c", "con.h", "NUL", "com1.log", "report.", "notes "] {
+            assert_eq!(safe_local_component(name), !cfg!(windows), "{name}");
+        }
+    }
+
+    #[test]
+    fn overwrite_policy_parses_and_defaults_to_never() {
+        assert_eq!(Overwrite::parse(None).unwrap(), Overwrite::Never);
+        assert_eq!(Overwrite::parse(Some("confirmed")).unwrap(), Overwrite::Confirmed);
+        assert!(Overwrite::parse(Some("replace")).unwrap().allows_replace());
+        assert!(!Overwrite::Never.allows_replace());
+        assert!(Overwrite::parse(Some("yes")).is_err());
+    }
+
+    /// Real file operations, with chosen calls made to fail.
+    struct FailFs {
+        /// Fail the Nth call (0-based) of each kind, by kind name.
+        fail: Vec<(&'static str, usize)>,
+        calls: std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
+        /// Offer the atomic exchange; off, it is `Unsupported` (Windows), so
+        /// the move-aside path runs.
+        swap: bool,
+        /// Run just before the Nth exchange (0-based).
+        before_exchange: Option<(usize, Box<dyn Fn() + Send + Sync>)>,
+        /// Run just before a no-replace rename FROM this path.
+        before_noreplace_from: Option<(std::path::PathBuf, Box<dyn Fn() + Send + Sync>)>,
+        /// Run just before the Nth identity lookup (0-based).
+        before_ident: Option<(usize, Box<dyn Fn() + Send + Sync>)>,
+        /// Make the exchange fail with this OS error (after any hook).
+        exchange_errno: Option<i32>,
+    }
+
+    impl FailFs {
+        fn new(fail: &[(&'static str, usize)]) -> Self {
+            Self {
+                fail: fail.to_vec(),
+                calls: Default::default(),
+                swap: false,
+                before_exchange: None,
+                before_noreplace_from: None,
+                before_ident: None,
+                exchange_errno: None,
+            }
+        }
+        fn with_exchange(fail: &[(&'static str, usize)]) -> Self {
+            Self { swap: true, ..Self::new(fail) }
+        }
+        fn calls(&self, kind: &'static str) -> usize {
+            self.calls.lock().unwrap().get(kind).copied().unwrap_or(0)
+        }
+        fn hit(&self, kind: &'static str) -> std::io::Result<()> {
+            let mut c = self.calls.lock().unwrap();
+            let n = c.entry(kind).or_insert(0);
+            let this = *n;
+            *n += 1;
+            if self.fail.contains(&(kind, this)) {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("injected {kind}#{this}")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl CommitFs for FailFs {
+        fn rename(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            self.hit("rename")?;
+            std::fs::rename(a, b)
+        }
+        fn rename_noreplace(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            if let Some((from, f)) = &self.before_noreplace_from {
+                if a == from {
+                    f();
+                }
+            }
+            self.hit("noreplace")?;
+            RealFs.rename_noreplace(a, b)
+        }
+        fn exchange(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            if !self.swap {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no exchange here"));
+            }
+            if let Some((n, f)) = &self.before_exchange {
+                if self.calls("exchange") == *n {
+                    f();
+                }
+            }
+            self.hit("exchange")?;
+            if let Some(errno) = self.exchange_errno {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            exchange_paths(a, b)
+        }
+        fn ident(&self, p: &std::path::Path) -> Option<(u64, u64)> {
+            if let Some((n, f)) = &self.before_ident {
+                if self.calls("ident") == *n {
+                    f();
+                }
+            }
+            let _ = self.hit("ident");
+            RealFs.ident(p)
+        }
+        fn hard_link(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            self.hit("link")?;
+            std::fs::hard_link(a, b)
+        }
+        fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+            self.hit("remove")?;
+            std::fs::remove_file(p)
+        }
+        fn kind(&self, p: &std::path::Path) -> Option<LocalKind> {
+            RealFs.kind(p)
+        }
+    }
+
+    /// A filesystem with no atomic no-replace at all (exFAT, some network
+    /// shares), where another program creates the destination at the worst
+    /// moment: inside any replacing rename to it.
+    struct RacyFs {
+        dest: std::path::PathBuf,
+    }
+
+    impl CommitFs for RacyFs {
+        fn rename(&self, a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+            if b == self.dest {
+                std::fs::write(&self.dest, "theirs").unwrap();
+            }
+            std::fs::rename(a, b)
+        }
+        fn rename_noreplace(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no RENAME_NOREPLACE here"))
+        }
+        fn hard_link(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no hard links here"))
+        }
+        fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
+            std::fs::remove_file(p)
+        }
+        fn kind(&self, p: &std::path::Path) -> Option<LocalKind> {
+            RealFs.kind(p)
+        }
+        fn exchange(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no exchange here"))
+        }
+        fn ident(&self, p: &std::path::Path) -> Option<(u64, u64)> {
+            RealFs.ident(p)
+        }
+    }
+
+    fn commit_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "hawser-commit-{tag}-{}-{}",
+            std::process::id(),
+            crate::utils::artifacts::random_hex(4)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn read(p: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(p).ok()
+    }
+
+    #[test]
+    fn download_commit_never_destroys_both_copies() {
+        // Each case: injected failures -> (ok?, dest content, tmp kept?, bak content).
+        let cases: &[(&[(&str, usize)], bool, Option<&str>, bool, Option<&str>)] = &[
+            (&[], true, Some("new"), false, None),
+            // Atomic replace refused: aside, then in (no-replace), works.
+            (&[("rename", 0)], true, Some("new"), false, None),
+            // Cannot move the original aside: original untouched, new kept.
+            (&[("rename", 0), ("noreplace", 0), ("rename", 1)], false, Some("old"), true, None),
+            // New copy cannot go in (no-replace, link, plain rename all fail):
+            // original restored without replacing, new kept.
+            (&[("rename", 0), ("noreplace", 1), ("link", 0), ("rename", 1)], false, Some("old"), true, None),
+            // ...and the restore fails too: original at bak, new kept.
+            (
+                &[("rename", 0), ("noreplace", 1), ("link", 0), ("rename", 1), ("noreplace", 2), ("link", 1)],
+                false,
+                None,
+                true,
+                Some("old"),
+            ),
+        ];
+        for (i, (fail, ok, dest_c, tmp_kept, bak_c)) in cases.iter().enumerate() {
+            let d = commit_dir(&format!("r{i}"));
+            let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+            std::fs::write(&tmp, "new").unwrap();
+            std::fs::write(&dest, "old").unwrap();
+            let fs = FailFs::new(fail);
+            let r = commit_download(&fs, &tmp, &dest, &bak, true);
+            assert_eq!(r.is_ok(), *ok, "case {i}: {r:?}");
+            assert_eq!(read(&dest).as_deref(), *dest_c, "case {i} dest");
+            assert_eq!(tmp.exists(), *tmp_kept, "case {i} tmp");
+            assert_eq!(read(&bak).as_deref(), *bak_c, "case {i} bak");
+            if let Err(e) = &r {
+                assert!(e.contains(&tmp.display().to_string()), "case {i}: error must name the kept copy: {e}");
+                if bak.exists() {
+                    assert!(e.contains(&bak.display().to_string()), "case {i}: error must name the backup: {e}");
+                }
+            }
+            // Never: one of the two contents survives somewhere.
+            let survivors = [read(&dest), read(&tmp), read(&bak)];
+            assert!(survivors.contains(&Some("new".into())), "case {i}: new copy lost");
+            assert!(*ok || survivors.contains(&Some("old".into())), "case {i}: original lost");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// A backup that cannot be removed after a successful replace is reported,
+    /// not silently left.
+    #[test]
+    fn download_commit_reports_a_backup_it_could_not_remove() {
+        let d = commit_dir("bak");
+        let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dest, "old").unwrap();
+        let note = commit_download(&FailFs::new(&[("rename", 0), ("remove", 0)]), &tmp, &dest, &bak, true)
+            .unwrap()
+            .expect("a note about the backup");
+        assert!(note.contains(&bak.display().to_string()), "{note}");
+        assert_eq!(read(&dest).as_deref(), Some("new"));
+        assert_eq!(read(&bak).as_deref(), Some("old"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A folder that took the destination's place during the copy is never
+    /// moved aside or replaced; the downloaded copy is kept and named.
+    #[test]
+    fn download_commit_never_moves_a_folder_aside() {
+        let d = commit_dir("dir");
+        let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("inside"), "keep").unwrap();
+        // Force the move-aside path even where rename(file, dir) would fail anyway.
+        let e = commit_download(&FailFs::new(&[("rename", 0)]), &tmp, &dest, &bak, true).unwrap_err();
+        assert!(e.contains("no longer a regular file") && e.contains(&tmp.display().to_string()), "{e}");
+        assert_eq!(read(&dest.join("inside")).as_deref(), Some("keep"));
+        assert!(!bak.exists());
+        assert_eq!(read(&tmp).as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// W3c item 3: the platform's atomic exchange swaps the original and the
+    /// download in one step: no moment where `dest` is missing, no backup.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn download_commit_replaces_by_atomic_exchange() {
+        let d = commit_dir("xchg");
+        let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dest, "old").unwrap();
+        // The plain replacing rename refused (as Windows does for an open file).
+        let fs = FailFs::with_exchange(&[("rename", 0)]);
+        assert_eq!(commit_download(&fs, &tmp, &dest, &bak, true).unwrap(), None);
+        assert_eq!(read(&dest).as_deref(), Some("new"));
+        assert!(!tmp.exists() && !bak.exists());
+        assert_eq!((fs.calls("exchange"), fs.calls("noreplace")), (1, 0), "no move-aside");
+        // The primitive itself: both names swap, neither is ever replaced.
+        std::fs::write(d.join("a"), "A").unwrap();
+        std::fs::write(d.join("b"), "B").unwrap();
+        exchange_paths(&d.join("a"), &d.join("b")).unwrap();
+        assert_eq!((read(&d.join("a")).as_deref(), read(&d.join("b")).as_deref()), (Some("B"), Some("A")));
+        assert!(exchange_paths(&d.join("a"), &d.join("missing")).is_err());
+        assert_eq!(read(&d.join("a")).as_deref(), Some("B"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// W3c item 3: a folder that takes the file's place between the type
+    /// check and the exchange is swapped straight back; the download is kept
+    /// and named. If even that fails, both paths are named.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn download_commit_swaps_back_a_folder_that_raced_in() {
+        for fail_back in [false, true] {
+            let d = commit_dir("xrace");
+            let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+            std::fs::write(&tmp, "new").unwrap();
+            std::fs::write(&dest, "old").unwrap();
+            let fail: &[(&str, usize)] = if fail_back { &[("rename", 0), ("exchange", 1)] } else { &[("rename", 0)] };
+            let mut fs = FailFs::with_exchange(fail);
+            let racer = dest.clone();
+            fs.before_exchange = Some((
+                0,
+                Box::new(move || {
+                    std::fs::remove_file(&racer).unwrap();
+                    std::fs::create_dir(&racer).unwrap();
+                    std::fs::write(racer.join("inside"), "keep").unwrap();
+                }),
+            ));
+            let e = commit_download(&fs, &tmp, &dest, &bak, true).unwrap_err();
+            assert!(!bak.exists(), "fail_back={fail_back}");
+            if fail_back {
+                // The folder is at the staging name, the download at dest: both named.
+                assert!(e.contains(&tmp.display().to_string()) && e.contains(&dest.display().to_string()), "{e}");
+                assert_eq!(read(&tmp.join("inside")).as_deref(), Some("keep"));
+                assert_eq!(read(&dest).as_deref(), Some("new"));
+            } else {
+                assert!(e.contains("left as it was") && e.contains(&tmp.display().to_string()), "{e}");
+                assert_eq!(read(&dest.join("inside")).as_deref(), Some("keep"));
+                assert_eq!(read(&tmp).as_deref(), Some("new"));
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// W3d item 3: if `dest` changed AGAIN before the swap-back (another
+    /// program replaced the download there), there is no second exchange —
+    /// it would move that program's entry to the staging name. The error
+    /// says which path holds what.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn download_commit_never_swaps_back_over_a_second_change() {
+        let d = commit_dir("xtwice");
+        let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dest, "old").unwrap();
+        let mut fs = FailFs::with_exchange(&[("rename", 0)]);
+        let racer = dest.clone();
+        fs.before_exchange = Some((
+            0,
+            Box::new(move || {
+                std::fs::remove_file(&racer).unwrap();
+                std::fs::create_dir(&racer).unwrap();
+                std::fs::write(racer.join("inside"), "keep").unwrap();
+            }),
+        ));
+        // Identity lookup 0 is the download's own (before the exchange); 1 is
+        // the check before the swap-back: a third party replaces dest first.
+        let racer = dest.clone();
+        fs.before_ident = Some((1, Box::new(move || {
+            let theirs = racer.with_file_name("theirs");
+            std::fs::write(&theirs, "theirs").unwrap();
+            std::fs::rename(&theirs, &racer).unwrap();
+        })));
+        let e = commit_download(&fs, &tmp, &dest, &bak, true).unwrap_err();
+        assert_eq!(fs.calls("exchange"), 1, "a second exchange ran: {e}");
+        assert!(e.contains("changed twice"), "{e}");
+        assert!(e.contains(&tmp.display().to_string()) && e.contains(&dest.display().to_string()), "{e}");
+        // Exactly as the error says: the displaced folder at tmp, theirs at dest.
+        assert_eq!(read(&tmp.join("inside")).as_deref(), Some("keep"));
+        assert_eq!(read(&dest).as_deref(), Some("theirs"));
+        assert!(!bak.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// W3d item 3: an exchange error that does not mean "unsupported here" is
+    /// reported (naming both paths), never followed by a move-aside; one that
+    /// does (EINVAL, ENOTSUP) falls back to the portable move-aside.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn download_commit_exchange_errors_are_not_silent_fallbacks() {
+        for (errno, falls_back) in [(libc::EACCES, false), (libc::EIO, false), (libc::EINVAL, true), (libc::ENOTSUP, true)] {
+            let d = commit_dir("xerr");
+            let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+            std::fs::write(&tmp, "new").unwrap();
+            std::fs::write(&dest, "old").unwrap();
+            let mut fs = FailFs::with_exchange(&[("rename", 0)]);
+            fs.exchange_errno = Some(errno);
+            let r = commit_download(&fs, &tmp, &dest, &bak, true);
+            if falls_back {
+                assert_eq!(r, Ok(None), "errno {errno}");
+                assert!(fs.calls("noreplace") > 0, "errno {errno}: no move-aside");
+                assert_eq!(read(&dest).as_deref(), Some("new"));
+            } else {
+                let e = r.unwrap_err();
+                assert_eq!(fs.calls("noreplace"), 0, "errno {errno}: moved aside anyway");
+                assert_eq!(fs.calls("rename"), 1, "errno {errno}: a second rename ran");
+                assert!(e.contains(&tmp.display().to_string()) && e.contains(&dest.display().to_string()), "{e}");
+                assert_eq!(read(&dest).as_deref(), Some("old"));
+                assert_eq!(read(&tmp).as_deref(), Some("new"));
+            }
+            assert!(!bak.exists(), "errno {errno}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// W3c item 3, no exchange (Windows): a folder that takes the file's place
+    /// right before the move-aside is moved, seen for what it is under the
+    /// backup name, and put back with a no-replace rename; the download is
+    /// kept and named.
+    #[test]
+    fn download_commit_puts_back_a_folder_moved_aside_by_a_race() {
+        let d = commit_dir("mrace");
+        let (tmp, dest, bak) = (d.join(".f.x.hawserpart"), d.join("f"), d.join(".f.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dest, "old").unwrap();
+        let mut fs = FailFs::new(&[("rename", 0)]);
+        let racer = dest.clone();
+        fs.before_noreplace_from = Some((
+            dest.clone(),
+            Box::new(move || {
+                if racer.is_file() {
+                    std::fs::remove_file(&racer).unwrap();
+                    std::fs::create_dir(&racer).unwrap();
+                    std::fs::write(racer.join("inside"), "keep").unwrap();
+                }
+            }),
+        ));
+        let e = commit_download(&fs, &tmp, &dest, &bak, true).unwrap_err();
+        assert!(e.contains("left as it was") && e.contains(&tmp.display().to_string()), "{e}");
+        assert_eq!(read(&dest.join("inside")).as_deref(), Some("keep"));
+        assert!(!bak.exists());
+        assert_eq!(read(&tmp).as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn download_commit_no_clobber_is_enforced_at_commit() {
+        let d = commit_dir("nc");
+        let (tmp, dest, bak) = (d.join(".g.x.hawserpart"), d.join("g"), d.join(".g.x.hawserbak"));
+        // Free destination: lands.
+        std::fs::write(&tmp, "new").unwrap();
+        commit_download(&RealFs, &tmp, &dest, &bak, false).unwrap();
+        assert_eq!(read(&dest).as_deref(), Some("new"));
+        // A file appeared there "after the prompt": never replaced.
+        std::fs::write(&dest, "theirs").unwrap();
+        std::fs::write(&tmp, "new").unwrap();
+        let e = commit_download(&RealFs, &tmp, &dest, &bak, false).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(read(&dest).as_deref(), Some("theirs"));
+        assert!(!tmp.exists());
+        // Without a no-replace rename, the hard link still refuses atomically.
+        std::fs::write(&tmp, "new").unwrap();
+        let fs = FailFs::new(&[("noreplace", 0)]);
+        let e = commit_download(&fs, &tmp, &dest, &bak, false).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(read(&dest).as_deref(), Some("theirs"));
+        // ...and with a free destination, the link puts it in place.
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::write(&tmp, "new").unwrap();
+        commit_download(&FailFs::new(&[("noreplace", 0)]), &tmp, &dest, &bak, false).unwrap();
+        assert_eq!(read(&dest).as_deref(), Some("new"));
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// W3 P1: on a filesystem with no atomic no-replace, `Never` used to check
+    /// and then rename over the destination, so a file created in between was
+    /// lost. Now it never renames over anything: it fails, keeping both.
+    #[test]
+    fn download_never_never_overwrites_a_late_file_without_atomic_noreplace() {
+        let d = commit_dir("late");
+        let (tmp, dest, bak) = (d.join(".h.x.hawserpart"), d.join("h"), d.join(".h.x.hawserbak"));
+        std::fs::write(&tmp, "new").unwrap();
+        let e = commit_download(&RacyFs { dest: dest.clone() }, &tmp, &dest, &bak, false).unwrap_err();
+        assert!(e.contains("choose Replace") && e.contains(&tmp.display().to_string()), "{e}");
+        // Nothing was renamed to the destination at all (RacyFs would have
+        // planted "theirs" and then clobbered it).
+        assert!(!dest.exists());
+        assert_eq!(read(&tmp).as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Cancel and Begin share one lock: whichever order they land in, and
+    /// however they interleave, a cancel is never lost.
+    #[test]
+    fn transfer_cancel_is_never_lost_to_registration() {
+        let reg = Arc::new(Registry::default());
+        for round in 0..2000 {
+            let id = format!("t{round}");
+            let (r1, r2) = (Arc::clone(&reg), Arc::clone(&reg));
+            let id2 = id.clone();
+            let canceller = std::thread::spawn(move || r1.transfer_cancel(&id2));
+            let begun = r2.transfer_begin(&id);
+            canceller.join().unwrap();
+            match begun {
+                Err(SshError::TransferCancelled) => {}
+                Ok((seq, rx)) => {
+                    assert!(*rx.borrow(), "round {round}: cancel lost");
+                    reg.transfer_end(&id, seq);
+                }
+                Err(e) => panic!("{e}"),
+            }
+            // No marker left behind for a transfer that already saw the cancel.
+            assert!(reg.transfers.lock().unwrap().early_cancels.get(&id).is_none(), "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_staging_is_exclusive_private_and_in_the_destination_folder() {
+        let d = commit_dir("stage");
+        let dest = d.join("x".repeat(250));
+        let (a, _fa) = create_local_staging(&dest).await.unwrap();
+        let (b, _fb) = create_local_staging(&dest).await.unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(d.as_path()));
+        assert!(a.file_name().unwrap().len() <= NAME_MAX);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // The pump that awaits forward teardown can be aborted by a reconnect or a
+    // tab close. Cut off at its first await, no listener or tunnel survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_teardown_survives_its_caller_being_dropped() {
+        async fn bind() -> (tokio::net::TcpListener, u16) {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            (l, p)
+        }
+        async fn port_free(port: u16) -> bool {
+            for _ in 0..100 {
+                if tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+
+        let (accepting, listen_port) = bind().await;
+        let (tunnel_sock, tunnel_port) = bind().await;
+        let listener = tokio::spawn(async move {
+            loop {
+                let _ = accepting.accept().await;
+            }
+        });
+        let tunnel = tokio::spawn(async move {
+            let _held = tunnel_sock;
+            std::future::pending::<()>().await
+        });
+        let fw = Forward {
+            info: ForwardInfo {
+                id: "fw-t-1".into(),
+                session_id: "t".into(),
+                local_port: listen_port,
+                remote_host: "r".into(),
+                remote_port: 1,
+                kind: "local",
+            },
+            generation: 1,
+            listener,
+            tunnels: Arc::new(std::sync::Mutex::new(vec![tunnel])),
+        };
+
+        // Poll the teardown once (to its first await), then drop it.
+        tokio::select! {
+            biased;
+            _ = teardown_forwards(vec![fw]) => {}
+            _ = std::future::ready(()) => {}
+        }
+        assert!(port_free(listen_port).await, "a listener outlived its teardown");
+        assert!(port_free(tunnel_port).await, "a tunnel outlived its teardown");
+    }
 }
+
+/// An in-process SFTP server (russh + russh-sftp over a real SSH session),
+/// for the transfer commit paths.
+#[cfg(all(test, unix))]
+#[path = "tests/sftp_harness.rs"]
+mod sftp_harness;

@@ -25,14 +25,14 @@ export const STARTUP_PRESETS: StartupPreset[] = [
     // others on attach means the current client alone decides the size.
     id: 'tmux',
     label: 'Keep session alive (tmux)',
-    command: 'tmux new-session -A -D -s skiff-{pane}',
-    hint: 'Survives closing Skiff. Each pane gets its own tmux session.',
+    command: 'tmux new-session -A -D -s hawser-{pane}',
+    hint: 'Survives closing Hawser. Each pane gets its own tmux session.',
   },
   {
     // -d detaches elsewhere, -R reattaches if possible, -R twice creates if not.
     id: 'screen',
     label: 'Keep session alive (screen)',
-    command: 'screen -dRR skiff-{pane}',
+    command: 'screen -dRR hawser-{pane}',
     hint: 'Same idea where tmux is unavailable.',
   },
   {

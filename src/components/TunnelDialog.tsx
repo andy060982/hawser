@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { ArrowRight, Cable, Plus, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
+import { validateForward } from '../lib/transfers'
 
 interface ForwardInfo {
   id: string
@@ -29,6 +31,9 @@ export function TunnelDialog({
   sessionTitle: string
   onClose: () => void
 }) {
+  // A modal layer (app shortcuts stay off behind it). Its Escape is the
+  // panel's own onKeyDown, so an alert stacked above keeps its Escape.
+  useModalLayer(true)
   const [forwards, setForwards] = useState<ForwardInfo[]>([])
   const [localPort, setLocalPort] = useState('')
   const [remoteHost, setRemoteHost] = useState('127.0.0.1')
@@ -38,40 +43,50 @@ export function TunnelDialog({
   const [busy, setBusy] = useState(false)
 
   const refresh = useCallback(() => {
-    void safeInvoke<ForwardInfo[]>('forwards_list', { sessionId }).then((l) =>
-      setForwards(l ?? []),
-    )
+    void safeInvoke<ForwardInfo[]>('forwards_list', { sessionId })
+      .then((l) => setForwards(l ?? []))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [sessionId])
+
+  /** Synchronous guard: `busy` is render-time state, so a double Enter (or a
+   *  click plus Enter) could start two forwards before it re-rendered. */
+  const busyRef = useRef(false)
 
   useEffect(refresh, [refresh])
 
+  /* Escape closes this dialog only when the key is pressed INSIDE it (no
+     window listener): a confirm or alert opened above it holds the focus,
+     so its Escape dismisses just that alert and never this dialog too. */
+  const panelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+    if (!panelRef.current?.contains(document.activeElement)) panelRef.current?.focus()
+  }, [])
+  const onPanelKey = (e: ReactKeyboardEvent) => {
+    if (e.key !== 'Escape') return
+    e.stopPropagation()
+    onClose()
+  }
 
   const add = async () => {
-    const rp = Number(remotePort)
-    if (mode === 'local' && (!remoteHost.trim() || !rp || rp < 1 || rp > 65535)) {
-      setError('Remote host and port are required.')
+    if (busyRef.current) return
+    const req = validateForward(mode, localPort, remoteHost, remotePort)
+    if (typeof req === 'string') {
+      setError(req)
       return
     }
+    busyRef.current = true
     setBusy(true)
     setError(null)
     try {
-      // Empty local port = 0 = "pick a free one"; the result shows what bound.
+      // Local port 0 = "pick a free one"; the result shows what bound.
       if (mode === 'socks') {
-        await safeInvoke('forward_start_socks', {
-          sessionId,
-          localPort: Number(localPort) || 0,
-        })
+        await safeInvoke('forward_start_socks', { sessionId, localPort: req.localPort })
       } else {
         await safeInvoke('forward_start', {
           sessionId,
-          localPort: Number(localPort) || 0,
-          remoteHost: remoteHost.trim(),
-          remotePort: rp,
+          localPort: req.localPort,
+          remoteHost: req.remoteHost,
+          remotePort: req.remotePort,
         })
       }
       setLocalPort('')
@@ -80,12 +95,15 @@ export function TunnelDialog({
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
   }
 
   const stop = (id: string) => {
-    void safeInvoke('forward_stop', { forwardId: id }).then(refresh)
+    void safeInvoke('forward_stop', { forwardId: id })
+      .catch((e) => setError(`Could not stop the forward: ${e instanceof Error ? e.message : String(e)}`))
+      .finally(refresh)
   }
 
   return (
@@ -93,10 +111,13 @@ export function TunnelDialog({
       <div className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]" aria-hidden />
 
       <div
+        ref={panelRef}
+        tabIndex={-1}
+        onKeyDown={onPanelKey}
         role="dialog"
         aria-modal="true"
         aria-labelledby="tun-title"
-        className="animate-drop-in relative mt-12 h-fit w-[34rem] max-w-[92vw] overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
+        className="animate-drop-in relative outline-none mt-12 h-fit w-[34rem] max-w-[92vw] overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
       >
         <header className="flex items-center gap-2 border-b border-line px-5 py-3">
           <Cable size={15} className="shrink-0 text-accent" aria-hidden />
@@ -191,7 +212,7 @@ export function TunnelDialog({
               <input
                 value={remotePort}
                 onChange={(e) => setRemotePort(e.target.value.replace(/\D/g, ''))}
-                onKeyDown={(e) => e.key === 'Enter' && void add()}
+                onKeyDown={(e) => e.key === 'Enter' && !busy && void add()}
                 placeholder="443"
                 className="h-7 w-full rounded border border-line bg-surface-0 px-2 font-mono text-[12px] text-ink placeholder:text-ink-faint focus:border-accent focus:outline-none"
               />

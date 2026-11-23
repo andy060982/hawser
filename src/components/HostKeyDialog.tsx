@@ -1,12 +1,22 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, Fingerprint, ShieldAlert, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 
 interface HostKeyRequest {
   requestId: string
   host: string
+  /** Peer address the socket actually connected to. Empty when the connection
+   *  rides a jump host: the bastion resolved and dialled the name (see `via`). */
   ip: string
   port: number
+  /** Catalogue name of the host, when it has one (a label only). */
+  hostName?: string | null
+  /** `user@host:port` the backend dialled. */
+  target: string
+  /** Bastion this connection rides, if any. */
+  via?: string | null
   keyType: string
   /** OpenSSH-style SHA256 fingerprint, identical to `ssh-keygen -lf` output. */
   fingerprint: string
@@ -85,18 +95,15 @@ export function HostKeyDialog() {
     setCopied(false)
     cancelRef.current?.focus()
 
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        void respond(false)
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request?.requestId])
 
+  // Escape denies, while this prompt is the top modal.
+  useModalLayer(!!request, () => void respondRef.current(false), LAYER.sshPrompt)
+  const respondRef = useRef<(accept: boolean) => Promise<void>>(async () => {})
+
   if (!request) return null
+  respondRef.current = respond
 
   async function respond(accept: boolean) {
     if (!request) return
@@ -120,7 +127,7 @@ export function HostKeyDialog() {
     : ['SHA256', request.fingerprint]
 
   return (
-    <div className="absolute inset-0 z-50 flex justify-center">
+    <div className="absolute inset-0 z-[80] flex justify-center">
       {/* Scrim: dims the shell without hiding it, so the user keeps the context
           of which window raised this. */}
       <div
@@ -148,7 +155,7 @@ export function HostKeyDialog() {
               Unrecognised host key
             </h2>
             <p id="hk-desc" className="mt-0.5 text-[12.5px] text-ink-dim">
-              Skiff has not connected to this server before.
+              Hawser has not connected to this server before.
               {queue.length > 1 && (
                 <span className="ml-1 text-ink-faint">
                   ({queue.length - 1} more {queue.length - 1 === 1 ? 'prompt' : 'prompts'} waiting)
@@ -160,16 +167,35 @@ export function HostKeyDialog() {
 
         {/* Identity block */}
         <dl className="mx-5 grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1.5 rounded border border-line bg-surface-1 px-4 py-3 text-[12.5px]">
-          <dt className="text-ink-faint">Hostname</dt>
-          <dd className="selectable truncate font-mono text-ink" title={request.host}>
-            {request.host}
+          {request.hostName && (
+            <>
+              <dt className="text-ink-faint">Host</dt>
+              <dd className="truncate text-ink" title={request.hostName}>
+                {request.hostName}
+              </dd>
+            </>
+          )}
+
+          <dt className="text-ink-faint">Connecting</dt>
+          <dd className="selectable truncate font-mono text-ink" title={request.target}>
+            {request.target}
           </dd>
 
           <dt className="text-ink-faint">Address</dt>
-          <dd className="selectable font-mono text-ink-dim">
-            {request.ip}
-            <span className="text-ink-faint">:{request.port}</span>
-          </dd>
+          {request.via ? (
+            <dd className="selectable font-mono text-ink-dim" title={request.via}>
+              <span className="text-ink-faint">via </span>
+              {request.via}
+              <span className="block font-sans text-[11px] text-ink-faint">
+                The bastion resolved and dialled {request.host}:{request.port}.
+              </span>
+            </dd>
+          ) : (
+            <dd className="selectable font-mono text-ink-dim">
+              {request.ip.includes(':') ? `[${request.ip}]` : request.ip}
+              <span className="text-ink-faint">:{request.port}</span>
+            </dd>
+          )}
 
           <dt className="text-ink-faint">Key type</dt>
           <dd className="font-mono uppercase text-ink-dim">{request.keyType}</dd>

@@ -1,7 +1,10 @@
 name: Release
 
-# Push a version tag (e.g. v0.2.0) and this builds Skiff on Windows and Linux
-# and attaches every installer/bundle to a GitHub release for that tag.
+# Push a version tag (e.g. v0.2.0) and this builds Hawser on Windows and Linux
+# and attaches every installer/bundle to a GitHub release for that tag, with
+# the updater signatures, then publishes latest.json for the in-app updater.
+# macOS is built, notarized and added to latest.json on Andy's Mac afterwards
+# (scripts/add-macos-to-latest.mjs; see RELEASING.md).
 on:
   push:
     tags: ['v*']
@@ -10,18 +13,57 @@ permissions:
   contents: write
 
 jobs:
+  # Refuse to publish a release whose tag does not name the version being
+  # built: a v0.6.1 tag on a 0.6.0 tree would otherwise publish
+  # Hawser_0.6.0_x64-setup.exe under "Hawser v0.6.1". The frontend tests run
+  # here too, once, before any bundle is built.
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the app version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n1)
+          echo "tag=$tag package.json=$pkg tauri.conf.json=$conf Cargo.toml=$cargo"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$conf" ] || [ "$tag" != "$cargo" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the version (package.json $pkg, tauri.conf.json $conf, Cargo.toml $cargo)"
+            exit 1
+          fi
+
+      # 22: npm test runs the TypeScript sources with --experimental-strip-types.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Frontend tests
+        run: npm test
+
   release:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # Linux on 22.04, not ubuntu-latest: the AppImage and .deb link against
+        # the runner's glibc, and 24.04's (2.39) would refuse to start on
+        # Ubuntu 22.04, Debian 12 or RHEL 9. 22.04 is the oldest base with
+        # webkit2gtk-4.1.
+        os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +78,7 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('src-tauri/Cargo.lock') }}
 
       - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -48,18 +90,55 @@ jobs:
 
       - run: npm ci
 
+      # The cargo cache restores src-tauri/target, bundles from an earlier
+      # version included. Clear them so only this build's installers and
+      # signatures are uploaded (the manifest job expects exactly one of each).
+      - name: Clear cached bundles
+        shell: bash
+        run: rm -rf src-tauri/target/release/bundle
+
       - name: Build release bundles
         # APPIMAGE_EXTRACT_AND_RUN lets appimagetool run without FUSE on the
         # GitHub runner. On Windows the flag is simply ignored.
+        # createUpdaterArtifacts signs the NSIS installer and the AppImage with
+        # the minisign key from the repo secrets (the CLI reads both variables
+        # itself; they are never echoed). A missing key fails the build. The
+        # CLI (@tauri-apps/cli >= 2.11.5, from package-lock.json) binds each
+        # signature to the app version, which requireSignedVersion demands.
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
+
+      # Tauri 2 (createUpdaterArtifacts: true, not "v1Compatible") signs the
+      # installers themselves: <name>-setup.exe.sig and <name>.AppImage.sig. No
+      # .nsis.zip or .AppImage.tar.gz is made.
+      - name: Check updater signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            bundles=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          else
+            bundles=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          fi
+          if [ "${#bundles[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one updater bundle, found ${#bundles[@]}: ${bundles[*]:-none}"
+            exit 1
+          fi
+          if [ ! -s "${bundles[0]}.sig" ]; then
+            echo "::error::${bundles[0]}.sig is missing: is TAURI_SIGNING_PRIVATE_KEY set?"
+            exit 1
+          fi
+          echo "signed: ${bundles[0]}"
 
       - name: Upload artifacts to the release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Skiff ${{ github.ref_name }}
+          name: Hawser ${{ github.ref_name }}
           draft: false
           # Any hyphenated tag (e.g. v0.5.0-beta.1, v1.0.0-rc.2) publishes as a
           # GitHub pre-release so it is not surfaced as the "Latest" download.
@@ -67,6 +146,53 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
-            src-tauri/target/release/skiff.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+            src-tauri/target/release/hawser.exe
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+
+  # latest.json for tauri-plugin-updater, once both platforms are on the
+  # release. The app fetches releases/latest/download/latest.json, and
+  # "latest" never resolves to a pre-release, so a hyphenated tag's manifest
+  # is published but offered to nobody. Signatures are public; no secret is
+  # used here beyond the job's own GITHUB_TOKEN.
+  manifest:
+    needs: release
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The updater bundles too: latest-json.mjs verifies every signature
+      # against the exact bytes users will download before publishing.
+      - name: Fetch signatures and updater bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sigs prev
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir sigs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*-setup.exe' --pattern '*.AppImage' --dir sigs
+          # A re-run keeps the macOS entries already merged into latest.json.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'latest.json' --dir prev || true
+          ls -l sigs
+
+      - name: Build latest.json
+        run: >-
+          node scripts/latest-json.mjs build
+          --tag "$TAG" --repo "$GITHUB_REPOSITORY" --sigdir sigs --assetdir sigs
+          --changelog CHANGELOG.md --conf src-tauri/tauri.conf.json
+          --existing prev/latest.json --out latest.json
+
+      - name: Upload latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber

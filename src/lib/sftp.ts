@@ -1,5 +1,6 @@
 import { sep } from '@tauri-apps/api/path'
-import type { DirListing, PaneSide } from '../types'
+import type { DirListing, PaneSide, TransferOutcome } from '../types'
+import type { TransferJob } from './transfers'
 import { safeInvoke, inTauri } from './tauri'
 import { mockLocalListing, mockRemoteListing } from '../data/mockHosts'
 
@@ -36,14 +37,30 @@ export async function listDirectory(
   return res
 }
 
+/** Run one transfer under `transferId` (the queue row's id: events carry it
+ *  and `cancelTransfer` takes it), with an explicit overwrite policy the
+ *  backend enforces when the file is committed. */
 export async function transfer(
   direction: 'upload' | 'download',
   sessionId: string,
-  localPath: string,
-  remotePath: string,
-): Promise<void> {
+  transferId: string,
+  job: TransferJob,
+): Promise<TransferOutcome | null> {
   const cmd = direction === 'upload' ? 'sftp_put' : 'sftp_get'
-  await safeInvoke(cmd, { sessionId, localPath, remotePath })
+  return (
+    (await safeInvoke<TransferOutcome>(cmd, {
+      sessionId,
+      localPath: job.local,
+      remotePath: job.remote,
+      transferId,
+      overwrite: job.overwrite,
+    })) ?? null
+  )
+}
+
+/** Stop a running transfer; its staging files are removed on both sides. */
+export async function cancelTransfer(transferId: string): Promise<void> {
+  await safeInvoke('sftp_cancel', { transferId })
 }
 
 /* --------------------------------------------------------------- path utils */

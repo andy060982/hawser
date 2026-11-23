@@ -8,16 +8,31 @@ import type { SearchAddon } from '@xterm/addon-search'
  *  A module-level map rather than context because the terminals live outside
  *  React's render cycle anyway — they are imperative objects that mount once
  *  and survive re-renders by design. */
-const terms = new Map<string, { term: Terminal; search: SearchAddon }>()
+export interface TermEntry {
+  term: Terminal
+  search: SearchAddon
+  /** Send text as user input through the pane's ordered write queue, and the
+   *  same bytes to exactly `mirrorTo` (sibling session ids the caller had
+   *  approved; [] for this pane only). Snippets use this. */
+  input: (text: string, mirrorTo: readonly string[]) => void
+  /** Paste into THIS pane only (xterm's paste, so bracketed-paste framing
+   *  applies), never broadcast. AI insert uses this. */
+  pasteLocal: (text: string) => void
+  /** The sibling sessions typed input in this pane is mirrored to right now
+   *  (broadcast on), else []. */
+  broadcastTargets: () => string[]
+}
 
-export function registerTerm(sessionId: string, term: Terminal, search: SearchAddon): void {
-  terms.set(sessionId, { term, search })
+const terms = new Map<string, TermEntry>()
+
+export function registerTerm(sessionId: string, entry: TermEntry): void {
+  terms.set(sessionId, entry)
 }
 
 export function unregisterTerm(sessionId: string): void {
   terms.delete(sessionId)
 }
 
-export function getTerm(sessionId: string): { term: Terminal; search: SearchAddon } | undefined {
+export function getTerm(sessionId: string): TermEntry | undefined {
   return terms.get(sessionId)
 }

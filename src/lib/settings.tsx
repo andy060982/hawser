@@ -1,7 +1,9 @@
 /** App-wide settings: host-color policies and a couple of safety toggles.
  *
- *  Persisted to %APPDATA%\skiff\settings.json via the settings_load/save IPC
- *  commands (same corrupt-tolerant contract as the host catalogue). Exposed
+ *  Persisted to %APPDATA%\hawser\settings.json via the settings_load/save IPC
+ *  commands (same fail-closed contract as the host catalogue: an unreadable
+ *  or corrupt file is a load error, and nothing is saved over it until the
+ *  user explicitly chooses to). Exposed
  *  through a context so the cross-cutting consumers — connect flow, AI panel,
  *  broadcast, close guard — read one source of truth instead of threading
  *  props through the whole tree.
@@ -36,6 +38,18 @@ export interface Settings {
   copyOnSelect: boolean
   /** Middle-click (mouse wheel button) pastes the clipboard, X11 / PuTTY style. */
   middleClickPaste: boolean
+  /** Open a local terminal tab when Hawser starts — "use it as my terminal". */
+  localShellOnStartup: boolean
+  /** Profile id for new local terminals (Ctrl+Shift+T, startup). Unset means
+   *  the first one the backend lists (PowerShell 7 / Windows PowerShell on
+   *  Windows, the login shell elsewhere). */
+  defaultLocalShell?: string
+  /** Keep a transcript of local terminals, like SSH sessions, so session
+   *  search covers them. Everything shown on screen is written to disk. */
+  recordLocalTranscripts: boolean
+  /** Check GitHub for a new release at startup (at most once a day). Never
+   *  installs on its own: an update waits for "Install and restart". */
+  autoUpdateCheck: boolean
 }
 
 const PERMISSIVE: ColorPolicy = { ai: 'on', confirmConnect: false, excludeFromBroadcast: false }
@@ -65,6 +79,9 @@ export function defaultSettings(): Settings {
     confirmCloseActive: true,
     copyOnSelect: true,
     middleClickPaste: true,
+    localShellOnStartup: false,
+    recordLocalTranscripts: true,
+    autoUpdateCheck: true,
   }
 }
 
@@ -83,6 +100,10 @@ function hydrate(raw: unknown): Settings {
   if (typeof r.confirmCloseActive === 'boolean') base.confirmCloseActive = r.confirmCloseActive
   if (typeof r.copyOnSelect === 'boolean') base.copyOnSelect = r.copyOnSelect
   if (typeof r.middleClickPaste === 'boolean') base.middleClickPaste = r.middleClickPaste
+  if (typeof r.localShellOnStartup === 'boolean') base.localShellOnStartup = r.localShellOnStartup
+  if (typeof r.defaultLocalShell === 'string') base.defaultLocalShell = r.defaultLocalShell
+  if (typeof r.recordLocalTranscripts === 'boolean') base.recordLocalTranscripts = r.recordLocalTranscripts
+  if (typeof r.autoUpdateCheck === 'boolean') base.autoUpdateCheck = r.autoUpdateCheck
   return base
 }
 
@@ -93,8 +114,19 @@ export function policyFor(settings: Settings, color: HostColor | undefined): Col
 
 interface SettingsCtx {
   settings: Settings
+  /** True once the saved settings have been read (startup actions wait for it). */
+  ready: boolean
   update: (patch: Partial<Settings>) => void
   setColorPolicy: (color: HostColor, patch: Partial<ColorPolicy>) => void
+  /** Why settings.json could not be read. While set, changes apply for this
+   *  run but are NOT saved (saving defaults would overwrite the real file),
+   *  until the user chooses `saveAnyway`. */
+  loadError: string | null
+  /** Why the last save failed; cleared by the next successful one. */
+  saveError: string | null
+  /** After a failed load: save the current settings over the unreadable
+   *  file from now on. */
+  saveAnyway: () => void
 }
 
 const Ctx = createContext<SettingsCtx | null>(null)
@@ -107,18 +139,40 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   // Don't persist the first load (that would just rewrite defaults before the
   // real file is read); only persist genuine user changes.
   const loaded = useRef(false)
+  const [ready, setReady] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   useEffect(() => {
-    void safeInvoke<unknown>('settings_load').then((raw) => {
-      setSettings(hydrate(raw))
-      loaded.current = true
-    })
+    void safeInvoke<unknown>('settings_load')
+      .then((raw) => {
+        setSettings(hydrate(raw))
+        loaded.current = true
+      })
+      .catch((e: unknown) => {
+        // Keep the defaults for this run, and say so: saving them would
+        // replace the user's real (unreadable right now) settings file.
+        setLoadError(e instanceof Error ? e.message : String(e))
+      })
+      .finally(() => setReady(true))
+  }, [])
+
+  const save = useCallback((next: Settings) => {
+    void safeInvoke('settings_save', { settings: next })
+      .then(() => setSaveError(null))
+      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)))
   }, [])
 
   const persist = useCallback((next: Settings) => {
     setSettings(next)
-    if (loaded.current) void safeInvoke('settings_save', { settings: next }).catch(() => {})
-  }, [])
+    if (loaded.current) save(next)
+  }, [save])
+
+  const saveAnyway = useCallback(() => {
+    loaded.current = true
+    setLoadError(null)
+    save(settingsRef.current)
+  }, [save])
 
   const update = useCallback(
     (patch: Partial<Settings>) => persist({ ...settingsRef.current, ...patch }),
@@ -138,7 +192,11 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [persist],
   )
 
-  return <Ctx.Provider value={{ settings, update, setColorPolicy }}>{children}</Ctx.Provider>
+  return (
+    <Ctx.Provider value={{ settings, ready, update, setColorPolicy, loadError, saveError, saveAnyway }}>
+      {children}
+    </Ctx.Provider>
+  )
 }
 
 export function useSettings(): SettingsCtx {

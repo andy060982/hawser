@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { KeyRound, Plus, Server, Trash2, X } from 'lucide-react'
 import type { AuthMethod, Host, HostNode, Snippet } from '../types'
-import { allHosts } from '../lib/tree'
+import {
+  allHosts, credentialDestinations, findHost, inheritedHostColor, ownColor, upsertHost, vaultSlotSharing,
+} from '../lib/tree'
 import {
   STARTUP_PRESETS,
   customCommands,
@@ -10,12 +12,16 @@ import {
 import { DEVICE_PROFILES } from '../lib/deviceProfiles'
 import { HOST_COLORS } from '../lib/hostColors'
 import { safeInvoke } from '../lib/tauri'
+import { sep } from '@tauri-apps/api/path'
+import { keyPathPlaceholder, vaultName } from '../lib/localPath'
+import { policyFor, useSettings } from '../lib/settings'
+import { useModalLayer } from '../lib/useModalLayer'
 
 /* ---------------------------------------------------------------------------
    Add / edit a saved host.
 
    The password field is the reason this component matters. Before it existed
-   the only way to store a credential was `cmdkey /generic:skiff:host:<id>`,
+   the only way to store a credential was `cmdkey /generic:hawser:host:<id>`,
    which is an unreasonable thing to ask of anyone.
 
    The secret goes straight to `credential_save`, which writes it to the Windows
@@ -31,8 +37,21 @@ interface Props {
   /** Full catalogue, for the jump-host picker. */
   catalogue: HostNode[]
   onSave: (host: Host) => void
-  onDelete?: (hostId: string) => void
+  /** Asks the user (with the host's dependents named) and deletes; resolves
+   *  whether it did, so the editor closes only then. */
+  onDelete?: (hostId: string) => Promise<boolean>
   onClose: () => void
+}
+
+/** The local platform, for wording and examples (the vault's name, a key
+ *  path). Outside Tauri (layout preview) it reads as "other". */
+function localPlatform(): 'windows' | 'macos' | 'other' {
+  try {
+    if (sep() === '\\') return 'windows'
+  } catch {
+    return 'other'
+  }
+  return /Mac/i.test(navigator.userAgent) ? 'macos' : 'other'
 }
 
 const blank = (): Host => ({
@@ -47,7 +66,12 @@ const blank = (): Host => ({
 
 export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props) {
   const [draft, setDraft] = useState<Host>(host ?? blank())
+  /** The port as typed: a number field snapped to 22 the moment it was
+   *  cleared, so select-all + type "8022" became "228022". Validated on save. */
+  const [portText, setPortText] = useState(() => String((host ?? blank()).port))
   const [password, setPassword] = useState('')
+  const { settings } = useSettings()
+  const platform = localPlatform()
   /** Live list of on-connect commands: selected presets plus custom lines. */
   const [startup, setStartup] = useState<string[]>(() =>
     rawStartupCommands(host ?? {}),
@@ -59,6 +83,8 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
   /** null while the vault lookup for the current credKey is in flight. */
   const [hasSaved, setHasSaved] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
+  /** A save is in flight: the editor cannot be dismissed until it settles. */
+  const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   /** Public key from a just-generated pair, shown for copying to the server. */
   const [generatedPub, setGeneratedPub] = useState<string | null>(null)
@@ -69,15 +95,45 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
   const installPwRef = useRef(installPw)
   installPwRef.current = installPw
   const firstRef = useRef<HTMLInputElement>(null)
+  /** Op id of a key install still in flight, so closing the editor cancels it
+   *  (and closes any host-key or password prompt it raised). */
+  const installOpRef = useRef<string | null>(null)
+  useEffect(
+    () => () => {
+      const op = installOpRef.current
+      if (op) void safeInvoke('ssh_copy_id_cancel', { opId: op })
+    },
+    [],
+  )
 
   /** The vault entry this host actually uses: a borrowed one when "Same as …"
    *  is chosen. Connect reads the vault by this id, so status and saves must
    *  use it too — saving under the host's own id stored a password that was
    *  never read. */
   const credKey = draft.credentialId ?? draft.id
-  const lender = draft.credentialId
-    ? allHosts(catalogue).find((h) => h.id === draft.credentialId)
-    : undefined
+  /** Who else uses that slot (lib/tree vaultSlotSharing): judged by the
+   *  effective slot, so borrowers of a deleted lender and case-variant ids
+   *  are caught too. A key passphrase lives in the same slot as a password,
+   *  so saving one into a shared slot would replace a password other hosts
+   *  log in with. */
+  const sharing = vaultSlotSharing(catalogue, draft)
+  const lender = sharing.lender
+  const sharedSlot = sharing.shared
+  const sharedWith = lender
+    ? lender.name
+    : sharing.others.length > 0
+      ? sharing.others.map((b) => b.name).slice(0, 3).join(', ')
+      : 'a host that was deleted'
+
+  /** The jump host this entry names, and whether it still exists: a deleted
+   *  bastion must read as such, never as "Direct connection". */
+  const jumpMissing = !!draft.jumpHostId && !findHost(catalogue, draft.jumpHostId)
+
+  /** The AI default this host gets when it has no explicit choice: the
+   *  colour policy for its effective colour (own, else its folder's), the
+   *  same rule the assistant itself applies (AiPanel aiAllowedFor). */
+  const effColor = ownColor(draft.color) ?? inheritedHostColor(catalogue, draft.id)
+  const aiDefault = policyFor(settings, effColor).ai !== 'off'
 
   useEffect(() => {
     firstRef.current?.focus()
@@ -97,22 +153,38 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
     }
   }, [credKey])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
-      e.preventDefault()
-      // Esc in the install-password overlay cancels only the overlay; closing
-      // the whole editor here discarded every unsaved edit (and the path of a
-      // key generated a moment ago).
-      if (installPwRef.current !== null) {
-        setInstallPw(null)
-        return
-      }
-      onClose()
+  /* Escape: the install overlay first, then the editor — but never while a
+     save is in flight (closing then still let the save land afterwards), and
+     only while the editor is the top modal (an alert over it takes its own
+     Escape). */
+  const savingRef = useRef(saving)
+  savingRef.current = saving
+  useModalLayer(true, () => {
+    // Esc in the install-password overlay cancels only the overlay; closing
+    // the whole editor here discarded every unsaved edit (and the path of a
+    // key generated a moment ago).
+    if (installPwRef.current !== null) {
+      setInstallPw(null)
+      return
     }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+    if (savingRef.current) return
+    onClose()
+  })
+
+  /** Set when the editor is dismissed, so a save still awaiting the vault
+   *  cannot write the host afterwards. */
+  const dismissedRef = useRef(false)
+  useEffect(() => {
+    dismissedRef.current = false
+    return () => {
+      dismissedRef.current = true
+    }
+  }, [])
+  const dismiss = () => {
+    if (savingRef.current) return
+    dismissedRef.current = true
+    onClose()
+  }
 
   const set = <K extends keyof Host>(k: K, v: Host[K]) =>
     setDraft((d) => ({ ...d, [k]: v }))
@@ -135,8 +207,15 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
     // The input's min/max are not enforced while typing; an out-of-range or
     // fractional port would save, then fail every connect and the whole
     // reachability sweep (the backend takes a u16).
-    if (!Number.isInteger(draft.port) || draft.port < 1 || draft.port > 65535) {
+    const port = /^\d{1,5}$/.test(portText.trim()) ? Number(portText.trim()) : NaN
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
       setError('Port must be a whole number from 1 to 65535.')
+      return
+    }
+    if (draft.auth === 'key' && password && sharedSlot) {
+      setError(
+        `This host shares a saved credential with ${sharedWith}. A key passphrase would replace that shared password. Choose "Own credential" to save a passphrase for this host.`,
+      )
       return
     }
     // A saved password is only ever sent to the destinations it was saved for
@@ -146,7 +225,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
     const destChanged =
       !host ||
       host.hostname !== draft.hostname ||
-      host.port !== draft.port ||
+      host.port !== port ||
       host.username !== draft.username ||
       (host.credentialId ?? host.id) !== credKey
     if (hasSaved === null) {
@@ -162,6 +241,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
       return
     }
     setBusy(true)
+    setSaving(true)
     setError(null)
     try {
       if (password) {
@@ -173,13 +253,23 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           // credential_save): it may only ever be sent here (and to catalogue
           // hosts that borrow it), regardless of later hosts.json edits.
           host: draft.hostname,
-          port: draft.port,
+          port,
+          // Exactly the hosts that will use this entry once this edit is
+          // saved: it replaces the binding, so this host's OLD address (or
+          // a borrower that went away) no longer receives the password.
+          destinations: credentialDestinations(
+            upsertHost(catalogue, { ...draft, port, kind: 'host' }),
+            credKey,
+          ),
         })
       }
+      // Dismissed while the vault write was pending: stop here.
+      if (dismissedRef.current) return
       // Write the array and clear the legacy single-command field, so the two
       // can never disagree about what runs.
       onSave({
         ...draft,
+        port,
         // Clean once, here: trim, drop blank lines, and de-duplicate — the last
         // also repairs any host whose commands were stacked by the old toggle.
         startupCommands: [...new Set(startup.map((c) => c.trim()).filter(Boolean))],
@@ -190,6 +280,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setBusy(false)
+      setSaving(false)
     }
   }
 
@@ -211,8 +302,9 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           <button
             type="button"
             aria-label="Close"
-            onClick={onClose}
-            className="grid h-6 w-6 place-items-center rounded text-ink-faint hover:bg-surface-3 hover:text-ink"
+            onClick={dismiss}
+            disabled={saving}
+            className="grid h-6 w-6 place-items-center rounded text-ink-faint hover:bg-surface-3 hover:text-ink disabled:opacity-40"
           >
             <X size={14} />
           </button>
@@ -240,11 +332,9 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
             </Field>
             <Field label="Port">
               <input
-                type="number"
-                min={1}
-                max={65535}
-                value={draft.port}
-                onChange={(e) => set('port', Number(e.target.value) || 22)}
+                inputMode="numeric"
+                value={portText}
+                onChange={(e) => setPortText(e.target.value)}
                 className={`${inputCls} font-mono`}
               />
             </Field>
@@ -263,15 +353,17 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
             <label className="flex cursor-pointer items-start gap-2 text-[12px] text-ink-dim">
               <input
                 type="checkbox"
-                checked={draft.aiAllowed ?? draft.color !== 'red'}
+                checked={draft.aiAllowed ?? aiDefault}
                 onChange={(e) => set('aiAllowed', e.target.checked)}
                 className="mt-[2px] h-3 w-3 accent-[var(--color-accent)]"
               />
               <span>
                 Allow the assistant to see this host&apos;s terminal output.
                 <span className="block text-[10.5px] text-ink-faint">
-                  Red-accented hosts default to off — enabling sends session
-                  context to whatever AI provider is configured.
+                  {draft.aiAllowed === undefined
+                    ? `Following the ${effColor && effColor !== 'none' ? `${effColor} ` : ''}colour policy (${aiDefault ? 'allowed' : 'off'}). `
+                    : 'Set for this host. '}
+                  Enabling sends session context to whatever AI provider is configured.
                 </span>
               </span>
             </label>
@@ -287,6 +379,26 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
               placeholder="show running-config"
               className={`${inputCls} font-mono`}
             />
+            <label
+              className={`mt-1.5 flex items-start gap-2 text-[12px] ${
+                draft.configCommand?.trim() ? 'cursor-pointer text-ink-dim' : 'text-ink-faint'
+              }`}
+            >
+              <input
+                type="checkbox"
+                disabled={!draft.configCommand?.trim()}
+                checked={!!draft.checkConfigOnConnect && !!draft.configCommand?.trim()}
+                onChange={(e) => set('checkConfigOnConnect', e.target.checked || undefined)}
+                className="mt-[2px] h-3 w-3 accent-[var(--color-accent)]"
+              />
+              <span>
+                Check for config changes on connect
+                <span className="block text-[10.5px] text-ink-faint">
+                  Runs the command above on each connect and tells you if anything
+                  changed since your last visit. A snapshot is saved only when it did.
+                </span>
+              </span>
+            </label>
           </Field>
 
           <Field
@@ -324,6 +436,11 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
               onChange={(e) => set('jumpHostId', e.target.value || undefined)}
               className={`${inputCls} appearance-none`}
             >
+              {jumpMissing && (
+                <option value={draft.jumpHostId}>
+                  (deleted host — connections refuse until you pick one)
+                </option>
+              )}
               <option value="">Direct connection</option>
               {allHosts(catalogue)
                 .filter((h) => h.id !== draft.id)
@@ -338,13 +455,16 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           <Field label="Accent colour">
             <div className="flex items-center gap-1.5">
               {HOST_COLORS.map((c) => {
-                const on = (draft.color ?? 'none') === c.key
+                // "off" is "no colour of my own": the host follows its folder
+                // (a red folder keeps it red). Stored as undefined, never
+                // as 'none', which used to override the folder's policy.
+                const on = (ownColor(draft.color) ?? 'none') === c.key
                 return (
                   <button
                     key={c.key}
                     type="button"
-                    onClick={() => set('color', c.key)}
-                    title={c.label}
+                    onClick={() => set('color', c.key === 'none' ? undefined : c.key)}
+                    title={c.key === 'none' ? 'No colour of its own (follows its folder)' : c.label}
                     aria-label={c.label}
                     aria-pressed={on}
                     className={`grid h-6 w-6 place-items-center rounded-full border transition-transform ${
@@ -396,8 +516,8 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 lender
                   ? `Shared with ${lender.name}: typing here replaces that shared password for every host using it.`
                   : hasSaved
-                    ? 'A password is already saved in Windows Credential Manager. Type to replace it.'
-                    : 'Stored in Windows Credential Manager, never in the host file.'
+                    ? `A password is already saved in ${vaultName(platform)}. Type to replace it.`
+                    : `Stored in ${vaultName(platform)}, never in the host file.`
               }
             >
               <div className="relative">
@@ -623,7 +743,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 <input
                   value={draft.keyPath ?? ''}
                   onChange={(e) => set('keyPath', e.target.value || undefined)}
-                  placeholder="C:\Users\you\.ssh\id_ed25519"
+                  placeholder={keyPathPlaceholder(platform === 'windows')}
                   className={`${inputCls} min-w-0 flex-1 font-mono`}
                 />
                 <button
@@ -631,7 +751,7 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                   title="Generate a new Ed25519 keypair in ~/.ssh and use it here"
                   onClick={() =>
                     void safeInvoke<{ privatePath: string; publicKey: string }>('ssh_keygen', {
-                      comment: `skiff ${draft.username || 'user'}@${draft.hostname || draft.name}`,
+                      comment: `hawser ${draft.username || 'user'}@${draft.hostname || draft.name}`,
                     })
                       .then((r) => {
                         if (!r) return
@@ -693,9 +813,11 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
             <Field
               label="Key passphrase"
               hint={
-                hasSaved
-                  ? 'A passphrase is saved in Windows Credential Manager. Type to replace it; leave empty to keep it.'
-                  : 'Only needed if the key file is encrypted. Stored in Windows Credential Manager.'
+                sharedSlot
+                  ? `Shared credential (${sharedWith}): a passphrase would replace the password those hosts use, so none can be saved here. Choose "Own credential" first.`
+                  : hasSaved
+                    ? 'Something is saved in the system credential store for this host. Type to replace it; leave empty to keep it.'
+                    : 'Only needed if the key file is encrypted. Stored in the system credential store.'
               }
             >
               <div className="relative">
@@ -706,11 +828,12 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 />
                 <input
                   type="password"
-                  value={password}
+                  value={sharedSlot ? '' : password}
+                  disabled={sharedSlot}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder={hasSaved ? '•••••••• (saved)' : ''}
+                  placeholder={sharedSlot ? 'not available for a shared credential' : hasSaved ? '•••••••• (saved)' : ''}
                   autoComplete="off"
-                  className={`${inputCls} pl-7 font-mono`}
+                  className={`${inputCls} pl-7 font-mono disabled:opacity-50`}
                 />
               </div>
             </Field>
@@ -718,8 +841,10 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
 
           {draft.auth === 'agent' && (
             <p className="rounded border border-line bg-surface-1 px-3 py-2 text-[11.5px] text-ink-faint">
-              Uses a running SSH agent — the Windows OpenSSH agent service or
-              PuTTY&apos;s Pageant. Keys stay in the agent; nothing is stored here.
+              {platform === 'windows'
+                ? 'Uses a running SSH agent — the Windows OpenSSH agent service or PuTTY’s Pageant.'
+                : 'Uses the running SSH agent (SSH_AUTH_SOCK).'}{' '}
+              Keys stay in the agent; nothing is stored here.
             </p>
           )}
 
@@ -734,7 +859,17 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           {host && onDelete && (
             <button
               type="button"
-              onClick={() => { onDelete(host.id); onClose() }}
+              disabled={busy}
+              onClick={() => {
+                // Asks first (naming any host that rides this one as its jump
+                // host); the editor closes only if the host was deleted.
+                void onDelete(host.id).then((done) => {
+                  if (done) {
+                    dismissedRef.current = true
+                    onClose()
+                  }
+                })
+              }}
               className="flex items-center gap-1.5 rounded border border-line px-2.5 py-1.5 text-[12.5px] text-ink-faint transition-colors hover:border-alert/50 hover:text-alert"
             >
               <Trash2 size={13} aria-hidden />
@@ -744,8 +879,9 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
           <div className="flex-1" />
           <button
             type="button"
-            onClick={onClose}
-            className="rounded border border-line bg-surface-2 px-3 py-1.5 text-[12.5px] text-ink-dim hover:bg-surface-3 hover:text-ink"
+            onClick={dismiss}
+            disabled={saving}
+            className="rounded border border-line bg-surface-2 px-3 py-1.5 text-[12.5px] text-ink-dim hover:bg-surface-3 hover:text-ink disabled:opacity-40"
           >
             Cancel
           </button>
@@ -789,18 +925,24 @@ export function HostEditor({ host, catalogue, onSave, onDelete, onClose }: Props
                 setInstallPw(null)
                 setBusy(true)
                 setError(null)
+                const opId = `install-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+                installOpRef.current = opId
                 void safeInvoke('ssh_copy_id', {
                   host: draft.hostname,
                   port: draft.port,
                   username: draft.username,
                   password: pw,
                   publicKey: generatedPub,
+                  opId,
                 })
                   .then(() =>
                     setError('✓ Key installed on the host. Save and connect with key auth.'),
                   )
                   .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-                  .finally(() => setBusy(false))
+                  .finally(() => {
+                    if (installOpRef.current === opId) installOpRef.current = null
+                    setBusy(false)
+                  })
               }}
               className={`${inputCls} font-mono`}
             />

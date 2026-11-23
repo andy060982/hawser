@@ -23,6 +23,8 @@ import {
   type ReactNode,
 } from 'react'
 import { AlertTriangle, X } from 'lucide-react'
+import { LAYER, PressGuard, enterOutcome, modals } from './modalStack'
+import { useModalLayer } from './useModalLayer'
 
 export interface ConfirmOptions {
   title?: string
@@ -106,11 +108,16 @@ export function DialogProvider({ children }: { children: ReactNode }) {
   )
 
   const head = queue[0] ?? null
-  const settle = useCallback((ok: boolean, value?: string) => {
+  /** Settle exactly the request that was answered, by id. Settling "the
+   *  head" let a second click land on the dialog that had just replaced the
+   *  answered one (a double-click on an alert's OK answered the overwrite
+   *  confirm queued behind it). A stale id (already answered) is a no-op. */
+  const settle = useCallback((id: number, ok: boolean, value?: string) => {
     setQueue((q) => {
-      const [first, ...rest] = q
-      first?.resolve(ok, value)
-      return rest
+      const req = q.find((r) => r.id === id)
+      if (!req) return q
+      req.resolve(ok, value)
+      return q.filter((r) => r.id !== id)
     })
   }, [])
 
@@ -133,8 +140,21 @@ function DialogModal({
   onSettle,
 }: {
   req: DialogRequest
-  onSettle: (ok: boolean, value?: string) => void
+  onSettle: (id: number, ok: boolean, value?: string) => void
 }) {
+  const settle = (ok: boolean, value?: string) => onSettle(req.id, ok, value)
+  const settleRef = useRef(settle)
+  settleRef.current = settle
+  /** Click-through guard: a click counts only if its pointerdown and
+   *  pointerup both landed on this dialog after it mounted (see PressGuard),
+   *  so the tail of a double-click on the dialog that stood here a moment
+   *  ago cannot answer this one. */
+  const press = useRef<PressGuard | null>(null)
+  if (!press.current) press.current = new PressGuard()
+  const guarded = (e: React.MouseEvent, ok: boolean, value?: string) => {
+    if (!press.current?.accepts(e.detail)) return
+    settle(ok, value)
+  }
   const confirmRef = useRef<HTMLButtonElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -150,37 +170,53 @@ function DialogModal({
   // activates whichever button actually has focus.
   const safeDefault = isConfirm && !!req.danger
 
-  // Focus the default action, and wire Enter / Escape. Reset whenever the head
-  // request changes (keyed by id below).
+  // Escape cancels, but only while this dialog is the top modal.
+  const layer = useModalLayer(true, () => settleRef.current(false), LAYER.dialog)
+
+  // Focus the default action, and wire Enter. Reset whenever the head request
+  // changes (keyed by id below).
   useEffect(() => {
-    if (isPrompt) {
-      inputRef.current?.focus()
-      inputRef.current?.select()
-    } else {
-      ;(safeDefault ? cancelRef : confirmRef).current?.focus()
+    // Only while on top: under an SSH prompt (a higher tier) taking focus
+    // would leave a native Enter to activate this hidden dialog's button.
+    if (modals.isTop(layer.current)) {
+      if (isPrompt) {
+        inputRef.current?.focus()
+        inputRef.current?.select()
+      } else {
+        ;(safeDefault ? cancelRef : confirmRef).current?.focus()
+      }
     }
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onSettle(false)
-      } else if (e.key === 'Enter') {
-        e.preventDefault()
-        if (isPrompt) onSettle(true, valueRef.current)
-        else if (!safeDefault) onSettle(true)
-        // Explicit Tab-to-confirm + Enter still confirms; anything else cancels.
-        else onSettle(document.activeElement === confirmRef.current)
-      }
+      if (e.key !== 'Enter' || !modals.isTop(layer.current)) return
+      e.preventDefault()
+      e.stopPropagation()
+      const active = document.activeElement
+      const focused =
+        active === cancelRef.current
+          ? 'cancel'
+          : active === confirmRef.current
+            ? 'confirm'
+            : active === inputRef.current
+              ? 'input'
+              : 'other'
+      const out = enterOutcome(req.kind, !!req.danger, focused)
+      if (out === 'confirm') settleRef.current(true, isPrompt ? valueRef.current : undefined)
+      else if (out === 'cancel') settleRef.current(false)
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [onSettle, safeDefault, isPrompt])
+  }, [safeDefault, isPrompt, req.kind, req.danger, layer])
 
   return (
-    <div className="absolute inset-0 z-[60] flex justify-center">
+    <div
+      className="absolute inset-0 z-[65] flex justify-center"
+      onPointerDownCapture={() => press.current?.pointerDown()}
+      onPointerUpCapture={() => press.current?.pointerUp()}
+    >
       <div
         className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]"
         aria-hidden
-        onClick={() => onSettle(false)}
+        onClick={(e) => guarded(e, false)}
       />
 
       <div
@@ -226,7 +262,7 @@ function DialogModal({
             <button
               ref={cancelRef}
               type="button"
-              onClick={() => onSettle(false)}
+              onClick={(e) => guarded(e, false)}
               className="flex items-center gap-1.5 rounded border border-line bg-surface-2 px-3 py-1.5 text-[12.5px] text-ink-dim transition-colors hover:bg-surface-3 hover:text-ink"
             >
               <X size={13} aria-hidden />
@@ -236,7 +272,7 @@ function DialogModal({
           <button
             ref={confirmRef}
             type="button"
-            onClick={() => onSettle(true, isPrompt ? value : undefined)}
+            onClick={(e) => guarded(e, true, isPrompt ? value : undefined)}
             className={`flex items-center gap-1.5 rounded border px-3 py-1.5 text-[12.5px] font-medium transition-colors ${
               req.danger
                 ? 'border-alert/60 bg-alert/15 text-alert hover:bg-alert/25'

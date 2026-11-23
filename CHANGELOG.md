@@ -1,10 +1,65 @@
 # Changelog
 
-All notable changes to Skiff are documented here. Format follows
+All notable changes to Hawser are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-23
+
+### Changed
+
+- **Renamed Skiff → Hawser.** New app name, bundle id, data folder, and
+  keychain namespace. Hosts and saved passwords from Skiff builds are not
+  migrated; export hosts from Skiff and import them into Hawser.
+
+### Added
+
+- **Signed auto-update.** Hawser checks GitHub releases at startup (at most
+  once a day; Settings → Updates turns it off, and has a manual "Check for
+  updates"). A new version shows a banner with its release notes; nothing
+  installs until you click "Install and restart", and live sessions are
+  confirmed first. Every update is verified against Hawser's signing key
+  before it installs. The portable Windows exe and the Linux .deb can't
+  replace themselves, so for those the banner links to the download page.
+- **Tamper-evident audit log** (menu → Audit log…). Connects, logins, file
+  transfers, deletes, key generation/installs, credential changes, and host
+  exports are recorded as a hash chain whose head is sealed in the OS keychain.
+  "Verify integrity" reports verified / not fully verified / failed, and where
+  the chain broke. Records hold metadata only: no passwords, keys, command
+  text, or command output. "Archive and start new" sets a failed log aside
+  (kept, and pinned by fingerprint in the new log).
+- **"What changed since my last visit."** Opt-in per host (Host editor →
+  "Check for config changes on connect"): on each connect Hawser runs the host's
+  config command on a side channel and compares it with the newest snapshot. You
+  get a one-line note in the terminal ("config unchanged since …" or "config
+  changed since …: +12 −3 lines") and a status-bar chip that opens the diff. A
+  snapshot is saved only when the config actually changed.
+- **Local terminals: use Hawser as your everyday terminal.** Ctrl+Shift+T (or
+  the app menu) opens PowerShell 7 / Windows PowerShell / Command Prompt / WSL /
+  Git Bash on Windows, or your login shell (zsh, bash, fish) on macOS and Linux,
+  in a real PTY (ConPTY on Windows). Local tabs get splits, find, copy-on-select,
+  themes, transcripts, and session search like SSH tabs. Settings → Local
+  terminal: default shell, open one at startup, and whether to record local
+  transcripts. The AI assistant can't see local terminals by default; opening
+  one is recorded in the audit log (what you type is not).
+- **Search inside sessions** in Session history: full-text search across every
+  recorded transcript, grouped by session, newest first; click a match to open
+  the transcript at that line.
+
+### Security
+
+- **russh 0.63 → 0.65.4.** Fixes the client key exchange running its
+  shared-secret step before the server's host key was verified
+  (GHSA-9264-jvgf-6w2f), plus two server/agent-side advisories
+  (GHSA-4wc5-f2rc-q74m, GHSA-j7h2-66j4-ghjf). Minimum Rust is now 1.89.
+- Patched transitive crates flagged by `cargo audit`: quinn-proto 0.11.19,
+  quinn-udp 0.5.16, url 2.5.9.
+- Build tooling: vite 6.4.6 and source-map-js 1.2.4 (dev-server advisories;
+  not shipped in the app).
+
+### Changed (bundle)
+
+- New Hawser app icon on every platform.
 
 ## [0.5.0-beta.1] - 2026-10-30
 

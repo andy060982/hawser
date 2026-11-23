@@ -1,6 +1,8 @@
 mod credentials;
+mod local_shell;
 mod utils;
 mod ssh;
+mod updater;
 
 use std::time::UNIX_EPOCH;
 
@@ -14,8 +16,21 @@ use std::sync::Arc;
 /// accepts or returns a password.
 type CmdResult<T> = Result<T, String>;
 
+/// Run blocking work (file I/O, an OS keychain call that may show a prompt)
+/// on the blocking pool, never on an async worker: a worker parked in a
+/// keychain prompt or a slow network share stalls every SSH pump scheduled on
+/// it.
+async fn off<T: Send + 'static>(f: impl FnOnce() -> CmdResult<T> + Send + 'static) -> CmdResult<T> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /* ------------------------------------------------------------------ session */
 
+/// Connect a tab. Resolves to the endpoint identity the backend dialled (see
+/// `utils::artifacts::dial_identity`), which the frontend uses for anything
+/// keyed by this connection after the dial.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn ssh_connect(
@@ -35,27 +50,49 @@ async fn ssh_connect(
     key_path: Option<String>,
     jump: Option<ssh::JumpParams>,
     one_shot_password: Option<String>,
-) -> CmdResult<()> {
-    registry
-        .connect(
-            app,
-            Arc::clone(&prompts),
-            Arc::clone(&auth_prompts),
-            &session_id,
-            &host_id,
-            &host,
-            port,
-            &username,
-            cols,
-            rows,
-            &startup_commands.unwrap_or_default(),
-            auth.as_deref().unwrap_or("password"),
-            key_path.as_deref(),
-            jump,
-            one_shot_password.as_deref(),
-        )
+    endpoint: Option<String>,
+    label: Option<String>,
+    ephemeral: Option<bool>,
+) -> CmdResult<String> {
+    // Wrapped at once, so the IPC-owned buffer itself is wiped on drop.
+    let one_shot_password = one_shot_password.map(zeroize::Zeroizing::new);
+    let spec = ssh::ConnectSpec {
+        session_id,
+        host_id,
+        host: host.clone(),
+        port,
+        username: username.clone(),
+        cols,
+        rows,
+        startup_commands: startup_commands.unwrap_or_default(),
+        auth: auth.unwrap_or_else(|| "password".into()),
+        key_path,
+        jump,
+        one_shot_password,
+        endpoint,
+        label,
+        ephemeral: ephemeral.unwrap_or(false),
+    };
+    let result = registry
+        .connect(app, Arc::clone(&prompts), Arc::clone(&auth_prompts), spec)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // Audit the authentication outcome. host/port/user are not secret; the error
+    // string is an SSH/protocol message (e.g. "authentication failed"), never a
+    // password. The connect result folds the host-key and auth steps together.
+    match &result {
+        Ok(_) => utils::audit::record(
+            "connect",
+            format!("connected {username}@{host}:{port}"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "connect.fail",
+            format!("connection to {username}@{host}:{port} failed"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 /// Answer a host-key prompt raised by the `ssh://host-key-prompt` event.
@@ -85,6 +122,8 @@ async fn auth_prompt_respond(
     answers: Vec<String>,
     #[allow(non_snake_case)] save: Option<bool>,
 ) -> CmdResult<()> {
+    // Each typed answer is wiped when the auth that consumes it is done.
+    let answers = answers.into_iter().map(zeroize::Zeroizing::new).collect();
     auth_prompts.respond(&request_id, answers, save.unwrap_or(false));
     Ok(())
 }
@@ -112,9 +151,19 @@ async fn auth_prompt_cancel(
 #[tauri::command]
 async fn ssh_write(
     registry: State<'_, Registry>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
     data: Vec<u8>,
 ) -> CmdResult<()> {
+    // Local terminals share the session commands (see local_shell). A PTY
+    // write can block while the shell isn't reading, so it runs off the
+    // async runtime.
+    if local.owns(&session_id) {
+        let local = Arc::clone(&local);
+        return tauri::async_runtime::spawn_blocking(move || local.write(&session_id, &data))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     registry
         .write(&session_id, &data)
         .await
@@ -127,14 +176,31 @@ async fn ssh_write(
 #[tauri::command]
 async fn ssh_resize(
     registry: State<'_, Registry>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
     cols: u32,
     rows: u32,
 ) -> CmdResult<()> {
+    if local.owns(&session_id) {
+        // Off the async runtime: the master lock can briefly wait on the exit
+        // watcher closing the console.
+        let local = Arc::clone(&local);
+        return tauri::async_runtime::spawn_blocking(move || local.resize(&session_id, cols, rows))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     registry
         .resize(&session_id, cols, rows)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The algorithms a live session negotiated with its target (kex, cipher,
+/// host key), for the status bar. None until the first key exchange is
+/// recorded; an error for a session that is not open.
+#[tauri::command]
+fn ssh_algorithms(registry: State<'_, Registry>, session_id: String) -> CmdResult<Option<ssh::Negotiated>> {
+    registry.algorithms(&session_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -143,11 +209,22 @@ async fn ssh_disconnect(
     registry: State<'_, Registry>,
     prompts: State<'_, Arc<HostKeyPrompts>>,
     auth_prompts: State<'_, Arc<AuthPrompts>>,
+    local: State<'_, Arc<local_shell::LocalShells>>,
     session_id: String,
 ) -> CmdResult<()> {
+    // A local terminal closes its shell (no-op for any other id). Off the
+    // async runtime: the kill escalates with a short grace period.
+    if local.owns(&session_id) {
+        let local = Arc::clone(&local);
+        let id = session_id.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || local.close(&id)).await;
+    }
     // Cancel an in-flight connect FIRST: once it is cancelled it cannot raise
     // a new prompt, so the sweep below cannot miss one registered behind it.
     registry.remove(&session_id).await;
+    // Its remote edits end with it: clean copies are deleted, unsynced ones
+    // kept and reported (utils::remote_edit::close_session).
+    utils::remote_edit::close_session(&app, &session_id).await;
     // A tab closed mid-connect may still have a host-key or password dialog up.
     // Drop those prompts and tell the UI to close them, rather than leave a
     // question nobody owns on screen.
@@ -159,6 +236,51 @@ async fn ssh_disconnect(
         ssh::emit_prompt_closed(&app, &request_id);
     }
     Ok(())
+}
+
+/* ------------------------------------------------------------ local shells */
+
+/// Shells available on this machine for "New local terminal".
+#[tauri::command]
+async fn local_shell_profiles() -> CmdResult<Vec<local_shell::ShellProfile>> {
+    off(|| Ok(local_shell::profiles())).await
+}
+
+/// Start a local shell in a PTY for `session_id`. `profile` is a profile id
+/// from `local_shell_profiles`, never a program path. `record` keeps a
+/// transcript like an SSH session does (Settings → Terminal).
+#[tauri::command]
+async fn local_shell_start(
+    app: AppHandle,
+    local: State<'_, Arc<local_shell::LocalShells>>,
+    session_id: String,
+    profile: String,
+    cols: u32,
+    rows: u32,
+    record: bool,
+) -> CmdResult<()> {
+    let local = Arc::clone(&local);
+    let started = tauri::async_runtime::spawn_blocking(move || {
+        local.start(&app, &session_id, &profile, cols, rows, record)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    // Audited like a connect (which shell, never what is typed). Recording is
+    // queued to the audit writer, so the terminal never waits on its seal.
+    let (event, summary, detail) = match &started {
+        Ok(p) => (
+            "local.open",
+            format!("opened a local terminal ({})", p.label),
+            serde_json::json!({ "profile": p.id, "ok": true }),
+        ),
+        Err(e) => (
+            "local.open.fail",
+            "a local terminal failed to start".to_string(),
+            serde_json::json!({ "error": e, "ok": false }),
+        ),
+    };
+    utils::audit::record(event, summary, detail);
+    started.map(|_| ())
 }
 
 /* --------------------------------------------------------------------- sftp */
@@ -175,32 +297,178 @@ async fn sftp_list(
         .map_err(|e| e.to_string())
 }
 
+/// A transfer's id: the frontend's, or a fresh one for a caller that sends
+/// none (it then cannot cancel, or match events to a row).
+fn transfer_id_or_new(id: Option<String>) -> String {
+    id.filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("t-{}", utils::artifacts::random_hex(8)))
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn sftp_get(
     app: AppHandle,
     registry: State<'_, Registry>,
     session_id: String,
     remote_path: String,
     local_path: String,
-) -> CmdResult<u64> {
-    registry
-        .download(&app, &session_id, &remote_path, &local_path)
+    transfer_id: Option<String>,
+    overwrite: Option<String>,
+) -> CmdResult<ssh::TransferOutcome> {
+    let policy = ssh::Overwrite::parse(overwrite.as_deref())?;
+    let transfer_id = transfer_id_or_new(transfer_id);
+    let result = registry
+        .download(&app, &session_id, &transfer_id, &remote_path, &local_path, policy)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    match &result {
+        Ok(out) => utils::audit::record(
+            "sftp.get",
+            format!("downloaded {remote_path} ({} bytes)", out.bytes),
+            serde_json::json!({ "remote": remote_path, "local": local_path, "bytes": out.bytes, "overwrite": overwrite, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.get.fail",
+            format!("download of {remote_path} failed"),
+            serde_json::json!({ "remote": remote_path, "local": local_path, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn sftp_put(
     app: AppHandle,
     registry: State<'_, Registry>,
     session_id: String,
     local_path: String,
     remote_path: String,
-) -> CmdResult<u64> {
-    registry
-        .upload(&app, &session_id, &local_path, &remote_path)
+    transfer_id: Option<String>,
+    overwrite: Option<String>,
+) -> CmdResult<ssh::TransferOutcome> {
+    let policy = ssh::Overwrite::parse(overwrite.as_deref())?;
+    let transfer_id = transfer_id_or_new(transfer_id);
+    let result = registry
+        .upload(&app, &session_id, &transfer_id, &local_path, &remote_path, policy)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    match &result {
+        Ok(out) => utils::audit::record(
+            "sftp.put",
+            format!("uploaded {remote_path} ({} bytes)", out.bytes),
+            serde_json::json!({ "local": local_path, "remote": remote_path, "bytes": out.bytes, "overwrite": overwrite, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.put.fail",
+            format!("upload to {remote_path} failed"),
+            serde_json::json!({ "local": local_path, "remote": remote_path, "ok": false, "error": e }),
+        ),
+    }
+    result
+}
+
+/// Cancel a running `sftp_get`/`sftp_put` by the id it was started with. Its
+/// staging files are removed on both sides; the destination is untouched.
+#[tauri::command]
+async fn sftp_cancel(registry: State<'_, Registry>, transfer_id: String) -> CmdResult<()> {
+    registry.transfer_cancel(&transfer_id);
+    Ok(())
+}
+
+/* ------------------------------------------------------- remote editing */
+
+/// Open a remote file in a local editor (see utils::remote_edit): download it
+/// to a private folder, open it, and upload each save after checking the
+/// remote file did not change meanwhile. Takes no editor or local path from
+/// the webview: the editor command is the validated one `edit_editor_save`
+/// stored.
+#[tauri::command]
+async fn edit_open(app: AppHandle, session_id: String, remote_path: String) -> CmdResult<utils::remote_edit::EditInfo> {
+    let result = utils::remote_edit::open(&app, &session_id, &remote_path).await;
+    match &result {
+        Ok(info) => utils::audit::record(
+            "sftp.edit.open",
+            format!("opened {remote_path} for editing ({} bytes)", info.bytes),
+            serde_json::json!({ "remote": remote_path, "sessionId": session_id, "bytes": info.bytes, "opener": info.opener, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.edit.open",
+            format!("opening {remote_path} for editing failed"),
+            serde_json::json!({ "remote": remote_path, "sessionId": session_id, "ok": false, "error": e }),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+fn edit_list(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>) -> Vec<utils::remote_edit::EditInfo> {
+    edits.list()
+}
+
+/// Push an edit now: `mode` is "now" (checked like a save), "overwrite" (a
+/// conflict's Overwrite remote) or "copy" (Save a copy as name.conflict).
+/// The push records `sftp.edit.upload` itself, as a watcher-driven save does.
+#[tauri::command]
+async fn edit_upload(app: AppHandle, edit_id: String, mode: String) -> CmdResult<utils::remote_edit::EditInfo> {
+    let mode = utils::remote_edit::PushMode::parse(&mode)?;
+    utils::remote_edit::upload(&app, &edit_id, mode).await
+}
+
+/// Stop editing: `mode` "ask" (the default: does nothing while there are
+/// unsynced changes, so the UI can ask), "discard" or "keep".
+#[tauri::command]
+async fn edit_stop(app: AppHandle, edit_id: String, mode: Option<String>) -> CmdResult<utils::remote_edit::StopOutcome> {
+    let mode = utils::remote_edit::StopMode::parse(mode.as_deref())?;
+    utils::remote_edit::stop(&app, &edit_id, mode).await
+}
+
+/// Reveal an edit's local copy. By id, never by path (see open_logs_folder).
+#[tauri::command]
+async fn edit_reveal(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>, edit_id: String) -> CmdResult<()> {
+    let edits = Arc::clone(&edits);
+    off(move || edits.reveal(&edit_id)).await
+}
+
+/// Copies kept because they had unsynced changes (this run or an earlier one).
+#[tauri::command]
+fn edit_leftovers(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>) -> Vec<utils::remote_edit::Leftover> {
+    edits.leftovers()
+}
+
+#[tauri::command]
+async fn edit_leftover_reveal(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>, id: String) -> CmdResult<()> {
+    let edits = Arc::clone(&edits);
+    off(move || edits.leftover_reveal(&id)).await
+}
+
+#[tauri::command]
+async fn edit_leftover_discard(edits: State<'_, Arc<utils::remote_edit::RemoteEdits>>, id: String) -> CmdResult<()> {
+    let edits = Arc::clone(&edits);
+    off(move || edits.leftover_discard(&id)).await
+}
+
+#[tauri::command]
+async fn edit_editor_load() -> CmdResult<utils::remote_edit::EditorView> {
+    off(utils::remote_edit::editor_view).await
+}
+
+/// Save the editor command ("" = the OS default app), validated first.
+#[tauri::command]
+async fn edit_editor_save(command: String) -> CmdResult<utils::remote_edit::EditorView> {
+    let result = off(move || utils::remote_edit::editor_save(&command)).await;
+    if let Ok(view) = &result {
+        utils::audit::record(
+            "sftp.edit.editor",
+            if view.command.is_empty() {
+                "remote editing uses the default app".to_string()
+            } else {
+                format!("remote editing uses {}", view.command)
+            },
+            serde_json::json!({ "command": view.command, "program": view.resolved, "ok": true }),
+        );
+    }
+    result
 }
 
 /* ----------------------------------------------------------------- tunnels */
@@ -214,10 +482,25 @@ async fn forward_start(
     remote_host: String,
     remote_port: u16,
 ) -> CmdResult<ssh::ForwardInfo> {
-    registry
+    let result = registry
         .forward_start(&session_id, local_port, &remote_host, remote_port)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // A local listener that tunnels into the remote network is security-
+    // relevant: record where it points.
+    match &result {
+        Ok(info) => utils::audit::record(
+            "tunnel.start",
+            format!("forwarded localhost:{} to {remote_host}:{remote_port}", info.local_port),
+            serde_json::json!({ "localPort": info.local_port, "remoteHost": remote_host, "remotePort": remote_port, "kind": "local", "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "tunnel.start.fail",
+            format!("forwarding localhost:{local_port} to {remote_host}:{remote_port} failed"),
+            serde_json::json!({ "localPort": local_port, "remoteHost": remote_host, "remotePort": remote_port, "kind": "local", "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 /// Start a SOCKS5 dynamic proxy (`ssh -D`) over an open session.
@@ -227,15 +510,33 @@ async fn forward_start_socks(
     session_id: String,
     local_port: u16,
 ) -> CmdResult<ssh::ForwardInfo> {
-    registry
+    let result = registry
         .forward_start_socks(&session_id, local_port)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    match &result {
+        Ok(info) => utils::audit::record(
+            "tunnel.start",
+            format!("opened a SOCKS proxy on localhost:{}", info.local_port),
+            serde_json::json!({ "localPort": info.local_port, "kind": "socks", "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "tunnel.start.fail",
+            format!("opening a SOCKS proxy on localhost:{local_port} failed"),
+            serde_json::json!({ "localPort": local_port, "kind": "socks", "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
 async fn forward_stop(registry: State<'_, Registry>, forward_id: String) -> CmdResult<()> {
-    registry.forward_stop(&forward_id);
+    registry.forward_stop(&forward_id).await;
+    utils::audit::record(
+        "tunnel.stop",
+        format!("stopped forward {forward_id}"),
+        serde_json::json!({ "forwardId": forward_id, "ok": true }),
+    );
     Ok(())
 }
 
@@ -260,7 +561,14 @@ async fn path_exists(
         let sid = session_id.ok_or("session required for remote check")?;
         registry.sftp_exists(&sid, &path).await.map_err(|e| e.to_string())
     } else {
-        Ok(std::fs::metadata(&path).is_ok())
+        // Without following links (a symlink at the destination is "there"),
+        // and an error other than not-found is reported, not read as "free".
+        off(move || match std::fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("{path}: {e}")),
+        })
+        .await
     }
 }
 
@@ -271,7 +579,20 @@ async fn sftp_rename(
     from: String,
     to: String,
 ) -> CmdResult<()> {
-    registry.sftp_rename(&session_id, &from, &to).await.map_err(|e| e.to_string())
+    let result = registry.sftp_rename(&session_id, &from, &to).await.map_err(|e| e.to_string());
+    match &result {
+        Ok(()) => utils::audit::record(
+            "sftp.rename",
+            format!("renamed {from} to {to}"),
+            serde_json::json!({ "from": from, "to": to, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.rename.fail",
+            format!("rename of {from} failed"),
+            serde_json::json!({ "from": from, "to": to, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -281,7 +602,20 @@ async fn sftp_delete(
     path: String,
     is_dir: bool,
 ) -> CmdResult<()> {
-    registry.sftp_delete(&session_id, &path, is_dir).await.map_err(|e| e.to_string())
+    let result = registry.sftp_delete(&session_id, &path, is_dir).await.map_err(|e| e.to_string());
+    match &result {
+        Ok(()) => utils::audit::record(
+            "sftp.delete",
+            format!("deleted {}{path}", if is_dir { "directory " } else { "" }),
+            serde_json::json!({ "path": path, "isDir": is_dir, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.delete.fail",
+            format!("delete of {path} failed"),
+            serde_json::json!({ "path": path, "isDir": is_dir, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -290,7 +624,20 @@ async fn sftp_mkdir(
     session_id: String,
     path: String,
 ) -> CmdResult<()> {
-    registry.sftp_mkdir(&session_id, &path).await.map_err(|e| e.to_string())
+    let result = registry.sftp_mkdir(&session_id, &path).await.map_err(|e| e.to_string());
+    match &result {
+        Ok(()) => utils::audit::record(
+            "sftp.mkdir",
+            format!("created directory {path}"),
+            serde_json::json!({ "path": path, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "sftp.mkdir.fail",
+            format!("creating directory {path} failed"),
+            serde_json::json!({ "path": path, "ok": false, "error": e }),
+        ),
+    }
+    result
 }
 
 /// Local-side mutations, mirroring the sftp_* trio so the two panes offer the
@@ -301,38 +648,66 @@ async fn sftp_mkdir(
 /// into data loss. The remote side's SFTP rename refuses too, so the panes agree.
 #[tauri::command]
 async fn local_rename(from: String, to: String) -> CmdResult<()> {
+    off(move || local_rename_blocking(&from, &to)).await
+}
+
+fn local_rename_blocking(from: &str, to: &str) -> CmdResult<()> {
     // A case-only rename on a case-insensitive filesystem (macOS, Windows)
     // resolves `to` to `from` itself; that is not a collision.
-    let same_entry = match (std::fs::canonicalize(&from), std::fs::canonicalize(&to)) {
+    let same_entry = match (std::fs::canonicalize(from), std::fs::canonicalize(to)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     };
-    if std::fs::symlink_metadata(&to).is_ok() && !same_entry {
+    if std::fs::symlink_metadata(to).is_ok() && !same_entry {
         return Err(format!("{to} already exists"));
     }
-    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+    std::fs::rename(from, to).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn local_delete(path: String, is_dir: bool) -> CmdResult<()> {
-    if is_dir {
-        std::fs::remove_dir(&path).map_err(|e| e.to_string())
-    } else {
-        std::fs::remove_file(&path).map_err(|e| e.to_string())
-    }
+    off(move || {
+        if is_dir {
+            std::fs::remove_dir(&path).map_err(|e| e.to_string())
+        } else {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())
+        }
+    })
+    .await
 }
 
 #[tauri::command]
 async fn local_mkdir(path: String) -> CmdResult<()> {
-    std::fs::create_dir(&path).map_err(|e| e.to_string())
+    off(move || std::fs::create_dir(&path).map_err(|e| e.to_string())).await
 }
 
 /* -------------------------------------------------------------------- local */
+
+/// Where the local file pane starts: the root of the system drive on Windows
+/// (`%SystemDrive%\`, which is not always C:), `/` elsewhere.
+#[tauri::command]
+async fn local_root() -> CmdResult<String> {
+    Ok(local_root_from(std::env::var("SystemDrive").ok().as_deref()))
+}
+
+fn local_root_from(system_drive: Option<&str>) -> String {
+    if !cfg!(windows) {
+        return "/".into();
+    }
+    match system_drive.map(str::trim) {
+        Some(d) if d.len() == 2 && d.as_bytes()[0].is_ascii_alphabetic() && d.ends_with(':') => format!("{d}\\"),
+        _ => "C:\\".into(),
+    }
+}
 
 /// Local half of the dual pane. Deliberately mirrors `sftp_list`'s shape so the
 /// two panes are the same component with a different data source.
 #[tauri::command]
 async fn local_list(path: String) -> CmdResult<DirListing> {
+    off(move || local_list_blocking(path)).await
+}
+
+fn local_list_blocking(path: String) -> CmdResult<DirListing> {
     let dir = std::path::Path::new(&path);
     let canonical = dir
         .canonicalize()
@@ -395,6 +770,7 @@ async fn local_list(path: String) -> CmdResult<DirListing> {
     Ok(DirListing {
         path: canonical,
         entries,
+        truncated: false,
     })
 }
 
@@ -404,38 +780,131 @@ async fn local_list(path: String) -> CmdResult<DirListing> {
 /// failure; the frontend seeds from its defaults in that case.
 #[tauri::command]
 async fn hosts_load() -> CmdResult<Option<serde_json::Value>> {
-    utils::hosts::load().map_err(|e| e.to_string())
+    off(|| utils::hosts::load().map_err(|e| e.to_string())).await
 }
 
+/// Save the catalogue. `narrow`: vault ids whose binding must first shrink to
+/// the destinations that still use them in `tree` (an edited, deleted or
+/// repointed host). Narrowing and saving are one operation, narrowing first:
+/// if a binding cannot be narrowed nothing is saved and the error says so.
+/// `generation`: the frontend's save number; a save that is not newer than
+/// the last one published is refused as stale (utils::hosts::STALE_SAVE), so
+/// an older tree never replaces a newer one.
 #[tauri::command]
-async fn hosts_save(tree: serde_json::Value) -> CmdResult<()> {
-    utils::hosts::save(&tree).map_err(|e| e.to_string())
+async fn hosts_save(tree: serde_json::Value, narrow: Option<Vec<String>>, generation: Option<u64>) -> CmdResult<()> {
+    off(move || utils::hosts::save_and_narrow(&tree, narrow.as_deref().unwrap_or(&[]), generation)).await
+}
+
+/// The first-run seed: written only if no catalogue file exists. Returns
+/// false when one appeared meanwhile (it is kept, and should be loaded).
+#[tauri::command]
+async fn hosts_seed(tree: serde_json::Value) -> CmdResult<bool> {
+    off(move || utils::hosts::save_new(&tree).map_err(|e| e.to_string())).await
+}
+
+/// Keep a `.corrupt-<ts>` copy of hosts.json, for a file the frontend's
+/// structural check refused. Returns the copy's path, if a file exists.
+#[tauri::command]
+async fn hosts_keep_backup() -> CmdResult<Option<String>> {
+    off(|| {
+        utils::hosts::keep_catalogue_backup()
+            .map(|p| p.map(|p| p.display().to_string()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// How the OS vault compares ids: `true` when it folds case (Windows
+/// Credential Manager). The frontend compares credential ids with this rule
+/// (lib/vaultId.ts), the same one the backend's bindings use.
+#[tauri::command]
+fn vault_id_rule() -> bool {
+    credentials::vault_folds_case()
 }
 
 /// Tabs open at last exit, so a restart can offer them again.
 #[tauri::command]
 async fn sessions_load() -> CmdResult<Option<serde_json::Value>> {
-    utils::hosts::load_sessions().map_err(|e| e.to_string())
+    off(|| utils::hosts::load_sessions().map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
 async fn sessions_save(list: serde_json::Value) -> CmdResult<()> {
-    utils::hosts::save_sessions(&list).map_err(|e| e.to_string())
+    off(move || utils::hosts::save_sessions(&list).map_err(|e| e.to_string())).await
 }
 
-/// Tail of the last transcript for a host, for replay into a reconnected tab.
+/// Tail of the last transcript for an endpoint, for replay into a reconnected
+/// tab and as AI context.
 ///
-/// Host-keyed rather than session-keyed: session ids are per-connection, and the
-/// point is to bridge ACROSS connections.
+/// Endpoint-keyed rather than session-keyed: session ids are per-connection, and
+/// the point is to bridge ACROSS connections. Not hostname-keyed either: two
+/// entries sharing an address must never see each other's output.
+/// The endpoint identity a lookup should use: the live session's own (derived
+/// from what it dialled) whenever `session_id` names one, else the identity
+/// the frontend computed for a host with no live session (the replay before a
+/// dial, or the history of a host that is not connected).
+fn lookup_endpoint(
+    registry: &Registry,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+) -> CmdResult<String> {
+    if let Some(ep) = session_id.as_deref().and_then(|sid| registry.endpoint_of(sid).ok()) {
+        return Ok(ep);
+    }
+    endpoint.ok_or_else(|| "no live session and no endpoint identity given".to_string())
+}
+
+/// Refuse a live session's history when it dialled another endpoint than the
+/// one its caller's policy check was made for.
+fn check_same_endpoint(live: &str, claimed: &str) -> CmdResult<()> {
+    if live == claimed {
+        Ok(())
+    } else {
+        Err("This tab is still connected to the host's previous address, account or bastion (the host was edited after it connected), so its output is not shared. Reconnect the tab first.".into())
+    }
+}
+
+/// The endpoint whose transcript `session_history` reads, from ONE resolution
+/// of the live session (`live`) and the identity the caller's policy check was
+/// made for (`claimed`): the live one when it matches the claim, a refusal
+/// when it does not, and the claim when no session is live.
+fn history_endpoint(live: Option<String>, claimed: Option<String>) -> CmdResult<String> {
+    match (live, claimed) {
+        (Some(live), Some(claimed)) => check_same_endpoint(&live, &claimed).map(|()| live),
+        (Some(live), None) => Ok(live),
+        (None, Some(claimed)) => Ok(claimed),
+        (None, None) => Err("no live session and no endpoint identity given".to_string()),
+    }
+}
+
 #[tauri::command]
-async fn session_history(host: String, max_bytes: usize) -> CmdResult<Option<String>> {
-    utils::session_log::latest_transcript(&host, max_bytes).map_err(|e| e.to_string())
+async fn session_history(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    max_bytes: usize,
+) -> CmdResult<Option<String>> {
+    // `endpoint` is the identity whose AI policy the caller checked (the
+    // catalogue entry as it stands now). If the live session dialled
+    // something else (the entry or its bastion was edited after it
+    // connected), its transcript comes from an endpoint that policy was never
+    // evaluated for, so it is refused rather than returned.
+    // The live session is resolved exactly once: the identity that passes the
+    // comparison is the one whose transcript is read.
+    let live = session_id.as_deref().and_then(|sid| registry.endpoint_of(sid).ok());
+    let endpoint = history_endpoint(live, endpoint)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        utils::session_log::latest_transcript(&endpoint, max_bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 /// List past session transcripts (newest first) for the history browser.
 #[tauri::command]
 async fn logs_list() -> CmdResult<Vec<utils::session_log::LogEntry>> {
-    utils::session_log::list().map_err(|e| e.to_string())
+    off(|| utils::session_log::list().map_err(|e| e.to_string())).await
 }
 
 /// Open the transcript directory in Explorer.
@@ -445,39 +914,159 @@ async fn logs_list() -> CmdResult<Vec<utils::session_log::LogEntry>> {
 /// injection. This one can open exactly one folder and nothing else.
 #[tauri::command]
 async fn open_logs_folder() -> CmdResult<()> {
-    let dir = utils::session_log::logs_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    utils::platform::open_dir(&dir).map_err(|e| e.to_string())?;
+    off(|| {
+        let dir = utils::session_log::logs_dir().map_err(|e| e.to_string())?;
+        utils::hosts::ensure_dir(&dir).map_err(|e| e.to_string())?;
+        utils::platform::open_dir(&dir).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Read one page of a transcript by its bare filename: the newest page by
+/// default, the page around `line` (a search hit), or the page before/after a
+/// byte offset of a page already shown.
+#[tauri::command]
+async fn log_read(
+    name: String,
+    line: Option<u64>,
+    before: Option<u64>,
+    after: Option<u64>,
+) -> CmdResult<utils::session_log::LogPage> {
+    use utils::session_log::PageAt;
+    let at = match (line, before, after) {
+        (Some(l), _, _) => PageAt::Line(l),
+        (_, Some(b), _) => PageAt::Before(b),
+        (_, _, Some(a)) => PageAt::After(a),
+        _ => PageAt::Tail,
+    };
+    tauri::async_runtime::spawn_blocking(move || utils::session_log::read_log(&name, at))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Search every transcript for a line containing `query` (case-insensitive),
+/// newest session first. Runs on the blocking pool: it reads every log file.
+/// Starting a search supersedes any still running.
+#[tauri::command]
+async fn logs_search(query: String, limit: usize) -> CmdResult<utils::session_log::SearchResult> {
+    let generation = utils::session_log::begin_search();
+    tauri::async_runtime::spawn_blocking(move || utils::session_log::search(&query, limit, generation))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Stop any running transcript search.
+#[tauri::command]
+async fn logs_search_cancel() -> CmdResult<()> {
+    utils::session_log::cancel_searches();
     Ok(())
 }
 
-/// Read one transcript by its bare filename.
+/// Most recent audit-log entries, newest first, for the Audit panel.
 #[tauri::command]
-async fn log_read(name: String) -> CmdResult<String> {
-    utils::session_log::read_log(&name).map_err(|e| e.to_string())
+async fn audit_list(limit: usize) -> CmdResult<Vec<utils::audit::AuditView>> {
+    // Clamp so a bad/huge limit cannot ask the UI to render the entire history.
+    off(move || utils::audit::list(limit.min(2000))).await
 }
 
-/// Export the host catalogue to Documents\skiff-hosts.json and reveal it.
+/// Walk the audit chain and report whether it is intact, where it broke, and
+/// whether the file head matches the keychain anchor.
+#[tauri::command]
+async fn audit_verify() -> CmdResult<utils::audit::VerifyReport> {
+    // On the audit writer thread (after every record queued before it); this
+    // task only waits for the answer, off the async workers.
+    off(utils::audit::verify).await
+}
+
+/// Set the current audit log aside (renamed, never deleted) and start a fresh,
+/// anchored one whose first entry names the archive. The only way back to a
+/// clean "verified" state after a failed or gapped check.
+#[tauri::command]
+async fn audit_archive() -> CmdResult<String> {
+    off(utils::audit::archive).await
+}
+
+/// Export the host catalogue to the user's Documents folder and reveal it.
 ///
 /// Topology only — names, addresses, folders, snippets. Passwords live in the
-/// Credential Manager and are structurally absent from hosts.json, so an
-/// export cannot leak a secret even by mistake. That boundary is the reason
-/// export is safe to offer as one click.
+/// OS credential vault and are structurally absent from hosts.json, so an
+/// export holds no password. It can still hold what users put into hosts.json
+/// themselves (usernames, on-connect commands, snippets), so it is written
+/// owner-only, and never over an existing file: `hawser-hosts.json`, else
+/// `hawser-hosts-2.json`, … (see `utils::hosts::export_to`).
 #[tauri::command]
 async fn hosts_export() -> CmdResult<String> {
-    let tree = utils::hosts::load()
-        .map_err(|e| e.to_string())?
-        .ok_or("no host catalogue to export")?;
-
-    let docs = utils::platform::documents_dir().ok_or("cannot resolve Documents folder")?;
-    std::fs::create_dir_all(&docs).map_err(|e| e.to_string())?;
-    let path = docs.join("skiff-hosts.json");
-    let text = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| e.to_string())?;
-
-    // Reveal rather than open: the point is "here is the file to copy".
-    let _ = utils::platform::reveal_file(&path);
+    let path = off(|| {
+        let tree = utils::hosts::load()
+            .map_err(|e| e.to_string())?
+            .ok_or("no host catalogue to export")?;
+        let docs = utils::platform::documents_dir().ok_or("cannot resolve Documents folder")?;
+        let path = utils::hosts::export_to(&docs, &tree)?;
+        // Reveal rather than open: the point is "here is the file to copy".
+        let _ = utils::platform::reveal_file(&path);
+        Ok(path)
+    })
+    .await?;
+    utils::audit::record(
+        "hosts.export",
+        "exported the host catalogue",
+        serde_json::json!({ "path": path.to_string_lossy(), "ok": true }),
+    );
     Ok(path.to_string_lossy().to_string())
+}
+
+/// What the "Import from SSH config / PuTTY" dialog can offer here: the
+/// default ssh config path, and whether PuTTY sessions can be read (Windows).
+#[tauri::command]
+fn hosts_import_sources() -> serde_json::Value {
+    let ssh_config = utils::platform::home_dir()
+        .map(|h| utils::ssh_import::default_ssh_config_path(&h).to_string_lossy().into_owned());
+    serde_json::json!({ "sshConfig": ssh_config, "putty": cfg!(windows) })
+}
+
+/// Scan an import source into candidate hosts for the preview. Reads only:
+/// nothing is saved here (the frontend saves the checked rows through
+/// `hosts_save`), and no secret is read or created.
+#[tauri::command]
+async fn hosts_import_scan(source: String, path: Option<String>) -> CmdResult<utils::ssh_import::ImportReport> {
+    off(move || {
+        let user = utils::ssh_import::local_user_name();
+        match source.as_str() {
+            "ssh-config" => {
+                let home = utils::platform::home_dir().ok_or("cannot resolve your home folder")?;
+                let file = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                    Some(p) => utils::platform::expand_home(p, Some(&home)),
+                    None => utils::ssh_import::default_ssh_config_path(&home),
+                };
+                utils::ssh_import::scan_ssh_config(&file, &home, &user)
+            }
+            "putty" => {
+                let sessions = utils::ssh_import::read_putty_sessions()?;
+                Ok(utils::ssh_import::putty_report(&sessions, &user))
+            }
+            _ => Err("unknown import source".to_string()),
+        }
+    })
+    .await
+}
+
+/// Audit a completed host import: source and count only, never the hosts.
+#[tauri::command]
+fn hosts_import_record(source: String, count: u32) -> CmdResult<()> {
+    let label = match source.as_str() {
+        "ssh-config" => "the SSH config",
+        "putty" => "PuTTY sessions",
+        "json" => "a Hawser export",
+        _ => return Err("unknown import source".to_string()),
+    };
+    utils::audit::record(
+        "hosts.import",
+        format!("imported {count} host(s) from {label}"),
+        serde_json::json!({ "source": source, "count": count, "ok": true }),
+    );
+    Ok(())
 }
 
 /* ---------------------------------------------------------------- network */
@@ -525,7 +1114,30 @@ async fn hosts_probe(
 
 /* ---------------------------------------------------------------- configs */
 
+/// Run blocking snapshot/diff file work off the async workers.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, utils::known_hosts::KnownHostsError> + Send + 'static,
+) -> CmdResult<T> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// An exec-capture error as audited: without the device's stderr, which
+/// `exec_capture` appends after ": " (device output, like the command line,
+/// stays out of the audit log).
+fn exec_error_for_audit(e: &str) -> &str {
+    e.split(": ").next().unwrap_or(e)
+}
+
+const NOTHING_CAPTURED: &str =
+    "capture returned nothing — the device may not support exec-channel commands";
+
 /// Capture a device's config over a fresh exec channel and store a snapshot.
+///
+/// The snapshot folder is keyed by the session's own endpoint identity (what
+/// it dialled; see utils::artifacts); `host` is only the readable label.
 #[tauri::command]
 async fn config_snapshot(
     registry: State<'_, Registry>,
@@ -533,38 +1145,120 @@ async fn config_snapshot(
     host: String,
     command: String,
 ) -> CmdResult<utils::configs::SnapshotResult> {
-    let output = registry
-        .exec_capture(&session_id, &command, 60)
-        .await
-        .map_err(|e| e.to_string())?;
-    if output.trim().is_empty() {
-        return Err(
-            "capture returned nothing — the device may not support exec-channel commands"
-                .to_string(),
-        );
+    // The snapshot belongs to what this session actually dialled, never to a
+    // key the webview supplies next to the session id.
+    // One resolution: the identity and the capture come from the same
+    // connection, even if a reconnect replaces the tab's session meanwhile.
+    let audited_host = host.clone();
+    let result: CmdResult<utils::configs::SnapshotResult> = async {
+        let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+        // stdout only: stderr noise (a login-shell warning) is not config.
+        let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
+        let endpoint = session.endpoint().to_string();
+        if output.trim().is_empty() {
+            return Err(NOTHING_CAPTURED.to_string());
+        }
+        blocking(move || utils::configs::save_snapshot(&endpoint, &host, &output)).await
     }
-    utils::configs::save_snapshot(&host, &output).map_err(|e| e.to_string())
+    .await;
+    // Like config_check: host and size (or the error) only — never the command
+    // or config.
+    match &result {
+        Ok(saved) => utils::audit::record(
+            "config.snapshot",
+            format!("saved a config snapshot of {audited_host}"),
+            serde_json::json!({ "host": audited_host, "lines": saved.lines, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "config.snapshot.fail",
+            format!("config snapshot of {audited_host} failed"),
+            serde_json::json!({ "host": audited_host, "ok": false, "error": exec_error_for_audit(e) }),
+        ),
+    }
+    result
+}
+
+/// "What changed since my last visit": capture the config over a fresh exec
+/// channel and compare it with the newest snapshot, saving only if it differs.
+/// Run on connect for hosts that opt in (Host editor), never otherwise.
+#[tauri::command]
+async fn config_check(
+    registry: State<'_, Registry>,
+    session_id: String,
+    host: String,
+    command: String,
+) -> CmdResult<utils::configs::ConfigCheck> {
+    // One resolution: the identity and the capture come from the same
+    // connection, even if a reconnect replaces the tab's session meanwhile.
+    let audited_host = host.clone();
+    let result: CmdResult<utils::configs::ConfigCheck> = async {
+        let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+        // stdout only: stderr noise (a login-shell warning) is not config.
+        let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
+        let endpoint = session.endpoint().to_string();
+        if output.trim().is_empty() {
+            return Err(NOTHING_CAPTURED.to_string());
+        }
+        blocking(move || utils::configs::check_snapshot(&endpoint, &host, &output)).await
+    }
+    .await;
+    // Like capture_output: host and outcome only — never the command or config.
+    match &result {
+        Ok(check) => utils::audit::record(
+            "config.check",
+            format!("checked the config on {audited_host}: {}", check.status),
+            serde_json::json!({ "host": audited_host, "status": check.status, "added": check.added, "removed": check.removed, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "config.check.fail",
+            format!("config check on {audited_host} failed"),
+            serde_json::json!({ "host": audited_host, "ok": false, "error": exec_error_for_audit(e) }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
-async fn config_list(host: String) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
-    utils::configs::list_snapshots(&host).map_err(|e| e.to_string())
+async fn config_list(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    host: String,
+) -> CmdResult<Vec<utils::configs::SnapshotInfo>> {
+    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
+    blocking(move || utils::configs::list_snapshots(&endpoint, &host)).await
 }
 
 #[tauri::command]
-async fn config_diff(host: String, older: String, newer: String) -> CmdResult<String> {
-    utils::configs::diff_snapshots(&host, &older, &newer).map_err(|e| e.to_string())
+async fn config_diff(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    host: String,
+    older: String,
+    newer: String,
+) -> CmdResult<String> {
+    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
+    blocking(move || utils::configs::diff_snapshots(&endpoint, &host, &older, &newer)).await
 }
 
 #[tauri::command]
-async fn config_read(host: String, name: String) -> CmdResult<String> {
-    utils::configs::read_snapshot(&host, &name).map_err(|e| e.to_string())
+async fn config_read(
+    registry: State<'_, Registry>,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    host: String,
+    name: String,
+) -> CmdResult<String> {
+    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
+    blocking(move || utils::configs::read_snapshot(&endpoint, &host, &name)).await
 }
 
 /// Run one command over a fresh hidden exec channel and save its output to a
-/// timestamped file under the host's captures folder — "log just this command's
-/// output" for a `show tech-support`-sized dump, without it scrolling past in
-/// the terminal. Same exec-capture path (and 16 MiB cap) as a config snapshot.
+/// timestamped file under the endpoint's captures folder — "log just this
+/// command's output" for a `show tech-support`-sized dump, without it scrolling
+/// past in the terminal. Same exec-capture path (and 16 MiB cap) as a config
+/// snapshot.
 #[tauri::command]
 async fn capture_output(
     registry: State<'_, Registry>,
@@ -572,17 +1266,36 @@ async fn capture_output(
     host: String,
     command: String,
 ) -> CmdResult<utils::captures::CaptureResult> {
-    let output = registry
-        .exec_capture(&session_id, &command, 120)
-        .await
-        .map_err(|e| e.to_string())?;
-    if output.trim().is_empty() {
-        return Err(
-            "capture returned nothing — the device may not support exec-channel commands"
-                .to_string(),
-        );
+    // One resolution: the identity and the capture come from the same
+    // connection, even if a reconnect replaces the tab's session meanwhile.
+    let result: CmdResult<utils::captures::CaptureResult> = async {
+        let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+        // A human-read capture keeps stderr, labelled apart from stdout.
+        let output = session.exec_capture(&command, 120).await.map_err(|e| e.to_string())?.labelled();
+        let endpoint = session.endpoint().to_string();
+        if output.trim().is_empty() {
+            return Err(NOTHING_CAPTURED.to_string());
+        }
+        let label = host.clone();
+        blocking(move || utils::captures::save_capture(&endpoint, &label, &output)).await
     }
-    utils::captures::save_capture(&host, &command, &output).map_err(|e| e.to_string())
+    .await;
+    // Neither the command nor its output is logged: a command line can carry
+    // a token or password (`curl -H 'Authorization: …'`). Only the host and
+    // the size of what was saved, or the error.
+    match &result {
+        Ok(cap) => utils::audit::record(
+            "exec.capture",
+            format!("captured command output on {host}"),
+            serde_json::json!({ "host": host, "bytes": cap.bytes, "lines": cap.lines, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "exec.capture.fail",
+            format!("command capture on {host} failed"),
+            serde_json::json!({ "host": host, "ok": false, "error": exec_error_for_audit(e) }),
+        ),
+    }
+    result
 }
 
 /// Generate an Ed25519 keypair into ~/.ssh, returning the private-key path
@@ -598,6 +1311,7 @@ async fn capture_output(
 #[tauri::command]
 async fn ssh_copy_id(
     app: AppHandle,
+    registry: State<'_, Registry>,
     prompts: State<'_, Arc<HostKeyPrompts>>,
     auth_prompts: State<'_, Arc<AuthPrompts>>,
     host: String,
@@ -605,23 +1319,123 @@ async fn ssh_copy_id(
     username: String,
     password: String,
     public_key: String,
+    op_id: Option<String>,
 ) -> CmdResult<()> {
-    ssh::copy_id(
-        app,
-        std::sync::Arc::clone(&prompts),
-        std::sync::Arc::clone(&auth_prompts),
-        &host,
-        port,
-        &username,
-        &password,
-        &public_key,
-    )
-    .await
-    .map_err(|e| e.to_string())
+    let password = zeroize::Zeroizing::new(password);
+    let result = registry
+        .copy_id_run(
+            app,
+            std::sync::Arc::clone(&prompts),
+            std::sync::Arc::clone(&auth_prompts),
+            op_id.as_deref(),
+            &host,
+            port,
+            &username,
+            password,
+            &public_key,
+        )
+        .await
+        .map_err(|e| e.to_string());
+    // The key is logged by fingerprint (its comment is free text); the password
+    // used for the one-shot login is never logged.
+    match &result {
+        Ok(()) => utils::audit::record(
+            "key.install",
+            format!("installed a public key for {username}@{host}:{port}"),
+            serde_json::json!({ "host": host, "port": port, "user": username, "keyFingerprint": utils::audit::key_fingerprint(&public_key), "ok": true }),
+        ),
+        Err(_) => utils::audit::record(
+            "key.install.fail",
+            format!("key install for {username}@{host}:{port} failed"),
+            // No error text: on failure it carries up to 200 chars of the remote
+            // command's output, and command output is never logged.
+            serde_json::json!({ "host": host, "port": port, "user": username, "ok": false }),
+        ),
+    }
+    result
+}
+
+/// Abandon an in-flight `ssh_copy_id` started with the same `op_id` (the host
+/// editor closed). Its connection is dropped and any prompt it raised closed.
+#[tauri::command]
+async fn ssh_copy_id_cancel(registry: State<'_, Registry>, op_id: String) -> CmdResult<()> {
+    registry.copy_id_cancel(&op_id);
+    Ok(())
+}
+
+/// Write a new keypair into `dir` as `hawser_ed25519[_N]` and `.pub`, never
+/// clobbering anything: a keypair someone already deployed to twenty servers
+/// is irreplaceable, and so is an unrelated `.pub` whose private half moved.
+/// BOTH names are reserved with an exclusive create (O_EXCL), bumping the
+/// suffix while either is taken. A failed write removes both files, so no
+/// half-written key is left behind. Returns the private key's path.
+fn write_keypair(
+    dir: &std::path::Path,
+    private_pem: &[u8],
+    public_line: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let create = |p: &std::path::Path, mode: u32| {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Private key 0600 from the start (OpenSSH refuses group- or
+            // world-readable keys); the public half 0644.
+            o.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        o.open(p)
+    };
+    for n in 0..10_000u32 {
+        let path = if n == 0 {
+            dir.join("hawser_ed25519")
+        } else {
+            dir.join(format!("hawser_ed25519_{n}"))
+        };
+        let pub_path = path.with_extension("pub");
+        let mut private = match create(&path, 0o600) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let mut public = match create(&pub_path, 0o644) {
+            Ok(f) => f,
+            Err(e) => {
+                drop(private);
+                let _ = std::fs::remove_file(&path);
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+        let written = private
+            .write_all(private_pem)
+            .and_then(|_| private.sync_all())
+            .and_then(|_| public.write_all(format!("{public_line}\n").as_bytes()));
+        if let Err(e) = written {
+            drop((private, public));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&pub_path);
+            return Err(e);
+        }
+        return Ok(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free hawser_ed25519 key name in ~/.ssh",
+    ))
 }
 
 #[tauri::command]
 async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
+    off(move || ssh_keygen_blocking(comment)).await
+}
+
+fn ssh_keygen_blocking(comment: String) -> CmdResult<serde_json::Value> {
     use russh::keys::ssh_key::{self, getrandom::SysRng, rand_core::UnwrapErr, LineEnding};
 
     // Cross-platform home via the shared helper (USERPROFILE on Windows, HOME
@@ -630,51 +1444,24 @@ async fn ssh_keygen(comment: String) -> CmdResult<serde_json::Value> {
     let dir = home.join(".ssh");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    // Never clobber an existing key: a keypair someone already deployed to
-    // twenty servers is irreplaceable. Reserve the name ATOMICALLY with an
-    // exclusive create (O_EXCL) and bump the suffix on collision — a plain
-    // exists()-then-write races two concurrent keygens onto the same path.
-    let mut path = dir.join("skiff_ed25519");
-    let mut n = 1;
-    let mut file = loop {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(f) => break f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                path = dir.join(format!("skiff_ed25519_{n}"));
-                n += 1;
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    // Private key file is 0600 on Unix (OpenSSH refuses group/world-readable keys).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-
     // ssh-key's RNG is fallible (SysRng: TryCryptoRng); UnwrapErr adapts it to
     // the infallible CryptoRng that PrivateKey::random requires.
     let mut rng = UnwrapErr(SysRng);
     let mut key = ssh_key::PrivateKey::random(&mut rng, ssh_key::Algorithm::Ed25519)
         .map_err(|e| e.to_string())?;
     key.set_comment(comment);
-
-    // Write into the handle we already hold, not a fresh path open — keeps the
-    // exclusive reservation intact.
-    {
-        use std::io::Write;
-        let pem = key.to_openssh(LineEnding::LF).map_err(|e| e.to_string())?;
-        file.write_all(pem.as_bytes()).map_err(|e| e.to_string())?;
-    }
-
+    let pem = key.to_openssh(LineEnding::LF).map_err(|e| e.to_string())?;
     let public = key
         .public_key()
         .to_openssh()
         .map_err(|e| e.to_string())?;
-    let pub_path = path.with_extension("pub");
-    std::fs::write(&pub_path, format!("{public}
-")).map_err(|e| e.to_string())?;
+    let path = write_keypair(&dir, pem.as_bytes(), &public).map_err(|e| e.to_string())?;
+
+    utils::audit::record(
+        "key.generate",
+        format!("generated an Ed25519 key at {}", path.to_string_lossy()),
+        serde_json::json!({ "privatePath": path.to_string_lossy(), "keyFingerprint": utils::audit::key_fingerprint(&public), "ok": true }),
+    );
 
     Ok(serde_json::json!({
         "privatePath": path.to_string_lossy(),
@@ -696,8 +1483,14 @@ async fn ai_chat(
     system_context: String,
     messages: Vec<utils::ai::ChatMessage>,
 ) -> CmdResult<()> {
-    tokio::spawn(utils::ai::chat(app, run_id, cfg, profile, system_context, messages));
+    utils::ai::start(app, run_id, cfg, profile, system_context, messages);
     Ok(())
+}
+
+/// Stop a running chat; its final `done` event reports "Cancelled.".
+#[tauri::command]
+async fn ai_cancel(run_id: String) -> CmdResult<bool> {
+    Ok(utils::ai::cancel(&run_id))
 }
 
 #[tauri::command]
@@ -707,53 +1500,81 @@ async fn ai_key_save(
     kind: String,
     base_url: String,
 ) -> CmdResult<()> {
-    utils::ai::save_key(&profile, &key, &kind, &base_url)
+    let key = zeroize::Zeroizing::new(key);
+    let (p, k) = (profile.clone(), kind.clone());
+    let result = off(move || utils::ai::save_key(&p, &key, &k, &base_url)).await;
+    if result.is_ok() {
+        // The API key itself is never logged — only that a key was saved for this
+        // provider profile.
+        utils::audit::record(
+            "aikey.save",
+            format!("saved an AI provider key for profile '{profile}'"),
+            serde_json::json!({ "profile": profile, "kind": kind, "ok": true }),
+        );
+    }
+    result
 }
 
 #[tauri::command]
 async fn ai_key_status(profile: String) -> CmdResult<bool> {
-    Ok(utils::ai::key_exists(&profile))
+    off(move || Ok(utils::ai::key_exists(&profile))).await
 }
 
 /// Remove a profile's saved API key and its origin binding — the way out after
 /// switching to a provider that needs no key (e.g. local Ollama).
 #[tauri::command]
 async fn ai_key_delete(profile: String) -> CmdResult<()> {
-    utils::ai::delete_key(&profile)
+    let p = profile.clone();
+    let result = off(move || utils::ai::delete_key(&p)).await;
+    if result.is_ok() {
+        utils::audit::record(
+            "aikey.delete",
+            format!("removed the AI provider key for profile '{profile}'"),
+            serde_json::json!({ "profile": profile, "ok": true }),
+        );
+    }
+    result
 }
 
 /// Provider settings (kind/baseUrl/model — never the key) as opaque JSON at
-/// %APPDATA%\skiffi.json, same pattern as the host catalogue.
+/// %APPDATA%\hawseri.json, same pattern as the host catalogue.
 #[tauri::command]
 async fn ai_config_load() -> CmdResult<Option<serde_json::Value>> {
-    utils::hosts::load_named("ai.json").map_err(|e| e.to_string())
+    off(|| utils::hosts::load_named("ai.json").map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
 async fn ai_config_save(config: serde_json::Value) -> CmdResult<()> {
-    utils::hosts::save_named("ai.json", &config).map_err(|e| e.to_string())
+    off(move || utils::hosts::save_named("ai.json", &config).map_err(|e| e.to_string())).await
 }
 
 /// App-wide settings (colour policies, device profiles, UI defaults).
-/// %APPDATA%\skiff\settings.json — opaque JSON owned by the frontend, same
-/// corrupt-tolerant contract as the host catalogue.
+/// %APPDATA%\hawser\settings.json — opaque JSON owned by the frontend, same
+/// fail-closed contract as the host catalogue: a corrupt file is an error
+/// (a copy kept), and the frontend saves over it only once the user agrees.
 #[tauri::command]
 async fn settings_load() -> CmdResult<Option<serde_json::Value>> {
-    utils::hosts::load_named("settings.json").map_err(|e| e.to_string())
+    off(|| utils::hosts::load_named("settings.json").map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
 async fn settings_save(settings: serde_json::Value) -> CmdResult<()> {
-    utils::hosts::save_named("settings.json", &settings).map_err(|e| e.to_string())
+    off(move || utils::hosts::save_named("settings.json", &settings).map_err(|e| e.to_string())).await
 }
 
 /* -------------------------------------------------------------- credentials */
 
-/// Save a password to the Windows Credential Manager.
+/// Save a password to the OS credential vault and bind it to its destinations.
 ///
 /// This is the one command that accepts a secret, and only because the user
 /// just typed it into the host editor. It goes straight into the OS vault and
 /// is never echoed back: there is deliberately no `credential_read` command.
+///
+/// `destinations` is the exact set of (host, port, username) the editor
+/// approved for this vault entry — the catalogue as it will be after the edit —
+/// and REPLACES the binding, so an edited host's old address can no longer
+/// receive the password. Without it (an older caller) the catalogue's current
+/// users of the entry are bound, as before.
 #[tauri::command]
 async fn credential_save(
     host_id: String,
@@ -761,19 +1582,24 @@ async fn credential_save(
     password: String,
     host: String,
     port: u16,
+    destinations: Option<Vec<utils::hosts::Dest>>,
 ) -> CmdResult<()> {
-    if credentials::is_reserved_id(&host_id) {
-        return Err(format!("'{host_id}' is a reserved vault id, not a host"));
-    }
-    credentials::write_secret(&host_id, &username, &password).map_err(|e| e.to_string())?;
-    // Record, in backend-owned state, that this secret may be sent to this
-    // destination (and to any catalogue borrower of it). ssh_connect authorizes
-    // against this — not the frontend-writable hosts.json — so a later poisoned
-    // catalogue cannot redirect the secret. Done here, where the human just
-    // supplied the secret, is the trustworthy moment to bind it. Propagated so
-    // the save is atomic: if the binding cannot be written, the save fails
-    // rather than silently leaving a secret that ssh_connect will later refuse.
-    utils::hosts::snapshot_binding(&host_id, &host, port, &username).map_err(|e| e.to_string())?;
+    let password = zeroize::Zeroizing::new(password);
+    let owner = utils::hosts::Dest { host: host.clone(), port, username: username.clone() };
+    let (id, user) = (host_id.clone(), username.clone());
+    // Secret and binding as one unit, under the vault lock that connect's read
+    // takes too; a failed binding write puts the previous secret back.
+    off(move || {
+        utils::hosts::save_credential(&id, &user, &password, &owner, destinations.as_deref())
+    })
+    .await?;
+    // The password is never logged — only that a credential was saved and bound
+    // to this destination.
+    utils::audit::record(
+        "credential.save",
+        format!("saved a password for {username}@{host}:{port}"),
+        serde_json::json!({ "hostId": host_id, "host": host, "port": port, "user": username, "ok": true }),
+    );
     Ok(())
 }
 
@@ -781,45 +1607,95 @@ async fn credential_save(
 /// "password saved" with no plaintext in the webview.
 #[tauri::command]
 async fn credential_status(host_id: String) -> CmdResult<bool> {
-    Ok(!credentials::is_reserved_id(&host_id) && credentials::has_secret(&host_id))
+    off(move || {
+        Ok(!credentials::is_reserved_id(&host_id)
+            && credentials::validate_id(&host_id).is_ok()
+            && credentials::has_secret(&host_id))
+    })
+    .await
 }
 
 #[tauri::command]
 async fn credential_delete(host_id: String) -> CmdResult<()> {
-    if credentials::is_reserved_id(&host_id) {
-        return Err(format!("'{host_id}' is a reserved vault id, not a host"));
-    }
-    // Drop the binding even when the secret is already gone, so stale bindings
-    // do not accumulate.
-    let deleted = credentials::delete_secret(&host_id);
-    utils::hosts::remove_binding(&host_id);
-    match deleted {
-        Ok(()) | Err(credentials::CredError::NotFound(_)) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    let id = host_id.clone();
+    // The binding is dropped only once the secret is gone (or was never
+    // there); a vault error keeps both and is reported.
+    off(move || utils::hosts::delete_credential(&id)).await?;
+    utils::audit::record(
+        "credential.delete",
+        format!("removed the saved password for host '{host_id}'"),
+        serde_json::json!({ "hostId": host_id, "ok": true }),
+    );
+    Ok(())
+}
+
+/// Revoke destinations from a saved credential's binding: keep only those in
+/// `destinations` (the catalogue's users of the entry after an edit or delete).
+/// Never adds one — widening needs the password typed again.
+#[tauri::command]
+async fn credential_binding_narrow(
+    host_id: String,
+    destinations: Vec<utils::hosts::Dest>,
+) -> CmdResult<()> {
+    off(move || utils::hosts::narrow_binding(&host_id, &destinations)).await
 }
 
 /* --------------------------------------------------------------------- run */
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let context = tauri::generate_context!();
+    // The app-wide instance lock, before ANY store is opened (the audit
+    // writer, hosts, bindings, the vault journal, settings): see
+    // utils::instance. Held until the process exits.
+    // Fails CLOSED: only "another live instance holds it" hands off; any
+    // other failure to take the lock is shown and the app exits, never runs
+    // unguarded.
+    let _instance = match utils::instance::decide(updater::acquire_instance()) {
+        utils::instance::Startup::Run(lock) => lock,
+        utils::instance::Startup::HandOff => return run_second_instance(context),
+        utils::instance::Startup::Refuse(message) => {
+            utils::instance::fatal_dialog("Hawser cannot start", &message);
+            std::process::exit(1);
+        }
+    };
+    let app = with_single_instance_plugin(with_app_menu(tauri::Builder::default()), |app| {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    })
+        // Self-update: signature-checked against plugins.updater.pubkey.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             app.manage(Registry::default());
+            app.manage(Arc::new(local_shell::LocalShells::default()));
             app.manage(Arc::new(HostKeyPrompts::default()));
             app.manage(Arc::new(AuthPrompts::default()));
             app.manage(utils::nettools::NetTools::default());
+            app.manage(Arc::new(utils::remote_edit::RemoteEdits::default()));
 
-            // Backfill credential→destination and AI-origin bindings for
-            // already-saved secrets, from the on-disk catalogue. This MUST run
-            // synchronously here, before setup returns and the webview can
-            // invoke any command: if it were spawned, a compromised frontend
-            // could race it — poisoning hosts.json via hosts_save before the
-            // migration reads it — and reintroduce the frontend-writable-source
-            // bug. Run inline (small catalogue + a few vault reads); a panic is
-            // contained so a migration hiccup never blocks startup.
-            let _ = std::panic::catch_unwind(utils::hosts::migrate_bindings);
-            let _ = std::panic::catch_unwind(utils::ai::migrate_ai_origins);
+            // The audit writer thread, before anything can be recorded. It
+            // also ingests records an earlier exit had to spill.
+            utils::audit::start();
+            // The data directory is owner-only (0700) on Unix; files in it are
+            // written 0600 (utils::hosts::write_atomic).
+            if let Ok(store) = utils::known_hosts::store_path() {
+                if let Some(dir) = store.parent() {
+                    let _ = utils::hosts::ensure_dir(dir);
+                }
+            }
+
+            // No credential upgrade runs here: no Hawser build has been
+            // released, so there is no earlier vault or binding format to
+            // migrate (see utils::vault_item). An item this build cannot read
+            // fails closed and is entered again.
+
+            // Remote-edit copies an earlier run left: clean ones are deleted,
+            // unsynced ones listed in the Editing panel (off-thread: hashing).
+            utils::remote_edit::startup_sweep(app.handle().clone());
 
             // Prune old transcripts on launch. Defaults chosen to keep a useful
             // window of history without letting plaintext firewall logs pile up
@@ -830,15 +1706,16 @@ pub fn run() {
                 // vanishing mid-scan) is reported rather than silently swallowed
                 // by a dead background thread.
                 match std::panic::catch_unwind(|| utils::session_log::prune(30, 500)) {
-                    Ok(n) if n > 0 => eprintln!("skiff: pruned {n} old session log(s)"),
+                    Ok(n) if n > 0 => eprintln!("hawser: pruned {n} old session log(s)"),
                     Ok(_) => {}
-                    Err(_) => eprintln!("skiff: session-log pruning thread panicked"),
+                    Err(_) => eprintln!("hawser: session-log pruning thread panicked"),
                 }
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             ssh_connect,
+            ssh_algorithms,
             ssh_write,
             ssh_resize,
             ssh_disconnect,
@@ -848,7 +1725,19 @@ pub fn run() {
             sftp_list,
             sftp_get,
             sftp_put,
+            sftp_cancel,
+            edit_open,
+            edit_list,
+            edit_upload,
+            edit_stop,
+            edit_reveal,
+            edit_leftovers,
+            edit_leftover_reveal,
+            edit_leftover_discard,
+            edit_editor_load,
+            edit_editor_save,
             local_list,
+            local_root,
             path_exists,
             sftp_rename,
             sftp_delete,
@@ -866,13 +1755,16 @@ pub fn run() {
             net_dns_lookup,
             hosts_probe,
             config_snapshot,
+            config_check,
             capture_output,
             config_list,
             config_diff,
             config_read,
             ssh_keygen,
             ssh_copy_id,
+            ssh_copy_id_cancel,
             ai_chat,
+            ai_cancel,
             ai_key_save,
             ai_key_status,
             ai_key_delete,
@@ -882,17 +1774,288 @@ pub fn run() {
             settings_save,
             hosts_load,
             hosts_save,
+            hosts_seed,
+            hosts_keep_backup,
+            vault_id_rule,
             hosts_export,
+            hosts_import_sources,
+            hosts_import_scan,
+            hosts_import_record,
             sessions_load,
             sessions_save,
             session_history,
             logs_list,
             open_logs_folder,
             log_read,
+            logs_search,
+            logs_search_cancel,
+            audit_list,
+            audit_verify,
+            audit_archive,
+            local_shell_profiles,
+            local_shell_start,
             credential_save,
             credential_status,
             credential_delete,
+            credential_binding_narrow,
+            updater::update_install_kind,
+            updater::update_open_releases,
+            updater::update_prepare_install,
         ])
-        .run(tauri::generate_context!())
+        .build(context)
         .expect("error while running tauri application");
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { code, .. } = &event {
+            updater::mark_relaunch(*code);
+        }
+        // Audit records are written by a background thread: give the queue
+        // up to 10 s to drain, then spill whatever is still pending to
+        // audit.pending-<ts>.jsonl, recorded at the next start.
+        if let tauri::RunEvent::Exit = event {
+            // Remote edits stop watching; clean copies are deleted, unsynced
+            // ones kept for the next launch to list.
+            if let Some(edits) = app.try_state::<Arc<utils::remote_edit::RemoteEdits>>() {
+                edits.shutdown();
+            }
+            utils::audit::shutdown(std::time::Duration::from_secs(10));
+        }
+    });
+}
+
+/// macOS app-menu item ids that the frontend handles.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MENU_CLOSE_TAB: &str = "hawser-close-tab";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MENU_QUIT: &str = "hawser-quit";
+
+/// The frontend event a custom menu item raises, if it is one of ours.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn menu_event_name(id: &str) -> Option<&'static str> {
+    match id {
+        MENU_CLOSE_TAB => Some("menu://close-tab"),
+        MENU_QUIT => Some("menu://quit"),
+        _ => None,
+    }
+}
+
+/// On macOS, replace Tauri's default menu. Its File > Close Window (Cmd+W)
+/// closed the app's only window, and App > Quit (Cmd+Q) exited, both with
+/// every SSH session in it and no confirmation. Here Cmd+W is "Close Tab"
+/// and Cmd+Q is "Quit Hawser"; both are handed to the frontend, which asks
+/// first while sessions are live (confirmCloseActive). Edit stays: WKWebView
+/// needs its items for copy and paste. Other platforms have no app menu.
+fn with_app_menu<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::Emitter;
+        builder.menu(macos_menu).on_menu_event(|app, event| {
+            if let Some(name) = menu_event_name(event.id().as_ref()) {
+                let _ = app.emit(name, ());
+            }
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_menu<R: tauri::Runtime>(h: &AppHandle<R>) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
+    let pkg = h.package_info();
+    let about = AboutMetadata {
+        name: Some(pkg.name.clone()),
+        version: Some(pkg.version.to_string()),
+        ..Default::default()
+    };
+    let app_menu = Submenu::with_items(
+        h,
+        pkg.name.clone(),
+        true,
+        &[
+            &PredefinedMenuItem::about(h, None, Some(about))?,
+            &PredefinedMenuItem::separator(h)?,
+            &PredefinedMenuItem::services(h, None)?,
+            &PredefinedMenuItem::separator(h)?,
+            &PredefinedMenuItem::hide(h, None)?,
+            &PredefinedMenuItem::hide_others(h, None)?,
+            &PredefinedMenuItem::show_all(h, None)?,
+            &PredefinedMenuItem::separator(h)?,
+            &MenuItem::with_id(h, MENU_QUIT, "Quit Hawser", true, Some("CmdOrCtrl+Q"))?,
+        ],
+    )?;
+    let file = Submenu::with_items(
+        h,
+        "File",
+        true,
+        &[&MenuItem::with_id(h, MENU_CLOSE_TAB, "Close Tab", true, Some("CmdOrCtrl+W"))?],
+    )?;
+    let edit = Submenu::with_items(
+        h,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(h, None)?,
+            &PredefinedMenuItem::redo(h, None)?,
+            &PredefinedMenuItem::separator(h)?,
+            &PredefinedMenuItem::cut(h, None)?,
+            &PredefinedMenuItem::copy(h, None)?,
+            &PredefinedMenuItem::paste(h, None)?,
+            &PredefinedMenuItem::select_all(h, None)?,
+        ],
+    )?;
+    let window = Submenu::with_items(
+        h,
+        "Window",
+        true,
+        &[&PredefinedMenuItem::minimize(h, None)?, &PredefinedMenuItem::maximize(h, None)?],
+    )?;
+    Menu::with_items(h, &[&app_menu, &file, &edit, &window])
+}
+
+/// Register the single-instance plugin, where it can run safely.
+///
+/// On Linux the plugin (2.4.1) unwraps the session-bus address, and a
+/// malformed `DBUS_SESSION_BUS_ADDRESS` would panic inside it (an abort in
+/// release builds). The address is checked first; without a usable bus the
+/// plugin is left out and only the instance lock guards the data (a second
+/// launch then exits without focusing the first window).
+fn with_single_instance_plugin<R: tauri::Runtime>(
+    builder: tauri::Builder<R>,
+    on_second: impl Fn(&tauri::AppHandle<R>) + Send + Sync + 'static,
+) -> tauri::Builder<R> {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = zbus::Address::session() {
+        eprintln!("hawser: no usable D-Bus session address ({e}); a second launch will not focus this window");
+        return builder;
+    }
+    builder.plugin(tauri_plugin_single_instance::init(move |app, _argv, _cwd| on_second(app)))
+}
+
+/// Another process holds the instance lock: open nothing, hand this launch to
+/// the running window, and exit. No window is created and no store is opened.
+///
+/// macOS: this process never runs the single-instance plugin (whose setup
+/// binds the hand-off socket when it finds none, and could then capture a
+/// primary that is still starting). It connects to the primary's socket
+/// itself, retrying with backoff for ~3 s (utils::instance::hand_off).
+fn run_second_instance(context: tauri::Context<tauri::Wry>) {
+    #[cfg(target_os = "macos")]
+    {
+        let socket = utils::instance::plugin_socket(&context.config().identifier);
+        let backoff: Vec<std::time::Duration> =
+            utils::instance::HAND_OFF_BACKOFF_MS.iter().map(|ms| std::time::Duration::from_millis(*ms)).collect();
+        if !utils::instance::hand_off(&socket, &utils::instance::hand_off_message(), &backoff) {
+            eprintln!("hawser: another Hawser instance is running but did not answer; exiting");
+        }
+        std::process::exit(0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Elsewhere the plugin hands off (and exits the process when it can).
+        // Its endpoint opens during the primary's setup, so give a launch at
+        // the same moment as the primary a moment first; see the plugin
+        // limitation in utils::instance.
+        let mut context = context;
+        context.config_mut().app.windows.clear();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let built = with_single_instance_plugin(tauri::Builder::default(), |_| {})
+            .setup(|_| {
+                // Reached only when the plugin did not hand off and exit.
+                eprintln!("hawser: another Hawser instance is running; exiting");
+                std::process::exit(0)
+            })
+            .build(context);
+        if let Err(e) = built {
+            eprintln!("hawser: another Hawser instance is running; exiting ({e})");
+        }
+        std::process::exit(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utils::artifacts::dial_identity;
+
+    /// W5: the custom macOS menu's Close Tab / Quit reach the frontend as
+    /// their own events; nothing else is forwarded.
+    #[test]
+    fn menu_items_map_to_frontend_events() {
+        assert_eq!(menu_event_name(MENU_CLOSE_TAB), Some("menu://close-tab"));
+        assert_eq!(menu_event_name(MENU_QUIT), Some("menu://quit"));
+        assert_eq!(menu_event_name("close_window"), None);
+        assert_eq!(menu_event_name(""), None);
+    }
+
+    /// A failed capture is audited without the device's stderr.
+    #[test]
+    fn audited_exec_errors_leave_out_device_output() {
+        assert_eq!(
+            exec_error_for_audit("capture command exited with status 1: token=abc123 rejected"),
+            "capture command exited with status 1"
+        );
+        assert_eq!(exec_error_for_audit("capture timed out after 60s; output discarded"), "capture timed out after 60s; output discarded");
+    }
+
+    #[test]
+    fn local_root_is_the_system_drive_on_windows_and_slash_elsewhere() {
+        if cfg!(windows) {
+            assert_eq!(local_root_from(Some("D:")), "D:\\");
+            assert_eq!(local_root_from(Some("bogus")), "C:\\");
+            assert_eq!(local_root_from(None), "C:\\");
+        } else {
+            assert_eq!(local_root_from(Some("D:")), "/");
+        }
+    }
+
+    #[test]
+    fn keygen_never_clobbers_an_orphan_public_key() {
+        let d = std::env::temp_dir().join(format!("hawser-keygen-{}", utils::artifacts::random_hex(6)));
+        std::fs::create_dir_all(&d).unwrap();
+        // An unrelated .pub whose private half was moved away.
+        std::fs::write(d.join("hawser_ed25519.pub"), "ssh-ed25519 KEEP me\n").unwrap();
+        let p = write_keypair(&d, b"PRIVATE", "ssh-ed25519 NEW").unwrap();
+        assert_eq!(p, d.join("hawser_ed25519_1"));
+        assert_eq!(std::fs::read_to_string(d.join("hawser_ed25519.pub")).unwrap(), "ssh-ed25519 KEEP me\n");
+        assert!(!d.join("hawser_ed25519").exists(), "the probe reservation must be released");
+        assert_eq!(std::fs::read_to_string(d.join("hawser_ed25519_1.pub")).unwrap(), "ssh-ed25519 NEW\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // A second key takes the next free pair.
+        assert_eq!(write_keypair(&d, b"P2", "ssh-ed25519 N2").unwrap(), d.join("hawser_ed25519_2"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ai_context_is_refused_when_the_live_dial_is_not_the_policy_endpoint() {
+        // The tab dialled 10.0.0.1; the entry was then repointed at 10.0.0.2
+        // (and, say, AI enabled for it). The panel's policy is for the new
+        // identity, the transcript comes from the old one.
+        let live = dial_identity(Some("host:h-1"), ("admin", "10.0.0.1", 22), None);
+        let now = dial_identity(Some("host:h-1"), ("admin", "10.0.0.2", 22), None);
+        assert!(check_same_endpoint(&live, &now).is_err());
+        assert!(check_same_endpoint(&live, &live).is_ok());
+        // Editing the bastion's account counts the same way.
+        let via = |user: &str| dial_identity(Some("host:h-1|via:host:b-1"), ("admin", "10.0.0.1", 22), Some((user, "bastion", 22)));
+        assert!(check_same_endpoint(&via("ops"), &via("root")).is_err());
+    }
+
+    #[test]
+    fn history_reads_the_endpoint_that_passed_the_check() {
+        // One resolution feeds both the comparison and the read: the result is
+        // the identity that was compared, never a second lookup's.
+        let live = dial_identity(Some("host:h-1"), ("admin", "10.0.0.1", 22), None);
+        let now = dial_identity(Some("host:h-1"), ("admin", "10.0.0.2", 22), None);
+        assert_eq!(history_endpoint(Some(live.clone()), Some(live.clone())).unwrap(), live);
+        assert!(history_endpoint(Some(live.clone()), Some(now.clone())).is_err());
+        // No live session: the caller's identity (replay before a dial).
+        assert_eq!(history_endpoint(None, Some(now.clone())).unwrap(), now);
+        assert_eq!(history_endpoint(Some(live.clone()), None).unwrap(), live);
+        assert!(history_endpoint(None, None).is_err());
+    }
 }

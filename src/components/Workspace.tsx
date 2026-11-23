@@ -1,3 +1,4 @@
+import type { TransferJob } from '../lib/transfers'
 import { FolderTree, Radio, ServerOff, SplitSquareHorizontal, SplitSquareVertical, SquareTerminal, Unlink } from 'lucide-react'
 import type { Session, WorkspaceView } from '../types'
 import { TerminalDeck } from './TerminalDeck'
@@ -25,7 +26,7 @@ interface Props {
   onStartTransfer: (
     sessionId: string,
     direction: 'upload' | 'download',
-    jobs: { name: string; local: string; remote: string }[],
+    jobs: TransferJob[],
   ) => void
   sftpPaths: Record<string, { local?: string; remote?: string }>
   onSftpPathsChange: (
@@ -38,15 +39,21 @@ interface Props {
   broadcast: boolean
   broadcastExcluded?: Set<string>
   onToggleBroadcast: () => void
+  /** False for local terminals, which have no SFTP side. */
+  filesAvailable?: boolean
 }
 
 export function Workspace({
+  filesAvailable = true,
   sessions, session, onChangeView, onSize, groupSessions, onFocusSession, onSplit, onSeparate,
   onClosePane, layout, onResizeSplit, onResetSplit,
   onStartTransfer, sftpPaths, onSftpPathsChange, transferTick, accentHex, broadcast, broadcastExcluded, onToggleBroadcast,
 }: Props) {
-  if (!session || sessions.length === 0) return <EmptyState />
-
+  if (sessions.length === 0) return <EmptyState />
+  // Open tabs but none selected (a moment during a close or restore): the
+  // deck stays MOUNTED, at the same place in the tree, under an empty-state
+  // cover. Unmounting it would run every pane's teardown, whose safety-net
+  // disconnect drops every live session.
   return (
     <div
       className="flex min-h-0 flex-1 flex-col bg-surface-0"
@@ -54,11 +61,12 @@ export function Workspace({
       // and the whole point of per-host colour: the wrong firewall looks wrong
       // before anything is typed. box-shadow rather than border so it does not
       // shift the layout by 2px when a plain host has no accent.
-      style={accentHex ? { boxShadow: `inset 0 0 0 2px ${accentHex}` } : undefined}
+      style={session && accentHex ? { boxShadow: `inset 0 0 0 2px ${accentHex}` } : undefined}
     >
       {/* View switcher. Terminal and SFTP are two lenses on one connection, not
           two connections — the toggle lives here rather than in the tab strip so
           a tab keeps meaning "a host I am connected to". */}
+      {session ? (
       <div className="flex h-8 shrink-0 items-center gap-2 border-b border-line bg-surface-0 px-2">
         <div
           role="tablist"
@@ -71,12 +79,14 @@ export function Workspace({
             icon={<SquareTerminal size={12} />}
             label="Terminal"
           />
-          <ViewTab
-            active={session.view === 'sftp'}
-            onClick={() => onChangeView('sftp')}
-            icon={<FolderTree size={12} />}
-            label="Files"
-          />
+          {filesAvailable && (
+            <ViewTab
+              active={session.view === 'sftp'}
+              onClick={() => onChangeView('sftp')}
+              icon={<FolderTree size={12} />}
+              label="Files"
+            />
+          )}
         </div>
         <div className="ml-auto flex items-center gap-1">
           {session.view === 'terminal' && (
@@ -136,6 +146,7 @@ export function Workspace({
           <span className="ml-1 font-mono text-[11px] text-ink-faint">Ctrl+Shift+E</span>
         </div>
       </div>
+      ) : null}
 
       {/* Both surfaces are absolutely positioned siblings in one relative box.
           The terminal deck is always mounted; SFTP is layered over it when
@@ -144,8 +155,8 @@ export function Workspace({
       <div className="relative min-h-0 flex-1">
         <TerminalDeck
           sessions={sessions}
-          layout={session.view === 'terminal' ? layout : null}
-          focusedId={session.id}
+          layout={session?.view === 'terminal' ? layout : null}
+          focusedId={session?.id ?? null}
           broadcast={broadcast}
           broadcastExcluded={broadcastExcluded}
           onResizeSplit={onResizeSplit}
@@ -154,7 +165,7 @@ export function Workspace({
           onFocus={onFocusSession}
           onSize={onSize}
         />
-        {session.view === 'sftp' && (
+        {session?.view === 'sftp' && (
           <div className="absolute inset-0">
             <SftpView
               key={session.id}
@@ -166,6 +177,11 @@ export function Workspace({
               }
               transferTick={transferTick}
             />
+          </div>
+        )}
+        {!session && (
+          <div className="absolute inset-0 flex bg-surface-0">
+            <EmptyState />
           </div>
         )}
       </div>

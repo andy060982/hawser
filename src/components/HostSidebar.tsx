@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronsDownUp, Clock, Plus, Radar, Search, X } from 'lucide-react'
+import { ChevronsDownUp, Clock, Download, Plus, Radar, Search, X } from 'lucide-react'
 import { type Host, type HostNode } from '../types'
 import { HostTree } from './HostTree'
 import { allFolderIds, filterTree } from '../lib/tree'
+import { anyModalOpen } from '../lib/modalStack'
 
 interface Props {
   hosts: HostNode[]
@@ -16,6 +17,8 @@ interface Props {
   onFolderMenu: (folderId: string, name: string, x: number, y: number) => void
   /** Right-click on the sidebar's empty area (not on a host/folder row). */
   onSidebarMenu: (x: number, y: number) => void
+  /** "Import from SSH config / PuTTY…" (offered in the empty state). */
+  onImportHosts?: () => void
   onProbe: () => void
   probing: boolean
   reachability: Record<string, { ok: boolean; ms?: number }>
@@ -25,7 +28,7 @@ interface Props {
 
 export function HostSidebar({
   hosts, width, onOpenHost, onSelectHost, onAddHost, onEditHost, onOpenHistory,
-  onHostMenu, onFolderMenu, onSidebarMenu, onProbe, probing, reachability, openHostIds, activeHostId,
+  onHostMenu, onFolderMenu, onSidebarMenu, onImportHosts, onProbe, probing, reachability, openHostIds, activeHostId,
 }: Props) {
   const [query, setQuery] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
@@ -40,8 +43,10 @@ export function HostSidebar({
   // terminal owns plain Ctrl+K (readline kill-to-end-of-line).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.code === 'KeyK') {
+      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === 'KeyK') {
         e.preventDefault()
+        // Behind a modal, the hidden filter must not take the typing.
+        if (anyModalOpen()) return
         searchRef.current?.focus()
         searchRef.current?.select()
       }
@@ -133,7 +138,29 @@ export function HostSidebar({
           onSidebarMenu(e.clientX, e.clientY)
         }}
       >
-        {tree.length === 0 ? (
+        {hosts.length === 0 && !query ? (
+          <div className="px-3 py-6 text-center text-[12px] text-ink-faint">
+            <p>No saved hosts yet.</p>
+            <button
+              type="button"
+              onClick={onAddHost}
+              className="mt-2 inline-flex items-center gap-1 rounded border border-line px-2 py-1 text-[11.5px] text-ink-dim hover:bg-surface-3 hover:text-ink"
+            >
+              <Plus size={12} aria-hidden />
+              Add host
+            </button>
+            {onImportHosts && (
+              <button
+                type="button"
+                onClick={onImportHosts}
+                className="mt-2 flex w-full items-center justify-center gap-1 text-[11.5px] text-ink-dim hover:text-ink"
+              >
+                <Download size={12} aria-hidden />
+                Import from SSH config / PuTTY…
+              </button>
+            )}
+          </div>
+        ) : tree.length === 0 ? (
           <p className="px-3 py-6 text-center text-[12px] text-ink-faint">
             No hosts match “{query}”.
           </p>

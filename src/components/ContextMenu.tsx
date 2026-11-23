@@ -1,4 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
+import { useModalLayer } from '../lib/useModalLayer'
+import { LAYER } from '../lib/modalStack'
 
 export interface MenuItem {
   label: string
@@ -43,12 +45,8 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
     setPos({ x: Math.max(pad, x), y: Math.max(pad, y) })
   }, [menu])
 
-  useEffect(() => {
-    if (!menu) return
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [menu, onClose])
+  // A layer while open: Escape closes the menu only, never a dialog under it.
+  useModalLayer(!!menu, onClose, LAYER.menu)
 
   if (!menu) return null
 

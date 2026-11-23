@@ -15,7 +15,7 @@ if everything still works:
   it) and writes it to Windows Credential Manager; there is deliberately no
   `credential_read` command.
 - **Changed host keys are refused, not prompted.** Only *unknown* keys get a
-  trust-on-first-use dialog. `%APPDATA%\skiff\known_hosts` is standard OpenSSH
+  trust-on-first-use dialog. `%APPDATA%\hawser\known_hosts` is standard OpenSSH
   format; a changed key requires manually editing that file.
 - **Port forwards bind 127.0.0.1 only.**
 - **`open_logs_folder` takes no path argument** — a parameterised open() would
@@ -37,7 +37,7 @@ that cannot yet be resolved by an upgrade are tracked in
 `src-tauri/.cargo/audit.toml` with a rationale, not silently ignored:
 
 - **RUSTSEC-2023-0071** (`rsa`, "Marvin Attack" timing sidechannel): no fixed
-  `rsa` release exists. It is a decryption/PKCS#1v1.5-unpadding oracle; Skiff
+  `rsa` release exists. It is a decryption/PKCS#1v1.5-unpadding oracle; Hawser
   performs only SSH signing with RSA (no decryption), a 2026-09-24 review found
   no reachable oracle, and users are steered to Ed25519/agent keys. Tracked for
   removal as soon as a patched `rsa` ships.

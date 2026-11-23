@@ -2,18 +2,39 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Camera, FileDiff, GitCompareArrows, X } from 'lucide-react'
 import type { Host } from '../types'
 import { safeInvoke } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
 
 interface SnapshotInfo {
+  /** Snapshot id: a filename, or `legacy:<filename>` for one recorded before
+   *  snapshots were keyed by endpoint (see utils::configs). */
   name: string
   bytes: number
   modified: number | null
+  legacy: boolean
 }
+
+const LEGACY_PREFIX = 'legacy:'
 
 interface SnapshotResult {
   name: string
   lines: number
   added: number | null
   removed: number | null
+}
+
+/* Chronological order of snapshot names "YYYYMMDD-HHMMSS[.n].txt". Plain string
+   sort is wrong for same-second snapshots: "…00.1.txt" sorts before "…00.txt"
+   ('.1' < '.t'), which would reverse a diff. */
+export const snapshotOrder = (a: string, b: string): number => {
+  const key = (id: string): [string, number] => {
+    // A legacy id orders by its timestamp like any other.
+    const n = id.startsWith(LEGACY_PREFIX) ? id.slice(LEGACY_PREFIX.length) : id
+    const m = /^(.*?)(?:\.(\d+))?\.txt$/.exec(n)
+    return m ? [m[1], m[2] ? Number(m[2]) : 0] : [n, 0]
+  }
+  const [sa, na] = key(a)
+  const [sb, nb] = key(b)
+  return sa < sb ? -1 : sa > sb ? 1 : na - nb
 }
 
 const fmtWhen = (epoch: number | null) => {
@@ -29,23 +50,36 @@ const fmtWhen = (epoch: number | null) => {
    Answers the question that starts most network incident calls — "what
    changed on this box". Snapshot runs the host's configured capture command
    over a fresh exec channel (invisible to the interactive terminal), stores
-   plain text under %APPDATA%\skiff\configs\<host>\, and any two snapshots
-   diff as unified text with added/removed colouring.
+   plain text under the app's configs folder, keyed by endpoint identity (so
+   two entries sharing an address never share a baseline), and any two
+   snapshots diff as unified text with added/removed colouring. Snapshots from
+   before that keying are listed as "legacy": readable and diffable, but they
+   may belong to another entry with the same hostname.
 
    Select one snapshot to view it; select two to diff them.
 --------------------------------------------------------------------------- */
 export function ConfigHistoryDialog({
   host,
+  endpoint,
   liveSessionId,
+  initialSelected,
   onClose,
 }: {
   host: Host
-  /** A connected session to this host, if any — required for Snapshot now. */
+  /** Endpoint identity of `host` (lib/endpoint); keys the snapshot folder
+   *  when no session to it is connected. */
+  endpoint: string
+  /** A connected session to this host, if any — required for Snapshot now.
+   *  While there is one, every lookup uses that session's own dialled
+   *  identity (the backend's), not `endpoint`. */
   liveSessionId: string | null
+  /** Snapshots to open with — two of them opens straight into their diff (used
+   *  by the "config changed since last visit" chip). */
+  initialSelected?: string[]
   onClose: () => void
 }) {
   const [snaps, setSnaps] = useState<SnapshotInfo[] | null>(null)
-  const [selected, setSelected] = useState<string[]>([])
+  const [selected, setSelected] = useState<string[]>(initialSelected ?? [])
   const [content, setContent] = useState('')
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
@@ -53,18 +87,19 @@ export function ConfigHistoryDialog({
   const captureCommand = host.configCommand?.trim() ?? ''
 
   const refresh = useCallback(() => {
-    void safeInvoke<SnapshotInfo[]>('config_list', { host: host.hostname }).then((l) =>
-      setSnaps(l ?? []),
-    )
-  }, [host.hostname])
+    void safeInvoke<SnapshotInfo[]>('config_list', { sessionId: liveSessionId, endpoint, host: host.hostname })
+      .then((l) => setSnaps(l ?? []))
+      .catch((e: unknown) => {
+        setSnaps([])
+        setNotice(`Could not list snapshots: ${e instanceof Error ? e.message : String(e)}`)
+      })
+  }, [liveSessionId, endpoint, host.hostname])
 
   useEffect(refresh, [refresh])
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Escape closes this dialog only while it is the top modal (an alert over
+  // it takes its own Escape).
+  useModalLayer(true, onClose)
 
   /* Selection drives the viewer: one snapshot shows its content, two show
      their diff (chronologically ordered regardless of click order). A
@@ -77,19 +112,25 @@ export function ConfigHistoryDialog({
     }
     setContent('')
     if (selected.length === 1) {
-      void safeInvoke<string>('config_read', { host: host.hostname, name: selected[0] })
+      void safeInvoke<string>('config_read', { sessionId: liveSessionId, endpoint, host: host.hostname, name: selected[0] })
         .then((c) => show(c ?? ''))
         .catch((e) => show(String(e)))
     } else if (selected.length === 2) {
-      const [a, b] = [...selected].sort() // timestamp names sort chronologically
-      void safeInvoke<string>('config_diff', { host: host.hostname, older: a, newer: b })
+      const [a, b] = [...selected].sort(snapshotOrder) // oldest first
+      void safeInvoke<string>('config_diff', {
+        sessionId: liveSessionId,
+        endpoint,
+        host: host.hostname,
+        older: a,
+        newer: b,
+      })
         .then((c) => show(c || '(no differences)'))
         .catch((e) => show(String(e)))
     }
     return () => {
       stale = true
     }
-  }, [selected, host.hostname])
+  }, [selected, liveSessionId, endpoint, host.hostname])
 
   const toggle = (name: string) =>
     setSelected((cur) =>
@@ -222,8 +263,16 @@ export function ConfigHistoryDialog({
                       className="h-3 w-3 shrink-0 accent-[var(--color-accent)]"
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block font-mono text-[11.5px] text-ink">
+                      <span className="flex items-center gap-1.5 font-mono text-[11.5px] text-ink">
                         {fmtWhen(sn.modified)}
+                        {sn.legacy && (
+                          <span
+                            title="Recorded before snapshots were kept per host entry. It may come from another entry with the same hostname, and is never used as the baseline for change checks."
+                            className="rounded-sm border border-line px-1 font-sans text-[9.5px] uppercase tracking-wider text-ink-faint"
+                          >
+                            legacy
+                          </span>
+                        )}
                       </span>
                       <span className="block text-[10.5px] text-ink-faint">
                         {(sn.bytes / 1024).toFixed(1)} KB

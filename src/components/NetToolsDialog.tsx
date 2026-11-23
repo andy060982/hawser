@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { Activity, Globe, Radar, Route, Square, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
+import { useModalLayer } from '../lib/useModalLayer'
+import { netTargetError, parsePort } from '../lib/transfers'
 
 interface ToolEvent {
   runId: string
@@ -29,6 +31,9 @@ export function NetToolsDialog({
   initialPort?: number
   onClose: () => void
 }) {
+  // A modal layer (app shortcuts stay off behind it). Its Escape is the
+  // panel's own onKeyDown, so an alert stacked above keeps its Escape.
+  useModalLayer(true)
   const [target, setTarget] = useState(initialTarget)
   const [port, setPort] = useState(String(initialPort ?? 22))
   const [lines, setLines] = useState<string[]>([])
@@ -43,18 +48,33 @@ export function NetToolsDialog({
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
 
+  /* Escape closes this dialog only when the key is pressed INSIDE it (no
+     window listener): a confirm or alert opened above it holds the focus,
+     so its Escape dismisses just that alert and never this dialog too. */
+  const panelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onCloseRef.current()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
+    if (!panelRef.current?.contains(document.activeElement)) panelRef.current?.focus()
   }, [])
+  const onPanelKey = (e: ReactKeyboardEvent) => {
+    if (e.key !== 'Escape') return
+    e.stopPropagation()
+    onCloseRef.current()
+  }
+
+  /** Synchronous run guard: `running` is render-time state, so two fast
+   *  clicks both saw it empty and started two runs (the first one's listener
+   *  then leaked and Stop reached only the second). */
+  const busyRef = useRef(false)
+  const mountedRef = useRef(true)
 
   // Unmount only: leaving the dialog cancels a live run — a traceroute nobody
   // is watching is pure wasted probe traffic.
   useEffect(
     () => () => {
+      mountedRef.current = false
       if (runIdRef.current) void safeInvoke('net_tool_cancel', { runId: runIdRef.current })
       unlistenRef.current?.()
+      unlistenRef.current = null
     },
     [],
   )
@@ -66,32 +86,66 @@ export function NetToolsDialog({
 
   const append = (text: string) => setLines((l) => [...l, text])
 
+  /** Claim the single run slot, after checking the input. */
+  const begin = (label: string, needsPort: boolean): { target: string; port: number } | null => {
+    if (busyRef.current) return null
+    const err = netTargetError(target)
+    if (err) {
+      append(`error: ${err}`)
+      return null
+    }
+    const p = parsePort(port, null)
+    if (needsPort && p === null) {
+      append('error: Port must be 1-65535.')
+      return null
+    }
+    busyRef.current = true
+    setRunning(label)
+    return { target: target.trim(), port: p ?? 0 }
+  }
+
+  const end = (runId?: string) => {
+    if (runId !== undefined && runIdRef.current !== runId) return
+    busyRef.current = false
+    runIdRef.current = null
+    unlistenRef.current?.()
+    unlistenRef.current = null
+    if (mountedRef.current) setRunning(null)
+  }
+
   const startStream = async (tool: 'ping' | 'traceroute') => {
-    if (running) return
+    const args = begin(tool, false)
+    if (!args) return
     const runId = `${tool}-${Date.now()}`
     runIdRef.current = runId
-    setRunning(tool)
-    append(`$ ${tool} ${target}`)
+    append(`$ ${tool} ${args.target}`)
 
-    unlistenRef.current = await safeListen<ToolEvent>(`net://${runId}`, (ev) => {
-      if (ev.done) {
-        setRunning(null)
-        runIdRef.current = null
-        unlistenRef.current?.()
-        unlistenRef.current = null
-      } else if (ev.line.trim() !== '') {
-        append(ev.line)
-      }
-    })
-
+    let un: (() => void) | null = null
     try {
-      await safeInvoke('net_tool_start', { runId, tool, target: target.trim() })
+      un = await safeListen<ToolEvent>(`net://${runId}`, (ev) => {
+        if (runIdRef.current !== runId) return
+        // The final event can carry the reason a run failed ("[process exited
+        // with …]"): show it before ending.
+        if (ev.line.trim() !== '') append(ev.line)
+        if (ev.done) end(runId)
+      })
     } catch (e) {
       append(`error: ${e instanceof Error ? e.message : e}`)
-      setRunning(null)
-      runIdRef.current = null
-      unlistenRef.current?.()
-      unlistenRef.current = null
+      end(runId)
+      return
+    }
+    // Closed (or stopped) while the listener was being registered.
+    if (!mountedRef.current || runIdRef.current !== runId) {
+      un()
+      return
+    }
+    unlistenRef.current = un
+
+    try {
+      await safeInvoke('net_tool_start', { runId, tool, target: args.target })
+    } catch (e) {
+      append(`error: ${e instanceof Error ? e.message : e}`)
+      end(runId)
     }
   }
 
@@ -99,42 +153,39 @@ export function NetToolsDialog({
     if (runIdRef.current) {
       void safeInvoke('net_tool_cancel', { runId: runIdRef.current })
       append('(cancelled)')
-      setRunning(null)
-      runIdRef.current = null
       // A cancelled run never sends `done`, so drop its listener here.
-      unlistenRef.current?.()
-      unlistenRef.current = null
+      end()
     }
   }
 
   const checkPort = async () => {
-    if (running) return
-    setRunning('port')
-    append(`$ port-check ${target}:${port}`)
+    const args = begin('port', true)
+    if (!args) return
+    append(`$ port-check ${args.target}:${args.port}`)
     try {
       const result = await safeInvoke<string>('net_port_check', {
-        target: target.trim(),
-        port: Number(port) || 22,
+        target: args.target,
+        port: args.port,
       })
       append(result ?? '(no result)')
     } catch (e) {
       append(`error: ${e instanceof Error ? e.message : e}`)
     } finally {
-      setRunning(null)
+      end()
     }
   }
 
   const lookup = async () => {
-    if (running) return
-    setRunning('dns')
-    append(`$ resolve ${target}`)
+    const args = begin('dns', false)
+    if (!args) return
+    append(`$ resolve ${args.target}`)
     try {
-      const addrs = await safeInvoke<string[]>('net_dns_lookup', { target: target.trim() })
+      const addrs = await safeInvoke<string[]>('net_dns_lookup', { target: args.target })
       ;(addrs ?? []).forEach((a) => append(`  ${a}`))
     } catch (e) {
       append(`error: ${e instanceof Error ? e.message : e}`)
     } finally {
-      setRunning(null)
+      end()
     }
   }
 
@@ -146,10 +197,13 @@ export function NetToolsDialog({
       <div className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]" aria-hidden />
 
       <div
+        ref={panelRef}
+        tabIndex={-1}
+        onKeyDown={onPanelKey}
         role="dialog"
         aria-modal="true"
         aria-labelledby="nt-title"
-        className="animate-drop-in relative mt-10 flex h-[70vh] w-[40rem] max-w-[94vw] flex-col overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
+        className="animate-drop-in relative outline-none mt-10 flex h-[70vh] w-[40rem] max-w-[94vw] flex-col overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
       >
         <header className="flex items-center gap-2 border-b border-line px-4 py-2.5">
           <Activity size={15} className="shrink-0 text-accent" aria-hidden />
