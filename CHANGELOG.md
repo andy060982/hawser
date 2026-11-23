@@ -4,7 +4,7 @@ All notable changes to Hawser are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - Unreleased
 
 ### Changed
 
@@ -38,6 +38,21 @@ All notable changes to Hawser are documented here. Format follows
 - **Search inside sessions** in Session history: full-text search across every
   recorded transcript, grouped by session, newest first; click a match to open
   the transcript at that line.
+
+### Security
+
+- **russh 0.63 → 0.65.4.** Fixes the client key exchange running its
+  shared-secret step before the server's host key was verified
+  (GHSA-9264-jvgf-6w2f), plus two server/agent-side advisories
+  (GHSA-4wc5-f2rc-q74m, GHSA-j7h2-66j4-ghjf). Minimum Rust is now 1.89.
+- Patched transitive crates flagged by `cargo audit`: quinn-proto 0.11.19,
+  quinn-udp 0.5.16, url 2.5.9.
+- Build tooling: vite 6.4.6 and source-map-js 1.2.4 (dev-server advisories;
+  not shipped in the app).
+
+### Changed (bundle)
+
+- New Hawser app icon on every platform.
 
 ## [0.5.0-beta.1] - 2026-10-30
 
