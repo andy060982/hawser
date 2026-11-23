@@ -45,6 +45,9 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Opening the session channel and the server's replies to the PTY and shell
 /// requests.
 const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long closing an exec channel, or disconnecting a throwaway connection,
+/// may take before it is abandoned.
+const EXEC_CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// After the shell's EOF, how long to wait for its exit status or channel close
 /// before treating the shell as gone. OpenSSH sends both at once.
 const SHELL_EOF_GRACE: Duration = Duration::from_secs(2);
@@ -87,6 +90,11 @@ pub enum SshError {
          shell)"
     )]
     ShellRefused { host: String },
+    /// The session ended before the server answered the PTY and shell
+    /// requests. `output` is what it printed first (often the only reason
+    /// given: an expired account, a forced command).
+    #[error("{}", shell_ended_early_text(.host, .output))]
+    ShellEndedEarly { host: String, output: String },
     #[error("{0}")]
     Connect(String),
     /// The tab that started this connect was closed before it finished.
@@ -102,6 +110,13 @@ pub enum SshError {
     Sftp(#[from] russh_sftp::client::error::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// `SshError::ShellEndedEarly`'s text: the server's output, then the reason
+/// on a line of its own.
+fn shell_ended_early_text(host: &str, output: &str) -> String {
+    let sep = if output.is_empty() || output.ends_with('\n') { "" } else { "\r\n" };
+    format!("{output}{sep}{host} closed the session before the shell started")
 }
 
 /* ------------------------------------------------------------------ payloads */
@@ -339,44 +354,202 @@ async fn within<F: std::future::Future>(
     }
 }
 
+/* ------------------------------------------------------------ kill switch */
+
+/// Ends one connect attempt's transports for real.
+///
+/// russh spawns its session task inside `connect_stream`, and that task owns
+/// the socket. Dropping the connect future (a deadline, a cancel) drops only
+/// the task's JoinHandle, which detaches it; and during key exchange the task
+/// does not poll the channel that would tell it its caller is gone, so it can
+/// sit on a stalled peer forever. Every stream handed to russh is therefore
+/// wrapped in `Killable`: firing the switch makes the stream's next poll fail,
+/// waking the parked task, which then unwinds and drops the socket. The host-key
+/// handler (which runs in that task and may be parked on a dialog) also stops
+/// waiting when it fires.
+#[derive(Clone, Default)]
+pub(crate) struct Kill(Arc<KillInner>);
+
+#[derive(Default)]
+struct KillInner {
+    fired: AtomicBool,
+    read: futures_util::task::AtomicWaker,
+    write: futures_util::task::AtomicWaker,
+    notify: tokio::sync::Notify,
+}
+
+impl Kill {
+    pub(crate) fn fire(&self) {
+        self.0.fired.store(true, Ordering::SeqCst);
+        self.0.read.wake();
+        self.0.write.wake();
+        self.0.notify.notify_waiters();
+    }
+
+    pub(crate) fn fired(&self) -> bool {
+        self.0.fired.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the switch has fired.
+    async fn wait(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a fire in between is not missed.
+            notified.as_mut().enable();
+            if self.fired() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Fires its `Kill` when dropped, unless disarmed. A connect attempt holds one
+/// from its first dial: any exit that does not hand the transport to a
+/// registered session (an error, a deadline, the future being dropped by a
+/// cancel) kills every stream the attempt created.
+pub(crate) struct KillGuard {
+    kill: Kill,
+    armed: bool,
+}
+
+impl KillGuard {
+    pub(crate) fn new() -> Self {
+        Self { kill: Kill::default(), armed: true }
+    }
+
+    pub(crate) fn kill(&self) -> Kill {
+        self.kill.clone()
+    }
+
+    /// The transports now belong to a registered session.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill.fire();
+        }
+    }
+}
+
+/// A stream whose I/O fails once its `Kill` fires (see `Kill`).
+pub(crate) struct Killable<S> {
+    inner: S,
+    kill: Kill,
+}
+
+impl<S> Killable<S> {
+    pub(crate) fn new(inner: S, kill: Kill) -> Self {
+        Self { inner, kill }
+    }
+}
+
+fn killed_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "connection attempt abandoned")
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Killable<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.kill.0.read.register(cx.waker());
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Err(killed_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Killable<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.kill.0.write.register(cx.waker());
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Err(killed_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.kill.0.write.register(cx.waker());
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Err(killed_error()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Killed: do not wait on a peer that stopped reading; dropping the
+        // stream closes it.
+        if self.kill.fired() {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Host-key algorithms to offer, pinned ones first (as OpenSSH orders them):
 /// a host pinned as ECDSA that later also offers Ed25519 keeps signing with the
 /// pinned key instead of being refused as CHANGED. Only algorithms russh
 /// implements are offered; an RSA pin covers all three RSA signature names.
+///
+/// The pinned block is in russh's own strength order (Ed25519, ECDSA,
+/// rsa-sha2-512/256, then SHA-1 `ssh-rsa`), not file order: with an RSA pin
+/// and an Ed25519 pin, a server offering both must get Ed25519, never SHA-1.
+/// SHA-1 `ssh-rsa` is therefore always the last pinned algorithm.
 fn preferred_host_key_order(pinned: &[russh::keys::Algorithm]) -> Vec<russh::keys::Algorithm> {
-    use russh::keys::{Algorithm, HashAlg};
+    use russh::keys::Algorithm;
     let defaults: &[Algorithm] = &russh::Preferred::DEFAULT.key;
-    let mut out: Vec<Algorithm> = Vec::with_capacity(defaults.len());
-    let mut push = |a: Algorithm| {
-        if defaults.contains(&a) && !out.contains(&a) {
-            out.push(a);
-        }
+    let rsa_pinned = pinned.iter().any(|a| matches!(a, Algorithm::Rsa { .. }));
+    let is_pinned = |a: &Algorithm| match a {
+        Algorithm::Rsa { .. } => rsa_pinned,
+        other => pinned.contains(other),
     };
-    for alg in pinned {
-        if matches!(alg, Algorithm::Rsa { .. }) {
-            push(Algorithm::Rsa { hash: Some(HashAlg::Sha512) });
-            push(Algorithm::Rsa { hash: Some(HashAlg::Sha256) });
-            push(Algorithm::Rsa { hash: None });
-        } else {
-            push(alg.clone());
-        }
-    }
+    let mut out: Vec<Algorithm> = defaults.iter().filter(|a| is_pinned(a)).cloned().collect();
     for alg in defaults {
-        push(alg.clone());
+        if !out.contains(alg) {
+            out.push(alg.clone());
+        }
     }
     out
 }
 
+/// keepalive interval and how many may go unanswered. russh ends the link when
+/// MORE than `KEEPALIVE_MAX` intervals pass without a reply, i.e. after
+/// `KEEPALIVE_INTERVAL * (KEEPALIVE_MAX + 1)`: 45s here.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_MAX: usize = 2;
+
+fn keepalive_timeout() -> Duration {
+    KEEPALIVE_INTERVAL * (KEEPALIVE_MAX as u32 + 1)
+}
+
 /// Client config for one hop: keepalives (what makes a dropped link
-/// detectable: three missed 15s keepalives end it after ~45s) and the host-key
-/// algorithm order for that host.
+/// detectable; see `KEEPALIVE_MAX`) and the host-key algorithm order for that
+/// host.
 fn hop_config(host: &str, port: u16) -> Arc<client::Config> {
     let pinned = known_hosts::pinned_algorithms(host, port);
     let mut preferred = russh::Preferred::default();
     preferred.key = std::borrow::Cow::Owned(preferred_host_key_order(&pinned));
     Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(15)),
-        keepalive_max: 3,
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
         nodelay: true,
         preferred,
         ..client::Config::default()
@@ -412,25 +585,41 @@ async fn dial_tcp(host: &str, port: u16) -> Result<(tokio::net::TcpStream, Strin
     Ok((stream, ip))
 }
 
-/// SSH identification + key exchange over `stream`, under `HANDSHAKE_TIMEOUT`.
-async fn handshake<S>(
+/// SSH identification + key exchange over `stream`, under `limit` of machine
+/// time (`HANDSHAKE_TIMEOUT` outside tests).
+///
+/// The stream goes to russh wrapped in `Killable`. On any failure here — the
+/// deadline included — the switch is fired, so russh's already-spawned
+/// session task unwinds and the socket closes instead of outliving the
+/// attempt (see `Kill`). The caller's `KillGuard` covers the future being
+/// dropped mid-way (a cancel).
+async fn handshake<H, S>(
     config: Arc<client::Config>,
     stream: S,
-    handler: ClientHandler,
+    handler: H,
     wait: &HumanWait,
-) -> Result<Handle<ClientHandler>, SshError>
+    host: &str,
+    limit: Duration,
+    kill: &Kill,
+) -> Result<Handle<H>, SshError>
 where
+    H: client::Handler<Error = SshError> + Send + 'static,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let host = format!("{}:{}", handler.host, handler.port);
-    within(
+    let stream = Killable::new(stream, kill.clone());
+    let r = within(
         wait,
-        HANDSHAKE_TIMEOUT,
-        &host,
+        limit,
+        host,
         "SSH handshake (no SSH banner, or the key exchange stalled)",
         client::connect_stream(config, stream, handler),
     )
-    .await?
+    .await
+    .and_then(|r| r);
+    if r.is_err() {
+        kill.fire();
+    }
+    r
 }
 
 /* -------------------------------------------------------------- host keys */
@@ -525,6 +714,23 @@ fn register_and_emit<T>(
         pending.remove(request_id);
         None
     }
+}
+
+/// `register_and_emit`, with the stage clocks paused FIRST: the deadline that
+/// races a prompt may run on another worker (a host-key check runs in russh's
+/// own task), and pausing only after the emit left a gap in which it could fire
+/// and close a dialog the user had just been shown. The guard comes back with
+/// the receiver and must be held until the answer arrives.
+fn raise_prompt<T>(
+    wait: &HumanWait,
+    pending: &DashMap<String, (PromptOwner, oneshot::Sender<T>)>,
+    request_id: &str,
+    owner: PromptOwner,
+    cancelled: impl FnOnce() -> bool,
+    emit: impl FnOnce() -> bool,
+) -> Option<(HumanWaitGuard, oneshot::Receiver<T>)> {
+    let human = wait.enter();
+    register_and_emit(pending, request_id, owner, cancelled, emit).map(|rx| (human, rx))
 }
 
 /// Payload of `ssh://prompt-closed`: a host-key or auth prompt that no longer
@@ -666,6 +872,9 @@ struct ClientHandler {
     wait: HumanWait,
     /// Why the transport ended, filled by `disconnected` for the output pump.
     death: DeathNote,
+    /// The attempt's kill switch: a parked host-key check gives up when it
+    /// fires (see `Kill`).
+    kill: Kill,
 }
 
 /// Where `ClientHandler::disconnected` leaves the reason a transport died.
@@ -735,6 +944,29 @@ async fn await_host_key_answer(rx: oneshot::Receiver<bool>, limit: Duration) -> 
     }
 }
 
+/// `settle_host_key` off the async runtime: trusting a key takes the
+/// known_hosts file lock (a bounded wait, see `known_hosts::trust_at`), which
+/// must never block a russh worker. Gives up with the attempt when `kill`
+/// fires; the blocking call itself then finishes within its lock bound.
+async fn settle_host_key_off_runtime(
+    end: PromptEnd,
+    host: &str,
+    port: u16,
+    key: &russh::keys::PublicKey,
+    store: &std::path::Path,
+    kill: &Kill,
+) -> Result<bool, SshError> {
+    if end != PromptEnd::Accepted {
+        return settle_host_key(&end, host, port, key, store);
+    }
+    let (h, k, s) = (host.to_string(), key.clone(), store.to_path_buf());
+    let task = tokio::task::spawn_blocking(move || settle_host_key(&end, &h, port, &k, &s));
+    tokio::select! {
+        r = task => r.map_err(|e| SshError::Connect(format!("recording the host key failed: {e}")))?,
+        _ = kill.wait() => Err(SshError::Cancelled(host.to_string())),
+    }
+}
+
 /// Turn a dialog's end into the handler's answer. Only an explicit accept
 /// trusts the key, and only after the store re-check in `trust_at` (under its
 /// lock) still sees the host as unknown or already pinned to this key.
@@ -792,17 +1024,18 @@ impl client::Handler for ClientHandler {
             fingerprint,
         };
         let mut was_cancelled = false;
-        let rx = register_and_emit(
+        let raised = raise_prompt(
+            &self.wait,
             &self.prompts.pending,
             &request_id,
             self.owner.clone(),
             || {
-                was_cancelled = self.cancelled();
+                was_cancelled = self.cancelled() || self.kill.fired();
                 was_cancelled
             },
             || self.app.emit("ssh://host-key-prompt", request).is_ok(),
         );
-        let Some(rx) = rx else {
+        let Some((human, rx)) = raised else {
             return Err(if was_cancelled {
                 SshError::Cancelled(self.owner.0.clone())
             } else {
@@ -810,10 +1043,17 @@ impl client::Handler for ClientHandler {
             });
         };
 
-        let end = {
-            let _human = self.wait.enter();
-            await_host_key_answer(rx, HOST_KEY_PROMPT_TIMEOUT).await
+        let end = tokio::select! {
+            end = await_host_key_answer(rx, HOST_KEY_PROMPT_TIMEOUT) => end,
+            // The attempt was abandoned (cancel or deadline): drop the dialog
+            // and let russh's task unwind.
+            _ = self.kill.wait() => {
+                self.prompts.cancel(&request_id);
+                emit_prompt_closed(&self.app, &request_id);
+                return Err(SshError::Cancelled(self.owner.0.clone()));
+            }
         };
+        drop(human);
         match end {
             // Sender dropped: the tab was closed (or the attempt swept). The
             // sweep already emitted prompt-closed after our prompt; repeat it
@@ -829,7 +1069,8 @@ impl client::Handler for ClientHandler {
         // Trust on first use, recorded so the next connection is silent. Same
         // store the check above read — writing anywhere else would mean
         // re-prompting forever.
-        settle_host_key(&end, &self.host, self.port, server_public_key, &store)
+        settle_host_key_off_runtime(end, &self.host, self.port, server_public_key, &store, &self.kill)
+            .await
     }
 
     async fn disconnected(
@@ -860,9 +1101,10 @@ impl client::Handler for ClientHandler {
 /// User-facing wording for a transport that ended with an error.
 fn death_reason(e: &SshError) -> String {
     match e {
-        SshError::Russh(russh::Error::KeepaliveTimeout) => {
-            "no reply to keepalives for 45s (the network path or VPN dropped)".into()
-        }
+        SshError::Russh(russh::Error::KeepaliveTimeout) => format!(
+            "no reply to keepalives for {}s (the network path or VPN dropped)",
+            keepalive_timeout().as_secs()
+        ),
         SshError::Russh(russh::Error::InactivityTimeout) => "closed after inactivity".into(),
         SshError::Russh(russh::Error::IO(io)) => format!("connection lost: {io}"),
         SshError::Io(io) => format!("connection lost: {io}"),
@@ -937,7 +1179,15 @@ pub struct Registry {
     connecting: DashMap<String, (u64, watch::Sender<()>)>,
     /// In-flight key installs (`copy_id`), op id -> cancel sender.
     copy_ids: DashMap<String, (u64, watch::Sender<()>)>,
+    /// Cancels that arrived for an op id not registered yet (the editor's
+    /// cancel IPC overtook its install IPC), op id -> when. An install that
+    /// registers under such an id stops before it dials. Pruned after
+    /// `COPY_ID_CANCEL_TTL`.
+    copy_id_cancels: DashMap<String, Instant>,
 }
+
+/// How long an early `copy_id_cancel` is remembered (see `copy_id_cancels`).
+const COPY_ID_CANCEL_TTL: Duration = Duration::from_secs(120);
 
 /// Generation counter for `Registry::connecting`.
 static CONNECT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1015,6 +1265,30 @@ async fn teardown_forward(fw: Forward) {
     }
 }
 
+/// Tear down forwards already removed from the map, in a way the caller being
+/// aborted cannot interrupt.
+///
+/// Every listener is aborted first, synchronously (`abort()` never waits), so
+/// none can outlive this call even if it is cut off at its first await. The
+/// ordered joins then run in a detached task that owns every handle: dropping
+/// the awaiting caller (the pump aborted by a reconnect or tab close) leaves
+/// that task running to completion instead of detaching half-joined
+/// listeners and tunnels that no registry sweep can find any more.
+async fn teardown_forwards(fws: Vec<Forward>) {
+    if fws.is_empty() {
+        return;
+    }
+    for fw in &fws {
+        fw.listener.abort();
+    }
+    let joiner = tokio::spawn(async move {
+        for fw in fws {
+            teardown_forward(fw).await;
+        }
+    });
+    let _ = joiner.await;
+}
+
 /// Remove every forward that matches from the map, for teardown.
 fn take_forwards(
     forwards: &DashMap<String, Forward>,
@@ -1088,8 +1362,15 @@ struct AuthSpec<'a> {
 ///
 /// A refused PTY is reported (the shell may still work, as with OpenSSH's
 /// "PTY allocation request failed"); a refused shell is an error.
-async fn open_shell(
-    handle: &Handle<ClientHandler>,
+///
+/// A session that ends before both replies (an expired account, a forced
+/// command that prints and exits) fails with what it printed, followed by the
+/// diagnostic: that output is usually the only explanation the user gets.
+///
+/// Startup input is NOT sent here: it goes out only once the output pump is
+/// reading (see `send_startup`).
+async fn open_shell<H: client::Handler>(
+    handle: &Handle<H>,
     host: &str,
     cols: u32,
     rows: u32,
@@ -1108,9 +1389,10 @@ async fn open_shell(
             Some(ChannelMsg::Success) => replies.push(true),
             Some(ChannelMsg::Failure) => replies.push(false),
             Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                return Err(SshError::Connect(format!(
-                    "{host} closed the session before the shell started"
-                )))
+                return Err(SshError::ShellEndedEarly {
+                    host: host.to_string(),
+                    output: early_output(&early),
+                })
             }
             Some(other) => early.push(other),
         }
@@ -1119,6 +1401,62 @@ async fn open_shell(
         return Err(SshError::ShellRefused { host: host.to_string() });
     }
     Ok((read_half, write_half, early, replies[0]))
+}
+
+/// Cap on the early output carried in a `ShellEndedEarly` error.
+const EARLY_OUTPUT_CAP: usize = 16 * 1024;
+
+/// The terminal text of messages buffered before the shell started, decoded as
+/// the pump would (stdout and stderr), capped at `EARLY_OUTPUT_CAP` bytes.
+fn early_output(early: &[ChannelMsg]) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    for m in early {
+        if let ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } = m {
+            let room = EARLY_OUTPUT_CAP.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&data[..data.len().min(room)]);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Send the startup commands as shell input. Called only once the output pump
+/// is reading: a shell that prints a lot at login (an MOTD, a tmux attach)
+/// fills russh's per-channel receive queue, and russh then blocks delivering
+/// that output — so it never processes the window adjustment that a write
+/// waiting for send credit needs. With nobody reading, connect hung forever.
+///
+/// Holds the shell writer for the whole batch, so the user's first keystrokes
+/// land after the startup lines, and gives up after `limit` (the session stays
+/// up; only the remaining startup lines are skipped).
+async fn send_startup(
+    shell: &Mutex<Option<ChannelWriteHalf<client::Msg>>>,
+    commands: &[String],
+    limit: Duration,
+) -> Result<(), SshError> {
+    let lines: Vec<String> = commands
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{c}\n"))
+        .collect();
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let mut guard = shell.lock().await;
+    let Some(w) = guard.as_mut() else { return Ok(()) };
+    let send = async {
+        for line in &lines {
+            w.data(line.as_bytes()).await?;
+        }
+        Ok::<(), SshError>(())
+    };
+    match tokio::time::timeout(limit, send).await {
+        Ok(r) => r,
+        Err(_) => Err(SshError::Connect(format!(
+            "the server took no input for {}s",
+            limit.as_secs()
+        ))),
+    }
 }
 
 /// One live session, resolved from the registry once. Its endpoint identity
@@ -1189,9 +1527,7 @@ impl Registry {
 
         // A forward's transport is this session; with it gone the listener
         // would sit accepting connections it can never tunnel, forever.
-        for fw in take_forwards(&self.forwards, |f| f.info.session_id == id) {
-            teardown_forward(fw).await;
-        }
+        teardown_forwards(take_forwards(&self.forwards, |f| f.info.session_id == id)).await;
     }
 
     /// Whether connect `ticket` for `id` is still wanted (no
@@ -1336,6 +1672,11 @@ impl Registry {
         let owner: PromptOwner = (session_id.to_string(), ticket);
         let wait = HumanWait::default();
         let death: DeathNote = Arc::default();
+        // Fires on every exit that does not register a session, including this
+        // future being dropped by a cancel: no russh task or socket from this
+        // attempt survives it (see `Kill`).
+        let mut guard = KillGuard::new();
+        let kill = guard.kill();
         let via = jump.as_ref().map(|j| {
             let ep = endpoint_label(&j.username, &j.host, j.port);
             match j.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -1365,8 +1706,13 @@ impl Registry {
                     cancel: cancel.clone(),
                     wait: wait.clone(),
                     death: Arc::default(),
+                    kill: kill.clone(),
                 };
-                let mut jh = handshake(hop_config(&j.host, j.port), tcp, jump_handler, &wait).await?;
+                let jlabel = format!("{}:{}", j.host, j.port);
+                let mut jh = handshake(
+                    hop_config(&j.host, j.port), tcp, jump_handler, &wait, &jlabel, HANDSHAKE_TIMEOUT, &kill,
+                )
+                .await?;
                 let jctx = PromptCtx {
                     app: &app,
                     auth_prompts: &auth_prompts,
@@ -1384,7 +1730,6 @@ impl Registry {
                     key_path: j.key_path.as_deref(),
                     secret: jump_secret,
                 };
-                let jlabel = format!("{}:{}", j.host, j.port);
                 within(&wait, AUTH_TIMEOUT, &jlabel, "authentication", authenticate(&mut jh, jspec, &jctx))
                     .await??;
                 if !self.still_wanted(session_id, ticket) {
@@ -1415,8 +1760,18 @@ impl Registry {
                     cancel: cancel.clone(),
                     wait: wait.clone(),
                     death: Arc::clone(&death),
+                    kill: kill.clone(),
                 };
-                let h = handshake(hop_config(host, port), tunnel.into_stream(), handler, &wait).await?;
+                let h = handshake(
+                    hop_config(host, port),
+                    tunnel.into_stream(),
+                    handler,
+                    &wait,
+                    &format!("{host}:{port}"),
+                    HANDSHAKE_TIMEOUT,
+                    &kill,
+                )
+                .await?;
                 (h, Some(jh))
             }
             None => {
@@ -1432,8 +1787,14 @@ impl Registry {
                     cancel: cancel.clone(),
                     wait: wait.clone(),
                     death: Arc::clone(&death),
+                    kill: kill.clone(),
                 };
-                (handshake(hop_config(host, port), tcp, handler, &wait).await?, None)
+                let h = handshake(
+                    hop_config(host, port), tcp, handler, &wait, &format!("{host}:{port}"),
+                    HANDSHAKE_TIMEOUT, &kill,
+                )
+                .await?;
+                (h, None)
             }
         };
 
@@ -1484,18 +1845,6 @@ impl Registry {
             return Err(SshError::Cancelled(session_id.to_string()));
         }
 
-        // Optional first line of input. Written as input rather than via
-        // request_exec so it degrades gracefully: if the command does not exist
-        // the user sees "command not found" and still has a working shell,
-        // whereas a failed exec would close the channel and look like a broken
-        // connection.
-        // Order matters and is the user's: a `tmux new-session` first means every
-        // later line runs *inside* tmux, which is usually what is wanted.
-        for cmd in startup_commands.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
-            let line = format!("{cmd}\n");
-            write_half.data(line.as_bytes()).await?;
-        }
-
         let session = Arc::new(Session {
             handle,
             shell: Mutex::new(Some(write_half)),
@@ -1511,6 +1860,14 @@ impl Registry {
         // transcript, which happens only after a successful registration: a
         // cancelled or superseded attempt creates no transcript file and
         // writes nothing into a tab a newer connect owns.
+        //
+        // The startup commands go with it: the pump sends them once it is
+        // reading (see `send_startup`). Written as input rather than via
+        // request_exec so they degrade gracefully: a missing command shows
+        // "command not found" in a working shell, where a failed exec would
+        // close the channel and look like a broken connection. Order is the
+        // user's: a `tmux new-session` first means every later line runs
+        // inside tmux, which is usually what is wanted.
         let (go_tx, go_rx) = oneshot::channel::<Option<SessionLog>>();
         let pump = tokio::spawn(run_pump(
             app.clone(),
@@ -1521,6 +1878,7 @@ impl Registry {
             go_rx,
             death,
             Arc::clone(&self.forwards),
+            startup_commands,
         ));
 
         // Register only while our ticket is still current, holding the
@@ -1530,6 +1888,14 @@ impl Registry {
         // tears down what we registered). Never `remove()` by id here: a newer
         // connect may own this id now, and that would cancel or tear down ITS
         // session instead of ours.
+        //
+        // The transcript is created and announced under that same entry lock:
+        // a close or superseding connect right after registration has to take
+        // the lock to remove or replace the entry, so it cannot slip in between
+        // registering and the file being created (which would leave the new
+        // owner's tab showing this attempt's "logging to"). Creating the file
+        // is one small local open; the emits only queue events.
+        let topic = format!("ssh://{session_id}");
         let mut pump = Some(pump);
         let registered = match self.connecting.get(session_id) {
             Some(g) if g.0 == ticket => {
@@ -1538,42 +1904,53 @@ impl Registry {
                 if let Some(p) = pump.take() {
                     self.pumps.insert(session_id.to_string(), p);
                 }
-                true
+                // Transcript. Degraded to None rather than propagated: losing
+                // a log must never take down a working connection.
+                let log = SessionLog::create_for(Some(&session.endpoint), host, username).ok();
+                if let Some(l) = log.as_ref() {
+                    let _ = app.emit(
+                        &topic,
+                        format!("\x1b[38;5;244mlogging to {}\x1b[0m\r\n", l.path().display()),
+                    );
+                }
+                if !pty_ok {
+                    let _ = app.emit(
+                        &topic,
+                        "\x1b[38;2;242;178;92mthe server refused a terminal (PTY); line editing and \
+                         full-screen programs may not work\x1b[0m\r\n"
+                            .to_string(),
+                    );
+                }
+                drop(g);
+                Some(log)
             }
-            _ => false,
+            _ => None,
         };
-        if !registered {
+        let Some(log) = registered else {
             // Superseded or cancelled: tear down only this attempt's own
             // resources. Detached, because the cancel that brought us here also
             // makes `connect`'s select drop this future at its next await — an
             // inline teardown would be cut off half-way. The pump never got its
             // go signal, so it has emitted nothing.
+            //
+            // The kill guard goes with it and fires once the disconnect has
+            // had a moment to reach the server, so the transport ends either
+            // way. Bounded: a window-blocked transport may never take the
+            // disconnect at all.
             if let Some(p) = pump.take() {
                 p.abort();
             }
             session.alive.store(false, Ordering::SeqCst);
-            tokio::spawn(async move { session.close("cancelled").await });
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(2), session.close("cancelled")).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                drop(guard);
+            });
             return Err(SshError::Cancelled(session_id.to_string()));
-        }
-
-        // Transcript. Degraded to None rather than propagated: losing a log
-        // must never take down a working connection.
-        let topic = format!("ssh://{session_id}");
-        let log = SessionLog::create_for(Some(&session.endpoint), host, username).ok();
-        if let Some(l) = log.as_ref() {
-            let _ = app.emit(
-                &topic,
-                format!("\x1b[38;5;244mlogging to {}\x1b[0m\r\n", l.path().display()),
-            );
-        }
-        if !pty_ok {
-            let _ = app.emit(
-                &topic,
-                "\x1b[38;2;242;178;92mthe server refused a terminal (PTY); line editing and \
-                 full-screen programs may not work\x1b[0m\r\n"
-                    .to_string(),
-            );
-        }
+        };
+        // Registered: the session owns its transports now, and its own
+        // teardown (`Session::close`) ends them.
+        guard.disarm();
         let _ = go_tx.send(log);
 
         Ok(session.endpoint.clone())
@@ -2109,7 +2486,7 @@ impl Registry {
         let id = fw.info.id.clone();
         let sid = fw.info.session_id.clone();
         if let Some(old) = self.forwards.insert(id.clone(), fw) {
-            teardown_forward(old).await;
+            teardown_forwards(vec![old]).await;
         }
         let live = self
             .sessions
@@ -2120,7 +2497,7 @@ impl Registry {
             if let Some((_, ours)) =
                 self.forwards.remove_if(&id, |_, f| f.generation == session.generation)
             {
-                teardown_forward(ours).await;
+                teardown_forwards(vec![ours]).await;
             }
             return Err(SshError::Disconnected(sid));
         }
@@ -2131,7 +2508,7 @@ impl Registry {
     /// traffic keeps flowing after the user stops it (see `teardown_forward`).
     pub async fn forward_stop(&self, forward_id: &str) {
         if let Some((_, fw)) = self.forwards.remove(forward_id) {
-            teardown_forward(fw).await;
+            teardown_forwards(vec![fw]).await;
         }
     }
 
@@ -2220,7 +2597,12 @@ impl Registry {
         let op = op_id.map(str::to_string).unwrap_or_else(|| session_id.clone());
         let (tx, rx) = watch::channel(());
         // A second install under the same op id supersedes (cancels) the first.
-        self.copy_ids.insert(op.clone(), (seq, tx));
+        // Registered, and checked against an early cancel, under the entry's
+        // lock and before anything dials, so a cancel either lands in
+        // `copy_id_cancels` first (seen here) or finds this entry.
+        if !self.copy_id_register(&op, seq, tx) {
+            return Err(SshError::Cancelled(op));
+        }
         let mut closed = rx.clone();
         let result = tokio::select! {
             biased;
@@ -2243,9 +2625,32 @@ impl Registry {
         result
     }
 
-    /// Cancel an in-flight `copy_id_run`. Unknown ids are ignored.
+    /// Register install `seq` under `op`, unless a cancel for `op` already
+    /// arrived (then false, and nothing is registered).
+    fn copy_id_register(&self, op: &str, seq: u64, tx: watch::Sender<()>) -> bool {
+        let entry = self.copy_ids.entry(op.to_string());
+        if self.copy_id_cancels.remove(op).is_some() {
+            return false;
+        }
+        entry.insert((seq, tx));
+        true
+    }
+
+    /// Cancel a `copy_id_run`. An id with no install registered yet is
+    /// remembered, so the install it belongs to stops as soon as it starts.
     pub fn copy_id_cancel(&self, op_id: &str) {
-        self.copy_ids.remove(op_id);
+        let now = Instant::now();
+        self.copy_id_cancels
+            .retain(|_, at| now.duration_since(*at) < COPY_ID_CANCEL_TTL);
+        // Under the entry lock, the mirror of `copy_id_run`'s registration.
+        match self.copy_ids.entry(op_id.to_string()) {
+            dashmap::Entry::Occupied(e) => {
+                e.remove();
+            }
+            dashmap::Entry::Vacant(_) => {
+                self.copy_id_cancels.insert(op_id.to_string(), now);
+            }
+        }
     }
 }
 
@@ -2355,10 +2760,12 @@ async fn run_exec(
         timed_out: false,
         confirmed: false,
     };
-    // These commands read no stdin. Send our EOF (like `ssh host cmd
-    // </dev/null`) so stacks that wait for the peer's EOF before closing do.
-    let _ = channel.eof().await;
     let collect = async {
+        // These commands read no stdin. Send our EOF (like `ssh host cmd
+        // </dev/null`) so stacks that wait for the peer's EOF before closing
+        // do. Inside the deadline: on a stalled transport even queueing it
+        // can wait.
+        let _ = channel.eof().await;
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
@@ -2390,8 +2797,9 @@ async fn run_exec(
     };
     run.timed_out = tokio::time::timeout(deadline, collect).await.is_err();
     // A plain russh Channel sends no CHANNEL_CLOSE on drop; without this a
-    // timed-out exec would leak a channel on the user's live session.
-    let _ = channel.close().await;
+    // timed-out exec would leak a channel on the user's live session. Bounded
+    // like the rest: a stalled transport must not hold the caller past it.
+    let _ = tokio::time::timeout(EXEC_CLOSE_GRACE, channel.close()).await;
     run
 }
 
@@ -2843,7 +3251,10 @@ async fn request_auth_answers(
     // the cancel select drops at its next await. A sweep that ran just before
     // this registration is followed by connect()'s own post-cancel sweep, which
     // then closes the prompt — after it was emitted (see register_and_emit).
-    let Some(rx) = register_and_emit(
+    // The stage deadlines stop before the prompt is shown and do not run
+    // while the human types.
+    let Some((_human, rx)) = raise_prompt(
+        &ctx.wait,
         &auth_prompts.pending,
         &request_id,
         ctx.owner.clone(),
@@ -2857,8 +3268,6 @@ async fn request_auth_answers(
         ));
     };
 
-    // The stage deadlines do not run while the human types.
-    let _human = ctx.wait.enter();
     match tokio::time::timeout(AUTH_PROMPT_TIMEOUT, rx).await {
         Ok(Ok(answer)) => Ok(answer),
         // Sender dropped (dialog cancelled, or the tab's prompts swept) —
@@ -2914,6 +3323,10 @@ async fn copy_id(
     let wait = HumanWait::default();
     let owner: PromptOwner = (session_id.to_string(), 0);
     let origin = PromptOrigin::new(None, username, host, port, None);
+    // As for a connect: whatever ends this install (an error, a deadline, a
+    // cancel dropping this future, or success) ends its transport too.
+    let guard = KillGuard::new();
+    let kill = guard.kill();
     let (tcp, ip) = dial_tcp(host, port).await?;
     let handler = ClientHandler {
         host: host.to_string(),
@@ -2926,8 +3339,11 @@ async fn copy_id(
         cancel,
         wait: wait.clone(),
         death: Arc::default(),
+        kill: kill.clone(),
     };
-    let mut handle = handshake(hop_config(host, port), tcp, handler, &wait).await?;
+    let hlabel = format!("{host}:{port}");
+    let mut handle =
+        handshake(hop_config(host, port), tcp, handler, &wait, &hlabel, HANDSHAKE_TIMEOUT, &kill).await?;
 
     // Password (with keyboard-interactive fallback), one-shot. host_id "" is
     // never consulted because the one-shot password is supplied.
@@ -2948,7 +3364,6 @@ async fn copy_id(
         key_path: None,
         secret: Some(password),
     };
-    let hlabel = format!("{host}:{port}");
     within(&wait, AUTH_TIMEOUT, &hlabel, "authentication", authenticate(&mut handle, spec, &ctx))
         .await??;
 
@@ -2979,7 +3394,8 @@ async fn copy_id(
         handle.channel_open_session(),
     )
     .await??;
-    channel.exec(true, cmd).await?;
+    within(&wait, CHANNEL_SETUP_TIMEOUT, &hlabel, "starting the install command", channel.exec(true, cmd))
+        .await??;
     // A timeout is a failure, not a silent success: don't judge the run by
     // whatever partial output happened to arrive before the clock ran out.
     let run = run_exec(&mut channel, 1024 * 1024, Duration::from_secs(20)).await;
@@ -2998,9 +3414,14 @@ async fn copy_id(
     let marker = String::from_utf8_lossy(&out).contains("HAWSER_KEY_OK");
     let exit_ok = exit_status.map_or(true, |code| code == 0);
     // A throwaway connection: close it properly rather than just dropping it.
-    let _ = handle
-        .disconnect(russh::Disconnect::ByApplication, "key installed", "")
-        .await;
+    // Bounded (a transport that stopped taking messages would hold this
+    // forever); the kill guard then ends the transport regardless.
+    let _ = tokio::time::timeout(
+        EXEC_CLOSE_GRACE,
+        handle.disconnect(russh::Disconnect::ByApplication, "key installed", ""),
+    )
+    .await;
+    drop(guard);
     if completed && exit_ok && marker {
         Ok(())
     } else {
@@ -3037,7 +3458,7 @@ async fn agent_auth(
             match try_agent_identities(&mut agent, handle, username, &mut rsa, &mut tried).await {
                 Ok(Some(r)) => return Ok(Some(r)),
                 Ok(None) => {}
-                Err(e) => errors.push(format!("OpenSSH agent: {e}")),
+                Err(e) => errors.push(format!("OpenSSH agent: {}", auth_detail(e))),
             }
         }
         // russh makes connect_pageant fallible; a missing Pageant is just "no
@@ -3046,7 +3467,7 @@ async fn agent_auth(
             match try_agent_identities(&mut pageant, handle, username, &mut rsa, &mut tried).await {
                 Ok(Some(r)) => return Ok(Some(r)),
                 Ok(None) => {}
-                Err(e) => errors.push(format!("Pageant: {e}")),
+                Err(e) => errors.push(format!("Pageant: {}", auth_detail(e))),
             }
         }
     }
@@ -3058,7 +3479,7 @@ async fn agent_auth(
             match try_agent_identities(&mut agent, handle, username, &mut rsa, &mut tried).await {
                 Ok(Some(r)) => return Ok(Some(r)),
                 Ok(None) => {}
-                Err(e) => errors.push(format!("agent: {e}")),
+                Err(e) => errors.push(format!("agent: {}", auth_detail(e))),
             }
         }
     }
@@ -3072,7 +3493,7 @@ async fn agent_auth(
 
 /// Offer each identity a connected agent holds to the server, signing with the
 /// agent. Returns `Ok(Some(..))` on the first accepted key, `Ok(None)` if the
-/// agent is unreachable or holds no accepted key. `tried` counts attempts
+/// agent holds no accepted key, and an error if it cannot list its keys. `tried` counts attempts
 /// across agents, for the MaxAuthTries hint.
 async fn try_agent_identities(
     agent: &mut russh::keys::agent::client::AgentClient<
@@ -3083,9 +3504,11 @@ async fn try_agent_identities(
     rsa: &mut RsaHash,
     tried: &mut usize,
 ) -> Result<Option<russh::client::AuthResult>, SshError> {
-    let Ok(identities) = agent.request_identities().await else {
-        return Ok(None);
-    };
+    // A reachable agent that cannot list its keys is reported as that, not
+    // folded into "no agent, or no key accepted".
+    let identities = agent.request_identities().await.map_err(|e| {
+        SshError::AuthFailed(format!("could not list the agent's keys: {e}"))
+    })?;
     for identity in identities {
         // AgentIdentity is a key or a certificate; publickey auth wants the
         // underlying PublicKey.
@@ -3112,6 +3535,15 @@ async fn try_agent_identities(
         }
     }
     Ok(None)
+}
+
+/// The detail of an auth error, without `AuthFailed`'s "authentication failed
+/// for" prefix (the caller adds its own context once).
+fn auth_detail(e: SshError) -> String {
+    match e {
+        SshError::AuthFailed(m) => m,
+        other => other.to_string(),
+    }
 }
 
 /// Wording for an agent-auth error. A server that drops the connection mid-way
@@ -3720,9 +4152,27 @@ async fn run_pump(
     go: oneshot::Receiver<Option<SessionLog>>,
     death: DeathNote,
     forwards: Arc<DashMap<String, Forward>>,
+    startup: Vec<String>,
 ) {
     let Ok(mut log) = go.await else { return };
     let topic = format!("ssh://{sid}");
+    // Startup input goes out concurrently with this loop, never before it:
+    // see `send_startup`. Aborted with the pump (the guard's drop), so it
+    // never outlives the session's reader.
+    let _startup = AbortOnDrop({
+        let session = Arc::clone(&session);
+        let (app, topic) = (app.clone(), topic.clone());
+        tokio::spawn(async move {
+            if let Err(e) = send_startup(&session.shell, &startup, CHANNEL_SETUP_TIMEOUT).await {
+                if session.alive.load(Ordering::SeqCst) {
+                    let _ = app.emit(
+                        &topic,
+                        format!("\x1b[38;2;242;178;92mstartup commands not sent: {e}\x1b[0m\r\n"),
+                    );
+                }
+            }
+        })
+    });
     // Incomplete UTF-8 tails carried to the next chunk, one per stream: a
     // packet boundary can split a multi-byte character, and decoding each chunk
     // alone would print two U+FFFD for one real character.
@@ -3845,12 +4295,22 @@ async fn run_pump(
     // and its transport. The registry entry stays (dead) until the tab is
     // closed or reconnected, so later calls fail as "disconnected".
     let generation = session.generation;
-    for fw in take_forwards(&forwards, |f| f.info.session_id == sid && f.generation == generation) {
-        teardown_forward(fw).await;
-    }
+    teardown_forwards(take_forwards(&forwards, |f| {
+        f.info.session_id == sid && f.generation == generation
+    }))
+    .await;
     session.close("session ended").await;
 }
 
+
+/// Aborts its task when dropped (a JoinHandle's drop only detaches it).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Streaming UTF-8 decode: append `data` to `pending`, return every complete
 /// character, and keep an incomplete trailing sequence (at most 3 bytes) in
@@ -4314,6 +4774,33 @@ mod tests {
         let store = Store::new("algs", &format!("fw01 {ECDSA}\n"));
         let pinned = known_hosts::pinned_algorithms_at("fw01", 22, &store.path());
         assert_eq!(preferred_host_key_order(&pinned)[0], p256);
+
+        // RSA pinned on the first line, Ed25519 later: a server offering
+        // Ed25519 and SHA-1 ssh-rsa must get Ed25519. SHA-1 is the last pinned
+        // algorithm, after every pinned non-SHA-1 one, and still ahead of the
+        // unpinned ones (it may be the only thing an old pinned host signs).
+        let order = preferred_host_key_order(&[Algorithm::Rsa { hash: None }, Algorithm::Ed25519]);
+        assert_eq!(
+            &order[..4],
+            &[
+                Algorithm::Ed25519,
+                Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+                Algorithm::Rsa { hash: Some(HashAlg::Sha256) },
+                Algorithm::Rsa { hash: None },
+            ]
+        );
+        assert_eq!(order[4], p256, "unpinned algorithms follow the pinned block");
+        assert_eq!(order.len(), defaults.len());
+        for pinned in [
+            vec![Algorithm::Rsa { hash: None }, p256.clone()],
+            vec![Algorithm::Rsa { hash: Some(HashAlg::Sha256) }, Algorithm::Ed25519, p256.clone()],
+        ] {
+            let order = preferred_host_key_order(&pinned);
+            let sha1 = order.iter().position(|a| *a == Algorithm::Rsa { hash: None }).unwrap();
+            for a in pinned.iter().filter(|a| **a != Algorithm::Rsa { hash: None }) {
+                assert!(order.iter().position(|o| o == a).unwrap() < sha1, "SHA-1 ahead of {a:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -4342,5 +4829,394 @@ mod tests {
         assert_eq!(o.target, "admin@10.0.0.1:22");
         assert_eq!(o.via.as_deref(), Some("bastion"));
         assert_eq!(PromptOrigin::new(Some(""), "u", "::1", 2222, None).target, "u@[::1]:2222");
+    }
+
+    #[test]
+    fn keepalive_wording_states_the_real_timeout() {
+        // russh ends the link after MORE than KEEPALIVE_MAX silent intervals.
+        assert_eq!(keepalive_timeout(), Duration::from_secs(45));
+        let text = death_reason(&SshError::Russh(russh::Error::KeepaliveTimeout));
+        assert!(text.contains("45s"), "{text}");
+    }
+
+    // The deadline that races a host-key prompt runs on another worker, so the
+    // stage clock must already be paused when the prompt is emitted.
+    #[test]
+    fn prompt_pauses_the_stage_clock_before_it_is_shown() {
+        let wait = HumanWait::default();
+        let pending: DashMap<String, (PromptOwner, oneshot::Sender<bool>)> = DashMap::new();
+        let owner = || -> PromptOwner { ("s1".to_string(), 1) };
+        let mut paused_at_emit = false;
+        let raised = raise_prompt(&wait, &pending, "hk-1", owner(), || false, || {
+            paused_at_emit = wait.waited().1;
+            true
+        });
+        assert!(paused_at_emit, "prompt emitted while the deadline was still running");
+        let (human, _rx) = raised.expect("shown");
+        assert!(wait.waited().1);
+        drop(human);
+        assert!(!wait.waited().1);
+        // A prompt that is never shown leaves the clock running.
+        assert!(raise_prompt(&wait, &pending, "hk-2", owner(), || true, || true).is_none());
+        assert!(!wait.waited().1);
+    }
+
+    #[test]
+    fn copy_id_cancel_that_overtakes_the_install_is_honoured() {
+        let r = Registry::default();
+        // The editor's cancel IPC is handled before the install registers.
+        r.copy_id_cancel("op-1");
+        let (tx, _rx) = watch::channel(());
+        assert!(!r.copy_id_register("op-1", 1, tx), "install ran after its cancel");
+        assert!(r.copy_ids.is_empty());
+        // The early cancel is consumed; a fresh install under the id runs.
+        let (tx, _rx) = watch::channel(());
+        assert!(r.copy_id_register("op-1", 2, tx));
+        // A cancel for a registered install removes it and leaves no tombstone.
+        r.copy_id_cancel("op-1");
+        assert!(r.copy_ids.is_empty() && r.copy_id_cancels.is_empty());
+    }
+
+    /* ------------------------------------------- transport lifetime (W2b) */
+
+    /// A client handler that trusts any key (the tests below are about the
+    /// transport's lifetime, not host-key policy).
+    struct AnyKey;
+
+    impl client::Handler for AnyKey {
+        type Error = SshError;
+
+        async fn check_server_key(
+            &mut self,
+            _: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// A listener that accepts one connection, sends an SSH banner, then never
+    /// answers the key exchange. Resolves the receiver when its side of the
+    /// socket sees the connection close (EOF or reset).
+    async fn kex_tarpit() -> (std::net::SocketAddr, oneshot::Receiver<Instant>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"SSH-2.0-tarpit\r\n").await.unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(Instant::now());
+        });
+        (addr, closed_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handshake_deadline_closes_a_stalled_transport() {
+        let (addr, closed) = kex_tarpit().await;
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let guard = KillGuard::new();
+        let start = Instant::now();
+        let r = handshake(
+            Arc::new(client::Config::default()),
+            sock,
+            AnyKey,
+            &HumanWait::default(),
+            "tarpit",
+            Duration::from_millis(300),
+            &guard.kill(),
+        )
+        .await;
+        assert!(matches!(r, Err(SshError::Timeout { .. })), "{:?}", r.err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // russh's session task owned the socket; the peer seeing it close
+        // means that task is gone too.
+        let at = tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("the stalled transport survived the deadline")
+            .unwrap();
+        assert!(at.duration_since(start) < Duration::from_secs(3));
+    }
+
+    // Control for the test above: the same deadline WITHOUT the kill switch
+    // leaves russh's task holding the socket open (the bug being fixed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_transport_outlives_a_plain_deadline() {
+        let (addr, closed) = kex_tarpit().await;
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r = within(
+            &HumanWait::default(),
+            Duration::from_millis(300),
+            "tarpit",
+            "handshake",
+            client::connect_stream(Arc::new(client::Config::default()), sock, AnyKey),
+        )
+        .await;
+        assert!(matches!(r, Err(SshError::Timeout { .. })));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), closed).await.is_err(),
+            "expected the unkilled transport to stay open"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_handshake_closes_its_transport() {
+        let (addr, closed) = kex_tarpit().await;
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let guard = KillGuard::new();
+        let kill = guard.kill();
+        let wait = HumanWait::default();
+        // A cancel drops the connect future mid-handshake...
+        tokio::select! {
+            _ = handshake(
+                Arc::new(client::Config::default()), sock, AnyKey, &wait,
+                "tarpit", Duration::from_secs(30), &kill,
+            ) => panic!("the tarpit completed a handshake"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        // ...and with it the attempt's guard.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("the cancelled transport survived")
+            .unwrap();
+    }
+
+    const TEST_SERVER_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACAfv5/eq75dWNkgZ+e28E5l7vex5x2Nk7HR13o0FD26OwAAAJhJGmXPSRpl
+zwAAAAtzc2gtZWQyNTUxOQAAACAfv5/eq75dWNkgZ+e28E5l7vex5x2Nk7HR13o0FD26Ow
+AAAEB3HRbaDvsyEtbyMLwOV9P5RVX3zX5N2iVkDacnyzPnAx+/n96rvl1Y2SBn57bwTmXu
+97HnHY2TsdHXejQUPbo7AAAAEmhhd3Nlci10ZXN0LXNlcnZlcgECAw==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    #[derive(Clone, Copy)]
+    enum ShellMode {
+        /// Accept the PTY, then print a reason and end the session without
+        /// answering the shell request (an expired account, a forced command).
+        ExitDuringSetup,
+        /// Start the shell, then print far more than the client buffers.
+        Flood,
+    }
+
+    struct TestServer {
+        mode: ShellMode,
+    }
+
+    impl russh::server::Handler for TestServer {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _: &str, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            // Drained, so the server side never blocks delivering our input.
+            tokio::spawn(async move {
+                let mut channel = channel;
+                while channel.wait().await.is_some() {}
+            });
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: &[(russh::Pty, u32)],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            match self.mode {
+                ShellMode::ExitDuringSetup => {
+                    session.data(channel, &b"This account has expired.\r\n"[..])?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                }
+                ShellMode::Flood => {
+                    session.channel_success(channel)?;
+                    let h = session.handle();
+                    tokio::spawn(async move {
+                        let chunk = vec![b'x'; 16 * 1024];
+                        for _ in 0..1024 {
+                            if h.data(channel, chunk.clone()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// An authenticated client session to an in-process russh server whose
+    /// receive window is `server_window` bytes.
+    async fn test_session(mode: ShellMode, server_window: u32) -> Handle<AnyKey> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let config = Arc::new(russh::server::Config {
+                keys: vec![russh::keys::PrivateKey::from_openssh(TEST_SERVER_KEY).unwrap()],
+                window_size: server_window,
+                auth_rejection_time: Duration::from_millis(1),
+                auth_rejection_time_initial: Some(Duration::ZERO),
+                ..Default::default()
+            });
+            let server = TestServer { mode };
+            if let Ok(running) = russh::server::run_stream(config, sock, server).await {
+                let _ = running.await;
+            }
+        });
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut h = handshake(
+            Arc::new(client::Config::default()),
+            sock,
+            AnyKey,
+            &HumanWait::default(),
+            "test",
+            Duration::from_secs(10),
+            &Kill::default(),
+        )
+        .await
+        .unwrap();
+        let auth = h.authenticate_password("u", "p").await.unwrap();
+        assert!(matches!(auth, russh::client::AuthResult::Success));
+        h
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_that_ends_during_setup_reports_its_output() {
+        let h = test_session(ShellMode::ExitDuringSetup, 2 * 1024 * 1024).await;
+        let e = open_shell(&h, "acct.example", 80, 24).await.unwrap_err();
+        assert!(matches!(e, SshError::ShellEndedEarly { .. }), "{e:?}");
+        let text = e.to_string();
+        assert!(text.starts_with("This account has expired.\r\n"), "{text:?}");
+        assert!(text.ends_with("acct.example closed the session before the shell started"));
+    }
+
+    #[test]
+    fn early_output_is_capped() {
+        let big = ChannelMsg::Data { data: vec![b'a'; EARLY_OUTPUT_CAP].into() };
+        let err = ChannelMsg::ExtendedData { data: b"more"[..].into(), ext: 1 };
+        assert_eq!(early_output(&[big, err]).len(), EARLY_OUTPUT_CAP);
+        assert_eq!(
+            shell_ended_early_text("h", "bye"),
+            "bye\r\nh closed the session before the shell started"
+        );
+        assert_eq!(shell_ended_early_text("h", ""), "h closed the session before the shell started");
+    }
+
+    /// Startup input larger than the server's window, against a shell that
+    /// floods output. With the output read concurrently (as the pump does) it
+    /// all goes out; with nobody reading, russh blocks delivering output and
+    /// never takes the window adjustment the write waits for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_input_goes_out_while_the_output_is_read() {
+        let commands: Vec<String> = (0..32).map(|i| format!("echo {i} {}", "y".repeat(8 * 1024))).collect();
+
+        let h = test_session(ShellMode::Flood, 4096).await;
+        let (mut read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
+        let shell = Mutex::new(Some(write));
+        let reader = tokio::spawn(async move {
+            let mut n = 0usize;
+            while let Some(m) = read.wait().await {
+                if let ChannelMsg::Data { data } = m {
+                    n += data.len();
+                }
+            }
+            n
+        });
+        send_startup(&shell, &commands, Duration::from_secs(10))
+            .await
+            .expect("startup input stalled although output was being read");
+        reader.abort();
+
+        // Control: the same, with the output left unread, deadlocks.
+        let h = test_session(ShellMode::Flood, 4096).await;
+        let (_read, write, _, _) = open_shell(&h, "flood", 80, 24).await.unwrap();
+        let shell = Mutex::new(Some(write));
+        assert!(
+            send_startup(&shell, &commands, Duration::from_secs(2)).await.is_err(),
+            "expected the unread session to block the startup input"
+        );
+    }
+
+    // The pump that awaits forward teardown can be aborted by a reconnect or a
+    // tab close. Cut off at its first await, no listener or tunnel survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_teardown_survives_its_caller_being_dropped() {
+        async fn bind() -> (tokio::net::TcpListener, u16) {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            (l, p)
+        }
+        async fn port_free(port: u16) -> bool {
+            for _ in 0..100 {
+                if tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+
+        let (accepting, listen_port) = bind().await;
+        let (tunnel_sock, tunnel_port) = bind().await;
+        let listener = tokio::spawn(async move {
+            loop {
+                let _ = accepting.accept().await;
+            }
+        });
+        let tunnel = tokio::spawn(async move {
+            let _held = tunnel_sock;
+            std::future::pending::<()>().await
+        });
+        let fw = Forward {
+            info: ForwardInfo {
+                id: "fw-t-1".into(),
+                session_id: "t".into(),
+                local_port: listen_port,
+                remote_host: "r".into(),
+                remote_port: 1,
+                kind: "local",
+            },
+            generation: 1,
+            listener,
+            tunnels: Arc::new(std::sync::Mutex::new(vec![tunnel])),
+        };
+
+        // Poll the teardown once (to its first await), then drop it.
+        tokio::select! {
+            biased;
+            _ = teardown_forwards(vec![fw]) => {}
+            _ = std::future::ready(()) => {}
+        }
+        assert!(port_free(listen_port).await, "a listener outlived its teardown");
+        assert!(port_free(tunnel_port).await, "a tunnel outlived its teardown");
     }
 }

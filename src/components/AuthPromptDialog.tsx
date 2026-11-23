@@ -203,9 +203,24 @@ export function AuthPromptDialog() {
         <div className="mx-5 mt-2 space-y-3">
           {request.prompts.map((p, i) => (
             <label key={i} className="block">
-              <span className="mb-1 block text-[12px] text-ink-dim">
-                {p.prompt.trim() || 'Response'}
-              </span>
+              {request.kind === 'password' ? (
+                <span className="mb-1 block text-[12px] text-ink-dim">
+                  {p.prompt.trim() || 'Response'}
+                </span>
+              ) : (
+                // A challenge's field labels are server-written text too, so
+                // they carry the same marking as the server's message: a
+                // server must not be able to label an input as another
+                // host's or account's, right above where the user types.
+                <span className="mb-1 block text-[12px]">
+                  <span className="text-[10.5px] uppercase tracking-wider text-ink-faint">
+                    Server asks:
+                  </span>{' '}
+                  <span className="whitespace-pre-wrap text-ink-dim">
+                    {p.prompt.trim() || 'a response'}
+                  </span>
+                </span>
+              )}
               <input
                 ref={i === 0 ? firstRef : undefined}
                 type={p.echo ? 'text' : 'password'}

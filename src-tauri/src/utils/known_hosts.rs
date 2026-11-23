@@ -53,6 +53,13 @@ pub enum KnownHostsError {
     },
     #[error("known_hosts store is malformed: {0}")]
     Parse(String),
+    /// The store's lock stayed taken for the whole bounded wait (see
+    /// `TRUST_LOCK_WAIT`). Nothing was trusted.
+    #[error(
+        "another Hawser instance is updating known hosts; the key was not trusted. Try again \
+         in a moment"
+    )]
+    Busy,
 }
 
 /// Result of checking a presented host key against the store.
@@ -355,6 +362,11 @@ fn host_entries(host: &str, port: u16, path: &Path) -> Result<Vec<HostEntry>, Kn
     Ok(out)
 }
 
+/// How long `trust_at` waits for the store's locks before failing closed.
+pub(crate) const TRUST_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll interval while those locks are taken.
+const TRUST_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Serialises trust decisions inside this process. The re-classification and
 /// the append must be one step: two sessions approving different unknown keys
 /// for the same host could otherwise both see `Unknown` and both append, and
@@ -371,13 +383,28 @@ static TRUST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// (another session pinned the same key while this prompt was open) is a
 /// no-op, not a duplicate line. The re-check and the append run under one
 /// lock, so two sessions approving different keys pin exactly one.
+///
+/// Blocking: run it off the async runtime. The locks are taken with a bounded
+/// wait (`TRUST_LOCK_WAIT`) and never blocked on: a suspended second instance
+/// holding the file lock must not strand an SSH task, nor (by blocking while
+/// holding the process lock) every other approval in this process. On timeout
+/// it fails closed with `Busy`.
 pub(crate) fn trust_at(
     host: &str,
     port: u16,
     key: &PublicKey,
     path: &Path,
 ) -> Result<(), KnownHostsError> {
-    let _guard = TRUST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    trust_at_within(host, port, key, path, TRUST_LOCK_WAIT)
+}
+
+pub(crate) fn trust_at_within(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<(), KnownHostsError> {
     // Another Hawser instance shares the store, so the process lock alone is
     // not enough. A sidecar file rather than the store itself: Windows locks are
     // mandatory, and the append below goes through a separate handle.
@@ -388,9 +415,30 @@ pub(crate) fn trust_at(
         .write(true)
         .open(&lock_path)
         .map_err(|source| KnownHostsError::Io { path: lock_path.clone(), source })?;
-    lock_file
-        .lock()
-        .map_err(|source| KnownHostsError::Io { path: lock_path.clone(), source })?;
+    let deadline = std::time::Instant::now() + wait;
+    // Both locks are only ever TRIED: whichever is taken, release what we hold
+    // and retry until the deadline, so nothing here blocks while holding the
+    // process lock.
+    let _guard = loop {
+        let process = match TRUST_LOCK.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(g) = process {
+            match lock_file.try_lock() {
+                Ok(()) => break g,
+                Err(std::fs::TryLockError::WouldBlock) => drop(g),
+                Err(std::fs::TryLockError::Error(source)) => {
+                    return Err(KnownHostsError::Io { path: lock_path, source })
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(KnownHostsError::Busy);
+        }
+        std::thread::sleep(TRUST_LOCK_POLL);
+    };
 
     match classify(host, port, key, path)? {
         HostKeyStatus::Changed { line } => {
@@ -419,7 +467,7 @@ pub(crate) fn trust_at(
         },
         other => KnownHostsError::Parse(other.to_string()),
     })
-    // The file lock is released when `lock_file` drops.
+    // Both locks are released on return (`_guard`, then `lock_file`).
 }
 
 #[cfg(test)]
@@ -595,5 +643,49 @@ mod tests {
         assert!(pinned_algorithms_at("nobody", 22, &path).is_empty());
         assert_ne!(algs[0], ka.algorithm());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Another instance holding the store lock (suspended, say) must not strand
+    // the approving task: the wait is bounded and fails closed, nothing is
+    // pinned, and this process's lock is not held while waiting — another
+    // store's trust in this process goes through meanwhile.
+    #[test]
+    fn trust_fails_closed_while_another_instance_holds_the_lock() {
+        let (dir, path) = temp_store("busy");
+        let (dir2, path2) = temp_store("busy-other");
+        let ka = PublicKey::from_openssh(ED_A).unwrap();
+        let other_instance = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_file_name("known_hosts.lock"))
+            .unwrap();
+        other_instance.lock().unwrap();
+
+        let waiting = {
+            let (k, p) = (ka.clone(), path.clone());
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let r = trust_at_within("busy.example", 22, &k, &p, std::time::Duration::from_millis(600));
+                (r, t.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let t = std::time::Instant::now();
+        trust_at("free.example", 22, &ka, &path2).unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_millis(400), "blocked on the process lock");
+
+        let (r, took) = waiting.join().unwrap();
+        assert!(matches!(r, Err(KnownHostsError::Busy)), "{r:?}");
+        assert!(took < std::time::Duration::from_secs(2));
+        assert!(r.unwrap_err().to_string().contains("another Hawser instance"));
+        assert_eq!(lines_for(&path, "busy.example"), 0);
+
+        // Released: the same trust now succeeds.
+        drop(other_instance);
+        trust_at("busy.example", 22, &ka, &path).unwrap();
+        assert_eq!(lines_for(&path, "busy.example"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
