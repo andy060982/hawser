@@ -9,6 +9,8 @@
 //! - SFTPv3 RENAME refuses an existing target (OpenSSH links, then unlinks),
 //!   or, in `rename_replaces` mode, replaces it as some servers do;
 //! - `posix-rename@openssh.com` (when enabled) replaces atomically;
+//! - `hardlink@openssh.com` (when enabled) is link(2): it refuses an existing
+//!   target (FAILURE, as OpenSSH maps EEXIST);
 //! - LSTAT reports a symlink as one, STAT and REALPATH follow it.
 //!
 //! Faults can be injected per operation (see `Fault`): fail it, delay it
@@ -50,8 +52,9 @@ enum Act {
     /// Take effect, but never send the reply; later requests are still
     /// answered.
     LoseReply,
-    /// RENAME only: lose the reply, and take effect only this long after the
-    /// request — after later requests on the channel were answered.
+    /// RENAME and hardlink only: lose the reply, and take effect only this
+    /// long after the request — after later requests on the channel were
+    /// answered.
     Defer(Duration),
 }
 
@@ -65,8 +68,9 @@ struct Hit {
 }
 
 /// A fault for operation `op` ("open", "close", "read", "write", "lstat",
-/// "remove", "rename", "posix-rename") on a path: `rename` matches against
-/// "<old> -> <new>", handle operations against the opened path. `path`
+/// "remove", "rename", "posix-rename", "hardlink") on a path: the two-path
+/// operations match against "<old> -> <new>", handle operations against the
+/// opened path. `path`
 /// matches as a substring, or exactly when it starts with '='.
 struct Fault {
     op: &'static str,
@@ -83,6 +87,7 @@ type Faults = Arc<std::sync::Mutex<Vec<Fault>>>;
 struct FsSftp {
     root: PathBuf,
     posix_rename: bool,
+    hardlink: bool,
     rename_replaces: bool,
     files: HashMap<String, (std::fs::File, String)>,
     dirs: HashMap<String, Vec<(String, FileAttributes)>>,
@@ -196,6 +201,9 @@ impl russh_sftp::server::Handler for FsSftp {
         let mut v = Version::new();
         if self.posix_rename {
             v.extensions.insert(POSIX_RENAME.to_string(), "1".to_string());
+        }
+        if self.hardlink {
+            v.extensions.insert(HARDLINK.to_string(), "1".to_string());
         }
         Ok(v)
     }
@@ -359,9 +367,11 @@ impl russh_sftp::server::Handler for FsSftp {
     }
 
     async fn extended(&mut self, id: u32, request: String, data: Vec<u8>) -> Result<Packet, Self::Error> {
-        if !(self.posix_rename && request == POSIX_RENAME) {
-            return Err(StatusCode::OpUnsupported);
-        }
+        let link = match request.as_str() {
+            POSIX_RENAME if self.posix_rename => false,
+            HARDLINK if self.hardlink => true,
+            _ => return Err(StatusCode::OpUnsupported),
+        };
         let mut rest = &data[..];
         let mut take = || -> Option<String> {
             let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
@@ -370,6 +380,22 @@ impl russh_sftp::server::Handler for FsSftp {
             Some(s)
         };
         let (from, to) = take().zip(take()).ok_or(StatusCode::BadMessage)?;
+        if link {
+            // link(2), as OpenSSH's sftp-server serves it: never replaces.
+            let hit = self.fault("hardlink", &format!("{from} -> {to}"), id).await?;
+            let (a, b) = (self.real(&from), self.real(&to));
+            let link = move || std::fs::hard_link(&a, &b).map_err(|e| code(&e));
+            if let Some(d) = hit.defer {
+                tokio::spawn(async move {
+                    tokio::time::sleep(d).await;
+                    let _ = link();
+                });
+                return Ok(Packet::Status(ok(id)));
+            }
+            link()?;
+            hold(hit.after).await;
+            return Ok(Packet::Status(ok(id)));
+        }
         let after = self.fault("posix-rename", &format!("{from} -> {to}"), id).await?.after;
         // rename(2): replaces an existing target atomically.
         std::fs::rename(self.real(&from), self.real(&to)).map_err(|e| code(&e))?;
@@ -384,6 +410,8 @@ impl russh_sftp::server::Handler for FsSftp {
 #[derive(Default, Clone)]
 struct Opts {
     posix_rename: bool,
+    /// Offer `hardlink@openssh.com`.
+    hardlink: bool,
     rename_replaces: bool,
     /// Answer the `sftp` subsystem request with a failure, and leave the
     /// channel open (as some servers do).
@@ -523,6 +551,7 @@ impl russh::server::Handler for SshServer {
                 let handler = FsSftp {
                     root: self.root.clone(),
                     posix_rename: self.opts.posix_rename,
+                    hardlink: self.opts.hardlink,
                     rename_replaces: self.opts.rename_replaces,
                     files: HashMap::new(),
                     dirs: HashMap::new(),
@@ -579,7 +608,7 @@ impl client::Handler for Recording {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negotiated_algorithms_are_recorded() {
     let algos: Algos = Arc::default();
-    let opts = Opts { posix_rename: false, rename_replaces: false, refuse_sftp: false };
+    let opts = Opts::default();
     let (_ssh, _remote, _faults, _seen) = connect_with(opts, Recording { algos: Arc::clone(&algos) }).await;
     let got = algos.lock().unwrap().clone().expect("kex_done recorded nothing");
     // The test server's only host key is Ed25519, so that is what was used.
@@ -658,16 +687,26 @@ where
 }
 
 async fn harness_with(opts: Opts) -> Harness {
-    let posix = opts.posix_rename;
+    let (posix, link) = (opts.posix_rename, opts.hardlink);
     let (ssh, remote, faults, seen) = connect(opts).await;
     // As Registry::sftp opens it.
     let conn = open_sftp_conn(&ssh, &AtomicBool::new(false)).await.unwrap();
-    assert_eq!(conn.posix_rename, posix);
+    assert_eq!((conn.posix_rename, conn.hardlink), (posix, link), "extensions as advertised");
     Harness { conn: Arc::new(conn), remote, local: scratch("local"), faults, seen, ssh }
 }
 
 async fn harness(posix_rename: bool) -> Harness {
     harness_with(Opts { posix_rename, ..Default::default() }).await
+}
+
+/// Every combination of the two OpenSSH extensions a commit can use.
+fn extension_sets() -> [Opts; 4] {
+    [(false, false), (true, false), (false, true), (true, true)]
+        .map(|(posix_rename, hardlink)| Opts { posix_rename, hardlink, ..Default::default() })
+}
+
+fn label(o: &Opts) -> String {
+    format!("posix={} hardlink={}", o.posix_rename, o.hardlink)
 }
 
 impl Harness {
@@ -741,14 +780,13 @@ impl Harness {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// No staging (`.hawserpart`), backup (`.hawserbak`) or probe file left
-    /// behind.
+    /// No staging (`.hawserpart`) or backup (`.hawserbak`) file left behind.
     fn assert_clean(dir: &Path) {
         let left: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.ends_with(PART_SUFFIX) || n.ends_with(BAK_SUFFIX) || n.ends_with(PROBE_SUFFIX))
+            .filter(|n| n.ends_with(PART_SUFFIX) || n.ends_with(BAK_SUFFIX))
             .collect();
         assert!(left.is_empty(), "left behind in {}: {left:?}", dir.display());
     }
@@ -758,8 +796,9 @@ impl Harness {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_to_a_new_file() {
-    for posix in [true, false] {
-        let h = harness(posix).await;
+    for opts in extension_sets() {
+        let posix = label(&opts);
+        let h = harness_with(opts).await;
         let body = vec![7u8; 300 * 1024]; // several chunks
         h.put_local("new.bin", &body, 0o640);
         let (n, notes) = h.upload("new.bin", "/new.bin", Overwrite::Never).await.unwrap();
@@ -774,12 +813,13 @@ async fn upload_to_a_new_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_never_refuses_an_existing_file() {
-    for posix in [true, false] {
-        let h = harness(posix).await;
+    for opts in extension_sets() {
+        let which = label(&opts);
+        let h = harness_with(opts).await;
         h.put_remote("cfg.txt", b"original", 0o600);
         h.put_local("cfg.txt", b"replacement", 0o644);
         let e = h.upload("cfg.txt", "/cfg.txt", Overwrite::Never).await.unwrap_err();
-        assert!(e.to_string().contains("already exists"), "{e}");
+        assert!(e.to_string().contains("already exists"), "{which}: {e}");
         assert_eq!(h.remote_body("cfg.txt"), b"original");
         Harness::assert_clean(&h.remote);
     }
@@ -881,8 +921,9 @@ async fn download_never_writes_through_a_local_symlink() {
 /// no-replace RENAME.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_commit_never_clobbers_a_file_that_appeared_meanwhile() {
-    for posix in [true, false] {
-        let h = harness(posix).await;
+    for opts in extension_sets() {
+        let posix = label(&opts);
+        let h = harness_with(opts).await;
         h.put_remote(".x.staged.hawserpart", b"staged", 0o644);
         h.put_remote("x", b"appeared", 0o644);
         let r = commit_upload(&h.conn, "/.x.staged.hawserpart", "/x", false).await;
@@ -1008,29 +1049,6 @@ async fn russh_sftp_drops_the_waiter_of_an_abandoned_request() {
     assert!(h.conn.hi.symlink_metadata("/b").await.is_ok());
     assert!(!h.remote.join("a").exists());
     assert!(h.conn.hi.symlink_metadata("/a").await.is_err());
-}
-
-/// Item 4: on a server whose plain RENAME replaces, `Never` cannot be
-/// guaranteed and fails before anything is written; Replace still works.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn upload_never_fails_on_a_server_whose_rename_replaces() {
-    let h = harness_with(Opts { rename_replaces: true, ..Default::default() }).await;
-    h.put_local("n.txt", b"new", 0o644);
-    let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err().to_string();
-    assert!(e.contains("choose Replace"), "{e}");
-    assert!(!h.remote.join("n.txt").exists());
-    Harness::assert_clean(&h.remote);
-    // The probe is remembered: the commit-time check refuses as well.
-    h.put_remote(".n.staged.hawserpart", b"staged", 0o644);
-    let r = commit_upload(&h.conn, "/.n.staged.hawserpart", "/n.txt", false).await;
-    assert!(matches!(&r, Err(e) if e.to_string().contains("choose Replace")), "{:?}", r.err());
-    Harness::assert_clean(&h.remote);
-
-    h.put_remote("n.txt", b"old", 0o640);
-    h.upload("n.txt", "/n.txt", Overwrite::Replace).await.unwrap();
-    assert_eq!(h.remote_body("n.txt"), b"new");
-    assert_eq!(Harness::mode(&h.remote.join("n.txt")), 0o640);
-    Harness::assert_clean(&h.remote);
 }
 
 /// Item 4: a destination that became a symlink (or a folder) while the upload
@@ -1206,18 +1224,6 @@ async fn nested_copy_stall_counts_as_a_dead_channel() {
 
 /* --------------------------------------------------- W3c regression tests */
 
-/// The probe files in the remote root, oldest name first.
-fn probe_files(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(root)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.to_string_lossy().ends_with(PROBE_SUFFIX))
-        .collect();
-    v.sort();
-    v
-}
-
 /// Wait up to `limit` for `cond`.
 async fn eventually(limit: Duration, cond: impl Fn() -> bool) -> bool {
     let start = Instant::now();
@@ -1228,91 +1234,6 @@ async fn eventually(limit: Duration, cond: impl Fn() -> bool) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     cond()
-}
-
-/// Item 1: a probe RENAME refused for some other reason (a policy on these
-/// names, an unsupported operation) proves nothing about ordinary targets. On
-/// a server whose RENAME does replace, `Never` must then refuse rather than
-/// trust it, and the doubt is not remembered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn upload_never_does_not_trust_a_probe_refused_for_another_reason() {
-    for status in [StatusCode::PermissionDenied, StatusCode::OpUnsupported, StatusCode::NoSuchFile] {
-        let h = harness_with(Opts { rename_replaces: true, ..Default::default() }).await;
-        h.put_local("n.txt", b"new", 0o644);
-        h.fault("rename", PROBE_SUFFIX, 1, vec![Act::Fail(status)]);
-        let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err().to_string();
-        assert!(e.contains("could not confirm") && e.contains("choose Replace"), "{status:?}: {e}");
-        assert!(!h.remote.join("n.txt").exists());
-        Harness::assert_clean(&h.remote);
-        // Asked again (the fault is used up): now the truth comes out.
-        let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err().to_string();
-        assert!(e.contains("rename replaces existing files"), "{status:?}: {e}");
-        assert!(!h.remote.join("n.txt").exists());
-    }
-}
-
-/// Item 1: a refusal is proof only if both probe files are still in place
-/// afterwards. Here the server reports a failure but did the rename.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn upload_never_trusts_a_probe_refusal_only_if_both_files_remain() {
-    let h = harness_with(Opts { rename_replaces: true, ..Default::default() }).await;
-    h.put_local("n.txt", b"new", 0o644);
-    let root = h.remote.clone();
-    h.fault(
-        "rename",
-        PROBE_SUFFIX,
-        1,
-        vec![
-            hook(move || {
-                let p = probe_files(&root);
-                std::fs::rename(&p[0], &p[1]).unwrap();
-            }),
-            Act::Fail(StatusCode::Failure),
-        ],
-    );
-    let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err().to_string();
-    assert!(e.contains("could not confirm"), "{e}");
-    assert!(!h.remote.join("n.txt").exists());
-    Harness::assert_clean(&h.remote);
-}
-
-/// Item 1: a verdict holds for its own folder only (another folder can be
-/// another mount, with other semantics).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn upload_probe_verdicts_are_per_folder() {
-    let h = harness(false).await;
-    std::fs::create_dir(h.remote.join("a")).unwrap();
-    std::fs::create_dir(h.remote.join("b")).unwrap();
-    h.put_local("x", b"x", 0o644);
-    h.upload("x", "/a/x", Overwrite::Never).await.unwrap();
-    // From now on no probe in any folder can be confirmed.
-    h.fault("rename", PROBE_SUFFIX, usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
-    h.upload("x", "/a/y", Overwrite::Never).await.unwrap();
-    let e = h.upload("x", "/b/z", Overwrite::Never).await.unwrap_err().to_string();
-    assert!(e.contains("could not confirm"), "{e}");
-    assert!(!h.remote.join("b/z").exists());
-    for d in ["a", "b"] {
-        Harness::assert_clean(&h.remote.join(d));
-    }
-}
-
-/// Item 1: after a failed install, the original is moved back only by a
-/// RENAME CONFIRMED to refuse an existing target; an unconfirmable probe
-/// leaves both copies, named.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn upload_restore_needs_a_confirmed_probe() {
-    let h = harness(false).await;
-    h.put_remote("cfg.txt", b"old", 0o600);
-    h.put_local("cfg.txt", b"new contents", 0o644);
-    h.fault("rename", "hawserpart -> /cfg.txt", usize::MAX, vec![Act::Fail(StatusCode::Failure)]);
-    h.fault("rename", PROBE_SUFFIX, usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
-    let e = h.upload("cfg.txt", "/cfg.txt", Overwrite::Replace).await.unwrap_err().to_string();
-    let (bak, part) = (h.remote_named(BAK_SUFFIX), h.remote_named(PART_SUFFIX));
-    assert_eq!((bak.len(), part.len()), (1, 1), "{bak:?} {part:?}");
-    assert!(e.contains("not moved back"), "{e}");
-    assert!(e.contains(&format!("/{}", bak[0])) && e.contains(&format!("/{}", part[0])), "{e}");
-    assert_eq!(std::fs::read(h.remote.join(&bak[0])).unwrap(), b"old");
-    assert!(!h.remote.join("cfg.txt").exists(), "nothing was written in its place");
 }
 
 /// Item 2: the move-aside's reply is lost and the server performs it only
@@ -1606,4 +1527,276 @@ async fn in_place_failure_on_a_dead_channel_stops_the_tree_and_evicts() {
     // ...so the cache drops the session.
     let slot = Mutex::new(Some(Arc::clone(&h.conn)));
     assert!(forget_sftp(&slot, &h.conn, &e).await);
+}
+
+/* --------------------------------------------------- W3d regression tests */
+
+/// Plant `body` at `name` in `root` while the staged upload is being written
+/// (after every up-front check): a file that arrives "late".
+fn plant_during_staging(h: &Harness, name: &str, body: &'static str) {
+    let late = h.remote.join(name);
+    h.fault("write", "hawserpart", 1, vec![hook(move || std::fs::write(&late, body).unwrap())]);
+}
+
+/// W3d item 1, hardlink path: on a server whose plain RENAME REPLACES, a
+/// file that appears at the destination during a `Never` upload is still
+/// never clobbered: the commit is link(2), which the server's kernel refuses
+/// atomically. A free destination is committed by the link alone (RENAME is
+/// refused outright here), leaving no staging name behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_hardlink_commit_never_clobbers_a_late_file() {
+    let h = harness_with(Opts { hardlink: true, rename_replaces: true, ..Default::default() }).await;
+    h.put_local("n.txt", b"new", 0o640);
+    plant_during_staging(&h, "n.txt", "theirs");
+    let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err();
+    assert!(e.to_string().contains("already exists"), "{e}");
+    assert_eq!(h.remote_body("n.txt"), b"theirs");
+    Harness::assert_clean(&h.remote);
+
+    h.fault("rename", "", usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+    let (_, notes) = h.upload("n.txt", "/m.txt", Overwrite::Never).await.unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(h.remote_body("m.txt"), b"new");
+    assert_eq!(Harness::mode(&h.remote.join("m.txt")), 0o640);
+    Harness::assert_clean(&h.remote);
+}
+
+/// W3d item 1, no-extension path: SFTPv3 RENAME, which (on a compliant
+/// server, as OpenSSH) refuses an existing target: a late file is kept, a
+/// free destination is committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_without_hardlink_commits_by_rename() {
+    let h = harness(false).await;
+    assert!(!h.conn.hardlink);
+    h.put_local("n.txt", b"new", 0o644);
+    plant_during_staging(&h, "n.txt", "theirs");
+    let e = h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap_err();
+    assert!(e.to_string().contains("already exists"), "{e}");
+    assert_eq!(h.remote_body("n.txt"), b"theirs");
+    Harness::assert_clean(&h.remote);
+    h.upload("n.txt", "/m.txt", Overwrite::Never).await.unwrap();
+    assert_eq!(h.remote_body("m.txt"), b"new");
+    Harness::assert_clean(&h.remote);
+}
+
+/// W3d item 1: a link refused with the destination free (a filesystem
+/// without hard links) falls back to RENAME; one refused because something
+/// is there is "already exists", with no RENAME attempted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_link_refused_for_another_reason_falls_back_to_rename() {
+    for status in [StatusCode::OpUnsupported, StatusCode::PermissionDenied, StatusCode::Failure] {
+        let h = harness_with(Opts { hardlink: true, ..Default::default() }).await;
+        h.put_local("n.txt", b"new", 0o644);
+        h.fault("hardlink", "-> /n.txt", 1, vec![Act::Fail(status)]);
+        h.upload("n.txt", "/n.txt", Overwrite::Never).await.unwrap();
+        assert_eq!(h.remote_body("n.txt"), b"new", "{status:?}");
+        Harness::assert_clean(&h.remote);
+    }
+}
+
+/// W3d item 2: a lost LINK reply. Made or not, the link only adds a name, so
+/// the staged upload is still there: nothing is deleted, and the error names
+/// both paths and says what was seen. (a) The link was made and the reply
+/// lost; (b) the server makes it only after answering the follow-up LSTATs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_lost_link_reply_keeps_and_names_both_paths() {
+    for deferred in [false, true] {
+        let h = harness_with(Opts { hardlink: true, ..Default::default() }).await;
+        h.put_local("n.txt", b"new", 0o644);
+        let act = if deferred { Act::Defer(Duration::from_millis(900)) } else { Act::LoseReply };
+        h.fault("hardlink", "-> /n.txt", 1, vec![act]);
+        let e = TEST_STALL
+            .scope(Duration::from_millis(300), h.upload("n.txt", "/n.txt", Overwrite::Never))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, SshError::ChannelLost(_)) && sftp_dead(&e), "deferred={deferred}: {e}");
+        let e = e.to_string();
+        let part = h.remote_named(PART_SUFFIX);
+        assert_eq!(part.len(), 1, "deferred={deferred}: the staged upload must be kept: {part:?}");
+        assert!(e.contains(&format!("/{}", part[0])) && e.contains("/n.txt"), "{e}");
+        if deferred {
+            assert!(e.contains("does not exist yet"), "{e}");
+            assert!(eventually(Duration::from_secs(3), || h.remote.join("n.txt").exists()).await);
+        } else {
+            assert!(e.contains("most likely went through"), "{e}");
+        }
+        assert_eq!(h.remote_body("n.txt"), b"new");
+        assert_eq!(std::fs::read(h.remote.join(&part[0])).unwrap(), b"new");
+    }
+}
+
+/// W3d item 6: during the `Never` commit, a stalled step — the link itself,
+/// or the LSTAT that follows a refused link or RENAME — is `ChannelLost`
+/// naming the staged upload (so a tree stops and the session is evicted),
+/// never an ordinary refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_never_commit_stall_is_channel_lost() {
+    for (link, stall_the_link) in [(true, true), (true, false), (false, false)] {
+        let h = harness_with(Opts { hardlink: link, ..Default::default() }).await;
+        h.put_local("n.txt", b"new", 0o644);
+        let op = if link { "hardlink" } else { "rename" };
+        if stall_the_link {
+            h.fault(op, "-> /n.txt", 1, vec![Act::Before(Duration::from_secs(2))]);
+        } else {
+            let faults = Arc::clone(&h.faults);
+            h.fault(
+                op,
+                "-> /n.txt",
+                1,
+                vec![
+                    hook(move || {
+                        faults.lock().unwrap().push(Fault {
+                            op: "lstat",
+                            path: "=/n.txt".into(),
+                            times: 1,
+                            acts: vec![Act::Before(Duration::from_secs(2))],
+                        })
+                    }),
+                    Act::Fail(StatusCode::Failure),
+                ],
+            );
+        }
+        let e = TEST_STALL
+            .scope(Duration::from_millis(300), h.upload("n.txt", "/n.txt", Overwrite::Never))
+            .await
+            .unwrap_err();
+        let which = format!("link={link} stall_the_link={stall_the_link}");
+        assert!(matches!(e, SshError::ChannelLost(_)), "{which}: {e}");
+        let part = h.remote_named(PART_SUFFIX);
+        assert_eq!(part.len(), 1, "{which}: {part:?}");
+        assert!(e.to_string().contains(&format!("/{}", part[0])), "{which}: {e}");
+        let slot = Mutex::new(Some(Arc::clone(&h.conn)));
+        assert!(forget_sftp(&slot, &h.conn, &e).await, "{which}: not evicted");
+    }
+}
+
+/// W3d item 1 (restore): after a failed replace, the original is put back by
+/// a hard link, so a file that appeared at the destination meanwhile is not
+/// overwritten even though this server's RENAME replaces. Nothing is lost,
+/// and the error names where each copy is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_restore_by_hardlink_never_clobbers_a_late_file() {
+    let h = harness_with(Opts { hardlink: true, rename_replaces: true, ..Default::default() }).await;
+    h.put_remote("cfg.txt", b"old", 0o600);
+    h.put_local("cfg.txt", b"new contents", 0o644);
+    let root = h.remote.clone();
+    h.fault(
+        "rename",
+        "hawserpart -> /cfg.txt",
+        usize::MAX,
+        vec![
+            hook(move || {
+                // Once the original is aside, someone else writes the name.
+                let aside = std::fs::read_dir(&root)
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().ends_with(BAK_SUFFIX));
+                if aside {
+                    std::fs::write(root.join("cfg.txt"), "theirs").unwrap();
+                }
+            }),
+            Act::Fail(StatusCode::Failure),
+        ],
+    );
+    let e = h.upload("cfg.txt", "/cfg.txt", Overwrite::Replace).await.unwrap_err().to_string();
+    let (bak, part) = (h.remote_named(BAK_SUFFIX), h.remote_named(PART_SUFFIX));
+    assert_eq!((bak.len(), part.len()), (1, 1), "{bak:?} {part:?}");
+    assert!(e.contains(&format!("/{}", bak[0])) && e.contains(&format!("/{}", part[0])), "{e}");
+    assert_eq!(h.remote_body("cfg.txt"), b"theirs");
+    assert_eq!(std::fs::read(h.remote.join(&bak[0])).unwrap(), b"old");
+    assert_eq!(std::fs::read(h.remote.join(&part[0])).unwrap(), b"new contents");
+}
+
+/// W3d item 4: the confirmed in-place fallback never OPENs with TRUNCATE
+/// unless an LSTAT has just SUCCEEDED and shown a regular file. Here LSTAT is
+/// denied (as a server could deny it while allowing OPEN): refused, the file
+/// untouched, no in-place warning, and the staged upload kept and named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_place_replace_refuses_when_its_lstat_fails() {
+    for status in [StatusCode::PermissionDenied, StatusCode::OpUnsupported, StatusCode::Failure] {
+        let h = harness(false).await;
+        h.put_remote("cfg.bin", b"old", 0o600);
+        h.put_local("cfg.bin", b"new body", 0o644);
+        let faults = Arc::clone(&h.faults);
+        // The move-aside is refused (so the upload falls back to in place),
+        // and from then on LSTAT of the destination fails.
+        h.fault(
+            "rename",
+            "/cfg.bin -> ",
+            1,
+            vec![
+                hook(move || {
+                    faults.lock().unwrap().push(Fault {
+                        op: "lstat",
+                        path: "=/cfg.bin".into(),
+                        times: usize::MAX,
+                        acts: vec![Act::Fail(status)],
+                    })
+                }),
+                Act::Fail(StatusCode::PermissionDenied),
+            ],
+        );
+        h.fault("rename", "", usize::MAX, vec![Act::Fail(StatusCode::PermissionDenied)]);
+        let opened = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&opened);
+        h.fault("open", "=/cfg.bin", usize::MAX, vec![hook(move || flag.store(true, Ordering::SeqCst))]);
+        let (_tx, rx) = watch::channel(false);
+        let mut p = Progress::detached(rx);
+        let local = h.local.join("cfg.bin").to_string_lossy().to_string();
+        let e = copy_local_file(&h.conn, &mut p, &local, "/cfg.bin", Overwrite::Confirmed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!opened.load(Ordering::SeqCst), "{status:?}: the destination was opened");
+        assert_eq!(h.remote_body("cfg.bin"), b"old");
+        assert!(!p.take_notes().iter().any(|n| n.contains("written in place")), "{status:?}");
+        let part = h.remote_named(PART_SUFFIX);
+        assert_eq!(part.len(), 1, "{part:?}");
+        assert!(e.contains("could not check") && e.contains(&format!("/{}", part[0])), "{status:?}: {e}");
+    }
+}
+
+/// W3d item 5: both sessions leave while the mux's writer is parked inside
+/// an SSH send (the server stopped reading) and its readers inside the full
+/// queue — none of them could see the sessions go. Dropping both ends stops
+/// the mux anyway: every task ends (the count reaches 0) while the `SftpMux`
+/// itself is still held, and the CLOSE goes out once the peer reads again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mux_stops_when_both_sessions_leave_while_its_writer_is_parked() {
+    use tokio::io::AsyncWriteExt as _;
+    let (ssh, _remote, _faults, seen) = connect(Opts::default()).await;
+    let (r, w, early) = open_sftp_channel(&ssh, &AtomicBool::new(false)).await.unwrap();
+    let (mut hi, raw, mux) = spawn_sftp_mux(r, w, early);
+    seen.stall();
+    // WRITE-shaped frames, far more than the SSH window plus every buffer.
+    let body = 200 * 1024;
+    let mut frame = Vec::with_capacity(4 + body);
+    frame.extend_from_slice(&(body as u32).to_be_bytes());
+    frame.push(6);
+    frame.resize(4 + body, 0);
+    let flood = async {
+        for _ in 0..200 {
+            if hi.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), flood).await.is_err(),
+        "a stalled server took everything"
+    );
+    assert_eq!(mux.running(), 4);
+    drop(hi);
+    drop(raw);
+    assert!(
+        eventually(Duration::from_secs(2), || mux.running() == 0).await,
+        "{} mux task(s) still running after both sessions left",
+        mux.running()
+    );
+    seen.unstall();
+    assert!(
+        eventually(Duration::from_secs(15), || seen.channels_closed.load(Ordering::SeqCst) == 1).await,
+        "the channel was never closed"
+    );
+    drop(mux);
 }
