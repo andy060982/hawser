@@ -1121,10 +1121,31 @@ async fn open_shell(
     Ok((read_half, write_half, early, replies[0]))
 }
 
+/// One live session, resolved from the registry once. Its endpoint identity
+/// and every operation run through it belong to the same connection, even if
+/// a reconnect replaces the tab's registry entry in between.
+pub struct SessionRef {
+    id: String,
+    session: Arc<Session>,
+}
+
+impl SessionRef {
+    /// The endpoint identity this connection dialled (see `Session::endpoint`).
+    pub fn endpoint(&self) -> &str {
+        &self.session.endpoint
+    }
+}
+
 impl Registry {
     /// The endpoint identity of a live session (see `Session::endpoint`).
     pub fn endpoint_of(&self, id: &str) -> Result<String, SshError> {
         Ok(self.get(id)?.endpoint.clone())
+    }
+
+    /// Resolve a live session once, for a caller that needs its identity and
+    /// an operation on the same connection (see `SessionRef`).
+    pub fn session(&self, id: &str) -> Result<SessionRef, SshError> {
+        Ok(SessionRef { id: id.to_string(), session: self.get(id)? })
     }
 
     fn get(&self, id: &str) -> Result<Arc<Session>, SshError> {
@@ -1185,13 +1206,17 @@ impl Registry {
     /// destination, held in a zeroizing buffer, and dropped as soon as
     /// authentication returns. It is never a parameter, never logged, and never
     /// sent to the webview.
+    ///
+    /// Returns the endpoint identity the connection dialled (see
+    /// `Session::endpoint`), so the caller keys follow-up work by what was
+    /// actually dialled rather than by the catalogue as it stands afterwards.
     pub async fn connect(
         &self,
         app: AppHandle,
         prompts: Arc<HostKeyPrompts>,
         auth_prompts: Arc<AuthPrompts>,
         spec: ConnectSpec,
-    ) -> Result<(), SshError> {
+    ) -> Result<String, SshError> {
         let session_id = spec.session_id.clone();
         let ticket = CONNECT_SEQ.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(());
@@ -1262,7 +1287,7 @@ impl Registry {
         spec: ConnectSpec,
         ticket: u64,
         cancel: watch::Receiver<()>,
-    ) -> Result<(), SshError> {
+    ) -> Result<String, SshError> {
         let ConnectSpec {
             session_id,
             host_id,
@@ -1551,7 +1576,7 @@ impl Registry {
         }
         let _ = go_tx.send(log);
 
-        Ok(())
+        Ok(session.endpoint.clone())
     }
 
     /* ------------------------------------------------------------ phase 1 */
@@ -2224,7 +2249,7 @@ impl Registry {
     }
 }
 
-impl Registry {
+impl SessionRef {
     /// Run one command on a fresh exec channel and capture its output.
     ///
     /// Exec, not the interactive shell: capturing through the user's live
@@ -2234,15 +2259,13 @@ impl Registry {
     /// interactive shells and refuse exec — those fail here with the server's
     /// own error, which the UI surfaces as "this device may not support
     /// command capture".
-    pub async fn exec_capture(
-        &self,
-        session_id: &str,
-        command: &str,
-        timeout_secs: u64,
-    ) -> Result<String, SshError> {
-        let session = self.get(session_id)?;
+    ///
+    /// On a `SessionRef` rather than the registry, so the output always comes
+    /// from the connection whose identity the caller files it under.
+    pub async fn exec_capture(&self, command: &str, timeout_secs: u64) -> Result<String, SshError> {
+        let session = &self.session;
         if !session.alive.load(Ordering::Relaxed) {
-            return Err(SshError::Disconnected(session_id.to_string()));
+            return Err(SshError::Disconnected(self.id.clone()));
         }
 
         let mut channel = session.handle.channel_open_session().await?;

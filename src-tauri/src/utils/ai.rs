@@ -218,10 +218,24 @@ pub fn save_key(profile: &str, key: &str, kind: &str, base_url: &str) -> Result<
     let previous = credentials::read_secret(&slot).ok();
     credentials::write_secret(&slot, "api-key", key).map_err(|e| e.to_string())?;
     if let Err(e) = snapshot_origin(profile, kind, base_url) {
-        let _ = match previous {
+        let restored = match previous {
             Some(old) => credentials::write_secret(&slot, "api-key", &old),
             None => credentials::delete_secret(&slot),
         };
+        if let Err(rollback) = restored {
+            // Neither the new binding nor the old key could be put in place,
+            // so the vault may hold the NEW key under the OLD origin. Fail
+            // closed: remove the key, so no chat can send it anywhere until
+            // it is saved again.
+            return Err(match credentials::delete_secret(&slot) {
+                Ok(()) | Err(credentials::CredError::NotFound(_)) => format!(
+                    "could not bind the key to its provider ({e}) or restore the previous key ({rollback}); the key was removed, save it again"
+                ),
+                Err(del) => format!(
+                    "could not bind the key to its provider ({e}), restore the previous key ({rollback}) or remove it ({del}); remove the AI key before using AI"
+                ),
+            });
+        }
         return Err(format!("could not bind the key to its provider: {e}"));
     }
     Ok(())
@@ -423,16 +437,71 @@ const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest gap between streamed chunks.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Cancel handles of the runs in flight, by run id.
-fn runs() -> &'static Mutex<HashMap<String, oneshot::Sender<()>>> {
-    static RUNS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
-    RUNS.get_or_init(Default::default)
+/// Runs in flight and Stops that arrived first, by run id.
+///
+/// The webview picks the run id and can send `ai_cancel` while its `ai_chat`
+/// is still on its way; the two IPC commands are not ordered. A cancel for a
+/// run that is not registered yet is remembered, and `register` then reports
+/// the run as already cancelled, so a Stop is never lost to that race.
+#[derive(Default)]
+struct RunTable {
+    live: HashMap<String, oneshot::Sender<()>>,
+    /// Cancels seen before their run registered, oldest first. Bounded: a
+    /// cancel for a run that already finished also lands here and is never
+    /// consumed.
+    early: std::collections::VecDeque<String>,
+}
+
+/// Most remembered early cancels.
+const MAX_EARLY_CANCELS: usize = 64;
+
+impl RunTable {
+    /// Register a run's cancel handle. None if a Stop for it already arrived.
+    fn register(&mut self, run_id: &str) -> Option<oneshot::Receiver<()>> {
+        if let Some(i) = self.early.iter().position(|r| r == run_id) {
+            self.early.remove(i);
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.live.insert(run_id.to_string(), tx);
+        Some(rx)
+    }
+
+    /// Cancel a run; true if it was running. A run not registered yet is
+    /// cancelled as soon as it registers.
+    fn cancel(&mut self, run_id: &str) -> bool {
+        match self.live.remove(run_id) {
+            Some(tx) => tx.send(()).is_ok(),
+            None => {
+                if !self.early.iter().any(|r| r == run_id) {
+                    if self.early.len() >= MAX_EARLY_CANCELS {
+                        self.early.pop_front();
+                    }
+                    self.early.push_back(run_id.to_string());
+                }
+                false
+            }
+        }
+    }
+
+    fn finish(&mut self, run_id: &str) {
+        self.live.remove(run_id);
+    }
+}
+
+fn runs() -> std::sync::MutexGuard<'static, RunTable> {
+    static RUNS: OnceLock<Mutex<RunTable>> = OnceLock::new();
+    RUNS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Start one chat completion in the background. Deltas, and exactly one final
 /// `done` event (with `error` set on failure, timeout or cancel), arrive on
 /// `ai://{run_id}`. Every path ends in that final event, so the panel's
 /// composer can never stay locked.
+///
+/// The cancel handle is registered before any work starts (no key read, no
+/// request, no CLI spawn), and a Stop that arrived even earlier ends the run
+/// here without starting it.
 pub fn start(
     app: AppHandle,
     run_id: String,
@@ -441,21 +510,28 @@ pub fn start(
     system_context: String,
     messages: Vec<ChatMessage>,
 ) {
-    let (cancel_tx, cancel_rx) = oneshot::channel();
-    runs().lock().unwrap_or_else(|e| e.into_inner()).insert(run_id.clone(), cancel_tx);
+    let Some(cancel_rx) = runs().register(&run_id) else {
+        let _ = app.emit(
+            &format!("ai://{run_id}"),
+            AiEvent { run_id: run_id.clone(), delta: String::new(), done: true, error: Some("Cancelled.".into()) },
+        );
+        return;
+    };
     tokio::spawn(async move {
         let budget = if cfg.kind == CLI_KIND { CLI_TIMEOUT } else { HTTP_TIMEOUT };
         let work = run(&app, &run_id, cfg, &profile, &system_context, messages);
         // Dropping `work` on timeout or cancel drops the HTTP request or the
-        // CLI child (kill_on_drop), so nothing keeps running unseen.
+        // CLI child (kill_on_drop), so nothing keeps running unseen. Biased to
+        // the cancel, so a Stop already sent wins over work that is ready.
         let outcome = tokio::select! {
+            biased;
+            _ = cancel_rx => Err("Cancelled.".into()),
             r = tokio::time::timeout(budget, work) => match r {
                 Ok(r) => r,
                 Err(_) => Err(format!("No answer within {}s; the request was stopped.", budget.as_secs())),
             },
-            _ = cancel_rx => Err("Cancelled.".into()),
         };
-        runs().lock().unwrap_or_else(|e| e.into_inner()).remove(&run_id);
+        runs().finish(&run_id);
         let _ = app.emit(
             &format!("ai://{run_id}"),
             AiEvent { run_id: run_id.clone(), delta: String::new(), done: true, error: outcome.err() },
@@ -463,12 +539,10 @@ pub fn start(
     });
 }
 
-/// Stop a run started by `start`. False if it already finished.
+/// Stop a run started by `start`. False if it is not running (finished, or
+/// not started yet, in which case it is cancelled when it starts).
 pub fn cancel(run_id: &str) -> bool {
-    match runs().lock().unwrap_or_else(|e| e.into_inner()).remove(run_id) {
-        Some(tx) => tx.send(()).is_ok(),
-        None => false,
-    }
+    runs().cancel(run_id)
 }
 
 async fn run(
@@ -1067,15 +1141,11 @@ async fn run_cli(emit: &(dyn Fn(String) + Sync), prompt: String) -> Result<(), S
     Err(cli_failure(&status.to_string(), &String::from_utf8_lossy(&err)))
 }
 
-/// Longest stderr excerpt shown for a failed CLI run, in characters.
-const MAX_CLI_EXCERPT: usize = 200;
-
-/// The message for a failed CLI run. Raw stderr is never forwarded: it can
-/// carry diagnostics from an inherited credential or provider configuration
-/// (an `ANTHROPIC_API_KEY` echoed in an auth error, a proxy URL with a
-/// password). The user gets a generic message with the likely fix, plus a
-/// short excerpt that has token-like strings redacted and control characters
-/// removed before it is cut.
+/// The message for a failed CLI run. Nothing from stderr is shown, not even a
+/// redacted excerpt: it can carry diagnostics from an inherited credential or
+/// provider configuration (an `ANTHROPIC_API_KEY` echoed in an auth error, a
+/// proxy URL with a password), and no redaction heuristic catches every
+/// secret shape. stderr only picks which generic hint to give.
 fn cli_failure(status: &str, stderr: &str) -> String {
     let err = stderr.trim();
     // The most common failure is an unauthenticated CLI, which often exits
@@ -1083,19 +1153,11 @@ fn cli_failure(status: &str, stderr: &str) -> String {
     // bare "exited 1".
     let lower = err.to_lowercase();
     let looks_unauthed = err.is_empty() || lower.contains("login") || lower.contains("auth") || lower.contains("not logged");
-    let head = if looks_unauthed {
+    if looks_unauthed {
         format!("Claude CLI exited {status}. It may not be logged in — run `claude` in a terminal once to authenticate, then retry.")
     } else {
-        format!("Claude CLI exited {status}.")
-    };
-    if err.is_empty() {
-        return head;
+        format!("Claude CLI exited {status}. Run `claude` in a terminal to see the error.")
     }
-    let excerpt: String = redact_tokens(err)
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    format!("{head} (excerpt: {})", truncate_chars(excerpt.trim(), MAX_CLI_EXCERPT))
 }
 
 /* ------------------------------------------------------- managed policy */
@@ -1411,9 +1473,39 @@ mod tests {
         assert!(out.starts_with("Claude CLI exited exit status: 1."), "{out}");
         assert!(!out.contains("ZZZ999"), "{out}");
         assert!(!out.contains('\x1b') && !out.contains('\n'), "{out}");
+        // Short or alphabetic-only secrets that no redaction heuristic would
+        // catch: no part of stderr reaches the message at all.
+        let out = cli_failure("1", "proxy rejected password hunter2 for user bob");
+        assert!(!out.contains("hunter2") && !out.contains("bob") && !out.contains("proxy"), "{out}");
+        assert!(!cli_failure("1", "secret SECRETWORD").contains("SECRETWORD"));
         let long = "e".repeat(5000);
         assert!(cli_failure("1", &long).chars().count() < 400);
         assert!(cli_failure("1", "").contains("may not be logged in"));
+    }
+
+    #[test]
+    fn stop_before_the_run_registers_still_cancels_it() {
+        // Stop's ai_cancel overtook ai_chat: the run never starts.
+        let mut t = RunTable::default();
+        assert!(!t.cancel("r1"));
+        assert!(t.register("r1").is_none());
+        assert!(t.live.is_empty() && t.early.is_empty());
+        // The usual order: registered first, then a Stop reaches it.
+        let mut rx = t.register("r2").expect("not cancelled");
+        assert!(rx.try_recv().is_err());
+        assert!(t.cancel("r2"));
+        assert!(rx.try_recv().is_ok());
+        // A run that finished leaves nothing to cancel; a later run with
+        // another id is unaffected by stale early cancels.
+        let _rx3 = t.register("r3").unwrap();
+        t.finish("r3");
+        assert!(!t.cancel("r3"));
+        assert!(t.register("r4").is_some());
+        // Early cancels are bounded.
+        for i in 0..(MAX_EARLY_CANCELS * 2) {
+            t.cancel(&format!("gone-{i}"));
+        }
+        assert_eq!(t.early.len(), MAX_EARLY_CANCELS);
     }
 
     #[test]

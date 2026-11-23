@@ -135,10 +135,11 @@ export function AiPanel({
   } | null>(null)
   const threadRef = useRef<HTMLDivElement>(null)
   const unlistenRef = useRef<(() => void) | null>(null)
-  /** The run in flight, for the Stop button. Set only once the backend has
-   *  registered it (ai_chat returned), so a Stop can always find it. */
+  /** The run in flight, for the Stop button. Set as ai_chat is sent: the
+   *  backend remembers a cancel that overtakes its ai_chat, so a Stop sent
+   *  from then on always reaches the run. */
   const runRef = useRef<string | null>(null)
-  /** Stop was pressed before the run was registered: cancel it as soon as it is. */
+  /** Stop was pressed before ai_chat was sent (listener setup): don't send it. */
   const stopPendingRef = useRef(false)
 
   const { settings } = useSettings()
@@ -239,11 +240,9 @@ export function AiPanel({
       runRef.current = null
       stopPendingRef.current = false
       const runId = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      /** The final event arrived (possibly before ai_chat even returned). */
-      let finished = false
       let started = false
+      /** The final event arrived (possibly before ai_chat even returned). */
       const finish = () => {
-        finished = true
         setStreaming(false)
         if (runRef.current === runId) runRef.current = null
         unlistenRef.current?.()
@@ -276,8 +275,9 @@ export function AiPanel({
           if (ev.done) finish()
         })
         if (stopPendingRef.current) throw new Error('Cancelled.')
-        // ai_chat registers the run before it returns, so from here a Stop
-        // reaches it.
+        // The run id is ours, so Stop can target it before ai_chat returns: a
+        // cancel that reaches the backend first ends the run as it starts.
+        runRef.current = runId
         await safeInvoke('ai_chat', {
           runId,
           cfg,
@@ -286,10 +286,6 @@ export function AiPanel({
           messages: thread,
         })
         started = true
-        if (!finished) {
-          runRef.current = runId
-          if (stopPendingRef.current) void safeInvoke('ai_cancel', { runId }).catch(() => {})
-        }
       } catch (e) {
         setThreadMsgs(target, (m) => [
           ...m.slice(0, -1),
@@ -769,7 +765,8 @@ function SettingsForm({
           hooks and settings are switched off, in an empty working folder, and
           a CLI too old to allow that is refused. Auth (API key or claude.ai
           subscription) is handled by Claude Code itself. Responses arrive in
-          one piece rather than streaming.
+          one piece rather than streaming. Organisation-managed Claude Code
+          policies are not covered; use the API presets on managed machines.
         </p>
       )}
 

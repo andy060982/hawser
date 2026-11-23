@@ -102,6 +102,12 @@ export const isFolder = (n: HostNode): n is HostFolder => n.kind === 'folder'
 
 export type SessionStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 
+/** What `ssh_connect` resolves to: the endpoint identity the backend actually
+ *  dialled (target and bastion as sent, see lib/endpoint). Anything keyed by
+ *  that connection after the dial uses this, not the catalogue as it stands
+ *  then. Undefined outside Tauri or from a backend that returned nothing. */
+export type DialIdentity = string
+
 /** Which surface a tab is showing. Stored per-session, not globally: switching
  *  tabs should restore whatever that tab was last doing. */
 export type WorkspaceView = 'terminal' | 'sftp'

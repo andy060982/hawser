@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Host, HostNode, Session, Transfer, TransferProgressEvent, TransferFailureEvent, WorkspaceView } from '../types'
+import type { DialIdentity, Host, HostNode, Session, Transfer, TransferProgressEvent, TransferFailureEvent, WorkspaceView } from '../types'
 import {
   addFolder, allFolders, allHosts, countHosts, findHost, moveHost, reidentify,
   effectiveHostColor, removeFolder, removeHost, renameFolder, setFolderColor, upsertHost,
@@ -136,6 +136,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  before the reply was delivered still loses the notice (the snapshot
    *  itself is on disk and shows in Config history). */
   const undeliveredChangeRef = useRef(new Map<string, ConfigCheckResult>())
+  /** Session id → the endpoint identity its current connection dialled, as
+   *  ssh_connect reported it. Lets a late config result find a tab by what it
+   *  is actually connected to, not what its catalogue entry says now. */
+  const dialledRef = useRef(new Map<string, DialIdentity>())
   const [showQuickConnect, setShowQuickConnect] = useState(false)
   const [showAi, setShowAi] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -523,7 +527,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
    *  config over a side exec channel and compare it with the newest snapshot.
    *  Reported as a dim line in the terminal, plus a status-bar chip that opens
    *  the diff when something changed. */
-  const checkConfigOnConnect = useCallback((sessionId: string, host: Host) => {
+  const checkConfigOnConnect = useCallback((sessionId: string, host: Host, dialled?: DialIdentity) => {
     const command = host.configCommand?.trim()
     if (!host.checkConfigOnConnect || !command) return
 
@@ -563,7 +567,10 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // A change found by a check whose tab went away is reported here, in
     // place of a new check: one would only compare against the snapshot that
     // change already saved and say "unchanged".
-    const ep = endpointFor(host)
+    // The identity the backend dialled, so a catalogue edit made during the
+    // dial cannot change which endpoint's notice this is. Recomputed from the
+    // catalogue only when the backend did not report one.
+    const ep = dialled ?? endpointFor(host)
     const missed = undeliveredChangeRef.current.get(ep)
     if (missed) {
       undeliveredChangeRef.current.delete(ep)
@@ -599,6 +606,8 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             // checked; a repointed entry is another endpoint now.
             const live = sessionsRef.current.find((s) => {
               if (s.status !== 'connected') return false
+              const dialledBy = dialledRef.current.get(s.id)
+              if (dialledBy !== undefined) return dialledBy === ep
               const h = lookupHost(s.hostId)
               return !!h && endpointFor(h) === ep
             })
@@ -624,6 +633,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
   useEffect(() => {
     const live = new Set(sessions.map((s) => s.id))
     configReplies.current.retain(live)
+    for (const id of dialledRef.current.keys()) if (!live.has(id)) dialledRef.current.delete(id)
     setConfigChanges((m) => {
       const stale = Object.keys(m).filter((id) => !live.has(id))
       if (stale.length === 0) return m
@@ -642,8 +652,9 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
     // A new connection for this tab: any config check from the previous one is
     // stale, even if this connect ends up throttled and runs no check of its own.
     configReplies.current.invalidate(sessionId)
+    dialledRef.current.delete(sessionId)
 
-    const dial = host.local
+    const dial: Promise<unknown> = host.local
       ? safeInvoke('local_shell_start', {
           sessionId,
           profile: host.local.profile,
@@ -651,7 +662,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
           rows,
           record: settingsRef.current.recordLocalTranscripts,
         })
-      : safeInvoke('ssh_connect', {
+      : safeInvoke<DialIdentity>('ssh_connect', {
       sessionId,
       // Credential sharing: the vault is keyed by this id, so pointing it at
       // another host's id is the whole feature — one entry, many hosts.
@@ -694,7 +705,7 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
       })(),
     })
     void dial
-      .then(() => {
+      .then((result) => {
         // The tab was closed while the connect was in flight: the backend has
         // just registered a session nothing owns, so tear it down.
         if (!sessionsRef.current.some((s) => s.id === sessionId)) {
@@ -708,7 +719,12 @@ export function AppLayout({ hosts: seedHosts, initialSessions = [] }: Props) {
             s.id === sessionId && s.status === 'connecting' ? { ...s, status: 'connected' } : s,
           ),
         )
-        checkConfigOnConnect(sessionId, host)
+        // ssh_connect reports the identity it dialled; anything else (a local
+        // shell, no Tauri) leaves the catalogue-derived identity in use.
+        const dialled: DialIdentity | undefined =
+          !host.local && typeof result === 'string' && result ? result : undefined
+        if (dialled) dialledRef.current.set(sessionId, dialled)
+        checkConfigOnConnect(sessionId, host, dialled)
       })
       .catch((e: unknown) => {
         // A tab closed mid-connect fails here as "cancelled"; nothing to show.

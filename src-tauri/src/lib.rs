@@ -17,6 +17,9 @@ type CmdResult<T> = Result<T, String>;
 
 /* ------------------------------------------------------------------ session */
 
+/// Connect a tab. Resolves to the endpoint identity the backend dialled (see
+/// `utils::artifacts::dial_identity`), which the frontend uses for anything
+/// keyed by this connection after the dial.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn ssh_connect(
@@ -39,7 +42,7 @@ async fn ssh_connect(
     endpoint: Option<String>,
     label: Option<String>,
     ephemeral: Option<bool>,
-) -> CmdResult<()> {
+) -> CmdResult<String> {
     // Wrapped at once, so the IPC-owned buffer itself is wiped on drop.
     let one_shot_password = one_shot_password.map(zeroize::Zeroizing::new);
     let spec = ssh::ConnectSpec {
@@ -67,7 +70,7 @@ async fn ssh_connect(
     // string is an SSH/protocol message (e.g. "authentication failed"), never a
     // password. The connect result folds the host-key and auth steps together.
     match &result {
-        Ok(()) => utils::audit::record(
+        Ok(_) => utils::audit::record(
             "connect",
             format!("connected {username}@{host}:{port}"),
             serde_json::json!({ "host": host, "port": port, "user": username, "ok": true }),
@@ -607,6 +610,19 @@ fn check_same_endpoint(live: &str, claimed: &str) -> CmdResult<()> {
     }
 }
 
+/// The endpoint whose transcript `session_history` reads, from ONE resolution
+/// of the live session (`live`) and the identity the caller's policy check was
+/// made for (`claimed`): the live one when it matches the claim, a refusal
+/// when it does not, and the claim when no session is live.
+fn history_endpoint(live: Option<String>, claimed: Option<String>) -> CmdResult<String> {
+    match (live, claimed) {
+        (Some(live), Some(claimed)) => check_same_endpoint(&live, &claimed).map(|()| live),
+        (Some(live), None) => Ok(live),
+        (None, Some(claimed)) => Ok(claimed),
+        (None, None) => Err("no live session and no endpoint identity given".to_string()),
+    }
+}
+
 #[tauri::command]
 async fn session_history(
     registry: State<'_, Registry>,
@@ -619,12 +635,10 @@ async fn session_history(
     // something else (the entry or its bastion was edited after it
     // connected), its transcript comes from an endpoint that policy was never
     // evaluated for, so it is refused rather than returned.
-    if let (Some(sid), Some(claimed)) = (session_id.as_deref(), endpoint.as_deref()) {
-        if let Ok(live) = registry.endpoint_of(sid) {
-            check_same_endpoint(&live, claimed)?;
-        }
-    }
-    let endpoint = lookup_endpoint(&registry, session_id, endpoint)?;
+    // The live session is resolved exactly once: the identity that passes the
+    // comparison is the one whose transcript is read.
+    let live = session_id.as_deref().and_then(|sid| registry.endpoint_of(sid).ok());
+    let endpoint = history_endpoint(live, endpoint)?;
     tauri::async_runtime::spawn_blocking(move || {
         utils::session_log::latest_transcript(&endpoint, max_bytes)
     })
@@ -812,11 +826,11 @@ async fn config_snapshot(
 ) -> CmdResult<utils::configs::SnapshotResult> {
     // The snapshot belongs to what this session actually dialled, never to a
     // key the webview supplies next to the session id.
-    let endpoint = registry.endpoint_of(&session_id).map_err(|e| e.to_string())?;
-    let output = registry
-        .exec_capture(&session_id, &command, 60)
-        .await
-        .map_err(|e| e.to_string())?;
+    // One resolution: the identity and the capture come from the same
+    // connection, even if a reconnect replaces the tab's session meanwhile.
+    let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?;
+    let endpoint = session.endpoint().to_string();
     if output.trim().is_empty() {
         return Err(
             "capture returned nothing — the device may not support exec-channel commands"
@@ -844,11 +858,11 @@ async fn config_check(
     host: String,
     command: String,
 ) -> CmdResult<utils::configs::ConfigCheck> {
-    let endpoint = registry.endpoint_of(&session_id).map_err(|e| e.to_string())?;
-    let output = registry
-        .exec_capture(&session_id, &command, 60)
-        .await
-        .map_err(|e| e.to_string())?;
+    // One resolution: the identity and the capture come from the same
+    // connection, even if a reconnect replaces the tab's session meanwhile.
+    let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?;
+    let endpoint = session.endpoint().to_string();
     if output.trim().is_empty() {
         return Err(
             "capture returned nothing — the device may not support exec-channel commands"
@@ -914,11 +928,11 @@ async fn capture_output(
     host: String,
     command: String,
 ) -> CmdResult<utils::captures::CaptureResult> {
-    let endpoint = registry.endpoint_of(&session_id).map_err(|e| e.to_string())?;
-    let output = registry
-        .exec_capture(&session_id, &command, 120)
-        .await
-        .map_err(|e| e.to_string())?;
+    // One resolution: the identity and the capture come from the same
+    // connection, even if a reconnect replaces the tab's session meanwhile.
+    let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+    let output = session.exec_capture(&command, 120).await.map_err(|e| e.to_string())?;
+    let endpoint = session.endpoint().to_string();
     if output.trim().is_empty() {
         return Err(
             "capture returned nothing — the device may not support exec-channel commands"
@@ -1354,5 +1368,19 @@ mod tests {
         // Editing the bastion's account counts the same way.
         let via = |user: &str| dial_identity(Some("host:h-1|via:host:b-1"), ("admin", "10.0.0.1", 22), Some((user, "bastion", 22)));
         assert!(check_same_endpoint(&via("ops"), &via("root")).is_err());
+    }
+
+    #[test]
+    fn history_reads_the_endpoint_that_passed_the_check() {
+        // One resolution feeds both the comparison and the read: the result is
+        // the identity that was compared, never a second lookup's.
+        let live = dial_identity(Some("host:h-1"), ("admin", "10.0.0.1", 22), None);
+        let now = dial_identity(Some("host:h-1"), ("admin", "10.0.0.2", 22), None);
+        assert_eq!(history_endpoint(Some(live.clone()), Some(live.clone())).unwrap(), live);
+        assert!(history_endpoint(Some(live.clone()), Some(now.clone())).is_err());
+        // No live session: the caller's identity (replay before a dial).
+        assert_eq!(history_endpoint(None, Some(now.clone())).unwrap(), now);
+        assert_eq!(history_endpoint(Some(live.clone()), None).unwrap(), live);
+        assert!(history_endpoint(None, None).is_err());
     }
 }
