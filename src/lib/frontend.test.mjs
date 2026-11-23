@@ -430,3 +430,14 @@ test('local path rules follow the local platform', () => {
   setLocalRoot('D:\\')
   assert.equal(defaultLocalRoot(true), 'D:\\')
 })
+
+/* W3b: Tunnel and Network Tools close on an Escape pressed inside them, never
+   from a window listener — that one also fired for an alert stacked above. */
+test('tunnel and network tools dialogs have no window Escape handler', async () => {
+  const { readFileSync } = await import('node:fs')
+  for (const f of ['TunnelDialog.tsx', 'NetToolsDialog.tsx']) {
+    const src = readFileSync(new URL(`../components/${f}`, import.meta.url), 'utf8')
+    assert.ok(!/addEventListener\(\s*'keydown'/.test(src), `${f} still listens on window`)
+    assert.ok(/onKeyDown=\{onPanelKey\}/.test(src), `${f} lost its panel Escape handler`)
+  }
+})

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { ArrowRight, Cable, Plus, X } from 'lucide-react'
 import { safeInvoke } from '../lib/tauri'
 import { validateForward } from '../lib/transfers'
@@ -50,11 +50,18 @@ export function TunnelDialog({
 
   useEffect(refresh, [refresh])
 
+  /* Escape closes this dialog only when the key is pressed INSIDE it (no
+     window listener): a confirm or alert opened above it holds the focus,
+     so its Escape dismisses just that alert and never this dialog too. */
+  const panelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+    if (!panelRef.current?.contains(document.activeElement)) panelRef.current?.focus()
+  }, [])
+  const onPanelKey = (e: ReactKeyboardEvent) => {
+    if (e.key !== 'Escape') return
+    e.stopPropagation()
+    onClose()
+  }
 
   const add = async () => {
     if (busyRef.current) return
@@ -100,10 +107,13 @@ export function TunnelDialog({
       <div className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]" aria-hidden />
 
       <div
+        ref={panelRef}
+        tabIndex={-1}
+        onKeyDown={onPanelKey}
         role="dialog"
         aria-modal="true"
         aria-labelledby="tun-title"
-        className="animate-drop-in relative mt-12 h-fit w-[34rem] max-w-[92vw] overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
+        className="animate-drop-in relative outline-none mt-12 h-fit w-[34rem] max-w-[92vw] overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
       >
         <header className="flex items-center gap-2 border-b border-line px-5 py-3">
           <Cable size={15} className="shrink-0 text-accent" aria-hidden />

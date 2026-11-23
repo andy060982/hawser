@@ -381,12 +381,17 @@ async fn forward_start(
         .map_err(|e| e.to_string());
     // A local listener that tunnels into the remote network is security-
     // relevant: record where it points.
-    if let Ok(info) = &result {
-        utils::audit::record(
+    match &result {
+        Ok(info) => utils::audit::record(
             "tunnel.start",
             format!("forwarded localhost:{} to {remote_host}:{remote_port}", info.local_port),
             serde_json::json!({ "localPort": info.local_port, "remoteHost": remote_host, "remotePort": remote_port, "kind": "local", "ok": true }),
-        );
+        ),
+        Err(e) => utils::audit::record(
+            "tunnel.start.fail",
+            format!("forwarding localhost:{local_port} to {remote_host}:{remote_port} failed"),
+            serde_json::json!({ "localPort": local_port, "remoteHost": remote_host, "remotePort": remote_port, "kind": "local", "ok": false, "error": e }),
+        ),
     }
     result
 }
@@ -402,12 +407,17 @@ async fn forward_start_socks(
         .forward_start_socks(&session_id, local_port)
         .await
         .map_err(|e| e.to_string());
-    if let Ok(info) = &result {
-        utils::audit::record(
+    match &result {
+        Ok(info) => utils::audit::record(
             "tunnel.start",
             format!("opened a SOCKS proxy on localhost:{}", info.local_port),
             serde_json::json!({ "localPort": info.local_port, "kind": "socks", "ok": true }),
-        );
+        ),
+        Err(e) => utils::audit::record(
+            "tunnel.start.fail",
+            format!("opening a SOCKS proxy on localhost:{local_port} failed"),
+            serde_json::json!({ "localPort": local_port, "kind": "socks", "ok": false, "error": e }),
+        ),
     }
     result
 }
@@ -921,6 +931,16 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())
 }
 
+/// An exec-capture error as audited: without the device's stderr, which
+/// `exec_capture` appends after ": " (device output, like the command line,
+/// stays out of the audit log).
+fn exec_error_for_audit(e: &str) -> &str {
+    e.split(": ").next().unwrap_or(e)
+}
+
+const NOTHING_CAPTURED: &str =
+    "capture returned nothing — the device may not support exec-channel commands";
+
 /// Capture a device's config over a fresh exec channel and store a snapshot.
 ///
 /// The snapshot folder is keyed by the session's own endpoint identity (what
@@ -936,25 +956,33 @@ async fn config_snapshot(
     // key the webview supplies next to the session id.
     // One resolution: the identity and the capture come from the same
     // connection, even if a reconnect replaces the tab's session meanwhile.
-    let session = registry.session(&session_id).map_err(|e| e.to_string())?;
-    // stdout only: stderr noise (a login-shell warning) is not config.
-    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
-    let endpoint = session.endpoint().to_string();
-    if output.trim().is_empty() {
-        return Err(
-            "capture returned nothing — the device may not support exec-channel commands"
-                .to_string(),
-        );
-    }
     let audited_host = host.clone();
-    let saved = blocking(move || utils::configs::save_snapshot(&endpoint, &host, &output)).await?;
-    // Like config_check: host and size only — never the command or config.
-    utils::audit::record(
-        "config.snapshot",
-        format!("saved a config snapshot of {audited_host}"),
-        serde_json::json!({ "host": audited_host, "lines": saved.lines, "ok": true }),
-    );
-    Ok(saved)
+    let result: CmdResult<utils::configs::SnapshotResult> = async {
+        let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+        // stdout only: stderr noise (a login-shell warning) is not config.
+        let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
+        let endpoint = session.endpoint().to_string();
+        if output.trim().is_empty() {
+            return Err(NOTHING_CAPTURED.to_string());
+        }
+        blocking(move || utils::configs::save_snapshot(&endpoint, &host, &output)).await
+    }
+    .await;
+    // Like config_check: host and size (or the error) only — never the command
+    // or config.
+    match &result {
+        Ok(saved) => utils::audit::record(
+            "config.snapshot",
+            format!("saved a config snapshot of {audited_host}"),
+            serde_json::json!({ "host": audited_host, "lines": saved.lines, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "config.snapshot.fail",
+            format!("config snapshot of {audited_host} failed"),
+            serde_json::json!({ "host": audited_host, "ok": false, "error": exec_error_for_audit(e) }),
+        ),
+    }
+    result
 }
 
 /// "What changed since my last visit": capture the config over a fresh exec
@@ -969,25 +997,32 @@ async fn config_check(
 ) -> CmdResult<utils::configs::ConfigCheck> {
     // One resolution: the identity and the capture come from the same
     // connection, even if a reconnect replaces the tab's session meanwhile.
-    let session = registry.session(&session_id).map_err(|e| e.to_string())?;
-    // stdout only: stderr noise (a login-shell warning) is not config.
-    let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
-    let endpoint = session.endpoint().to_string();
-    if output.trim().is_empty() {
-        return Err(
-            "capture returned nothing — the device may not support exec-channel commands"
-                .to_string(),
-        );
-    }
     let audited_host = host.clone();
-    let check = blocking(move || utils::configs::check_snapshot(&endpoint, &host, &output)).await?;
+    let result: CmdResult<utils::configs::ConfigCheck> = async {
+        let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+        // stdout only: stderr noise (a login-shell warning) is not config.
+        let output = session.exec_capture(&command, 60).await.map_err(|e| e.to_string())?.stdout;
+        let endpoint = session.endpoint().to_string();
+        if output.trim().is_empty() {
+            return Err(NOTHING_CAPTURED.to_string());
+        }
+        blocking(move || utils::configs::check_snapshot(&endpoint, &host, &output)).await
+    }
+    .await;
     // Like capture_output: host and outcome only — never the command or config.
-    utils::audit::record(
-        "config.check",
-        format!("checked the config on {audited_host}: {}", check.status),
-        serde_json::json!({ "host": audited_host, "status": check.status, "added": check.added, "removed": check.removed, "ok": true }),
-    );
-    Ok(check)
+    match &result {
+        Ok(check) => utils::audit::record(
+            "config.check",
+            format!("checked the config on {audited_host}: {}", check.status),
+            serde_json::json!({ "host": audited_host, "status": check.status, "added": check.added, "removed": check.removed, "ok": true }),
+        ),
+        Err(e) => utils::audit::record(
+            "config.check.fail",
+            format!("config check on {audited_host} failed"),
+            serde_json::json!({ "host": audited_host, "ok": false, "error": exec_error_for_audit(e) }),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -1040,29 +1075,34 @@ async fn capture_output(
 ) -> CmdResult<utils::captures::CaptureResult> {
     // One resolution: the identity and the capture come from the same
     // connection, even if a reconnect replaces the tab's session meanwhile.
-    let session = registry.session(&session_id).map_err(|e| e.to_string())?;
-    // A human-read capture keeps stderr, labelled apart from stdout.
-    let output = session.exec_capture(&command, 120).await.map_err(|e| e.to_string())?.labelled();
-    let endpoint = session.endpoint().to_string();
-    if output.trim().is_empty() {
-        return Err(
-            "capture returned nothing — the device may not support exec-channel commands"
-                .to_string(),
-        );
+    let result: CmdResult<utils::captures::CaptureResult> = async {
+        let session = registry.session(&session_id).map_err(|e| e.to_string())?;
+        // A human-read capture keeps stderr, labelled apart from stdout.
+        let output = session.exec_capture(&command, 120).await.map_err(|e| e.to_string())?.labelled();
+        let endpoint = session.endpoint().to_string();
+        if output.trim().is_empty() {
+            return Err(NOTHING_CAPTURED.to_string());
+        }
+        let label = host.clone();
+        blocking(move || utils::captures::save_capture(&endpoint, &label, &output)).await
     }
-    let label = host.clone();
-    let saved = blocking(move || utils::captures::save_capture(&endpoint, &label, &output)).await;
-    if let Ok(cap) = &saved {
-        // Neither the command nor its output is logged: a command line can carry
-        // a token or password (`curl -H 'Authorization: …'`). Only the host and
-        // the size of what was saved.
-        utils::audit::record(
+    .await;
+    // Neither the command nor its output is logged: a command line can carry
+    // a token or password (`curl -H 'Authorization: …'`). Only the host and
+    // the size of what was saved, or the error.
+    match &result {
+        Ok(cap) => utils::audit::record(
             "exec.capture",
             format!("captured command output on {host}"),
             serde_json::json!({ "host": host, "bytes": cap.bytes, "lines": cap.lines, "ok": true }),
-        );
+        ),
+        Err(e) => utils::audit::record(
+            "exec.capture.fail",
+            format!("command capture on {host} failed"),
+            serde_json::json!({ "host": host, "ok": false, "error": exec_error_for_audit(e) }),
+        ),
     }
-    saved
+    result
 }
 
 /// Generate an Ed25519 keypair into ~/.ssh, returning the private-key path
@@ -1559,6 +1599,16 @@ pub fn run() {
 mod tests {
     use super::*;
     use utils::artifacts::dial_identity;
+
+    /// A failed capture is audited without the device's stderr.
+    #[test]
+    fn audited_exec_errors_leave_out_device_output() {
+        assert_eq!(
+            exec_error_for_audit("capture command exited with status 1: token=abc123 rejected"),
+            "capture command exited with status 1"
+        );
+        assert_eq!(exec_error_for_audit("capture timed out after 60s; output discarded"), "capture timed out after 60s; output discarded");
+    }
 
     #[test]
     fn local_root_is_the_system_drive_on_windows_and_slash_elsewhere() {

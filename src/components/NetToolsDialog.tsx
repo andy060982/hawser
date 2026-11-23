@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { Activity, Globe, Radar, Route, Square, X } from 'lucide-react'
 import { safeInvoke, safeListen } from '../lib/tauri'
 import { netTargetError, parsePort } from '../lib/transfers'
@@ -44,11 +44,18 @@ export function NetToolsDialog({
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
 
+  /* Escape closes this dialog only when the key is pressed INSIDE it (no
+     window listener): a confirm or alert opened above it holds the focus,
+     so its Escape dismisses just that alert and never this dialog too. */
+  const panelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onCloseRef.current()
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
+    if (!panelRef.current?.contains(document.activeElement)) panelRef.current?.focus()
   }, [])
+  const onPanelKey = (e: ReactKeyboardEvent) => {
+    if (e.key !== 'Escape') return
+    e.stopPropagation()
+    onCloseRef.current()
+  }
 
   /** Synchronous run guard: `running` is render-time state, so two fast
    *  clicks both saw it empty and started two runs (the first one's listener
@@ -186,10 +193,13 @@ export function NetToolsDialog({
       <div className="animate-scrim-in absolute inset-0 bg-surface-0/75 backdrop-blur-[2px]" aria-hidden />
 
       <div
+        ref={panelRef}
+        tabIndex={-1}
+        onKeyDown={onPanelKey}
         role="dialog"
         aria-modal="true"
         aria-labelledby="nt-title"
-        className="animate-drop-in relative mt-10 flex h-[70vh] w-[40rem] max-w-[94vw] flex-col overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
+        className="animate-drop-in relative outline-none mt-10 flex h-[70vh] w-[40rem] max-w-[94vw] flex-col overflow-hidden rounded-panel border border-line-strong bg-surface-2 shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75)]"
       >
         <header className="flex items-center gap-2 border-b border-line px-4 py-2.5">
           <Activity size={15} className="shrink-0 text-accent" aria-hidden />

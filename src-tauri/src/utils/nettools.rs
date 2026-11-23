@@ -294,30 +294,7 @@ impl NetTools {
         if addrs.is_empty() {
             return Ok(format!("{target}:{port} DNS FAILED — no addresses returned."));
         }
-        let mut lines = Vec::new();
-        for addr in addrs.iter().take(4) {
-            let started = Instant::now();
-            let (v, detail) = match tokio::time::timeout(
-                Duration::from_millis(timeout_ms),
-                tokio::net::TcpStream::connect(addr),
-            )
-            .await
-            {
-                Ok(Ok(_)) => (PortVerdict::Open, format!("{} ms", started.elapsed().as_millis())),
-                Ok(Err(e)) => (classify_connect_error(e.kind()), e.to_string()),
-                Err(_) => (PortVerdict::Filtered, String::new()),
-            };
-            let label = if addr.ip().to_string() == target {
-                target.to_string()
-            } else {
-                format!("{target} ({})", addr.ip())
-            };
-            lines.push(port_line(&label, port, v, &detail, timeout_ms));
-            if v == PortVerdict::Open {
-                break;
-            }
-        }
-        Ok(lines.join("\n"))
+        Ok(check_addrs(target, port, &addrs, timeout_ms).await)
     }
 
     /// DNS resolution via the OS resolver — the same answer every other app on
@@ -391,6 +368,51 @@ pub async fn probe_hosts(targets: Vec<(String, String, u16)>) -> Vec<ProbeResult
     out
 }
 
+/// How many resolved addresses a port check tries.
+const MAX_PORT_ADDRS: usize = 4;
+
+/// Try `addrs` in order (at most `MAX_PORT_ADDRS`), stopping at the first
+/// open one, one line per address tried. When the list was cut short without
+/// finding an open port, say so: a name whose only reachable address is the
+/// fifth must not read as "every address failed".
+async fn check_addrs(target: &str, port: u16, addrs: &[std::net::SocketAddr], timeout_ms: u64) -> String {
+    let mut lines = Vec::new();
+    let mut tried = 0usize;
+    let mut open = false;
+    for addr in addrs.iter().take(MAX_PORT_ADDRS) {
+        tried += 1;
+        let started = Instant::now();
+        let (v, detail) = match tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => (PortVerdict::Open, format!("{} ms", started.elapsed().as_millis())),
+            Ok(Err(e)) => (classify_connect_error(e.kind()), e.to_string()),
+            Err(_) => (PortVerdict::Filtered, String::new()),
+        };
+        let label = if addr.ip().to_string() == target {
+            target.to_string()
+        } else {
+            format!("{target} ({})", addr.ip())
+        };
+        lines.push(port_line(&label, port, v, &detail, timeout_ms));
+        if v == PortVerdict::Open {
+            open = true;
+            break;
+        }
+    }
+    if !open && tried < addrs.len() {
+        lines.push(format!(
+            "tried {tried} of {} addresses for {target}; the other {} were not tried.",
+            addrs.len(),
+            addrs.len() - tried
+        ));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +479,23 @@ mod tests {
         assert!(line.starts_with("Ping wird ausgef"));
         assert!(line.ends_with("r 1.1.1.1"));
         assert!(line.contains('\u{FFFD}'));
+    }
+
+    /// Six addresses, none open: four are tried and the result says the other
+    /// two were not, rather than reading as "every address failed".
+    #[tokio::test]
+    async fn port_check_says_when_addresses_were_skipped() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let out = check_addrs("h.example", port, &[addr; 6], 2000).await;
+        assert_eq!(out.lines().count(), 5, "{out}");
+        assert!(out.contains("tried 4 of 6 addresses"), "{out}");
+        assert!(out.contains("other 2 were not tried"), "{out}");
+        // All tried: nothing to report.
+        let out = check_addrs("h.example", port, &[addr; 2], 2000).await;
+        assert!(!out.contains("tried"), "{out}");
     }
 }
